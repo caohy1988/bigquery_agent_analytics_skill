@@ -1,0 +1,9 @@
+# Generated file — run `python scripts/compile.py` to rebuild
+bigquery-agent-analytics-skill/compiled_skill.md
+
+# Python
+__pycache__/
+*.pyc
+
+# Environment
+.env
