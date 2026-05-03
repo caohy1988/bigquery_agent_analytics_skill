@@ -128,7 +128,48 @@ The plugin records these BQAA events:
 | `Notification`, `SessionEnd` | `STATE_DELTA` |
 | `SubagentStop` | child-agent `LLM_RESPONSE` |
 
-## Codex / Other Agents
+## Codex CLI
+
+Codex CLI doesn't ship a hook system, but `codex exec --json` emits a
+JSONL event stream. The `bqaa-codex` wrapper at
+`scripts/bqaa_codex.py` runs `codex exec --json` as a subprocess,
+maps each event to a BQAA row via the same spool/drainer pipeline as
+the Claude Code hook adapter, and forwards Codex's agent text to your
+stdout — so the wrapper is a drop-in for `codex exec`.
+
+```bash
+# Where you used to run:
+codex exec --skip-git-repo-check --sandbox read-only "list the files"
+
+# Run instead:
+python plugins/bigquery-agent-analytics-tracing/scripts/bqaa_codex.py \
+  --skip-git-repo-check --sandbox read-only "list the files"
+
+# Or alias it:
+alias bqaa-codex="python /path/to/scripts/bqaa_codex.py"
+bqaa-codex --skip-git-repo-check --sandbox read-only "list the files"
+```
+
+Event mapping:
+
+| Codex event | BQAA event |
+| --- | --- |
+| `thread.started` | captured as `session_id` |
+| `turn.started` | `LLM_REQUEST` (with the wrapper-captured prompt) |
+| `item.started` (non-message) | `TOOL_STARTING` |
+| `item.completed` (non-message) | `TOOL_COMPLETED` |
+| `item.completed` (`agent_message`) | accumulated, echoed to stdout |
+| `turn.completed` | `LLM_RESPONSE` (with `usage`) |
+
+Rows are tagged `attributes.source = "codex_cli"` and
+`attributes.writer.agent = "codex-cli"` (override `BQAA_AGENT_NAME`
+to change). All other BQAA env vars work unchanged.
+
+`BQAA_CODEX_BIN` lets you point at a non-`PATH` Codex install.
+`BQAA_CODEX_PROMPT` is a fallback prompt for stdin-driven runs where
+no positional argument carries the prompt.
+
+## Other Agents (direct SDK)
 
 Codex packaging is in `.codex-plugin/plugin.json`, with an example
 marketplace entry in `codex-marketplace.example.json`.
