@@ -15,6 +15,21 @@ export BQ_TABLE="agent_events"          # optional, defaults to agent_events
 pip install google-cloud-bigquery
 ```
 
+## Tracing Plugin
+
+This repo also includes `plugins/bigquery-agent-analytics-tracing`, a Claude
+Code/Codex-oriented tracing bridge that emits rows in the same BigQuery Agent
+Analytics `agent_events` format analyzed by this skill.
+
+- Claude Code: install from the repo-local `.claude-plugin/marketplace.json`.
+- Codex/other agents: use the `.codex-plugin` package metadata and the Python
+  SDK at `plugins/bigquery-agent-analytics-tracing/sdk/python/bqaa_tracing.py`.
+- The plugin maps coding-agent hooks to BQAA events such as `LLM_REQUEST`,
+  `LLM_RESPONSE`, `TOOL_STARTING`, and `TOOL_COMPLETED`.
+
+See
+`plugins/bigquery-agent-analytics-tracing/README.md` for setup and SDK examples.
+
 ### 2. Install in your AI assistant
 
 **Claude Code** — add to `CLAUDE.md` or copy to `.claude/skills/`:

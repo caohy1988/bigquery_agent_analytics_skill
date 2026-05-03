@@ -1,0 +1,20 @@
+{
+  "name": "bigquery-agent-analytics-plugin",
+  "interface": {
+    "displayName": "BigQuery Agent Analytics"
+  },
+  "plugins": [
+    {
+      "name": "bigquery-agent-analytics-tracing",
+      "source": {
+        "source": "local",
+        "path": "./plugins/bigquery-agent-analytics-tracing"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

@@ -1,0 +1,37 @@
+{
+  "name": "bigquery-agent-analytics-tracing",
+  "version": "0.1.0",
+  "description": "SDK and plugin packaging for logging Codex or Claude agent traces to BigQuery Agent Analytics.",
+  "author": {
+    "name": "Erroration2022"
+  },
+  "homepage": "https://adk.dev/integrations/bigquery-agent-analytics/",
+  "repository": "https://github.com/Erroration2022/bigquery_agent_analytics_skill",
+  "license": "MIT",
+  "keywords": [
+    "bigquery",
+    "agent-analytics",
+    "observability",
+    "tracing",
+    "codex",
+    "claude-code"
+  ],
+  "interface": {
+    "displayName": "BigQuery Agent Analytics Tracing",
+    "shortDescription": "Log agent traces into ADK BQAA tables.",
+    "longDescription": "Provides a small Python SDK and Claude Code hook bridge that write agent events in the Google ADK BigQuery Agent Analytics agent_events schema.",
+    "developerName": "Erroration2022",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://adk.dev/integrations/bigquery-agent-analytics/",
+    "defaultPrompt": [
+      "Instrument this agent with BQAA tracing.",
+      "Show recent BQAA errors.",
+      "Compare tool latency in BigQuery."
+    ],
+    "brandColor": "#4285F4"
+  }
+}
