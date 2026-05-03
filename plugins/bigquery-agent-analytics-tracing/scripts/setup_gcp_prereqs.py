@@ -13,6 +13,7 @@ import os
 import shlex
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -25,6 +26,14 @@ from bqaa_tracing import bq_schema  # noqa: E402
 
 
 BIGQUERY_API_SERVICES = ("bigquery.googleapis.com", "bigquerystorage.googleapis.com")
+PRINCIPAL_PREFIXES = (
+    "user:",
+    "serviceAccount:",
+    "group:",
+    "domain:",
+    "principal://",
+    "principalSet://",
+)
 
 
 @dataclass(frozen=True)
@@ -32,6 +41,7 @@ class Step:
     label: str
     command: list[str] | None = None
     action: Callable[[], None] | None = None
+    detail: str | None = None
 
 
 def _default_project() -> str:
@@ -84,21 +94,44 @@ def _ensure_service_account(project: str, value: str) -> None:
     if describe.returncode == 0:
         print(f"OK service account exists: {email}")
         return
-    subprocess.run(
-        [
-            "gcloud",
-            "iam",
-            "service-accounts",
-            "create",
-            _service_account_id(value),
-            "--project",
-            project,
-            "--display-name",
-            "BQAA tracing writer",
-        ],
-        check=True,
+    command = [
+        "gcloud",
+        "iam",
+        "service-accounts",
+        "create",
+        _service_account_id(value),
+        "--project",
+        project,
+        "--display-name",
+        "BQAA tracing writer",
+    ]
+    last_result: subprocess.CompletedProcess[str] | None = None
+    for attempt in range(1, 4):
+        last_result = subprocess.run(command, check=False)
+        if last_result.returncode == 0:
+            print(f"CREATED service account: {email}")
+            return
+        if attempt < 3:
+            print(
+                "Service account create failed; retrying after API/IAM propagation "
+                f"delay (attempt {attempt}/3).",
+                file=sys.stderr,
+            )
+            time.sleep(5)
+    returncode = last_result.returncode if last_result else 1
+    raise subprocess.CalledProcessError(returncode, command)
+
+
+def _validate_principal(value: str) -> None:
+    if value in ("allUsers", "allAuthenticatedUsers"):
+        return
+    if any(value.startswith(prefix) for prefix in PRINCIPAL_PREFIXES):
+        return
+    raise SystemExit(
+        "--principal must start with one of: "
+        "user:, serviceAccount:, group:, domain:, principal://, principalSet:// "
+        "(or be allUsers/allAuthenticatedUsers)"
     )
-    print(f"CREATED service account: {email}")
 
 
 def _require_project_dataset(args: argparse.Namespace) -> None:
@@ -108,6 +141,8 @@ def _require_project_dataset(args: argparse.Namespace) -> None:
         )
     if not args.dataset:
         raise SystemExit("--dataset is required, or set BQAA_DATASET")
+    if args.principal:
+        _validate_principal(args.principal)
 
 
 def _ensure_dataset(project: str, dataset: str, location: str | None) -> None:
@@ -181,6 +216,10 @@ def _build_steps(args: argparse.Namespace) -> list[Step]:
             Step(
                 f"Ensure service account {_service_account_email(args.project, args.service_account)}",
                 action=lambda: _ensure_service_account(args.project, args.service_account),
+                detail=(
+                    "gcloud iam service-accounts describe; on missing, "
+                    "create service account with a short retry for API/IAM propagation"
+                ),
             )
         )
 
@@ -189,6 +228,10 @@ def _build_steps(args: argparse.Namespace) -> list[Step]:
             Step(
                 f"Ensure dataset {args.project}.{args.dataset}",
                 action=lambda: _ensure_dataset(args.project, args.dataset, args.location),
+                detail=(
+                    "bigquery.Client.get_dataset(); on NotFound, "
+                    f"create_dataset(location={args.location or 'client default'})"
+                ),
             )
         )
 
@@ -198,6 +241,10 @@ def _build_steps(args: argparse.Namespace) -> list[Step]:
                 f"Ensure table {args.project}.{args.dataset}.{args.table}",
                 action=lambda: _ensure_table(
                     args.project, args.dataset, args.table, args.location
+                ),
+                detail=(
+                    "bigquery.Client.get_table(); on NotFound, create partitioned "
+                    "agent_events table using bqaa_tracing.bq_schema()"
                 ),
             )
         )
@@ -210,6 +257,7 @@ def _build_steps(args: argparse.Namespace) -> list[Step]:
                     [
                         "bq",
                         "add-iam-policy-binding",
+                        "-d",
                         f"{args.project}:{args.dataset}",
                         "--member",
                         args.principal,
@@ -271,15 +319,15 @@ def _print_plan(args: argparse.Namespace, steps: list[Step]) -> None:
         if step.command:
             print(f"   {_quote_command(step.command)}")
         elif step.action:
-            print("   python action")
+            print(f"   python action: {step.detail or 'run setup action'}")
     print()
 
 
 def run(args: argparse.Namespace) -> int:
-    _require_project_dataset(args)
     if args.service_account and not args.principal:
         email = _service_account_email(args.project, args.service_account)
         args.principal = f"serviceAccount:{email}"
+    _require_project_dataset(args)
     steps = _build_steps(args)
     _print_plan(args, steps)
     if not args.execute:

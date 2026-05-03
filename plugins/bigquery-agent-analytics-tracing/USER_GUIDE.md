@@ -103,6 +103,7 @@ SERVICE_ACCOUNT="bqaa-writer@${BQAA_PROJECT_ID}.iam.gserviceaccount.com"
 
 # Existing dataset/table, or auto-create table inside an existing dataset:
 bq add-iam-policy-binding \
+  -d \
   "${BQAA_PROJECT_ID}:${BQAA_DATASET}" \
   --member "serviceAccount:${SERVICE_ACCOUNT}" \
   --role roles/bigquery.dataEditor

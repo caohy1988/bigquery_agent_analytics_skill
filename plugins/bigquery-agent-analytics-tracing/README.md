@@ -106,7 +106,8 @@ Then append `--execute` to apply the plan. The script can create the
 `bqaa-writer` service account, create the BigQuery dataset/table, enable APIs,
 and grant runtime IAM. See
 [USER_GUIDE.md](./USER_GUIDE.md#1-prepare-bigquery) for the full IAM matrix,
-manual commands, and runtime auto-create options.
+manual commands, and runtime auto-create options. Dataset IAM bindings are
+emitted with explicit `bq add-iam-policy-binding -d`.
 
 ### Python runtime
 
