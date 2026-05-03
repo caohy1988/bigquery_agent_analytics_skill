@@ -43,6 +43,85 @@ The identity needs dataset write access. For auto-create behavior, it also
 needs permission to create tables, and optionally datasets if
 `BQAA_AUTO_CREATE_DATASET=true`.
 
+Automatic bootstrap, safe dry-run first:
+
+```bash
+python -m pip install google-cloud-bigquery
+
+python plugins/bigquery-agent-analytics-tracing/scripts/setup_gcp_prereqs.py \
+  --project "$BQAA_PROJECT_ID" \
+  --dataset "$BQAA_DATASET" \
+  --table "$BQAA_TABLE" \
+  --location "$BQAA_LOCATION" \
+  --service-account bqaa-writer
+```
+
+If the printed plan is correct, apply it:
+
+```bash
+python plugins/bigquery-agent-analytics-tracing/scripts/setup_gcp_prereqs.py \
+  --project "$BQAA_PROJECT_ID" \
+  --dataset "$BQAA_DATASET" \
+  --table "$BQAA_TABLE" \
+  --location "$BQAA_LOCATION" \
+  --service-account bqaa-writer \
+  --execute
+```
+
+The bootstrap command enables the required BigQuery APIs, creates the dataset
+and `agent_events` table if missing, and grants the runtime principal the
+narrow BigQuery roles below. `--service-account bqaa-writer` creates
+`bqaa-writer@${BQAA_PROJECT_ID}.iam.gserviceaccount.com` if it does not exist.
+Use `--principal "user:name@example.com"` instead when the agent runtime uses
+user ADC. Add `--runtime-auto-create-dataset` only when the runtime itself will
+run with `BQAA_AUTO_CREATE_DATASET=true`.
+
+Required APIs:
+
+```bash
+gcloud services enable bigquery.googleapis.com bigquerystorage.googleapis.com iam.googleapis.com \
+  --project "$BQAA_PROJECT_ID"
+```
+
+`iam.googleapis.com` is only needed when the bootstrap command creates a
+service account; the BigQuery APIs are needed for the tracing writer paths.
+
+Recommended IAM by deployment mode:
+
+| Mode | Required roles |
+| --- | --- |
+| Existing dataset and table | `roles/bigquery.dataEditor` on the dataset |
+| Auto-create table in an existing dataset | `roles/bigquery.dataEditor` on the dataset |
+| Auto-create dataset and table in the bootstrap script | bootstrap identity needs create permissions; runtime principal needs `roles/bigquery.dataEditor` on the dataset after creation |
+| Runtime auto-creates dataset/table | `roles/bigquery.user` on the project plus `roles/bigquery.dataEditor` after the dataset exists, or `roles/bigquery.admin` for bootstrap-only setup |
+| Run verification SQL or smoke scripts that query the table | `roles/bigquery.jobUser` on the project plus dataset read/write access |
+
+Manual IAM equivalent:
+
+```bash
+SERVICE_ACCOUNT="bqaa-writer@${BQAA_PROJECT_ID}.iam.gserviceaccount.com"
+
+# Existing dataset/table, or auto-create table inside an existing dataset:
+bq add-iam-policy-binding \
+  "${BQAA_PROJECT_ID}:${BQAA_DATASET}" \
+  --member "serviceAccount:${SERVICE_ACCOUNT}" \
+  --role roles/bigquery.dataEditor
+
+# Needed for `bq query` verification and smoke scripts that query BigQuery:
+gcloud projects add-iam-policy-binding "$BQAA_PROJECT_ID" \
+  --member "serviceAccount:${SERVICE_ACCOUNT}" \
+  --role roles/bigquery.jobUser
+
+# Only if BQAA_AUTO_CREATE_DATASET=true in the runtime:
+gcloud projects add-iam-policy-binding "$BQAA_PROJECT_ID" \
+  --member "serviceAccount:${SERVICE_ACCOUNT}" \
+  --role roles/bigquery.user
+```
+
+Keep `roles/bigquery.admin` out of steady-state agent runtimes. It is useful
+for first-time bootstrap in a dev project, but the runtime writer only needs
+the narrower roles above.
+
 ## 2. Install Runtime Dependencies
 
 Minimum:

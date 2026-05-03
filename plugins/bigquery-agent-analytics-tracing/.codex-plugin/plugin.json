@@ -25,6 +25,7 @@
     "websiteURL": "https://adk.dev/integrations/bigquery-agent-analytics/",
     "defaultPrompt": [
       "Instrument this agent with BQAA tracing.",
+      "Bootstrap GCP IAM and BigQuery prerequisites for BQAA tracing.",
       "Show recent BQAA errors.",
       "Compare tool latency in BigQuery."
     ],
