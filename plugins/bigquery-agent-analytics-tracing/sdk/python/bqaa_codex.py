@@ -34,6 +34,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from typing import Any
 
@@ -55,9 +56,69 @@ TOOL_NAME_MAP = {
     "web_search": "web_search",
 }
 
+# Codex `exec` flags that consume the next argv token. Drawn from
+# `codex exec --help` (codex-cli 0.128). Boolean flags and the
+# combined ``--flag=value`` form do not need to appear here. The
+# parser walks argv left-to-right and skips one token after each of
+# these flags so the remaining positionals are the real prompt
+# candidates — fixes the prior best-effort right-to-left walk that
+# could pick up flag values like ``--output-last-message out.txt``.
+CODEX_VALUE_FLAGS: frozenset[str] = frozenset(
+    {
+        "-c",
+        "--config",
+        "--enable",
+        "--disable",
+        "-i",
+        "--image",
+        "-m",
+        "--model",
+        "--local-provider",
+        "-p",
+        "--profile",
+        "-s",
+        "--sandbox",
+        "-C",
+        "--cd",
+        "--add-dir",
+        "--output-schema",
+        "--color",
+        "-o",
+        "--output-last-message",
+    }
+)
+
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def _codex_version(codex_bin: str) -> str | None:
+    """Return ``codex --version`` output (best effort, capped, cached-per-init)."""
+    try:
+        result = subprocess.run(
+            [codex_bin, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (FileNotFoundError, OSError, subprocess.SubprocessError):
+        return None
+    text = (result.stdout or result.stderr or "").strip()
+    return text[:128] if text else None
+
+
+def _combine_prompt(argv_prompt: str, stdin_payload: str) -> str:
+    """Mirror Codex's prompt composition for BQAA's LLM_REQUEST.
+
+    Codex docs: "If stdin is piped and a prompt is also provided, stdin
+    is appended as a `<stdin>` block." We mirror that so the captured
+    LLM_REQUEST content matches what Codex actually sees.
+    """
+    if argv_prompt and stdin_payload:
+        return f"{argv_prompt}\n<stdin>\n{stdin_payload}\n</stdin>"
+    return stdin_payload or argv_prompt
 
 
 def _resolve_agent_name(config: BQAAConfig) -> str:
@@ -73,32 +134,75 @@ def _resolve_agent_name(config: BQAAConfig) -> str:
 
 
 def _extract_prompt(argv: list[str]) -> str:
-    """Best-effort prompt capture from the wrapper's argv.
+    """Pull the trailing positional out of argv, skipping known flag values.
 
-    Codex itself accepts the prompt as a trailing positional, with options
-    interspersed via ``-c key=value``, ``--config``, ``--model``, etc. For
-    BQAA's purposes we only need it for the LLM_REQUEST content, so we
-    walk argv right-to-left and pick the first non-flag, non-``-`` token.
+    Walks argv left-to-right (not right-to-left) and consumes a value
+    token after every known value-flag in ``CODEX_VALUE_FLAGS``. Combined
+    ``--flag=value`` is treated as a single token. Anything after ``--``
+    is positional. The trailing positional is the prompt; falls back to
+    the ``BQAA_CODEX_PROMPT`` env override if no positional is found.
 
-    If no prompt is in argv (e.g. user piped via stdin and passed ``-``),
-    we honor the BQAA_CODEX_PROMPT env override; otherwise an empty
-    string lands in LLM_REQUEST and the row still flows through.
+    Note: stdin-supplied prompts are picked up by the wrapper separately
+    (see ``CodexBQAAWrapper._read_stdin_payload``); this function only
+    sees argv.
     """
-    for token in reversed(argv):
-        if not token:
+    positionals: list[str] = []
+    i = 0
+    n = len(argv)
+    while i < n:
+        token = argv[i]
+        if token == "--":
+            positionals.extend(t for t in argv[i + 1 :] if t and t != "-")
+            break
+        if token.startswith("-") and token != "-":
+            if "=" in token:
+                # --flag=value form: value is bundled in this token.
+                i += 1
+                continue
+            if token in CODEX_VALUE_FLAGS and i + 1 < n:
+                # Skip the value that follows.
+                i += 2
+                continue
+            # Unknown long flag or known boolean flag — single token.
+            i += 1
             continue
-        if token == "-" or token.startswith("-"):
-            continue
-        return token
+        if token and token != "-":
+            positionals.append(token)
+        i += 1
+    if positionals:
+        return positionals[-1]
     return os.environ.get("BQAA_CODEX_PROMPT", "")
 
 
-def _attributes(extra: dict[str, Any] | None = None) -> dict[str, Any]:
+def _attributes(
+    *,
+    codex_version: str | None,
+    raw_event_type: str | None = None,
+    raw_item_type: str | None = None,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the attributes block for a row.
+
+    Always includes a ``codex`` block with at least the Codex CLI
+    version (captured via ``codex --version`` at wrapper init). When
+    relevant, also stamps the raw Codex event type and item type so
+    that future schema drift in the JSONL stream is debuggable from
+    the events table itself, without needing to re-derive from logs.
+    """
+    codex_block: dict[str, Any] = {}
+    if codex_version:
+        codex_block["version"] = codex_version
+    if raw_event_type:
+        codex_block["raw_event_type"] = raw_event_type
+    if raw_item_type:
+        codex_block["raw_item_type"] = raw_item_type
     base: dict[str, Any] = {
         "source": SOURCE,
         "session_metadata": {"source": SOURCE},
         "custom_tags": {"assistant": DEFAULT_AGENT_NAME},
     }
+    if codex_block:
+        base["codex"] = codex_block
     if extra:
         base.update(extra)
     return base
@@ -146,6 +250,8 @@ def _usage_extras(usage: dict[str, Any]) -> dict[str, Any]:
 class CodexBQAAWrapper:
     """Drives a single ``codex exec --json`` subprocess and emits BQAA rows."""
 
+    STDIN_READ_LIMIT = 1 * 1024 * 1024  # 1 MiB cap on the captured stdin payload.
+
     def __init__(
         self,
         codex_argv: list[str],
@@ -153,17 +259,23 @@ class CodexBQAAWrapper:
         config: BQAAConfig | None = None,
         codex_bin: str | None = None,
         prompt: str | None = None,
+        stdin: Any = None,
         stdout: Any = None,
         stderr: Any = None,
     ):
         self.codex_argv = codex_argv
         self.codex_bin = codex_bin or os.environ.get("BQAA_CODEX_BIN") or "codex"
-        self.prompt = prompt if prompt is not None else _extract_prompt(codex_argv)
+        self.argv_prompt = prompt if prompt is not None else _extract_prompt(codex_argv)
         self.config = config or BQAAConfig.from_env()
         self.agent = _resolve_agent_name(self.config)
         self.logger = BigQueryAgentAnalyticsLogger(self.config)
+        self._stdin = stdin if stdin is not None else sys.stdin
         self._stdout = stdout if stdout is not None else sys.stdout
         self._stderr = stderr if stderr is not None else sys.stderr
+        self.codex_version = _codex_version(self.codex_bin)
+        # Captured at run() time once we know whether stdin is piped.
+        self.stdin_payload: str = ""
+        self.prompt: str = self.argv_prompt
 
         # Per-process state. Codex emits one or more turn cycles per
         # invocation (interactive resume / forks). We reset turn state on
@@ -179,10 +291,21 @@ class CodexBQAAWrapper:
     # ---- entrypoint ------------------------------------------------------
 
     def run(self) -> int:
+        # Capture piped stdin (if any) so the BQAA LLM_REQUEST records
+        # the real prompt bytes the model saw, not just the argv-derived
+        # prompt. Codex itself reads stdin as part of its prompt when
+        # `-` is the trailing positional or when it's piped without one.
+        self.stdin_payload = self._read_stdin_payload()
+        self.prompt = _combine_prompt(self.argv_prompt, self.stdin_payload)
+
+        # Decide stdin handling for the Codex child. If we captured a
+        # payload, write it to Codex's stdin via PIPE; otherwise inherit
+        # the wrapper's stdin (TTY or unread fd).
         argv = [self.codex_bin, "exec", "--json", *self.codex_argv]
         try:
             proc = subprocess.Popen(
                 argv,
+                stdin=subprocess.PIPE if self.stdin_payload else self._stdin,
                 stdout=subprocess.PIPE,
                 stderr=self._stderr,
                 bufsize=1,  # line-buffered so we see events as Codex emits them
@@ -192,6 +315,28 @@ class CodexBQAAWrapper:
             print(f"bqaa-codex: cannot launch codex ({exc})", file=self._stderr)
             return 127
 
+        # Feed captured stdin to Codex on a background thread so reads
+        # of Codex's stdout aren't blocked behind a slow consumer in
+        # Codex itself.
+        feeder: threading.Thread | None = None
+        if self.stdin_payload and proc.stdin is not None:
+            payload = self.stdin_payload
+            stdin_handle = proc.stdin
+
+            def _feed() -> None:
+                try:
+                    stdin_handle.write(payload)
+                except BrokenPipeError:
+                    pass
+                finally:
+                    try:
+                        stdin_handle.close()
+                    except (BrokenPipeError, OSError):
+                        pass
+
+            feeder = threading.Thread(target=_feed, daemon=True)
+            feeder.start()
+
         try:
             assert proc.stdout is not None
             for line in proc.stdout:
@@ -199,8 +344,34 @@ class CodexBQAAWrapper:
         except KeyboardInterrupt:
             proc.terminate()
             proc.wait()
+            if feeder is not None:
+                feeder.join(timeout=1)
             return 130
-        return proc.wait()
+        result = proc.wait()
+        if feeder is not None:
+            feeder.join(timeout=1)
+        return result
+
+    def _read_stdin_payload(self) -> str:
+        """Return piped stdin contents (capped) or '' if stdin is a TTY."""
+        stream = self._stdin
+        try:
+            isatty = stream.isatty()
+        except (AttributeError, ValueError):
+            isatty = True
+        if isatty:
+            return ""
+        try:
+            data = stream.read(self.STDIN_READ_LIMIT + 1)
+        except (OSError, ValueError):
+            return ""
+        if not data:
+            return ""
+        if isinstance(data, bytes):
+            data = data.decode("utf-8", "replace")
+        if len(data) > self.STDIN_READ_LIMIT:
+            data = data[: self.STDIN_READ_LIMIT] + "\n...[STDIN_TRUNCATED]"
+        return data
 
     # ---- per-line dispatch ----------------------------------------------
 
@@ -251,7 +422,10 @@ class CodexBQAAWrapper:
             span_id=self.turn_llm_span,
             agent=self.agent,
             user_id=self.config.user_id,
-            attributes=_attributes(),
+            attributes=_attributes(
+                codex_version=self.codex_version,
+                raw_event_type="turn.started",
+            ),
         )
 
     def _on_item_started(self, event: dict[str, Any]) -> None:
@@ -282,7 +456,11 @@ class CodexBQAAWrapper:
             parent_span_id=self.turn_llm_span,
             agent=self.agent,
             tool_origin=_tool_origin_for(item_type),
-            attributes=_attributes({"codex_item_type": item_type}),
+            attributes=_attributes(
+                codex_version=self.codex_version,
+                raw_event_type="item.started",
+                raw_item_type=item_type,
+            ),
         )
 
     def _on_item_completed(self, event: dict[str, Any]) -> None:
@@ -318,14 +496,21 @@ class CodexBQAAWrapper:
             total_ms=max(0, _now_ms() - start_ms),
             status=status,
             error_message=error_message,
-            attributes=_attributes({"codex_item_type": item_type}),
+            attributes=_attributes(
+                codex_version=self.codex_version,
+                raw_event_type="item.completed",
+                raw_item_type=item_type,
+            ),
         )
 
     def _on_turn_completed(self, event: dict[str, Any]) -> None:
         usage = event.get("usage") or {}
         usage_metadata = _normalize_usage(usage)
         extras = _usage_extras(usage)
-        attrs = _attributes()
+        attrs = _attributes(
+            codex_version=self.codex_version,
+            raw_event_type="turn.completed",
+        )
         if extras:
             attrs["usage_extras"] = extras
         total_ms = max(0, _now_ms() - int(self.turn_start_ms or _now_ms()))

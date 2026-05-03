@@ -128,7 +128,7 @@ The plugin records these BQAA events:
 | `Notification`, `SessionEnd` | `STATE_DELTA` |
 | `SubagentStop` | child-agent `LLM_RESPONSE` |
 
-## Codex CLI
+## Codex CLI (codex exec only)
 
 Codex CLI doesn't ship a hook system, but `codex exec --json` emits a
 JSONL event stream. The `bqaa-codex` wrapper at
@@ -136,6 +136,13 @@ JSONL event stream. The `bqaa-codex` wrapper at
 maps each event to a BQAA row via the same spool/drainer pipeline as
 the Claude Code hook adapter, and forwards Codex's agent text to your
 stdout — so the wrapper is a drop-in for `codex exec`.
+
+> **Scope:** this wrapper instruments `codex exec` (the non-interactive
+> entrypoint). Interactive `codex` TUI sessions are **not** captured —
+> there is no equivalent JSONL or hook surface in the TUI today. If
+> Codex grows a runtime tracing callback, swap the wrapper for that.
+> Codex plugins (`codex plugin marketplace`) package commands, not
+> hooks, so they aren't a fit either.
 
 ```bash
 # Where you used to run:
@@ -165,9 +172,37 @@ Rows are tagged `attributes.source = "codex_cli"` and
 `attributes.writer.agent = "codex-cli"` (override `BQAA_AGENT_NAME`
 to change). All other BQAA env vars work unchanged.
 
-`BQAA_CODEX_BIN` lets you point at a non-`PATH` Codex install.
-`BQAA_CODEX_PROMPT` is a fallback prompt for stdin-driven runs where
-no positional argument carries the prompt.
+For schema-drift debugging, every row also carries an
+`attributes.codex` block:
+
+- `codex.version` — `codex --version` captured at wrapper init.
+- `codex.raw_event_type` — the source event type (`turn.started`,
+  `turn.completed`, `item.started`, `item.completed`).
+- `codex.raw_item_type` — the underlying Codex item type for tool
+  rows (`command_execution`, `agent_message`, `mcp_tool_call`, etc.).
+
+### Prompt capture
+
+The wrapper combines argv and stdin so `attributes.content.prompt`
+matches what Codex actually sees:
+
+- The trailing positional in argv is the argv prompt. The parser
+  knows Codex's value-flags (`-c`, `-m`, `-s`, `-o`,
+  `--output-last-message`, `--output-schema`, etc.) so it doesn't
+  mistake a flag value for the prompt.
+- If stdin is piped (non-TTY), the wrapper reads it (capped at
+  1 MiB) and tees it into Codex's stdin in a background thread.
+  When both argv and stdin are present, the wrapper records the
+  prompt as `<argv>\n<stdin>...stdin payload...</stdin>` to mirror
+  Codex's own `<stdin>` block convention.
+- `BQAA_CODEX_PROMPT` is a final fallback when neither argv nor
+  stdin yields a prompt.
+
+### Other env vars
+
+`BQAA_CODEX_BIN` lets you point at a non-`PATH` Codex install (the
+wrapper invokes `codex --version` and `codex exec --json` against
+this binary).
 
 ## Other Agents (direct SDK)
 
