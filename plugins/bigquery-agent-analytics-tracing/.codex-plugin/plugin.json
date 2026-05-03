@@ -22,10 +22,6 @@
     "longDescription": "Provides a small Python SDK and Claude Code hook bridge that write agent events in the Google ADK BigQuery Agent Analytics agent_events schema.",
     "developerName": "Erroration2022",
     "category": "Productivity",
-    "capabilities": [
-      "Read",
-      "Write"
-    ],
     "websiteURL": "https://adk.dev/integrations/bigquery-agent-analytics/",
     "defaultPrompt": [
       "Instrument this agent with BQAA tracing.",

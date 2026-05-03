@@ -80,6 +80,9 @@ def run(args: argparse.Namespace) -> int:
         agent_name=args.agent,
         user_id=args.user,
         dry_run=args.dry_run,
+        # Smoke test must observe the round-trip in this process, so bypass
+        # the spool/drainer and write inline. The hook path defaults to spool.
+        direct_write=not args.dry_run,
         auto_create_table=not args.no_create_table,
         auto_create_dataset=args.create_dataset,
         location=args.location,
