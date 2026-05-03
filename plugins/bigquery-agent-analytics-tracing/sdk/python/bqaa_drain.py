@@ -45,6 +45,7 @@ os.environ.setdefault("GRPC_ENABLE_FORK_SUPPORT", "1")
 
 from bqaa_tracing import (  # noqa: E402  (after env tweak)
     BQAAConfig,
+    WRITER_LABEL,
     _log,
     bq_schema,
 )
@@ -123,7 +124,12 @@ def _read_envelope(path: Path) -> _Envelope | None:
 
 
 def _group_envelopes(envelopes: list[_Envelope]) -> dict[tuple, list[_Envelope]]:
-    """Group by destination table so each batch hits a single table."""
+    """Group by destination table + writer label.
+
+    The writer label is part of the key so a single drainer process can serve
+    envelopes from differently-labeled deployments without bleeding their
+    AppendRowsRequest.trace_id values together.
+    """
     grouped: dict[tuple, list[_Envelope]] = {}
     for env in envelopes:
         cfg = env.config_dict
@@ -132,6 +138,7 @@ def _group_envelopes(envelopes: list[_Envelope]) -> dict[tuple, list[_Envelope]]
             cfg.get("dataset"),
             cfg.get("table"),
             cfg.get("location"),
+            cfg.get("writer_label") or WRITER_LABEL,
         )
         grouped.setdefault(key, []).append(env)
     return grouped
@@ -283,6 +290,7 @@ async def _write_batch_storage_api(
     rows: list[dict[str, Any]],
     retry: _RetryConfig,
     config: BQAAConfig,
+    writer_label: str,
 ) -> bool:
     """Write a batch via the Storage Write API. Returns True on success."""
     import pyarrow as pa
@@ -314,7 +322,9 @@ async def _write_batch_storage_api(
     try:
         req = bq_storage_types.AppendRowsRequest(
             write_stream=write_stream,
-            trace_id="bqaa-tracing-plugin/0.1.0",
+            # Writer attribution — visible in
+            # `INFORMATION_SCHEMA.WRITE_API_TIMELINE_BY_*.trace_id`.
+            trace_id=writer_label,
         )
         req.arrow_rows.writer_schema.serialized_schema = serialized_schema
         req.arrow_rows.rows.serialized_record_batch = serialized_batch
@@ -500,7 +510,7 @@ async def _drain_group_async(
     config: BQAAConfig,
     use_storage_api: bool,
 ) -> None:
-    project, dataset, table, location = key
+    project, dataset, table, location, writer_label = key
     if not project or not dataset or not table:
         for env in envelopes:
             _quarantine(env.path, reason="missing-config")
@@ -517,6 +527,7 @@ async def _drain_group_async(
             rows=rows,
             retry=retry,
             config=config,
+            writer_label=writer_label or WRITER_LABEL,
         )
         if not success:
             _log(config, "DRAINER storage_api_failed, falling back to insert_rows_json")

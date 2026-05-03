@@ -60,6 +60,7 @@ export BQAA_DRAIN_IDLE_SECONDS="8"
 export BQAA_DRAIN_POLL_SECONDS="0.5"
 export BQAA_TRANSCRIPT_MAX_BYTES="262144"     # 256 KB cap for SubagentStop transcripts
 export BQAA_STATE_TTL_HOURS="24"              # purge orphaned state files older than this
+export BQAA_WRITER_LABEL="bqaa-coding-agent-plugin/0.1.0"   # see "Writer attribution" below
 ```
 
 ### Authentication
@@ -181,6 +182,73 @@ The table is auto-created on first write (day-partitioned on `timestamp`,
 clustered on `event_type, agent, user_id`). Dataset auto-creation is off
 by default; set `BQAA_AUTO_CREATE_DATASET=true` only when the identity
 is allowed to create datasets.
+
+## Writer attribution & adoption tracking
+
+Every write carries a writer label so a dataset operator can attribute traces
+back to this plugin without inspecting the agent's environment. ADK does the
+same thing with `google-adk-bq-logger/<version>`; this plugin uses
+`bqaa-coding-agent-plugin/<version>` by default.
+
+The label appears in two places:
+
+1. **`attributes.writer` on every row.** Visible from the events table
+   itself, on both the Storage Write and the `insert_rows_json` paths.
+   This is the primary surface for self-service adoption queries.
+   Fields: `plugin`, `version`, `label`, `agent`, `mode`
+   (`spool` / `direct` / `dry_run`).
+2. **`AppendRowsRequest.trace_id`** when writing via the Storage Write API.
+   This is request-level metadata recorded server-side by Google for
+   diagnostics; it isn't surfaced as a column in the
+   `INFORMATION_SCHEMA.WRITE_API_TIMELINE_BY_*` views, but it lets
+   Google Cloud support attribute traffic back to this plugin when
+   investigating throughput / quota issues.
+
+Override the label per deployment with `BQAA_WRITER_LABEL` (e.g.
+`bqaa-coding-agent-plugin/0.1.0/team-foo`) so multiple teams sharing one
+dataset stay distinguishable. The override flows through to both surfaces.
+
+### Adoption / usage queries
+
+**Plugin adoption broken down by agent + mode + version** (works for any
+write path):
+
+```sql
+SELECT
+  JSON_VALUE(attributes, '$.writer.label')   AS writer_label,
+  JSON_VALUE(attributes, '$.writer.plugin')  AS plugin,
+  JSON_VALUE(attributes, '$.writer.version') AS plugin_version,
+  JSON_VALUE(attributes, '$.writer.agent')   AS agent,
+  JSON_VALUE(attributes, '$.writer.mode')    AS mode,
+  COUNT(DISTINCT session_id) AS sessions,
+  COUNT(DISTINCT user_id)    AS users,
+  COUNT(*)                   AS events
+FROM `your-project.your_dataset.agent_events`
+WHERE timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
+GROUP BY writer_label, plugin, plugin_version, agent, mode
+ORDER BY events DESC
+```
+
+**Storage Write API volume on this dataset** (no writer breakdown — the
+Storage Write API timeline view doesn't expose the trace_id column —
+useful for sanity-checking that writes are flowing and for capacity
+planning):
+
+```sql
+SELECT
+  table_id,
+  stream_type,
+  error_code,
+  SUM(total_rows) AS rows_written,
+  SUM(total_requests) AS requests,
+  SUM(total_input_bytes) AS input_bytes
+FROM `region-us`.INFORMATION_SCHEMA.WRITE_API_TIMELINE_BY_PROJECT
+WHERE start_timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)
+  AND project_id = 'your-project'
+  AND dataset_id = 'your_dataset'
+GROUP BY table_id, stream_type, error_code
+ORDER BY rows_written DESC
+```
 
 ## Reliability
 

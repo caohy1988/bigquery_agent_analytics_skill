@@ -77,6 +77,23 @@ DEFAULT_DRAIN_IDLE_SECONDS = 8.0
 DEFAULT_DRAIN_BATCH_SIZE = 50
 DEFAULT_DRAIN_POLL_SECONDS = 0.5
 
+# Writer identity. Mirrors how the ADK BQAA plugin tags its Storage Write
+# requests (`google-adk-bq-logger/<version>`) so adopters can attribute
+# writes back to this plugin from BigQuery's side.
+#
+# Two surfaces use this label:
+#   * AppendRowsRequest.trace_id — visible server-side in
+#     `INFORMATION_SCHEMA.WRITE_API_TIMELINE_BY_*` views as `trace_id`.
+#   * Every row's `attributes.writer.{plugin,version,agent,mode}` block —
+#     queryable from the events table itself, even on the
+#     insert_rows_json fallback path that has no Storage Write trace_id.
+#
+# Override per deployment with the BQAA_WRITER_LABEL env var (e.g. when
+# running multiple distinct deployments against one dataset).
+WRITER_PLUGIN_NAME = "bqaa-coding-agent-plugin"
+WRITER_PLUGIN_VERSION = "0.1.0"
+WRITER_LABEL = f"{WRITER_PLUGIN_NAME}/{WRITER_PLUGIN_VERSION}"
+
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -269,6 +286,7 @@ class BQAAConfig:
     drain_idle_seconds: float = DEFAULT_DRAIN_IDLE_SECONDS
     drain_batch_size: int = DEFAULT_DRAIN_BATCH_SIZE
     drain_poll_seconds: float = DEFAULT_DRAIN_POLL_SECONDS
+    writer_label: str = WRITER_LABEL
 
     @classmethod
     def from_env(cls) -> "BQAAConfig":
@@ -308,6 +326,7 @@ class BQAAConfig:
             drain_poll_seconds=float(
                 os.environ.get("BQAA_DRAIN_POLL_SECONDS", str(DEFAULT_DRAIN_POLL_SECONDS))
             ),
+            writer_label=os.environ.get("BQAA_WRITER_LABEL") or WRITER_LABEL,
         )
 
 
@@ -353,8 +372,24 @@ class BigQueryAgentAnalyticsLogger:
         clipped_content, content_truncated = _truncate(
             content or {}, self.config.max_content_length
         )
+        # Stamp writer identity onto every row so adoption/usage queries on
+        # the events table itself can group by plugin without depending on
+        # the Storage Write API's INFORMATION_SCHEMA views.
+        merged_attributes = dict(attributes or {})
+        merged_attributes.setdefault(
+            "writer",
+            {
+                "plugin": WRITER_PLUGIN_NAME,
+                "version": WRITER_PLUGIN_VERSION,
+                "label": self.config.writer_label,
+                "agent": agent or self.config.agent_name,
+                "mode": "dry_run"
+                if self.config.dry_run
+                else ("direct" if self.config.direct_write else "spool"),
+            },
+        )
         clipped_attributes, attr_truncated = _truncate(
-            attributes or {}, self.config.max_content_length
+            merged_attributes, self.config.max_content_length
         )
         clipped_latency, latency_truncated = _truncate(latency_ms or {}, 1000)
         clipped_parts, parts_truncated = _truncate(
@@ -548,6 +583,7 @@ class BigQueryAgentAnalyticsLogger:
                 "location": self.config.location,
                 "auto_create_table": self.config.auto_create_table,
                 "auto_create_dataset": self.config.auto_create_dataset,
+                "writer_label": self.config.writer_label,
             },
             "row": bq_row,
         }
