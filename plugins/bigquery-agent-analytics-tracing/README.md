@@ -168,6 +168,42 @@ Add `plugins/bigquery-agent-analytics-tracing/sdk/python` to `PYTHONPATH`,
 or vendor the two SDK modules (`bqaa_tracing.py`, `bqaa_drain.py`) into
 your agent runtime.
 
+## OpenAI Agents SDK
+
+The OpenAI Agents SDK supports custom trace exporters through
+`TracingProcessor`. Register this plugin with `add_trace_processor()` when you
+want to keep OpenAI's default exporter and also write BQAA rows:
+
+```bash
+pip install openai-agents google-cloud-bigquery
+```
+
+```python
+from agents import Agent, Runner
+from bqaa_openai_agents import add_bqaa_trace_processor
+
+add_bqaa_trace_processor(agent_name="openai-agents")
+
+agent = Agent(name="Assistant", instructions="Be concise.")
+result = Runner.run_sync(agent, "Say hello")
+```
+
+`generation` spans become paired `LLM_REQUEST` / `LLM_RESPONSE` rows, and
+`function` spans become paired `TOOL_STARTING` / `TOOL_COMPLETED` rows. Use
+`agents.tracing.set_trace_processors([processor])` only when you intentionally
+want to replace the SDK's default processors.
+
+To smoke-test the processor without making a model call:
+
+```bash
+PYTHONPATH="plugins/bigquery-agent-analytics-tracing/sdk/python:$PYTHONPATH" \
+python plugins/bigquery-agent-analytics-tracing/scripts/e2e_openai_agents_smoke.py \
+  --project "$BQAA_PROJECT_ID" \
+  --dataset agent_analytics \
+  --table agent_events \
+  --location US
+```
+
 ## Table Shape
 
 Rows are written to `{project}.{dataset}.{table}` with the same columns
