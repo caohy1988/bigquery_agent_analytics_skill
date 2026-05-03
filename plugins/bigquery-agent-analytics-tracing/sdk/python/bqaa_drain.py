@@ -124,21 +124,28 @@ def _read_envelope(path: Path) -> _Envelope | None:
 
 
 def _group_envelopes(envelopes: list[_Envelope]) -> dict[tuple, list[_Envelope]]:
-    """Group by destination table + writer label.
+    """Group by destination table + writer label + auto-create policy.
 
     The writer label is part of the key so a single drainer process can serve
     envelopes from differently-labeled deployments without bleeding their
-    AppendRowsRequest.trace_id values together.
+    AppendRowsRequest.trace_id values together. The auto-create flags are
+    part of the key so the fallback path honors each producer's policy
+    instead of clobbering it with hard-coded defaults.
     """
     grouped: dict[tuple, list[_Envelope]] = {}
     for env in envelopes:
         cfg = env.config_dict
+        # Defaults match BQAAConfig defaults in bqaa_tracing.py.
+        auto_create_table = cfg.get("auto_create_table")
+        auto_create_dataset = cfg.get("auto_create_dataset")
         key = (
             cfg.get("project_id"),
             cfg.get("dataset"),
             cfg.get("table"),
             cfg.get("location"),
             cfg.get("writer_label") or WRITER_LABEL,
+            True if auto_create_table is None else bool(auto_create_table),
+            False if auto_create_dataset is None else bool(auto_create_dataset),
         )
         grouped.setdefault(key, []).append(env)
     return grouped
@@ -322,8 +329,11 @@ async def _write_batch_storage_api(
     try:
         req = bq_storage_types.AppendRowsRequest(
             write_stream=write_stream,
-            # Writer attribution — visible in
-            # `INFORMATION_SCHEMA.WRITE_API_TIMELINE_BY_*.trace_id`.
+            # Writer attribution. Recorded server-side for Google support
+            # diagnostics; not surfaced as a column in
+            # `INFORMATION_SCHEMA.WRITE_API_TIMELINE_BY_*`. Adoption
+            # analytics use the row-level `attributes.writer` block
+            # instead — see WRITER_LABEL in bqaa_tracing.py.
             trace_id=writer_label,
         )
         req.arrow_rows.writer_schema.serialized_schema = serialized_schema
@@ -510,7 +520,15 @@ async def _drain_group_async(
     config: BQAAConfig,
     use_storage_api: bool,
 ) -> None:
-    project, dataset, table, location, writer_label = key
+    (
+        project,
+        dataset,
+        table,
+        location,
+        writer_label,
+        auto_create_table,
+        auto_create_dataset,
+    ) = key
     if not project or not dataset or not table:
         for env in envelopes:
             _quarantine(env.path, reason="missing-config")
@@ -534,7 +552,9 @@ async def _drain_group_async(
 
     if not success:
         # Fallback / second attempt path. Run in a thread so the event loop
-        # isn't blocked by the synchronous BQ client.
+        # isn't blocked by the synchronous BQ client. Use the per-envelope
+        # auto-create policy that the producer recorded in the spool, not a
+        # hard-coded default that would silently override their settings.
         success = await asyncio.to_thread(
             _write_batch_insert_rows_json,
             project=project,
@@ -544,8 +564,8 @@ async def _drain_group_async(
             rows=rows,
             retry=retry,
             config=config,
-            auto_create_table=True,
-            auto_create_dataset=False,
+            auto_create_table=auto_create_table,
+            auto_create_dataset=auto_create_dataset,
         )
 
     if success:

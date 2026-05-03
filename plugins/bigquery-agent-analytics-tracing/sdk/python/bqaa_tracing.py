@@ -82,11 +82,14 @@ DEFAULT_DRAIN_POLL_SECONDS = 0.5
 # writes back to this plugin from BigQuery's side.
 #
 # Two surfaces use this label:
-#   * AppendRowsRequest.trace_id — visible server-side in
-#     `INFORMATION_SCHEMA.WRITE_API_TIMELINE_BY_*` views as `trace_id`.
-#   * Every row's `attributes.writer.{plugin,version,agent,mode}` block —
-#     queryable from the events table itself, even on the
-#     insert_rows_json fallback path that has no Storage Write trace_id.
+#   * Every row's `attributes.writer.{plugin,version,label,agent,mode}`
+#     block — the queryable surface for self-service adoption analytics.
+#     Set on every write path, including the insert_rows_json fallback.
+#   * `AppendRowsRequest.trace_id` on Storage Write API batches — recorded
+#     server-side by Google for diagnostics. NOT exposed as a column in
+#     `INFORMATION_SCHEMA.WRITE_API_TIMELINE_BY_*`, so it can't power
+#     adoption queries; it lets Google Cloud support attribute traffic
+#     back to this plugin during throughput / quota investigations.
 #
 # Override per deployment with the BQAA_WRITER_LABEL env var (e.g. when
 # running multiple distinct deployments against one dataset).
@@ -514,7 +517,12 @@ class BigQueryAgentAnalyticsLogger:
         parent_span_id: str | None,
         agent: str | None = None,
         tool_origin: str = "LOCAL",
+        attributes: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        # No source default — the writer.agent block already identifies
+        # the producer, and a hard-coded "claude_code" mislabels Codex /
+        # OpenAI / direct-SDK callers. Pass attributes explicitly when
+        # you want a richer label.
         return self.log_event(
             event_type="TOOL_STARTING",
             agent=agent,
@@ -524,7 +532,7 @@ class BigQueryAgentAnalyticsLogger:
             span_id=span_id,
             parent_span_id=parent_span_id,
             content={"tool": tool, "args": args, "tool_origin": tool_origin},
-            attributes={"source": "claude_code"},
+            attributes=attributes,
         )
 
     def log_tool_completed(
@@ -542,6 +550,7 @@ class BigQueryAgentAnalyticsLogger:
         total_ms: int | None = None,
         status: str = "OK",
         error_message: str | None = None,
+        attributes: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         return self.log_event(
             event_type="TOOL_COMPLETED",
@@ -552,7 +561,7 @@ class BigQueryAgentAnalyticsLogger:
             span_id=span_id,
             parent_span_id=parent_span_id,
             content={"tool": tool, "result": result, "tool_origin": tool_origin},
-            attributes={"source": "claude_code"},
+            attributes=attributes,
             latency_ms={"total_ms": total_ms} if total_ms is not None else {},
             status=status,
             error_message=error_message,
@@ -1034,6 +1043,7 @@ class ClaudeHookBQAAAdapter:
             parent_span_id=state.get("current_span_id"),
             agent=state.get("agent"),
             tool_origin=_tool_origin(tool_name),
+            attributes={"source": "claude_code"},
         )
 
     def _post_tool_use(self, payload: dict[str, Any], state: StateStore) -> None:
@@ -1059,6 +1069,7 @@ class ClaudeHookBQAAAdapter:
             total_ms=max(0, _timestamp_ms() - start_ms),
             status=status,
             error_message=error_message,
+            attributes={"source": "claude_code"},
         )
 
     def _stop(self, payload: dict[str, Any], state: StateStore) -> None:
