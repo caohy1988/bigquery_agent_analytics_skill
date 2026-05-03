@@ -8,6 +8,7 @@ start emitting rows for each supported producer.
 | Channel | Distribution | Runtime integration |
 | --- | --- | --- |
 | Claude Code | Claude plugin marketplace in this repo | Native Claude hook plugin |
+| Claude Agent SDK (Python) | Same Claude plugin in this repo, loaded via `ClaudeAgentOptions` | Native Claude hook plugin in the SDK-spawned `claude` subprocess |
 | Codex CLI | Wrapper command in this repo | `codex exec --json` JSONL stream |
 | OpenAI Agents SDK | Python module in this repo | `TracingProcessor` via `add_trace_processor()` |
 | Other Python agents | Python SDK module in this repo | Direct logger calls |
@@ -119,7 +120,97 @@ ORDER BY timestamp DESC
 LIMIT 20;
 ```
 
-## 5. Codex CLI
+## 5. Claude Agent SDK (Python)
+
+Distribution channel: same Claude plugin in this repo, loaded into the
+`claude` subprocess that the Agent SDK spawns. This means SDK-driven
+agents emit the same Claude Code BQAA rows (writer.agent =
+`claude-code` by default, override via `BQAA_AGENT_NAME`) without any
+new code paths to maintain.
+
+Install:
+
+```bash
+pip install claude-agent-sdk
+```
+
+Load the plugin from this repo via `ClaudeAgentOptions.plugins`:
+
+```python
+import asyncio
+import os
+from pathlib import Path
+
+from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
+
+PLUGIN_DIR = Path("/path/to/plugins/bigquery-agent-analytics-tracing").resolve()
+
+
+async def main() -> None:
+    options = ClaudeAgentOptions(
+        cwd="/your/project/path",
+        env={
+            **os.environ,
+            "BQAA_PROJECT_ID": "your-gcp-project",
+            "BQAA_DATASET": "agent_analytics",
+            "BQAA_TABLE": "agent_events",
+            "BQAA_LOCATION": "US",
+            # Distinguish SDK-driven traffic from Claude Code TUI traffic:
+            "BQAA_AGENT_NAME": "claude-agent-sdk",
+            "BQAA_WRITER_LABEL": "bqaa-coding-agent-plugin/0.1.0/sdk-app-name",
+        },
+        permission_mode="bypassPermissions",
+        plugins=[{"type": "local", "path": str(PLUGIN_DIR)}],
+    )
+    async with ClaudeSDKClient(options=options) as client:
+        await client.query("Read README.md and summarize it in one sentence.")
+        async for _message in client.receive_response():
+            pass
+
+
+asyncio.run(main())
+```
+
+Either of these load mechanisms works. Pick `plugins=` for a typed,
+declarative API; pick `extra_args=` if you're forwarding arbitrary
+flags to the underlying `claude` binary already:
+
+```python
+# Equivalent — passes --plugin-dir to the spawned claude binary.
+options = ClaudeAgentOptions(
+    cwd="/your/project/path",
+    env={...},  # same env block as above
+    extra_args={"plugin-dir": str(PLUGIN_DIR)},
+)
+```
+
+The plugin loads when the SDK spawns its `claude` subprocess, so
+hooks fire from the very first turn of the SDK session — no restart
+semantics to worry about.
+
+Verify:
+
+```sql
+SELECT event_type, agent, JSON_VALUE(attributes, '$.writer.agent') AS writer_agent,
+       JSON_VALUE(attributes, '$.writer.label') AS writer_label
+FROM `your-project.agent_analytics.agent_events`
+WHERE timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR)
+  AND JSON_VALUE(attributes, '$.writer.agent') = 'claude-agent-sdk'
+ORDER BY timestamp DESC
+LIMIT 20;
+```
+
+Caveats:
+
+- The SDK runs `claude` under the hood, so `claude` must be on `PATH`
+  (or set via `ClaudeAgentOptions.cli_path`).
+- `ClaudeAgentOptions.env` must include `BQAA_*` — the SDK does not
+  inherit the parent process env unless you pass it through.
+- For multi-turn SDK sessions, each turn produces its own
+  `LLM_REQUEST` / `LLM_RESPONSE` row pair under the same Claude
+  `session_id`, so trace continuity holds across turns.
+
+## 6. Codex CLI
 
 Distribution channel: wrapper command in this repo.
 
@@ -184,7 +275,7 @@ ORDER BY timestamp DESC
 LIMIT 20;
 ```
 
-## 6. OpenAI Agents SDK
+## 7. OpenAI Agents SDK
 
 Distribution channel: Python module in this repo.
 
@@ -222,7 +313,7 @@ python plugins/bigquery-agent-analytics-tracing/scripts/e2e_openai_agents_smoke.
   --location "$BQAA_LOCATION"
 ```
 
-## 7. Other Python Agents
+## 8. Other Python Agents
 
 Distribution channel: direct Python SDK module in this repo.
 
@@ -251,7 +342,7 @@ logger.log_llm_response(
 )
 ```
 
-## 8. Adoption Query
+## 9. Adoption Query
 
 Use this query to see all supported producers in one table:
 
@@ -270,14 +361,20 @@ GROUP BY agent, source, writer_label
 ORDER BY events DESC;
 ```
 
-## 9. Troubleshooting
+## 10. Troubleshooting
 
 - No rows: check `BQAA_PROJECT_ID`, `BQAA_DATASET`, credentials, and
   `BQAA_DRY_RUN`.
 - Rows stuck in spool: check `BQAA_SPOOL_DIR/dead-letter/` and
   `BQAA_LOG_FILE`.
-- Claude rows missing: restart Claude Code after installing the plugin.
-- Codex TUI missing: use the `bqaa_codex.py` wrapper with `codex exec`; the TUI
-  is outside this integration.
-- OpenAI Agents rows missing: confirm `openai-agents` is installed and
-  `add_bqaa_trace_processor()` runs before `Runner.run*()`.
+- Claude Code rows missing: restart Claude Code after installing the
+  plugin.
+- Claude Agent SDK rows missing: confirm `BQAA_*` env vars are passed
+  via `ClaudeAgentOptions.env` (the SDK does not inherit parent env)
+  and that `plugins=[{"type":"local","path":...}]` (or
+  `extra_args={"plugin-dir":...}`) points at this repo's plugin
+  directory.
+- Codex TUI missing: use the `bqaa_codex.py` wrapper with
+  `codex exec`; the TUI is outside this integration.
+- OpenAI Agents rows missing: confirm `openai-agents` is installed
+  and `add_bqaa_trace_processor()` runs before `Runner.run*()`.
