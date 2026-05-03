@@ -1,0 +1,27 @@
+{
+  "name": "bigquery-agent-analytics-plugin",
+  "owner": {
+    "name": "Erroration2022"
+  },
+  "metadata": {
+    "description": "Plugins for tracing coding-agent sessions to Google ADK BigQuery Agent Analytics."
+  },
+  "plugins": [
+    {
+      "name": "bigquery-agent-analytics-tracing",
+      "source": "./plugins/bigquery-agent-analytics-tracing",
+      "description": "Log Claude Code hook traces to BigQuery Agent Analytics agent_events tables.",
+      "version": "0.1.0",
+      "homepage": "https://adk.dev/integrations/bigquery-agent-analytics/",
+      "repository": "https://github.com/Erroration2022/bigquery_agent_analytics_skill",
+      "license": "MIT",
+      "keywords": [
+        "bigquery",
+        "agent-analytics",
+        "observability",
+        "tracing"
+      ],
+      "category": "observability"
+    }
+  ]
+}
