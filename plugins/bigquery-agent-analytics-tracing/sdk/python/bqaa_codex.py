@@ -34,7 +34,7 @@ import json
 import os
 import subprocess
 import sys
-import threading
+import tempfile
 import time
 from typing import Any
 
@@ -273,7 +273,9 @@ class CodexBQAAWrapper:
         self._stdout = stdout if stdout is not None else sys.stdout
         self._stderr = stderr if stderr is not None else sys.stderr
         self.codex_version = _codex_version(self.codex_bin)
-        # Captured at run() time once we know whether stdin is piped.
+        # Captured at run() time once we know whether stdin is piped. This is
+        # capped for BQAA row size, but the child Codex process still receives
+        # the full stdin stream via a temp file.
         self.stdin_payload: str = ""
         self.prompt: str = self.argv_prompt
 
@@ -295,17 +297,17 @@ class CodexBQAAWrapper:
         # the real prompt bytes the model saw, not just the argv-derived
         # prompt. Codex itself reads stdin as part of its prompt when
         # `-` is the trailing positional or when it's piped without one.
-        self.stdin_payload = self._read_stdin_payload()
+        self.stdin_payload, child_stdin = self._read_stdin_payload()
         self.prompt = _combine_prompt(self.argv_prompt, self.stdin_payload)
 
-        # Decide stdin handling for the Codex child. If we captured a
-        # payload, write it to Codex's stdin via PIPE; otherwise inherit
-        # the wrapper's stdin (TTY or unread fd).
+        # Decide stdin handling for the Codex child. If stdin was piped, pass
+        # a temp file containing the full payload; otherwise inherit the
+        # wrapper's stdin (TTY or unread fd).
         argv = [self.codex_bin, "exec", "--json", *self.codex_argv]
         try:
             proc = subprocess.Popen(
                 argv,
-                stdin=subprocess.PIPE if self.stdin_payload else self._stdin,
+                stdin=child_stdin if child_stdin is not None else self._stdin,
                 stdout=subprocess.PIPE,
                 stderr=self._stderr,
                 bufsize=1,  # line-buffered so we see events as Codex emits them
@@ -313,29 +315,9 @@ class CodexBQAAWrapper:
             )
         except FileNotFoundError as exc:
             print(f"bqaa-codex: cannot launch codex ({exc})", file=self._stderr)
+            if child_stdin is not None:
+                child_stdin.close()
             return 127
-
-        # Feed captured stdin to Codex on a background thread so reads
-        # of Codex's stdout aren't blocked behind a slow consumer in
-        # Codex itself.
-        feeder: threading.Thread | None = None
-        if self.stdin_payload and proc.stdin is not None:
-            payload = self.stdin_payload
-            stdin_handle = proc.stdin
-
-            def _feed() -> None:
-                try:
-                    stdin_handle.write(payload)
-                except BrokenPipeError:
-                    pass
-                finally:
-                    try:
-                        stdin_handle.close()
-                    except (BrokenPipeError, OSError):
-                        pass
-
-            feeder = threading.Thread(target=_feed, daemon=True)
-            feeder.start()
 
         try:
             assert proc.stdout is not None
@@ -344,34 +326,65 @@ class CodexBQAAWrapper:
         except KeyboardInterrupt:
             proc.terminate()
             proc.wait()
-            if feeder is not None:
-                feeder.join(timeout=1)
+            if child_stdin is not None:
+                child_stdin.close()
             return 130
         result = proc.wait()
-        if feeder is not None:
-            feeder.join(timeout=1)
+        if child_stdin is not None:
+            child_stdin.close()
         return result
 
-    def _read_stdin_payload(self) -> str:
-        """Return piped stdin contents (capped) or '' if stdin is a TTY."""
+    def _read_stdin_payload(self) -> tuple[str, Any | None]:
+        """Return (captured_prompt, full_child_stdin_file).
+
+        The BQAA prompt capture is capped at STDIN_READ_LIMIT, but the full
+        stdin payload is written to a temp file and passed to Codex unchanged.
+        """
         stream = self._stdin
         try:
             isatty = stream.isatty()
         except (AttributeError, ValueError):
             isatty = True
         if isatty:
-            return ""
+            return "", None
+
+        captured_parts: list[str] = []
+        captured_len = 0
+        truncated = False
+        wrote_any = False
+        child_stdin = tempfile.TemporaryFile(mode="w+t", encoding="utf-8")
         try:
-            data = stream.read(self.STDIN_READ_LIMIT + 1)
+            while True:
+                chunk = stream.read(64 * 1024)
+                if not chunk:
+                    break
+                if isinstance(chunk, bytes):
+                    chunk = chunk.decode("utf-8", "replace")
+                wrote_any = True
+                child_stdin.write(chunk)
+
+                if captured_len < self.STDIN_READ_LIMIT:
+                    remaining = self.STDIN_READ_LIMIT - captured_len
+                    if len(chunk) > remaining:
+                        captured_parts.append(chunk[:remaining])
+                        captured_len = self.STDIN_READ_LIMIT
+                        truncated = True
+                    else:
+                        captured_parts.append(chunk)
+                        captured_len += len(chunk)
+                else:
+                    truncated = True
         except (OSError, ValueError):
-            return ""
-        if not data:
-            return ""
-        if isinstance(data, bytes):
-            data = data.decode("utf-8", "replace")
-        if len(data) > self.STDIN_READ_LIMIT:
-            data = data[: self.STDIN_READ_LIMIT] + "\n...[STDIN_TRUNCATED]"
-        return data
+            child_stdin.close()
+            return "", None
+
+        if not wrote_any:
+            child_stdin.close()
+            return "", None
+        if truncated:
+            captured_parts.append("\n...[STDIN_TRUNCATED]")
+        child_stdin.seek(0)
+        return "".join(captured_parts), child_stdin
 
     # ---- per-line dispatch ----------------------------------------------
 

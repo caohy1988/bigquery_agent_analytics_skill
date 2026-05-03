@@ -8,6 +8,10 @@ This is the operational counterpart to the
 this repo: the skill teaches Claude how to query BQAA data; this plugin is
 what produces that data from your local Claude Code sessions.
 
+For installation and first-use instructions across all supported channels, see
+[USER_GUIDE.md](USER_GUIDE.md). This README focuses on implementation details
+and per-channel reference snippets.
+
 ## How it works
 
 ```
@@ -190,8 +194,8 @@ matches what Codex actually sees:
   knows Codex's value-flags (`-c`, `-m`, `-s`, `-o`,
   `--output-last-message`, `--output-schema`, etc.) so it doesn't
   mistake a flag value for the prompt.
-- If stdin is piped (non-TTY), the wrapper reads it (capped at
-  1 MiB) and tees it into Codex's stdin in a background thread.
+- If stdin is piped (non-TTY), the wrapper captures the first 1 MiB
+  for the BQAA row but still passes the full stdin payload to Codex.
   When both argv and stdin are present, the wrapper records the
   prompt as `<argv>\n<stdin>...stdin payload...</stdin>` to mirror
   Codex's own `<stdin>` block convention.
