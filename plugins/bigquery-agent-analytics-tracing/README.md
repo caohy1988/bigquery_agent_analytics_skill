@@ -78,8 +78,19 @@ The plugin uses the standard Google Cloud auth chain. Either of these works:
 
 The service account or user identity needs:
 
-- `bigquery.dataEditor` on the dataset (for inserts and table create-on-first-use).
-- `bigquery.jobUser` on the project (for table existence checks during fallback).
+- `roles/bigquery.dataEditor` on the dataset for inserts and table
+  create-on-first-use inside an existing dataset.
+- `roles/bigquery.jobUser` on the project for verification queries and smoke
+  scripts that run `SELECT` statements.
+- `roles/bigquery.user` on the project only if
+  `BQAA_AUTO_CREATE_DATASET=true`.
+
+Enable `bigquery.googleapis.com` for all write paths. Enable
+`bigquerystorage.googleapis.com` for the recommended async Storage Write API
+drainer path.
+
+See [USER_GUIDE.md](./USER_GUIDE.md#1-prepare-bigquery) for copy-paste IAM
+commands and the full prerequisite matrix.
 
 ### Python runtime
 

@@ -43,6 +43,48 @@ The identity needs dataset write access. For auto-create behavior, it also
 needs permission to create tables, and optionally datasets if
 `BQAA_AUTO_CREATE_DATASET=true`.
 
+Enable the required Google Cloud APIs once per project:
+
+```bash
+gcloud services enable bigquery.googleapis.com bigquerystorage.googleapis.com \
+  --project "$BQAA_PROJECT_ID"
+```
+
+Recommended IAM by deployment mode:
+
+| Mode | Required roles |
+| --- | --- |
+| Existing dataset and table | `roles/bigquery.dataEditor` on the dataset |
+| Auto-create table in an existing dataset | `roles/bigquery.dataEditor` on the dataset |
+| Auto-create dataset and table | `roles/bigquery.user` on the project plus `roles/bigquery.dataEditor` after the dataset exists, or `roles/bigquery.admin` for bootstrap-only setup |
+| Run verification SQL or smoke scripts that query the table | `roles/bigquery.jobUser` on the project plus dataset read/write access |
+
+For a service account:
+
+```bash
+SERVICE_ACCOUNT="bqaa-writer@${BQAA_PROJECT_ID}.iam.gserviceaccount.com"
+
+# Existing dataset/table, or auto-create table inside an existing dataset:
+bq add-iam-policy-binding \
+  "${BQAA_PROJECT_ID}:${BQAA_DATASET}" \
+  --member "serviceAccount:${SERVICE_ACCOUNT}" \
+  --role roles/bigquery.dataEditor
+
+# Needed for `bq query` verification and smoke scripts that query BigQuery:
+gcloud projects add-iam-policy-binding "$BQAA_PROJECT_ID" \
+  --member "serviceAccount:${SERVICE_ACCOUNT}" \
+  --role roles/bigquery.jobUser
+
+# Only if BQAA_AUTO_CREATE_DATASET=true:
+gcloud projects add-iam-policy-binding "$BQAA_PROJECT_ID" \
+  --member "serviceAccount:${SERVICE_ACCOUNT}" \
+  --role roles/bigquery.user
+```
+
+Keep `roles/bigquery.admin` out of steady-state agent runtimes. It is useful
+for first-time bootstrap in a dev project, but the runtime writer only needs
+the narrower roles above.
+
 ## 2. Install Runtime Dependencies
 
 Minimum:
