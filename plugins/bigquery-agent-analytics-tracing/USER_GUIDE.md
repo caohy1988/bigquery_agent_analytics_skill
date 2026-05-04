@@ -83,7 +83,9 @@ A **service account** (`--service-account bqaa-writer`) is the right choice
 for shared workstations, server-side / CI agents, or org policies that
 centralize credentials. The script will create the SA and grant it IAM, but
 **you must wire the runtime to actually use the SA** — creation alone does
-not redirect the hooks. Pick one:
+not redirect the hooks. The BQAA hooks call `google-cloud-bigquery` directly
+via ADC; they do not consult gcloud config. Whatever routes the SA into
+runtime has to route it into **ADC**. Pick one:
 
 ```bash
 # Option A — SA impersonation via ADC (recommended, no JSON key):
@@ -91,16 +93,23 @@ gcloud auth application-default login \
   --impersonate-service-account=bqaa-writer@${BQAA_PROJECT_ID}.iam.gserviceaccount.com
 # The caller needs roles/iam.serviceAccountTokenCreator on the SA.
 
-# Option B — gcloud-level impersonation (also affects gcloud commands):
-gcloud config set auth/impersonate_service_account \
-  bqaa-writer@${BQAA_PROJECT_ID}.iam.gserviceaccount.com
-
-# Option C — service-account JSON key (least preferred; rotate on schedule):
+# Option B — service-account JSON key (least preferred; rotate on schedule):
 export GOOGLE_APPLICATION_CREDENTIALS=/path/to/bqaa-writer.json
+
+# Option C — Workload Identity Federation (for CI / unattended; no key file):
+#   https://cloud.google.com/iam/docs/workload-identity-federation
+#   GOOGLE_APPLICATION_CREDENTIALS points at the WIF credential-config JSON.
 ```
 
 Without one of those, the BQAA hooks will keep running under whoever is
 logged in via ADC and the SA grants are dead weight.
+
+> **Do not substitute `gcloud config set auth/impersonate_service_account`.**
+> That setting only redirects gcloud / bq CLI commands you run yourself. It
+> does **not** change which identity the BQAA Python hooks use. Setting it
+> alone passes the bootstrap script's gcloud subcommands but leaves the
+> hooks writing under the wrong identity. It's complementary to Option A,
+> not a substitute.
 
 The bootstrap command enables the required BigQuery APIs, creates the dataset
 and `agent_events` table if missing, and grants the runtime principal the

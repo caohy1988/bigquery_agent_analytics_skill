@@ -57,8 +57,9 @@ when:
 - Your org centralizes credential management on SAs.
 
 If you go that route, the hooks will *not* automatically use the SA — ADC is
-still whoever is logged in. You have to pick one of these to actually route
-runtime traffic through the SA:
+still whoever is logged in. The BQAA hooks call `google-cloud-bigquery`
+directly, which reads ADC; they do not consult `gcloud` config. So whatever
+routes the SA into runtime has to route it into **ADC**. Pick one:
 
 ```bash
 # Option A — SA impersonation via ADC (recommended, no JSON key):
@@ -66,17 +67,26 @@ gcloud auth application-default login \
   --impersonate-service-account=bqaa-writer@PROJECT.iam.gserviceaccount.com
 # Caller still needs roles/iam.serviceAccountTokenCreator on the SA.
 
-# Option B — gcloud-level impersonation (also affects gcloud commands):
-gcloud config set auth/impersonate_service_account \
-  bqaa-writer@PROJECT.iam.gserviceaccount.com
-
-# Option C — service-account JSON key (least preferred; rotate on schedule):
+# Option B — service-account JSON key (least preferred; rotate on schedule):
 export GOOGLE_APPLICATION_CREDENTIALS=/path/to/bqaa-writer.json
+
+# Option C — Workload Identity Federation (for CI / unattended; no key file):
+#   See https://cloud.google.com/iam/docs/workload-identity-federation
+#   The agent picks up SA credentials from GOOGLE_APPLICATION_CREDENTIALS
+#   pointing at the WIF credential-config JSON.
 ```
+
+> **Do NOT confuse with `gcloud config set auth/impersonate_service_account`.**
+> That setting redirects the **gcloud / bq CLI** account only. It does **not**
+> affect the BQAA Python hooks — they read ADC. Setting it alone leaves the
+> hooks running under whoever ADC is configured for, even though `gcloud`
+> commands you type yourself will run as the SA. Use it as a complement to
+> Option A if you want CLI commands to also impersonate; never use it as the
+> only step.
 
 If the user picked the SA path without picking A/B/C, **stop and tell them**
 the SA was created and granted but the runtime hooks will keep using their own
-identity until impersonation/key is wired. Most local-dev users should just
+identity until ADC routes through the SA. Most local-dev users should just
 take the user-principal default.
 
 Echo the values back to the user before any subprocess call. Phrasing like
