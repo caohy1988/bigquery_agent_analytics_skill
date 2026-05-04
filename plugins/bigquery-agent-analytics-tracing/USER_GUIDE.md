@@ -103,19 +103,46 @@ Preflight:
   gcloud config project: my-gcp-project (matches --project)
 ```
 
-With `--execute`, the script hard-fails before touching anything when:
+With `--execute`, the script hard-fails before touching anything when
+any of these credential surfaces are missing for steps that need them:
 
-- `gcloud` is not on `PATH` — `gcloud is required for --execute but is
-  not available. Install the Google Cloud SDK and re-run.`
-- Application Default Credentials are not configured —
-  `Application Default Credentials are not configured. Run
-  `gcloud auth application-default login` (or set
-  `GOOGLE_APPLICATION_CREDENTIALS` to a service-account JSON key) and
-  re-run.`
+- `gcloud` is not on `PATH`:
 
-In dry-run, both conditions are reported but the plan is still printed
-so an agent can pre-stage everything before the human runs the OAuth
-flow.
+  ```text
+  gcloud is required for --execute but is not available.
+  Install the Google Cloud SDK and re-run.
+  ```
+
+- Application Default Credentials are not configured (only required
+  when the plan calls google-cloud-bigquery directly — i.e.
+  `--create-dataset` / `--create-table` is in the plan):
+
+  ```text
+  Application Default Credentials are not configured but this plan
+  calls google-cloud-bigquery directly.
+  Run: gcloud auth application-default login
+  (or set GOOGLE_APPLICATION_CREDENTIALS to a service-account JSON
+  key) and re-run.
+  ```
+
+- gcloud CLI auth is not configured (required when the plan shells
+  out to `gcloud` or `bq` — i.e. API enable, IAM grants, service-
+  account create):
+
+  ```text
+  gcloud CLI auth is not configured but this plan shells out to
+  gcloud / bq.
+  Run: gcloud auth login (and `gcloud config set account ACCOUNT`
+  if multiple identities are listed) and re-run.
+  ADC alone is not enough: gcloud subcommands ignore ADC and use
+  the active CLI account.
+  ```
+
+In most local-dev setups the same human identity backs both ADC and
+the gcloud CLI; on agent boxes and CI they are often separate, which
+is why the script reports them independently. In dry-run, all three
+conditions are reported but the plan is still printed so an agent
+can pre-stage everything before the human runs the OAuth flow.
 
 For unattended runs (Codex, Claude SDK, CI), pass `--non-interactive`:
 

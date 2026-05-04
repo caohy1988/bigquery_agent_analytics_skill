@@ -48,13 +48,28 @@ class Step:
 class _PreflightResult:
     """Captured state of the caller's gcloud auth + config.
 
-    Used in two ways: dry-run prints the result so an agent can see what
-    credentials will be used, and ``--execute`` hard-fails when ADC is
-    missing so the agent fails fast instead of catching a 401 mid-bootstrap.
+    Two distinct credential surfaces matter and they fail independently:
+
+    * **ADC** — used by every google-cloud-* Python client (so
+      ``bigquery.Client.create_dataset``, ``create_table``, etc.)
+      Validated with ``gcloud auth application-default print-access-token``.
+    * **gcloud CLI auth** — used by every ``gcloud`` and ``bq`` subprocess
+      this script spawns (``services enable``, ``projects
+      add-iam-policy-binding``, ``iam service-accounts create``,
+      ``bq add-iam-policy-binding``). Validated with ``gcloud auth list``
+      and ``gcloud auth print-access-token``.
+
+    They share an identity in most local-dev setups (one ``gcloud auth
+    login`` plus one ``application-default login``), but on agent boxes
+    or CI they're often separate, so check both. Reporting them
+    separately also makes the failure message actionable.
     """
 
     adc_ok: bool
     adc_message: str
+    cli_auth_ok: bool
+    cli_auth_account: str
+    cli_auth_message: str
     gcloud_project: str
     gcloud_available: bool
 
@@ -343,14 +358,49 @@ def _build_steps(args: argparse.Namespace) -> list[Step]:
     return steps
 
 
-def _run_preflight() -> _PreflightResult:
-    """Capture gcloud auth + project state without raising.
+def _summarize_stderr(stderr: str, fallback: str) -> str:
+    """Compact a multi-line gcloud error to a one-line preflight summary.
 
-    Calls ``gcloud auth application-default print-access-token`` to test that
-    Application Default Credentials are reachable, and ``gcloud config
-    get-value project`` to read the active project. Both calls are bounded
-    by a short timeout so a stuck gcloud install can't hang the bootstrap.
+    Joins the last few non-empty stderr lines with `` | `` so the
+    actionable parts (`ERROR:`, `Reauthentication required`,
+    `to select an already authenticated account run: gcloud config set
+    account ACCOUNT`) all survive into the one-screen preflight output.
+    Earlier code took only the last line, which on real gcloud failures
+    discarded the part of the message that named the fix.
     """
+    lines = [line.strip() for line in (stderr or "").splitlines() if line.strip()]
+    if not lines:
+        return fallback
+    return " | ".join(lines[-3:])
+
+
+def _run_preflight() -> _PreflightResult:
+    """Capture gcloud auth + config state without raising.
+
+    Tests both credential surfaces:
+
+    * ADC, via ``gcloud auth application-default print-access-token``.
+      What the google-cloud-bigquery Python client uses.
+    * gcloud CLI auth, via ``gcloud auth list`` (active account name)
+      and ``gcloud auth print-access-token`` (token actually works).
+      What every ``gcloud`` and ``bq`` subprocess this script spawns
+      uses.
+
+    Each subprocess call is bounded by a short timeout so a stuck
+    gcloud install can't hang the bootstrap.
+    """
+
+    def _empty_result(reason: str, gcloud_available: bool) -> _PreflightResult:
+        return _PreflightResult(
+            adc_ok=False,
+            adc_message=reason,
+            cli_auth_ok=False,
+            cli_auth_account="",
+            cli_auth_message=reason,
+            gcloud_project="",
+            gcloud_available=gcloud_available,
+        )
+
     try:
         adc = subprocess.run(
             ["gcloud", "auth", "application-default", "print-access-token"],
@@ -360,16 +410,68 @@ def _run_preflight() -> _PreflightResult:
             timeout=15,
         )
     except FileNotFoundError:
-        return _PreflightResult(False, "gcloud not on PATH", "", False)
+        return _empty_result("gcloud not on PATH", False)
     except subprocess.TimeoutExpired:
-        return _PreflightResult(False, "gcloud timed out", "", True)
+        return _empty_result("gcloud timed out", True)
     adc_ok = adc.returncode == 0
     if adc_ok:
         adc_message = "ADC token reachable"
     else:
-        # gcloud puts the human-readable error on stderr; fall back to a
-        # generic message so the script still says something useful.
-        adc_message = (adc.stderr.strip().splitlines() or ["no token"])[-1]
+        adc_message = "not configured — " + _summarize_stderr(
+            adc.stderr, fallback="no token"
+        )
+
+    cli_auth_account = ""
+    cli_auth_ok = False
+    cli_auth_message = "not configured"
+    try:
+        listed = subprocess.run(
+            [
+                "gcloud",
+                "auth",
+                "list",
+                "--filter=status:ACTIVE",
+                "--format=value(account)",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=15,
+        )
+        cli_auth_account = listed.stdout.strip().splitlines()[0] if listed.stdout.strip() else ""
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        cli_auth_account = ""
+    if cli_auth_account:
+        # An active account is listed. Confirm the token actually works —
+        # ``gcloud auth list`` happily reports an account whose token is
+        # expired or whose grant has been revoked, so the list-only check
+        # alone is too optimistic. ``print-access-token`` is the cheap
+        # ground-truth probe.
+        try:
+            tok = subprocess.run(
+                ["gcloud", "auth", "print-access-token"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=15,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            tok = None
+            cli_auth_message = f"token probe failed: {exc}"
+        else:
+            if tok.returncode == 0:
+                cli_auth_ok = True
+                cli_auth_message = f"active account {cli_auth_account}"
+            else:
+                cli_auth_message = (
+                    f"active account {cli_auth_account} but token probe failed — "
+                    + _summarize_stderr(tok.stderr, fallback="no token")
+                )
+    else:
+        cli_auth_message = (
+            "no active account — run `gcloud auth login` "
+            "or `gcloud config set account ACCOUNT`"
+        )
 
     try:
         proj = subprocess.run(
@@ -382,11 +484,17 @@ def _run_preflight() -> _PreflightResult:
         gcloud_project = proj.stdout.strip() if proj.returncode == 0 else ""
     except (FileNotFoundError, subprocess.TimeoutExpired):
         gcloud_project = ""
-    # ``(unset)`` is what gcloud config get-value prints when no project is
-    # configured; treat it as empty so we don't pretend a value was set.
     if gcloud_project == "(unset)":
         gcloud_project = ""
-    return _PreflightResult(adc_ok, adc_message, gcloud_project, True)
+    return _PreflightResult(
+        adc_ok=adc_ok,
+        adc_message=adc_message,
+        cli_auth_ok=cli_auth_ok,
+        cli_auth_account=cli_auth_account,
+        cli_auth_message=cli_auth_message,
+        gcloud_project=gcloud_project,
+        gcloud_available=True,
+    )
 
 
 def _print_preflight(result: _PreflightResult, args: argparse.Namespace) -> None:
@@ -397,6 +505,8 @@ def _print_preflight(result: _PreflightResult, args: argparse.Namespace) -> None
         return
     adc_label = "OK" if result.adc_ok else "NOT CONFIGURED"
     print(f"  ADC: {adc_label} — {result.adc_message}")
+    cli_label = "OK" if result.cli_auth_ok else "NOT CONFIGURED"
+    print(f"  gcloud CLI auth: {cli_label} — {result.cli_auth_message}")
     if result.gcloud_project:
         if result.gcloud_project == args.project:
             note = "matches --project"
@@ -410,6 +520,19 @@ def _print_preflight(result: _PreflightResult, args: argparse.Namespace) -> None
     else:
         print("  gcloud config project: (unset)")
     print()
+
+
+def _steps_need_python_actions(steps: list[Step]) -> bool:
+    """Any step that calls google-cloud-* directly needs ADC."""
+    return any(step.action is not None for step in steps)
+
+
+def _steps_need_gcloud_or_bq(steps: list[Step]) -> bool:
+    """Any step that shells out to gcloud or bq needs CLI auth."""
+    for step in steps:
+        if step.command and step.command and step.command[0] in {"gcloud", "bq"}:
+            return True
+    return False
 
 
 def _print_plan(args: argparse.Namespace, steps: list[Step]) -> None:
@@ -443,19 +566,30 @@ def run(args: argparse.Namespace) -> int:
     _require_project_dataset(args)
     preflight = _run_preflight()
     _print_preflight(preflight, args)
-    if args.execute and not preflight.gcloud_available:
-        raise SystemExit(
-            "gcloud is required for --execute but is not available. "
-            "Install the Google Cloud SDK and re-run."
-        )
-    if args.execute and not preflight.adc_ok:
-        raise SystemExit(
-            "Application Default Credentials are not configured. "
-            "Run `gcloud auth application-default login` "
-            "(or set GOOGLE_APPLICATION_CREDENTIALS to a service-account "
-            "JSON key) and re-run."
-        )
     steps = _build_steps(args)
+    if args.execute:
+        if not preflight.gcloud_available:
+            raise SystemExit(
+                "gcloud is required for --execute but is not available. "
+                "Install the Google Cloud SDK and re-run."
+            )
+        if _steps_need_python_actions(steps) and not preflight.adc_ok:
+            raise SystemExit(
+                "Application Default Credentials are not configured but "
+                "this plan calls google-cloud-bigquery directly. "
+                "Run: gcloud auth application-default login "
+                "(or set GOOGLE_APPLICATION_CREDENTIALS to a service-"
+                "account JSON key) and re-run."
+            )
+        if _steps_need_gcloud_or_bq(steps) and not preflight.cli_auth_ok:
+            raise SystemExit(
+                "gcloud CLI auth is not configured but this plan shells "
+                "out to gcloud / bq. "
+                "Run: gcloud auth login (and `gcloud config set account "
+                "ACCOUNT` if multiple identities are listed) and re-run. "
+                "ADC alone is not enough: gcloud subcommands ignore ADC "
+                "and use the active CLI account."
+            )
     _print_plan(args, steps)
     if not args.execute:
         print("No changes made. Re-run with --execute to apply this plan.")
