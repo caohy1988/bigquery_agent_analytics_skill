@@ -93,7 +93,7 @@ creates a service account.
 ### Easiest path: ask Claude Code to do it
 
 After installing the plugin and restarting Claude Code, type
-**`/bqaa-setup`** (or just say "set up BQAA tracing for this project").
+**`/bigquery-agent-analytics-tracing:bqaa-setup`** (or just say "set up BQAA tracing for this project").
 The plugin ships a `bqaa-setup` skill and slash command that walk through:
 
 1. Confirming project / dataset / location / service-account choices.
@@ -110,8 +110,13 @@ The plugin ships a `bqaa-setup` skill and slash command that walk through:
 
 The skill is auto-discovered when you mention setup ("set up BQAA",
 "why aren't my BQAA rows landing", "fix BQAA permissions", etc.); the
-slash command at `/bqaa-setup [project] [dataset]` triggers it
-deterministically.
+slash command
+`/bigquery-agent-analytics-tracing:bqaa-setup [args]` triggers it
+deterministically. Claude Code namespaces plugin commands as
+`<plugin-name>:<command>`, so the full path is verbose — for daily
+use the natural-language path is shorter; the slash form is best for
+docs, runbooks, and unattended runs where the trigger needs to be
+deterministic.
 
 ### Manual: run the script yourself
 

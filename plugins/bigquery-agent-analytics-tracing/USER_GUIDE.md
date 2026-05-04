@@ -43,10 +43,10 @@ The identity needs dataset write access. For auto-create behavior, it also
 needs permission to create tables, and optionally datasets if
 `BQAA_AUTO_CREATE_DATASET=true`.
 
-### Easiest path: `/bqaa-setup` in Claude Code
+### Easiest path: `/bigquery-agent-analytics-tracing:bqaa-setup` in Claude Code
 
 After the plugin is installed and Claude Code is restarted, just type
-`/bqaa-setup` (or describe the goal in plain English: "set up BQAA
+`/bigquery-agent-analytics-tracing:bqaa-setup` (or describe the goal in plain English: "set up BQAA
 tracing", "why aren't my BQAA rows showing up", "configure agent
 analytics for this project"). The plugin's `bqaa-setup` skill walks
 Claude through the same dry-run → approval → execute → verify flow as
