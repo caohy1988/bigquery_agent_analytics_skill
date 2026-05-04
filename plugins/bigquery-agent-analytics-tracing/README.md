@@ -109,6 +109,14 @@ and grant runtime IAM. See
 manual commands, and runtime auto-create options. Dataset IAM bindings are
 emitted with explicit `bq add-iam-policy-binding -d`.
 
+Every run begins with a preflight that prints the active gcloud ADC and
+project so an agent can see what credentials will be used. With
+`--execute`, missing ADC hard-fails before any API call, with a clear
+"run `gcloud auth application-default login`" message instead of an
+opaque 401 mid-bootstrap. Add `--non-interactive` to inject `--quiet`
+into every gcloud and bq subcommand so unattended Codex / Claude / CI
+runs never block on a confirmation prompt.
+
 ### Python runtime
 
 ```bash

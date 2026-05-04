@@ -44,6 +44,48 @@ class Step:
     detail: str | None = None
 
 
+@dataclass(frozen=True)
+class _PreflightResult:
+    """Captured state of the caller's gcloud auth + config.
+
+    Used in two ways: dry-run prints the result so an agent can see what
+    credentials will be used, and ``--execute`` hard-fails when ADC is
+    missing so the agent fails fast instead of catching a 401 mid-bootstrap.
+    """
+
+    adc_ok: bool
+    adc_message: str
+    gcloud_project: str
+    gcloud_available: bool
+
+
+def _gcloud_command(args: argparse.Namespace, *parts: str) -> list[str]:
+    """Build a gcloud invocation; in --non-interactive mode injects --quiet.
+
+    gcloud's --quiet is a global flag that auto-confirms prompts and
+    suppresses interactive checks. Required when an agent runs the
+    bootstrap unattended so a confirmation prompt can never block.
+    """
+    cmd = ["gcloud"]
+    if args.non_interactive:
+        cmd.append("--quiet")
+    cmd.extend(parts)
+    return cmd
+
+
+def _bq_command(args: argparse.Namespace, *parts: str) -> list[str]:
+    """Build a bq invocation; in --non-interactive mode injects --quiet.
+
+    bq's --quiet is a global flag that suppresses status messages and
+    interactive confirms. Same purpose as gcloud's --quiet.
+    """
+    cmd = ["bq"]
+    if args.non_interactive:
+        cmd.append("--quiet")
+    cmd.extend(parts)
+    return cmd
+
+
 def _default_project() -> str:
     return (
         os.environ.get("BQAA_PROJECT_ID")
@@ -75,18 +117,20 @@ def _service_account_id(value: str) -> str:
     return value.split("@", 1)[0]
 
 
-def _ensure_service_account(project: str, value: str) -> None:
+def _ensure_service_account(args: argparse.Namespace) -> None:
+    project = args.project
+    value = args.service_account
     email = _service_account_email(project, value)
     describe = subprocess.run(
-        [
-            "gcloud",
+        _gcloud_command(
+            args,
             "iam",
             "service-accounts",
             "describe",
             email,
             "--project",
             project,
-        ],
+        ),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         check=False,
@@ -94,8 +138,8 @@ def _ensure_service_account(project: str, value: str) -> None:
     if describe.returncode == 0:
         print(f"OK service account exists: {email}")
         return
-    command = [
-        "gcloud",
+    command = _gcloud_command(
+        args,
         "iam",
         "service-accounts",
         "create",
@@ -104,7 +148,7 @@ def _ensure_service_account(project: str, value: str) -> None:
         project,
         "--display-name",
         "BQAA tracing writer",
-    ]
+    )
     last_result: subprocess.CompletedProcess[str] | None = None
     for attempt in range(1, 4):
         last_result = subprocess.run(command, check=False)
@@ -200,14 +244,14 @@ def _build_steps(args: argparse.Namespace) -> list[Step]:
         steps.append(
             Step(
                 "Enable Google Cloud APIs",
-                [
-                    "gcloud",
+                _gcloud_command(
+                    args,
                     "services",
                     "enable",
                     *services,
                     "--project",
                     args.project,
-                ],
+                ),
             )
         )
 
@@ -215,7 +259,7 @@ def _build_steps(args: argparse.Namespace) -> list[Step]:
         steps.append(
             Step(
                 f"Ensure service account {_service_account_email(args.project, args.service_account)}",
-                action=lambda: _ensure_service_account(args.project, args.service_account),
+                action=lambda: _ensure_service_account(args),
                 detail=(
                     "gcloud iam service-accounts describe; on missing, "
                     "create service account with a short retry for API/IAM propagation"
@@ -254,8 +298,8 @@ def _build_steps(args: argparse.Namespace) -> list[Step]:
             [
                 Step(
                     "Grant dataset dataEditor to runtime principal",
-                    [
-                        "bq",
+                    _bq_command(
+                        args,
                         "add-iam-policy-binding",
                         "-d",
                         f"{args.project}:{args.dataset}",
@@ -263,12 +307,12 @@ def _build_steps(args: argparse.Namespace) -> list[Step]:
                         args.principal,
                         "--role",
                         "roles/bigquery.dataEditor",
-                    ],
+                    ),
                 ),
                 Step(
                     "Grant project jobUser for verification queries",
-                    [
-                        "gcloud",
+                    _gcloud_command(
+                        args,
                         "projects",
                         "add-iam-policy-binding",
                         args.project,
@@ -276,7 +320,7 @@ def _build_steps(args: argparse.Namespace) -> list[Step]:
                         args.principal,
                         "--role",
                         "roles/bigquery.jobUser",
-                    ],
+                    ),
                 ),
             ]
         )
@@ -284,8 +328,8 @@ def _build_steps(args: argparse.Namespace) -> list[Step]:
             steps.append(
                 Step(
                     "Grant project bigquery.user for runtime dataset creation",
-                    [
-                        "gcloud",
+                    _gcloud_command(
+                        args,
                         "projects",
                         "add-iam-policy-binding",
                         args.project,
@@ -293,10 +337,79 @@ def _build_steps(args: argparse.Namespace) -> list[Step]:
                         args.principal,
                         "--role",
                         "roles/bigquery.user",
-                    ],
+                    ),
                 )
             )
     return steps
+
+
+def _run_preflight() -> _PreflightResult:
+    """Capture gcloud auth + project state without raising.
+
+    Calls ``gcloud auth application-default print-access-token`` to test that
+    Application Default Credentials are reachable, and ``gcloud config
+    get-value project`` to read the active project. Both calls are bounded
+    by a short timeout so a stuck gcloud install can't hang the bootstrap.
+    """
+    try:
+        adc = subprocess.run(
+            ["gcloud", "auth", "application-default", "print-access-token"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=15,
+        )
+    except FileNotFoundError:
+        return _PreflightResult(False, "gcloud not on PATH", "", False)
+    except subprocess.TimeoutExpired:
+        return _PreflightResult(False, "gcloud timed out", "", True)
+    adc_ok = adc.returncode == 0
+    if adc_ok:
+        adc_message = "ADC token reachable"
+    else:
+        # gcloud puts the human-readable error on stderr; fall back to a
+        # generic message so the script still says something useful.
+        adc_message = (adc.stderr.strip().splitlines() or ["no token"])[-1]
+
+    try:
+        proj = subprocess.run(
+            ["gcloud", "config", "get-value", "project"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=15,
+        )
+        gcloud_project = proj.stdout.strip() if proj.returncode == 0 else ""
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        gcloud_project = ""
+    # ``(unset)`` is what gcloud config get-value prints when no project is
+    # configured; treat it as empty so we don't pretend a value was set.
+    if gcloud_project == "(unset)":
+        gcloud_project = ""
+    return _PreflightResult(adc_ok, adc_message, gcloud_project, True)
+
+
+def _print_preflight(result: _PreflightResult, args: argparse.Namespace) -> None:
+    print("Preflight:")
+    if not result.gcloud_available:
+        print(f"  gcloud: NOT AVAILABLE — {result.adc_message}")
+        print()
+        return
+    adc_label = "OK" if result.adc_ok else "NOT CONFIGURED"
+    print(f"  ADC: {adc_label} — {result.adc_message}")
+    if result.gcloud_project:
+        if result.gcloud_project == args.project:
+            note = "matches --project"
+        else:
+            note = (
+                f"differs from --project ({args.project}); "
+                "subcommands pass --project explicitly so this is OK, "
+                "but cross-check before --execute"
+            )
+        print(f"  gcloud config project: {result.gcloud_project} ({note})")
+    else:
+        print("  gcloud config project: (unset)")
+    print()
 
 
 def _print_plan(args: argparse.Namespace, steps: list[Step]) -> None:
@@ -328,6 +441,20 @@ def run(args: argparse.Namespace) -> int:
         email = _service_account_email(args.project, args.service_account)
         args.principal = f"serviceAccount:{email}"
     _require_project_dataset(args)
+    preflight = _run_preflight()
+    _print_preflight(preflight, args)
+    if args.execute and not preflight.gcloud_available:
+        raise SystemExit(
+            "gcloud is required for --execute but is not available. "
+            "Install the Google Cloud SDK and re-run."
+        )
+    if args.execute and not preflight.adc_ok:
+        raise SystemExit(
+            "Application Default Credentials are not configured. "
+            "Run `gcloud auth application-default login` "
+            "(or set GOOGLE_APPLICATION_CREDENTIALS to a service-account "
+            "JSON key) and re-run."
+        )
     steps = _build_steps(args)
     _print_plan(args, steps)
     if not args.execute:
@@ -400,11 +527,21 @@ def main(argv: list[str] | None = None) -> int:
             "datasets when BQAA_AUTO_CREATE_DATASET=true."
         ),
     )
+    parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help=(
+            "Run without interactive prompts. Adds --quiet to every gcloud "
+            "and bq subcommand so Codex / Claude / CI can run --execute "
+            "unattended without a confirmation hanging the bootstrap."
+        ),
+    )
     parser.set_defaults(
         enable_apis=True,
         create_dataset=True,
         create_table=True,
         grant_iam=True,
+        non_interactive=False,
     )
     return run(parser.parse_args(argv))
 

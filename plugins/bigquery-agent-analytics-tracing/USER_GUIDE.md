@@ -76,6 +76,47 @@ Use `--principal "user:name@example.com"` instead when the agent runtime uses
 user ADC. Add `--runtime-auto-create-dataset` only when the runtime itself will
 run with `BQAA_AUTO_CREATE_DATASET=true`.
 
+### Preflight + unattended (agent) runs
+
+Every invocation prints a one-screen preflight summary so an agent can see
+what credentials it would use:
+
+```
+Preflight:
+  ADC: OK — ADC token reachable
+  gcloud config project: my-gcp-project (matches --project)
+```
+
+With `--execute`, the script hard-fails before touching anything when:
+
+- `gcloud` is not on `PATH` — `gcloud is required for --execute but is
+  not available. Install the Google Cloud SDK and re-run.`
+- Application Default Credentials are not configured —
+  `Application Default Credentials are not configured. Run
+  `gcloud auth application-default login` (or set
+  `GOOGLE_APPLICATION_CREDENTIALS` to a service-account JSON key) and
+  re-run.`
+
+In dry-run, both conditions are reported but the plan is still printed
+so an agent can pre-stage everything before the human runs the OAuth
+flow.
+
+For unattended runs (Codex, Claude SDK, CI), pass `--non-interactive`:
+
+```bash
+python plugins/bigquery-agent-analytics-tracing/scripts/setup_gcp_prereqs.py \
+  --project "$BQAA_PROJECT_ID" \
+  --dataset "$BQAA_DATASET" \
+  --service-account bqaa-writer \
+  --non-interactive --execute
+```
+
+`--non-interactive` injects `--quiet` into every `gcloud` and `bq`
+subcommand so a confirmation prompt can never block the bootstrap.
+`gcloud config get-value project` mismatches with `--project` are
+warnings, not errors — every subcommand passes `--project` explicitly,
+so the explicit flag wins.
+
 Required APIs:
 
 ```bash

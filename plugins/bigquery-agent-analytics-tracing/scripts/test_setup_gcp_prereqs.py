@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 from pathlib import Path
 import sys
 
@@ -25,9 +27,26 @@ def _args(**overrides: object) -> argparse.Namespace:
         "create_table": True,
         "grant_iam": True,
         "runtime_auto_create_dataset": False,
+        "non_interactive": False,
     }
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
+
+
+@contextlib.contextmanager
+def _stub_preflight(result: setup._PreflightResult):
+    """Replace _run_preflight for the duration of one test without monkeypatch.
+
+    Tests that exercise the run() path need a deterministic preflight
+    answer; calling the real subprocesses would couple the test to the
+    machine's gcloud install.
+    """
+    original = setup._run_preflight
+    setup._run_preflight = lambda: result
+    try:
+        yield
+    finally:
+        setup._run_preflight = original
 
 
 def _commands(args: argparse.Namespace) -> list[list[str]]:
@@ -159,6 +178,82 @@ def test_python_action_details_are_visible() -> None:
     assert "bqaa_tracing.bq_schema()" in str(details[2])
 
 
+def test_non_interactive_injects_quiet_into_gcloud_and_bq() -> None:
+    commands = _commands(_args(service_account="bqaa-writer", non_interactive=True))
+    # First command is gcloud services enable; --quiet must be the second
+    # token (gcloud's --quiet is a global flag that goes before the
+    # subcommand group).
+    assert commands[0][:2] == ["gcloud", "--quiet"], commands[0]
+    bq_commands = [c for c in commands if c and c[0] == "bq"]
+    assert bq_commands, "expected at least one bq command in the plan"
+    for cmd in bq_commands:
+        assert cmd[:2] == ["bq", "--quiet"], cmd
+    project_iam = [
+        c for c in commands if c[:2] == ["gcloud", "--quiet"] and "projects" in c
+    ]
+    assert project_iam, "expected gcloud --quiet projects add-iam-policy-binding"
+
+
+def test_default_does_not_add_quiet() -> None:
+    # Confirms --non-interactive is opt-in; default plan keeps the bare
+    # gcloud/bq commands so it stays git-diff-friendly with prior PRs.
+    commands = _commands(_args(service_account="bqaa-writer"))
+    assert commands[0][1] != "--quiet", commands[0]
+    bq_commands = [c for c in commands if c and c[0] == "bq"]
+    for cmd in bq_commands:
+        assert cmd[1] != "--quiet", cmd
+
+
+def test_preflight_failure_blocks_execute() -> None:
+    failed = setup._PreflightResult(
+        adc_ok=False,
+        adc_message="no token",
+        gcloud_project="",
+        gcloud_available=True,
+    )
+    with _stub_preflight(failed):
+        with contextlib.redirect_stdout(io.StringIO()):
+            try:
+                setup.run(_args(execute=True))
+            except SystemExit as exc:
+                assert "Application Default Credentials" in str(exc), exc
+            else:
+                raise AssertionError("ADC missing must hard-fail --execute")
+
+
+def test_preflight_failure_does_not_block_dry_run() -> None:
+    failed = setup._PreflightResult(
+        adc_ok=False,
+        adc_message="no token",
+        gcloud_project="",
+        gcloud_available=True,
+    )
+    with _stub_preflight(failed):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            assert setup.run(_args()) == 0
+        out = buf.getvalue()
+        assert "DRY RUN" in out
+        assert "ADC: NOT CONFIGURED" in out
+
+
+def test_preflight_missing_gcloud_blocks_execute() -> None:
+    no_gcloud = setup._PreflightResult(
+        adc_ok=False,
+        adc_message="gcloud not on PATH",
+        gcloud_project="",
+        gcloud_available=False,
+    )
+    with _stub_preflight(no_gcloud):
+        with contextlib.redirect_stdout(io.StringIO()):
+            try:
+                setup.run(_args(execute=True))
+            except SystemExit as exc:
+                assert "gcloud is required" in str(exc), exc
+            else:
+                raise AssertionError("missing gcloud must hard-fail --execute")
+
+
 if __name__ == "__main__":
     for test in (
         test_service_account_plan,
@@ -166,6 +261,11 @@ if __name__ == "__main__":
         test_runtime_auto_create_dataset_adds_user_role,
         test_principal_prefix_validation,
         test_python_action_details_are_visible,
+        test_non_interactive_injects_quiet_into_gcloud_and_bq,
+        test_default_does_not_add_quiet,
+        test_preflight_failure_blocks_execute,
+        test_preflight_failure_does_not_block_dry_run,
+        test_preflight_missing_gcloud_blocks_execute,
     ):
         test()
     print("setup_gcp_prereqs tests passed")
