@@ -90,7 +90,32 @@ Enable `bigquery.googleapis.com` for all write paths. Enable
 drainer path. Enable `iam.googleapis.com` only when the bootstrap command
 creates a service account.
 
-To let Codex or Claude set this up from one deterministic command, run the
+### Easiest path: ask Claude Code to do it
+
+After installing the plugin and restarting Claude Code, type
+**`/bqaa-setup`** (or just say "set up BQAA tracing for this project").
+The plugin ships a `bqaa-setup` skill and slash command that walk through:
+
+1. Confirming project / dataset / location / service-account choices.
+2. Checking that Application Default Credentials are configured
+   (Claude will pause and ask you to run
+   `gcloud auth application-default login` yourself if ADC is missing —
+   it's an interactive browser flow no agent can complete).
+3. Dry-run of `setup_gcp_prereqs.py`, with the full plan shown before
+   anything mutates.
+4. Explicit approval gate, then `--execute --non-interactive`.
+5. End-to-end verification via `e2e_bigquery_smoke.py`.
+6. Writing the BQAA env block into `.claude/settings.local.json` so
+   the next Claude Code session in this directory auto-traces.
+
+The skill is auto-discovered when you mention setup ("set up BQAA",
+"why aren't my BQAA rows landing", "fix BQAA permissions", etc.); the
+slash command at `/bqaa-setup [project] [dataset]` triggers it
+deterministically.
+
+### Manual: run the script yourself
+
+To do it without Claude in the loop, run the
 bootstrap script in dry-run mode first:
 
 ```bash

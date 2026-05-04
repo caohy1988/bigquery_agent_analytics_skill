@@ -43,6 +43,22 @@ The identity needs dataset write access. For auto-create behavior, it also
 needs permission to create tables, and optionally datasets if
 `BQAA_AUTO_CREATE_DATASET=true`.
 
+### Easiest path: `/bqaa-setup` in Claude Code
+
+After the plugin is installed and Claude Code is restarted, just type
+`/bqaa-setup` (or describe the goal in plain English: "set up BQAA
+tracing", "why aren't my BQAA rows showing up", "configure agent
+analytics for this project"). The plugin's `bqaa-setup` skill walks
+Claude through the same dry-run → approval → execute → verify flow as
+the manual script below, plus persists the `BQAA_*` env into
+`.claude/settings.local.json` so the next session traces automatically.
+
+The skill explicitly does **not** run `gcloud auth application-default
+login` for the user (that's a browser OAuth flow no agent can
+complete); it pauses and asks the user to run it, then resumes.
+
+### Manual: dry-run first, --execute when the plan looks right
+
 Automatic bootstrap, safe dry-run first:
 
 ```bash
