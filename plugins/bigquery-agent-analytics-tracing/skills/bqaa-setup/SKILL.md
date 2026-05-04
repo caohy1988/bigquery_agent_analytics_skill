@@ -37,6 +37,17 @@ own Google identity. Why: the BQAA hooks read ADC, and ADC == that same identity
 on a normal `gcloud auth application-default login` setup. No impersonation, no
 extra wiring; runtime "just works" once env is set in Step 6.
 
+> **Multi-account warning.** The default grants the active **gcloud CLI**
+> account (`gcloud config get-value account`), but runtime hooks use **ADC**
+> (`gcloud auth application-default login`). On most setups they're the same
+> identity, but if the user has multiple Google accounts logged in, those two
+> can diverge — the IAM grant lands on account A and the hooks keep writing
+> as account B (which has no grant). The preflight surfaces both: if the
+> `ADC: OK` line and the `gcloud CLI auth: OK` line don't show the same email,
+> stop and confirm with the user which account should be granted, then have
+> them run `gcloud auth application-default login` with that account before
+> --execute.
+
 A **service account** (`--service-account bqaa-writer`) is the right choice
 when:
 
@@ -129,19 +140,21 @@ Common variations:
 
 ## Step 4 — Wait for explicit approval, then execute
 
-Only after the user says yes (or equivalent), append `--execute`:
+**Hard rule: re-run the EXACT command from Step 3 with `--execute` appended.**
+Do not switch the principal, the service-account flag, or any other option
+between dry-run and execute. The user approved one plan; running anything
+different — even a "more sensible" variant — bypasses approval and can
+silently apply a different identity path than what was reviewed.
 
-```bash
-python plugins/bigquery-agent-analytics-tracing/scripts/setup_gcp_prereqs.py \
-  --project "$BQAA_PROJECT_ID" \
-  --dataset "$BQAA_DATASET" \
-  --table "${BQAA_TABLE:-agent_events}" \
-  --location "${BQAA_LOCATION:-US}" \
-  --service-account bqaa-writer \
-  --non-interactive --execute
-```
+In practice this means: if Step 3 ran with `--principal "user:..."`, Step 4
+runs the same command + `--execute`; if Step 3 ran with
+`--service-account bqaa-writer`, Step 4 runs that same command + `--execute`.
+Any change to the plan goes back through Step 3 first.
 
-If a step fails (most often `Permission denied: serviceusage.services.enable` or IAM propagation latency), the script's own retry covers IAM propagation. For permission errors, tell the user which role they're missing — it's almost always one of:
+If a step fails at execute time (most often `Permission denied:
+serviceusage.services.enable` or IAM propagation latency), the script's own
+retry covers IAM propagation. For permission errors, tell the user which
+role they're missing — it's almost always one of:
 
 - `roles/serviceusage.serviceUsageAdmin` to enable APIs
 - `roles/iam.serviceAccountAdmin` to create the SA

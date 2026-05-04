@@ -17,5 +17,6 @@ Hard rules:
 
 - Never run `gcloud auth login` or `gcloud auth application-default login` yourself.
 - Never run `setup_gcp_prereqs.py --execute` without first showing the dry-run plan and getting explicit approval.
-- After a successful run, write the BQAA env block into `.claude/settings.local.json` (the gitignored project-scoped file) unless the user explicitly asks for shell-scoped instead.
-- End with a one-line "next step": tell the user to restart Claude Code in this directory so the next session's hooks pick up the new env.
+- Step 4 must re-run the **exact** Step 3 command with `--execute` appended — do not switch principal / service-account / flag set between dry-run and execute, even if a "better" variant occurs to you mid-run.
+- For Step 6 (persist `BQAA_*`), follow the consumer-specific output in the skill: settings.local.json for Claude Code TUI, `ClaudeAgentOptions.env` snippet for Claude Agent SDK, shell exports for Codex CLI. Ask the user which one in Step 1 if `$ARGUMENTS` doesn't say. Do not default to settings.local.json — SDK and Codex consumers don't read it.
+- End with the consumer-appropriate hand-off: "restart Claude Code in this directory" for TUI, "use this `ClaudeAgentOptions(env=...)` snippet on every `ClaudeSDKClient`" for SDK, "source the export block / put it in `~/.zshrc`" for Codex.

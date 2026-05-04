@@ -115,8 +115,19 @@ what credentials it would use:
 ```
 Preflight:
   ADC: OK — ADC token reachable
+  gcloud CLI auth: OK — active account my-account@example.com
   gcloud config project: my-gcp-project (matches --project)
 ```
+
+Three lines, three independent surfaces. ADC backs the
+google-cloud-bigquery Python client (used by `--create-dataset` /
+`--create-table`); gcloud CLI auth backs every `gcloud` and `bq`
+subprocess (API enable, IAM grants, service-account create); the
+project line is a sanity check against `--project`. On most local-dev
+setups the ADC and CLI accounts are the same identity, but on agent
+boxes / CI they often diverge — if these two emails don't match and
+you intend to grant IAM to one of them, double-check before
+`--execute`.
 
 With `--execute`, the script hard-fails before touching anything when
 any of these credential surfaces are missing for steps that need them:
