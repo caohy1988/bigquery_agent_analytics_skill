@@ -78,8 +78,81 @@ The plugin uses the standard Google Cloud auth chain. Either of these works:
 
 The service account or user identity needs:
 
-- `bigquery.dataEditor` on the dataset (for inserts and table create-on-first-use).
-- `bigquery.jobUser` on the project (for table existence checks during fallback).
+- `roles/bigquery.dataEditor` on the dataset for inserts and table
+  create-on-first-use inside an existing dataset.
+- `roles/bigquery.jobUser` on the project for verification queries and smoke
+  scripts that run `SELECT` statements.
+- `roles/bigquery.user` on the project only if
+  `BQAA_AUTO_CREATE_DATASET=true`.
+
+Enable `bigquery.googleapis.com` for all write paths. Enable
+`bigquerystorage.googleapis.com` for the recommended async Storage Write API
+drainer path. Enable `iam.googleapis.com` only when the bootstrap command
+creates a service account.
+
+### Easiest path: ask Claude Code to do it
+
+After installing the plugin and restarting Claude Code, type
+**`/bigquery-agent-analytics-tracing:bqaa-setup`** (or just say "set up BQAA tracing for this project").
+The plugin ships a `bqaa-setup` skill and slash command that walk through:
+
+1. Confirming project / dataset / location / service-account choices.
+2. Checking that Application Default Credentials are configured
+   (Claude will pause and ask you to run
+   `gcloud auth application-default login` yourself if ADC is missing —
+   it's an interactive browser flow no agent can complete).
+3. Dry-run of `setup_gcp_prereqs.py`, with the full plan shown before
+   anything mutates.
+4. Explicit approval gate, then `--execute --non-interactive`.
+5. End-to-end verification via `e2e_bigquery_smoke.py`.
+6. Writing the BQAA env block into `.claude/settings.local.json` so
+   the next Claude Code session in this directory auto-traces.
+
+The skill is auto-discovered when you mention setup ("set up BQAA",
+"why aren't my BQAA rows landing", "fix BQAA permissions", etc.); the
+slash command
+`/bigquery-agent-analytics-tracing:bqaa-setup [args]` triggers it
+deterministically. Claude Code namespaces plugin commands as
+`<plugin-name>:<command>`, so the full path is verbose — for daily
+use the natural-language path is shorter; the slash form is best for
+docs, runbooks, and unattended runs where the trigger needs to be
+deterministic.
+
+### Manual: run the script yourself
+
+To do it without Claude in the loop, run the
+bootstrap script in dry-run mode first:
+
+For local Claude Code / SDK / Codex on a workstation, grant your own Google
+identity (no impersonation, ADC works directly):
+
+```bash
+python plugins/bigquery-agent-analytics-tracing/scripts/setup_gcp_prereqs.py \
+  --project "$BQAA_PROJECT_ID" \
+  --dataset "$BQAA_DATASET" \
+  --table "$BQAA_TABLE" \
+  --location "$BQAA_LOCATION" \
+  --principal "user:$(gcloud config get-value account)"
+```
+
+For shared workstations / unattended agents / CI, swap in
+`--service-account bqaa-writer` and wire impersonation per
+[USER_GUIDE.md → Service-account path](./USER_GUIDE.md#1-prepare-bigquery)
+(creating the SA does not redirect runtime traffic on its own).
+
+Then append `--execute` to apply the plan. The script can create the SA,
+create the BigQuery dataset/table, enable APIs, and grant runtime IAM. See
+[USER_GUIDE.md](./USER_GUIDE.md#1-prepare-bigquery) for the full IAM matrix,
+manual commands, and runtime auto-create options. Dataset IAM bindings are
+emitted with explicit `bq add-iam-policy-binding -d`.
+
+Every run begins with a preflight that prints the active gcloud ADC and
+project so an agent can see what credentials will be used. With
+`--execute`, missing ADC hard-fails before any API call, with a clear
+"run `gcloud auth application-default login`" message instead of an
+opaque 401 mid-bootstrap. Add `--non-interactive` to inject `--quiet`
+into every gcloud and bq subcommand so unattended Codex / Claude / CI
+runs never block on a confirmation prompt.
 
 ### Python runtime
 

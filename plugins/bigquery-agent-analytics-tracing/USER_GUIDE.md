@@ -43,6 +43,208 @@ The identity needs dataset write access. For auto-create behavior, it also
 needs permission to create tables, and optionally datasets if
 `BQAA_AUTO_CREATE_DATASET=true`.
 
+### Easiest path: `/bigquery-agent-analytics-tracing:bqaa-setup` in Claude Code
+
+After the plugin is installed and Claude Code is restarted, just type
+`/bigquery-agent-analytics-tracing:bqaa-setup` (or describe the goal in plain English: "set up BQAA
+tracing", "why aren't my BQAA rows showing up", "configure agent
+analytics for this project"). The plugin's `bqaa-setup` skill walks
+Claude through the same dry-run → approval → execute → verify flow as
+the manual script below, plus persists the `BQAA_*` env into
+`.claude/settings.local.json` so the next session traces automatically.
+
+The skill explicitly does **not** run `gcloud auth application-default
+login` for the user (that's a browser OAuth flow no agent can
+complete); it pauses and asks the user to run it, then resumes.
+
+### Manual: dry-run first, --execute when the plan looks right
+
+Automatic bootstrap, safe dry-run first.
+
+For local Claude Code / SDK / Codex on a developer workstation, the
+recommended principal is **the developer's own Google identity** — the BQAA
+hooks read ADC, and ADC == that same identity, so the runtime "just works"
+without service-account impersonation:
+
+```bash
+python -m pip install google-cloud-bigquery
+
+python plugins/bigquery-agent-analytics-tracing/scripts/setup_gcp_prereqs.py \
+  --project "$BQAA_PROJECT_ID" \
+  --dataset "$BQAA_DATASET" \
+  --table "$BQAA_TABLE" \
+  --location "$BQAA_LOCATION" \
+  --principal "user:$(gcloud config get-value account)"
+```
+
+If the printed plan is correct, apply it by appending `--execute`.
+
+A **service account** (`--service-account bqaa-writer`) is the right choice
+for shared workstations, server-side / CI agents, or org policies that
+centralize credentials. The script will create the SA and grant it IAM, but
+**you must wire the runtime to actually use the SA** — creation alone does
+not redirect the hooks. The BQAA hooks call `google-cloud-bigquery` directly
+via ADC; they do not consult gcloud config. Whatever routes the SA into
+runtime has to route it into **ADC**. Pick one:
+
+```bash
+# Option A — SA impersonation via ADC (recommended, no JSON key):
+gcloud auth application-default login \
+  --impersonate-service-account=bqaa-writer@${BQAA_PROJECT_ID}.iam.gserviceaccount.com
+# The caller needs roles/iam.serviceAccountTokenCreator on the SA.
+
+# Option B — service-account JSON key (least preferred; rotate on schedule):
+export GOOGLE_APPLICATION_CREDENTIALS=/path/to/bqaa-writer.json
+
+# Option C — Workload Identity Federation (for CI / unattended; no key file):
+#   https://cloud.google.com/iam/docs/workload-identity-federation
+#   GOOGLE_APPLICATION_CREDENTIALS points at the WIF credential-config JSON.
+```
+
+Without one of those, the BQAA hooks will keep running under whoever is
+logged in via ADC and the SA grants are dead weight.
+
+> **Do not substitute `gcloud config set auth/impersonate_service_account`.**
+> That setting only redirects gcloud / bq CLI commands you run yourself. It
+> does **not** change which identity the BQAA Python hooks use. Setting it
+> alone passes the bootstrap script's gcloud subcommands but leaves the
+> hooks writing under the wrong identity. It's complementary to Option A,
+> not a substitute.
+
+The bootstrap command enables the required BigQuery APIs, creates the dataset
+and `agent_events` table if missing, and grants the runtime principal the
+narrow BigQuery roles below. Add `--runtime-auto-create-dataset` only when
+the runtime itself will run with `BQAA_AUTO_CREATE_DATASET=true`.
+
+### Preflight + unattended (agent) runs
+
+Every invocation prints a one-screen preflight summary so an agent can see
+what credentials it would use:
+
+```
+Preflight:
+  ADC: OK — ADC token reachable
+  gcloud CLI auth: OK — active account my-account@example.com
+  gcloud config project: my-gcp-project (matches --project)
+```
+
+Three lines, three independent surfaces. ADC backs the
+google-cloud-bigquery Python client (used by `--create-dataset` /
+`--create-table`); gcloud CLI auth backs every `gcloud` and `bq`
+subprocess (API enable, IAM grants, service-account create); the
+project line is a sanity check against `--project`. On most local-dev
+setups the ADC and CLI accounts are the same identity, but on agent
+boxes / CI they often diverge — if these two emails don't match and
+you intend to grant IAM to one of them, double-check before
+`--execute`.
+
+With `--execute`, the script hard-fails before touching anything when
+any of these credential surfaces are missing for steps that need them:
+
+- `gcloud` is not on `PATH`:
+
+  ```text
+  gcloud is required for --execute but is not available.
+  Install the Google Cloud SDK and re-run.
+  ```
+
+- Application Default Credentials are not configured (only required
+  when the plan calls google-cloud-bigquery directly — i.e.
+  `--create-dataset` / `--create-table` is in the plan):
+
+  ```text
+  Application Default Credentials are not configured but this plan
+  calls google-cloud-bigquery directly.
+  Run: gcloud auth application-default login
+  (or set GOOGLE_APPLICATION_CREDENTIALS to a service-account JSON
+  key) and re-run.
+  ```
+
+- gcloud CLI auth is not configured (required when the plan shells
+  out to `gcloud` or `bq` — i.e. API enable, IAM grants, service-
+  account create):
+
+  ```text
+  gcloud CLI auth is not configured but this plan shells out to
+  gcloud / bq.
+  Run: gcloud auth login (and `gcloud config set account ACCOUNT`
+  if multiple identities are listed) and re-run.
+  ADC alone is not enough: gcloud subcommands ignore ADC and use
+  the active CLI account.
+  ```
+
+In most local-dev setups the same human identity backs both ADC and
+the gcloud CLI; on agent boxes and CI they are often separate, which
+is why the script reports them independently. In dry-run, all three
+conditions are reported but the plan is still printed so an agent
+can pre-stage everything before the human runs the OAuth flow.
+
+For unattended runs (Codex, Claude SDK, CI), pass `--non-interactive`. The
+SA path is typical here — once the SA exists and its impersonation/key is
+wired (see options A/B/C above), the runtime is identity-stable across
+machines:
+
+```bash
+python plugins/bigquery-agent-analytics-tracing/scripts/setup_gcp_prereqs.py \
+  --project "$BQAA_PROJECT_ID" \
+  --dataset "$BQAA_DATASET" \
+  --service-account bqaa-writer \
+  --non-interactive --execute
+```
+
+`--non-interactive` injects `--quiet` into every `gcloud` and `bq`
+subcommand so a confirmation prompt can never block the bootstrap.
+`gcloud config get-value project` mismatches with `--project` are
+warnings, not errors — every subcommand passes `--project` explicitly,
+so the explicit flag wins.
+
+Required APIs:
+
+```bash
+gcloud services enable bigquery.googleapis.com bigquerystorage.googleapis.com iam.googleapis.com \
+  --project "$BQAA_PROJECT_ID"
+```
+
+`iam.googleapis.com` is only needed when the bootstrap command creates a
+service account; the BigQuery APIs are needed for the tracing writer paths.
+
+Recommended IAM by deployment mode:
+
+| Mode | Required roles |
+| --- | --- |
+| Existing dataset and table | `roles/bigquery.dataEditor` on the dataset |
+| Auto-create table in an existing dataset | `roles/bigquery.dataEditor` on the dataset |
+| Auto-create dataset and table in the bootstrap script | bootstrap identity needs create permissions; runtime principal needs `roles/bigquery.dataEditor` on the dataset after creation |
+| Runtime auto-creates dataset/table | `roles/bigquery.user` on the project plus `roles/bigquery.dataEditor` after the dataset exists, or `roles/bigquery.admin` for bootstrap-only setup |
+| Run verification SQL or smoke scripts that query the table | `roles/bigquery.jobUser` on the project plus dataset read/write access |
+
+Manual IAM equivalent:
+
+```bash
+SERVICE_ACCOUNT="bqaa-writer@${BQAA_PROJECT_ID}.iam.gserviceaccount.com"
+
+# Existing dataset/table, or auto-create table inside an existing dataset:
+bq add-iam-policy-binding \
+  -d \
+  "${BQAA_PROJECT_ID}:${BQAA_DATASET}" \
+  --member "serviceAccount:${SERVICE_ACCOUNT}" \
+  --role roles/bigquery.dataEditor
+
+# Needed for `bq query` verification and smoke scripts that query BigQuery:
+gcloud projects add-iam-policy-binding "$BQAA_PROJECT_ID" \
+  --member "serviceAccount:${SERVICE_ACCOUNT}" \
+  --role roles/bigquery.jobUser
+
+# Only if BQAA_AUTO_CREATE_DATASET=true in the runtime:
+gcloud projects add-iam-policy-binding "$BQAA_PROJECT_ID" \
+  --member "serviceAccount:${SERVICE_ACCOUNT}" \
+  --role roles/bigquery.user
+```
+
+Keep `roles/bigquery.admin` out of steady-state agent runtimes. It is useful
+for first-time bootstrap in a dev project, but the runtime writer only needs
+the narrower roles above.
+
 ## 2. Install Runtime Dependencies
 
 Minimum:
