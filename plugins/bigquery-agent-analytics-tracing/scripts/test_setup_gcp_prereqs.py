@@ -264,15 +264,36 @@ def test_preflight_cli_auth_failure_allowed_when_only_python_actions() -> None:
         grant_iam=False,
         service_account=None,
     )
-    with _stub_preflight(_preflight(cli_auth_ok=False)):
-        with contextlib.redirect_stdout(io.StringIO()):
-            # Should not raise. We can't actually let it run --execute
-            # against real BQ in tests, so monkey-patch the action loop
-            # by stubbing the only remaining steps' .action callables.
-            # Easier: stop before executing actions by validating that
-            # _build_steps()-returned plan contains no gcloud/bq commands.
-            steps = setup._build_steps(args)
-            assert not setup._steps_need_gcloud_or_bq(steps), steps
+    steps = setup._build_steps(args)
+    assert not setup._steps_need_cli_auth(steps), steps
+    assert setup._steps_need_adc(steps), steps
+
+
+def test_service_account_only_plan_needs_cli_auth_not_adc() -> None:
+    # Reviewer Finding #2 regression: a plan with ONLY the
+    # service-account step (no dataset/table create, no IAM grants)
+    # is a Step.action that shells out to gcloud — must trigger
+    # CLI-auth gating, must NOT trigger ADC gating. The prior heuristic
+    # `any(step.action is not None)` got this wrong.
+    args = _args(
+        execute=True,
+        enable_apis=False,
+        create_dataset=False,
+        create_table=False,
+        grant_iam=False,
+        service_account="bqaa-writer",
+    )
+    if args.service_account and not args.principal:
+        email = setup._service_account_email(args.project, args.service_account)
+        args.principal = f"serviceAccount:{email}"
+    steps = setup._build_steps(args)
+    assert len(steps) == 1, steps
+    assert steps[0].action is not None
+    assert steps[0].needs_cli_auth, "SA action shells out to gcloud"
+    assert not steps[0].needs_adc, "SA action doesn't use ADC"
+    # And the gating helpers reflect the same:
+    assert setup._steps_need_cli_auth(steps)
+    assert not setup._steps_need_adc(steps)
 
 
 def test_preflight_failure_does_not_block_dry_run() -> None:
@@ -324,6 +345,7 @@ if __name__ == "__main__":
         test_preflight_adc_failure_blocks_execute_when_python_actions_run,
         test_preflight_cli_auth_failure_blocks_execute_when_gcloud_steps_run,
         test_preflight_cli_auth_failure_allowed_when_only_python_actions,
+        test_service_account_only_plan_needs_cli_auth_not_adc,
         test_preflight_failure_does_not_block_dry_run,
         test_preflight_missing_gcloud_blocks_execute,
         test_summarize_stderr_keeps_actionable_context,

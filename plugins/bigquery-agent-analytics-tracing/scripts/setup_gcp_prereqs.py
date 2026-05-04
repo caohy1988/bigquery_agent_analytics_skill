@@ -38,10 +38,22 @@ PRINCIPAL_PREFIXES = (
 
 @dataclass(frozen=True)
 class Step:
+    """One unit of bootstrap work.
+
+    Each step declares which credential surfaces it actually needs so
+    the preflight gate can fail-fast on the right one. ``Step.action``
+    callbacks aren't all ADC-backed — ``_ensure_service_account`` is
+    an action but it shells out to ``gcloud iam service-accounts``,
+    which uses the gcloud CLI account, not ADC. Inferring needs from
+    ``command`` vs ``action`` was wrong; explicit flags are the fix.
+    """
+
     label: str
     command: list[str] | None = None
     action: Callable[[], None] | None = None
     detail: str | None = None
+    needs_adc: bool = False
+    needs_cli_auth: bool = False
 
 
 @dataclass(frozen=True)
@@ -267,6 +279,7 @@ def _build_steps(args: argparse.Namespace) -> list[Step]:
                     "--project",
                     args.project,
                 ),
+                needs_cli_auth=True,
             )
         )
 
@@ -279,6 +292,9 @@ def _build_steps(args: argparse.Namespace) -> list[Step]:
                     "gcloud iam service-accounts describe; on missing, "
                     "create service account with a short retry for API/IAM propagation"
                 ),
+                # Reviewer Finding #2: this action shells out to gcloud,
+                # so it depends on CLI auth, not ADC.
+                needs_cli_auth=True,
             )
         )
 
@@ -291,6 +307,7 @@ def _build_steps(args: argparse.Namespace) -> list[Step]:
                     "bigquery.Client.get_dataset(); on NotFound, "
                     f"create_dataset(location={args.location or 'client default'})"
                 ),
+                needs_adc=True,
             )
         )
 
@@ -305,6 +322,7 @@ def _build_steps(args: argparse.Namespace) -> list[Step]:
                     "bigquery.Client.get_table(); on NotFound, create partitioned "
                     "agent_events table using bqaa_tracing.bq_schema()"
                 ),
+                needs_adc=True,
             )
         )
 
@@ -323,6 +341,7 @@ def _build_steps(args: argparse.Namespace) -> list[Step]:
                         "--role",
                         "roles/bigquery.dataEditor",
                     ),
+                    needs_cli_auth=True,
                 ),
                 Step(
                     "Grant project jobUser for verification queries",
@@ -336,6 +355,7 @@ def _build_steps(args: argparse.Namespace) -> list[Step]:
                         "--role",
                         "roles/bigquery.jobUser",
                     ),
+                    needs_cli_auth=True,
                 ),
             ]
         )
@@ -353,6 +373,7 @@ def _build_steps(args: argparse.Namespace) -> list[Step]:
                         "--role",
                         "roles/bigquery.user",
                     ),
+                    needs_cli_auth=True,
                 )
             )
     return steps
@@ -522,17 +543,14 @@ def _print_preflight(result: _PreflightResult, args: argparse.Namespace) -> None
     print()
 
 
-def _steps_need_python_actions(steps: list[Step]) -> bool:
-    """Any step that calls google-cloud-* directly needs ADC."""
-    return any(step.action is not None for step in steps)
+def _steps_need_adc(steps: list[Step]) -> bool:
+    """Whether any step in the plan needs Application Default Credentials."""
+    return any(step.needs_adc for step in steps)
 
 
-def _steps_need_gcloud_or_bq(steps: list[Step]) -> bool:
-    """Any step that shells out to gcloud or bq needs CLI auth."""
-    for step in steps:
-        if step.command and step.command and step.command[0] in {"gcloud", "bq"}:
-            return True
-    return False
+def _steps_need_cli_auth(steps: list[Step]) -> bool:
+    """Whether any step in the plan needs the gcloud CLI account."""
+    return any(step.needs_cli_auth for step in steps)
 
 
 def _print_plan(args: argparse.Namespace, steps: list[Step]) -> None:
@@ -573,7 +591,7 @@ def run(args: argparse.Namespace) -> int:
                 "gcloud is required for --execute but is not available. "
                 "Install the Google Cloud SDK and re-run."
             )
-        if _steps_need_python_actions(steps) and not preflight.adc_ok:
+        if _steps_need_adc(steps) and not preflight.adc_ok:
             raise SystemExit(
                 "Application Default Credentials are not configured but "
                 "this plan calls google-cloud-bigquery directly. "
@@ -581,7 +599,7 @@ def run(args: argparse.Namespace) -> int:
                 "(or set GOOGLE_APPLICATION_CREDENTIALS to a service-"
                 "account JSON key) and re-run."
             )
-        if _steps_need_gcloud_or_bq(steps) and not preflight.cli_auth_ok:
+        if _steps_need_cli_auth(steps) and not preflight.cli_auth_ok:
             raise SystemExit(
                 "gcloud CLI auth is not configured but this plan shells "
                 "out to gcloud / bq. "

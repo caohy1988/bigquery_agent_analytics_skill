@@ -123,18 +123,25 @@ deterministic.
 To do it without Claude in the loop, run the
 bootstrap script in dry-run mode first:
 
+For local Claude Code / SDK / Codex on a workstation, grant your own Google
+identity (no impersonation, ADC works directly):
+
 ```bash
 python plugins/bigquery-agent-analytics-tracing/scripts/setup_gcp_prereqs.py \
   --project "$BQAA_PROJECT_ID" \
   --dataset "$BQAA_DATASET" \
   --table "$BQAA_TABLE" \
   --location "$BQAA_LOCATION" \
-  --service-account bqaa-writer
+  --principal "user:$(gcloud config get-value account)"
 ```
 
-Then append `--execute` to apply the plan. The script can create the
-`bqaa-writer` service account, create the BigQuery dataset/table, enable APIs,
-and grant runtime IAM. See
+For shared workstations / unattended agents / CI, swap in
+`--service-account bqaa-writer` and wire impersonation per
+[USER_GUIDE.md → Service-account path](./USER_GUIDE.md#1-prepare-bigquery)
+(creating the SA does not redirect runtime traffic on its own).
+
+Then append `--execute` to apply the plan. The script can create the SA,
+create the BigQuery dataset/table, enable APIs, and grant runtime IAM. See
 [USER_GUIDE.md](./USER_GUIDE.md#1-prepare-bigquery) for the full IAM matrix,
 manual commands, and runtime auto-create options. Dataset IAM bindings are
 emitted with explicit `bq add-iam-policy-binding -d`.

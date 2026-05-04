@@ -59,7 +59,12 @@ complete); it pauses and asks the user to run it, then resumes.
 
 ### Manual: dry-run first, --execute when the plan looks right
 
-Automatic bootstrap, safe dry-run first:
+Automatic bootstrap, safe dry-run first.
+
+For local Claude Code / SDK / Codex on a developer workstation, the
+recommended principal is **the developer's own Google identity** — the BQAA
+hooks read ADC, and ADC == that same identity, so the runtime "just works"
+without service-account impersonation:
 
 ```bash
 python -m pip install google-cloud-bigquery
@@ -69,28 +74,38 @@ python plugins/bigquery-agent-analytics-tracing/scripts/setup_gcp_prereqs.py \
   --dataset "$BQAA_DATASET" \
   --table "$BQAA_TABLE" \
   --location "$BQAA_LOCATION" \
-  --service-account bqaa-writer
+  --principal "user:$(gcloud config get-value account)"
 ```
 
-If the printed plan is correct, apply it:
+If the printed plan is correct, apply it by appending `--execute`.
+
+A **service account** (`--service-account bqaa-writer`) is the right choice
+for shared workstations, server-side / CI agents, or org policies that
+centralize credentials. The script will create the SA and grant it IAM, but
+**you must wire the runtime to actually use the SA** — creation alone does
+not redirect the hooks. Pick one:
 
 ```bash
-python plugins/bigquery-agent-analytics-tracing/scripts/setup_gcp_prereqs.py \
-  --project "$BQAA_PROJECT_ID" \
-  --dataset "$BQAA_DATASET" \
-  --table "$BQAA_TABLE" \
-  --location "$BQAA_LOCATION" \
-  --service-account bqaa-writer \
-  --execute
+# Option A — SA impersonation via ADC (recommended, no JSON key):
+gcloud auth application-default login \
+  --impersonate-service-account=bqaa-writer@${BQAA_PROJECT_ID}.iam.gserviceaccount.com
+# The caller needs roles/iam.serviceAccountTokenCreator on the SA.
+
+# Option B — gcloud-level impersonation (also affects gcloud commands):
+gcloud config set auth/impersonate_service_account \
+  bqaa-writer@${BQAA_PROJECT_ID}.iam.gserviceaccount.com
+
+# Option C — service-account JSON key (least preferred; rotate on schedule):
+export GOOGLE_APPLICATION_CREDENTIALS=/path/to/bqaa-writer.json
 ```
+
+Without one of those, the BQAA hooks will keep running under whoever is
+logged in via ADC and the SA grants are dead weight.
 
 The bootstrap command enables the required BigQuery APIs, creates the dataset
 and `agent_events` table if missing, and grants the runtime principal the
-narrow BigQuery roles below. `--service-account bqaa-writer` creates
-`bqaa-writer@${BQAA_PROJECT_ID}.iam.gserviceaccount.com` if it does not exist.
-Use `--principal "user:name@example.com"` instead when the agent runtime uses
-user ADC. Add `--runtime-auto-create-dataset` only when the runtime itself will
-run with `BQAA_AUTO_CREATE_DATASET=true`.
+narrow BigQuery roles below. Add `--runtime-auto-create-dataset` only when
+the runtime itself will run with `BQAA_AUTO_CREATE_DATASET=true`.
 
 ### Preflight + unattended (agent) runs
 
@@ -144,7 +159,10 @@ is why the script reports them independently. In dry-run, all three
 conditions are reported but the plan is still printed so an agent
 can pre-stage everything before the human runs the OAuth flow.
 
-For unattended runs (Codex, Claude SDK, CI), pass `--non-interactive`:
+For unattended runs (Codex, Claude SDK, CI), pass `--non-interactive`. The
+SA path is typical here — once the SA exists and its impersonation/key is
+wired (see options A/B/C above), the runtime is identity-stable across
+machines:
 
 ```bash
 python plugins/bigquery-agent-analytics-tracing/scripts/setup_gcp_prereqs.py \
