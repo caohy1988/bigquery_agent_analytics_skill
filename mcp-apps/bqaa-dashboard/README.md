@@ -102,3 +102,7 @@ src/mcp-app.ts   Charts (inline SVG), tooltips, filters, host bridge
 src/mock.ts      Deterministic sample data (server mock mode + standalone preview)
 src/types.ts     Shared payload types
 ```
+
+## Credits
+
+UI type: [Space Grotesk](https://fonts.google.com/specimen/Space+Grotesk) (OFL), embedded in the bundle so it renders under the MCP-app CSP.

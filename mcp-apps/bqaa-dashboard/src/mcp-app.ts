@@ -3,6 +3,7 @@
 // the server via the ext-apps bridge. Standalone (opened directly in a browser)
 // it falls back to the deterministic mock dataset for preview/QA.
 
+import "./styles.css";
 import { App } from "@modelcontextprotocol/ext-apps";
 import { mockDashboard } from "./mock.js";
 import type { DashboardData, TimeBucket } from "./types.js";
@@ -121,9 +122,15 @@ function lineChart(
   container: HTMLElement,
   buckets: TimeBucket[],
   series: LineSeries[],
-  opts: { yFmt: (v: number | null) => string; granularity: "hour" | "day"; height?: number; ariaLabel: string },
+  opts: {
+    yFmt: (v: number | null) => string;
+    granularity: "hour" | "day";
+    height?: number;
+    ariaLabel: string;
+    areaFirst?: boolean; // ~10% wash under the first series
+  },
 ): void {
-  const H = opts.height ?? 210;
+  const H = opts.height ?? 236;
   const W = Math.max(280, container.clientWidth || 560);
   const n = buckets.length;
   if (n === 0) {
@@ -173,17 +180,28 @@ function lineChart(
 
   // series paths, end dots, selective end labels
   const endLabelYs: number[] = [];
-  for (const s of series) {
+  series.forEach((s, si) => {
     let d = "";
     let pen = false;
+    let firstIdx = -1;
+    let lastIdx = -1;
     s.values.forEach((v, i) => {
       if (v == null) {
         pen = false;
         return;
       }
+      if (firstIdx < 0) firstIdx = i;
+      lastIdx = i;
       d += `${pen ? "L" : "M"}${x(i).toFixed(1)},${y(v).toFixed(1)}`;
       pen = true;
     });
+    if (d && si === 0 && opts.areaFirst && firstIdx >= 0 && lastIdx > firstIdx) {
+      const wash = svgEl("path", {
+        d: `${d}L${x(lastIdx).toFixed(1)},${(m.top + ph).toFixed(1)}L${x(firstIdx).toFixed(1)},${(m.top + ph).toFixed(1)}Z`,
+      });
+      wash.style.fill = "var(--wash)";
+      svg.appendChild(wash);
+    }
     if (d) {
       const path = svgEl("path", {
         d,
@@ -217,7 +235,7 @@ function lineChart(
         svg.appendChild(label);
       }
     }
-  }
+  });
 
   // crosshair + hover/focus layer
   const cross = svgEl("line", { y1: m.top, y2: m.top + ph, x1: 0, x2: 0, visibility: "hidden" });
@@ -475,11 +493,48 @@ function table<T>(container: HTMLElement, cols: Col<T>[], rows: T[]): void {
   container.appendChild(scroll);
 }
 
-function tile(label: string, value: string, detail?: string): HTMLElement {
+// 12-point stat-tile sparkline: de-emphasis stroke, current period as accent dot
+function sparkline(values: Array<number | null>): SVGSVGElement | null {
+  const nums = values.map((v) => v ?? 0);
+  if (nums.length < 2) return null;
+  const pts: number[] = [];
+  const N = Math.min(12, nums.length);
+  for (let i = 0; i < N; i++) {
+    const lo = Math.floor((i / N) * nums.length);
+    const hi = Math.max(lo + 1, Math.floor(((i + 1) / N) * nums.length));
+    pts.push(nums.slice(lo, hi).reduce((a, b) => a + b, 0) / (hi - lo));
+  }
+  const W = 76;
+  const H = 26;
+  const max = Math.max(1, ...pts);
+  const x = (i: number) => 2 + (i / (N - 1)) * (W - 8);
+  const y = (v: number) => H - 3 - (v / max) * (H - 7);
+  const svg = svgEl("svg", { width: W, height: H, "aria-hidden": "true" });
+  svg.classList.add("spark");
+  const path = svgEl("path", {
+    d: pts.map((v, i) => `${i ? "L" : "M"}${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(""),
+    fill: "none",
+    "stroke-width": 1.5,
+    "stroke-linecap": "round",
+    "stroke-linejoin": "round",
+  });
+  path.style.stroke = "var(--spark-line)";
+  svg.appendChild(path);
+  const dot = svgEl("circle", { cx: x(N - 1), cy: y(pts[N - 1]), r: 2.5 });
+  dot.style.fill = "var(--accent)";
+  svg.appendChild(dot);
+  return svg;
+}
+
+function tile(label: string, value: string, detail?: string, spark?: Array<number | null>): HTMLElement {
   const card = el("div", "card tile");
   card.appendChild(el("div", "label", label));
   card.appendChild(el("div", "value", value));
   if (detail) card.appendChild(el("div", "detail", detail));
+  if (spark) {
+    const s = sparkline(spark);
+    if (s) card.appendChild(s);
+  }
   return card;
 }
 
@@ -495,8 +550,13 @@ interface LegendItem {
   kind: "line" | "rect";
 }
 
-function chartCard(title: string, sub: string | null, legend: LegendItem[]): { card: HTMLElement; body: HTMLElement } {
-  const card = el("div", "card");
+function chartCard(
+  title: string,
+  sub: string | null,
+  legend: LegendItem[],
+  span: "full" | "half" = "full",
+): { card: HTMLElement; body: HTMLElement } {
+  const card = el("div", `card${span === "full" ? " span-full" : ""}`);
   card.appendChild(el("h2", undefined, title));
   if (sub) card.appendChild(el("div", "sub", sub));
   if (legend.length >= 2) {
@@ -520,42 +580,48 @@ function chartCard(title: string, sub: string | null, legend: LegendItem[]): { c
 
 function renderOverview(d: DashboardData, main: HTMLElement): void {
   const o = d.overview;
+  const ts = d.timeseries;
   main.appendChild(
     tileRow(
-      tile("Events", fmtCompact(o.total_events)),
+      tile("Events", fmtCompact(o.total_events), undefined, ts.map((b) => b.events)),
       tile("Sessions", fmtCompact(o.sessions)),
       tile("Users", fmtCompact(o.users)),
-      tile("Error rate", fmtPct(o.error_rate_pct), `${fmtInt(o.errors)} errors`),
-      tile("P95 latency", fmtMs(o.p95_latency_ms), "all events"),
+      tile("Error rate", fmtPct(o.error_rate_pct), `${fmtInt(o.errors)} errors`, ts.map((b) => b.errors)),
+      tile("P95 latency", fmtMs(o.p95_latency_ms), "all events", ts.map((b) => b.p95_latency_ms)),
     ),
   );
 
   const events = chartCard("Events over time", null, [
     { name: "Events", cssVar: "--s1", kind: "line" },
     { name: "Errors", cssVar: "--s8", kind: "line" },
-  ]);
+  ], "half");
   main.appendChild(events.card); // attach before measuring width
   lineChart(
     events.body,
-    d.timeseries,
+    ts,
     [
-      { name: "Events", cssVar: "--s1", values: d.timeseries.map((b) => b.events) },
-      { name: "Errors", cssVar: "--s8", values: d.timeseries.map((b) => b.errors) },
+      { name: "Events", cssVar: "--s1", values: ts.map((b) => b.events) },
+      { name: "Errors", cssVar: "--s8", values: ts.map((b) => b.errors) },
     ],
-    { yFmt: (v) => fmtInt(v), granularity: d.meta.granularity, ariaLabel: "Events and errors over time" },
+    {
+      yFmt: (v) => fmtInt(v),
+      granularity: d.meta.granularity,
+      ariaLabel: "Events and errors over time",
+      areaFirst: true,
+    },
   );
 
   const lat = chartCard("LLM latency over time", null, [
     { name: "p50", cssVar: "--s1", kind: "line" },
     { name: "p95", cssVar: "--s2", kind: "line" },
-  ]);
+  ], "half");
   main.appendChild(lat.card);
   lineChart(
     lat.body,
-    d.timeseries,
+    ts,
     [
-      { name: "p50", cssVar: "--s1", values: d.timeseries.map((b) => b.p50_latency_ms) },
-      { name: "p95", cssVar: "--s2", values: d.timeseries.map((b) => b.p95_latency_ms) },
+      { name: "p50", cssVar: "--s1", values: ts.map((b) => b.p50_latency_ms) },
+      { name: "p95", cssVar: "--s2", values: ts.map((b) => b.p95_latency_ms) },
     ],
     { yFmt: fmtMs, granularity: d.meta.granularity, ariaLabel: "LLM latency percentiles over time" },
   );
@@ -628,9 +694,9 @@ function renderTokens(d: DashboardData, main: HTMLElement): void {
   const llmCalls = d.timeseries.reduce((a, b) => a + b.llm_calls, 0);
   main.appendChild(
     tileRow(
-      tile("Total tokens", fmtCompact(prompt + completion)),
-      tile("Prompt tokens", fmtCompact(prompt)),
-      tile("Completion tokens", fmtCompact(completion)),
+      tile("Total tokens", fmtCompact(prompt + completion), undefined, d.timeseries.map((b) => b.prompt_tokens + b.completion_tokens)),
+      tile("Prompt tokens", fmtCompact(prompt), undefined, d.timeseries.map((b) => b.prompt_tokens)),
+      tile("Completion tokens", fmtCompact(completion), undefined, d.timeseries.map((b) => b.completion_tokens)),
       tile("Avg tokens / call", llmCalls ? fmtCompact((prompt + completion) / llmCalls) : "—", `${fmtCompact(llmCalls)} LLM calls`),
     ),
   );
@@ -650,7 +716,7 @@ function renderTokens(d: DashboardData, main: HTMLElement): void {
     { yFmt: (v) => fmtCompact(v), granularity: d.meta.granularity, ariaLabel: "Prompt and completion tokens over time" },
   );
 
-  const models = chartCard("Model comparison", "LLM_RESPONSE events", []);
+  const models = chartCard("Model comparison", "LLM_RESPONSE events", [], "half");
   table(models.body, [
     { label: "Model", get: (r) => r.model_id ?? "?" },
     { label: "Calls", get: (r) => fmtInt(r.calls) },
@@ -663,7 +729,7 @@ function renderTokens(d: DashboardData, main: HTMLElement): void {
   ], d.modelComparison);
   main.appendChild(models.card);
 
-  const sessions = chartCard("Top sessions by tokens", "cost estimation: multiply by your per-model prices", []);
+  const sessions = chartCard("Top sessions by tokens", "cost estimation: multiply by your per-model prices", [], "half");
   table(sessions.body, [
     { label: "Session", get: (r) => r.session_id.length > 24 ? `${r.session_id.slice(0, 24)}…` : r.session_id },
     { label: "Model", get: (r) => r.model_id ?? "?" },
@@ -741,6 +807,71 @@ const scopeEl = document.getElementById("scope-note") as HTMLElement;
 const statusEl = document.getElementById("status-note") as HTMLElement;
 const rangeEl = document.getElementById("f-range") as HTMLSelectElement;
 const agentEl = document.getElementById("f-agent") as HTMLSelectElement;
+const pulseWrapEl = document.getElementById("pulse-wrap") as HTMLElement;
+const pulseEl = document.getElementById("pulse") as HTMLElement;
+const footEl = document.getElementById("foot-note") as HTMLElement;
+
+// Signature element: a slim, always-visible pulse of event volume that keeps
+// fleet context on screen whichever tab is open.
+function renderPulse(d: DashboardData): void {
+  pulseEl.replaceChildren();
+  const ts = d.timeseries;
+  if (ts.length < 2) {
+    pulseWrapEl.hidden = true;
+    return;
+  }
+  pulseWrapEl.hidden = false;
+  const W = Math.max(280, pulseEl.clientWidth || 800);
+  const H = 46;
+  const top = 14;
+  const bottom = 4;
+  const ph = H - top - bottom;
+  const n = ts.length;
+  const max = Math.max(1, ...ts.map((b) => b.events));
+  const x = (i: number) => (i / (n - 1)) * W;
+  const y = (v: number) => top + ph - (v / max) * ph;
+  const svg = svgEl("svg", { width: W, height: H, role: "img", "aria-label": "Event volume over the selected window" });
+
+  let d1 = "";
+  ts.forEach((b, i) => {
+    d1 += `${i ? "L" : "M"}${x(i).toFixed(1)},${y(b.events).toFixed(1)}`;
+  });
+  const wash = svgEl("path", { d: `${d1}L${W},${H - bottom}L0,${H - bottom}Z` });
+  wash.style.fill = "var(--wash)";
+  svg.appendChild(wash);
+  const line = svgEl("path", { d: d1, fill: "none", "stroke-width": 1.5, "stroke-linejoin": "round" });
+  line.style.stroke = "var(--s1)";
+  svg.appendChild(line);
+  // mark only buckets whose error rate is clearly above the window's norm
+  const totalEv = ts.reduce((a, b) => a + b.events, 0);
+  const avgRate = totalEv ? ts.reduce((a, b) => a + b.errors, 0) / totalEv : 0;
+  const threshold = Math.max(0.01, avgRate * 1.5);
+  ts.forEach((b, i) => {
+    if (b.events > 0 && b.errors / b.events > threshold) {
+      const dot = svgEl("circle", { cx: x(i), cy: y(b.events), r: 2.4 });
+      dot.style.fill = "var(--s8)";
+      svg.appendChild(dot);
+    }
+  });
+
+  const overlay = svgEl("rect", { x: 0, y: 0, width: W, height: H, fill: "transparent" });
+  overlay.addEventListener("pointermove", (e) => {
+    const rect = svg.getBoundingClientRect();
+    const i = Math.max(0, Math.min(n - 1, Math.round(((e.clientX - rect.left) / W) * (n - 1))));
+    showTooltip(
+      bucketLabel(ts[i].ts, d.meta.granularity),
+      [
+        { name: "events", value: fmtInt(ts[i].events), cssVar: "--s1" },
+        { name: "errors", value: fmtInt(ts[i].errors), cssVar: "--s8" },
+      ],
+      e.clientX,
+      e.clientY,
+    );
+  });
+  overlay.addEventListener("pointerleave", hideTooltip);
+  svg.appendChild(overlay);
+  pulseEl.appendChild(svg);
+}
 
 let data: DashboardData | null = null;
 const initialView = VIEWS.find((v) => `#${v.id}` === location.hash)?.id;
@@ -777,9 +908,17 @@ function setData(d: DashboardData): void {
   const hours = Math.round((Date.parse(d.meta.end) - Date.parse(d.meta.start)) / 3_600_000);
   // reflect the data's actual window in the range control when it matches a preset
   if ([...rangeEl.options].some((o) => o.value === String(hours))) rangeEl.value = String(hours);
-  scopeEl.textContent = `${d.meta.source === "mock" ? "sample data" : d.meta.source} · last ${
-    hours % 24 === 0 && hours >= 48 ? `${hours / 24} days` : `${hours} h`
-  } · by ${d.meta.granularity}`;
+  scopeEl.replaceChildren();
+  scopeEl.appendChild(el("span", "pill", d.meta.source === "mock" ? "sample data" : d.meta.source));
+  scopeEl.appendChild(
+    document.createTextNode(
+      `last ${hours % 24 === 0 && hours >= 48 ? `${hours / 24} days` : `${hours} h`} · by ${d.meta.granularity}`,
+    ),
+  );
+  footEl.textContent = `BigQuery Agent Analytics · ${fmtCompact(d.overview.total_events)} events in window · updated ${new Date(
+    d.meta.end,
+  ).toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}`;
+  renderPulse(d);
   const selected = agentEl.value;
   agentEl.replaceChildren();
   const all = el("option", undefined, "All agents");
@@ -876,7 +1015,10 @@ agentEl.addEventListener("change", refresh);
 let resizeTimer: ReturnType<typeof setTimeout> | undefined;
 window.addEventListener("resize", () => {
   clearTimeout(resizeTimer);
-  resizeTimer = setTimeout(renderView, 150);
+  resizeTimer = setTimeout(() => {
+    renderView();
+    if (data) renderPulse(data);
+  }, 150);
 });
 
 renderTabs();
