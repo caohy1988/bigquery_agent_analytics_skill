@@ -775,6 +775,8 @@ function renderView(): void {
 function setData(d: DashboardData): void {
   data = d;
   const hours = Math.round((Date.parse(d.meta.end) - Date.parse(d.meta.start)) / 3_600_000);
+  // reflect the data's actual window in the range control when it matches a preset
+  if ([...rangeEl.options].some((o) => o.value === String(hours))) rangeEl.value = String(hours);
   scopeEl.textContent = `${d.meta.source === "mock" ? "sample data" : d.meta.source} · last ${
     hours % 24 === 0 && hours >= 48 ? `${hours / 24} days` : `${hours} h`
   } · by ${d.meta.granularity}`;
@@ -815,10 +817,12 @@ let appBridge: App | null = null;
 
 // Standalone (no MCP host): served over HTTP the page can fetch live data from
 // its own server; opened from disk (file://) it falls back to sample data.
-async function fetchStandalone(hours: number, agent?: string): Promise<DashboardData> {
+async function fetchStandalone(hours: number | null, agent?: string): Promise<DashboardData> {
   if (location.protocol.startsWith("http")) {
     try {
-      const q = new URLSearchParams({ time_range_hours: String(hours) });
+      // hours === null → let the server apply its configured default window
+      const q = new URLSearchParams();
+      if (hours != null) q.set("time_range_hours", String(hours));
       if (agent) q.set("agent", agent);
       const res = await fetch(`api/dashboard?${q}`);
       if (res.ok) {
@@ -829,10 +833,13 @@ async function fetchStandalone(hours: number, agent?: string): Promise<Dashboard
       /* fall through to sample data */
     }
   }
+  const h = hours ?? Number(rangeEl.value);
   const end = new Date();
-  const start = new Date(end.getTime() - hours * 3_600_000);
-  return mockDashboard(start, end, hours <= 72 ? "hour" : "day", agent ?? null);
+  const start = new Date(end.getTime() - h * 3_600_000);
+  return mockDashboard(start, end, h <= 72 ? "hour" : "day", agent ?? null);
 }
+
+let rangeTouched = false;
 
 async function refresh(): Promise<void> {
   const hours = Number(rangeEl.value);
@@ -850,7 +857,7 @@ async function refresh(): Promise<void> {
       if (d) setData(d);
       else throw new Error("no data in tool result");
     } else {
-      setData(await fetchStandalone(hours, agent));
+      setData(await fetchStandalone(rangeTouched ? hours : null, agent));
     }
   } catch (e) {
     statusEl.textContent = `Refresh failed: ${e instanceof Error ? e.message : String(e)}`;
@@ -860,7 +867,10 @@ async function refresh(): Promise<void> {
   }
 }
 
-rangeEl.addEventListener("change", refresh);
+rangeEl.addEventListener("change", () => {
+  rangeTouched = true;
+  void refresh();
+});
 agentEl.addEventListener("change", refresh);
 
 let resizeTimer: ReturnType<typeof setTimeout> | undefined;
@@ -876,12 +886,7 @@ if (embedded) {
   const app = new App({ name: "BQAA Dashboard", version: "0.1.0" });
   app.ontoolresult = (result: any) => {
     const d = extractData(result);
-    if (d) {
-      // reflect the tool call's window in the range control if it matches a preset
-      const hours = Math.round((Date.parse(d.meta.end) - Date.parse(d.meta.start)) / 3_600_000);
-      if ([...rangeEl.options].some((o) => o.value === String(hours))) rangeEl.value = String(hours);
-      setData(d);
-    }
+    if (d) setData(d); // setData syncs the range control to the data's window
   };
   appBridge = app;
   app

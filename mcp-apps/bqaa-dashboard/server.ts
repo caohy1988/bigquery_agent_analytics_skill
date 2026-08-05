@@ -34,7 +34,19 @@ const CONFIG = {
   mock: process.env.BQAA_MOCK === "1" || !process.env.BQAA_PROJECT,
   maxBytesBilled: process.env.BQAA_MAX_BYTES_BILLED ?? "2000000000",
   port: Number(process.env.PORT ?? 3001),
+  defaultHours: Number(process.env.BQAA_DEFAULT_HOURS ?? 168),
 };
+
+// The agent_events schema varies slightly by producer (ADK plugin versions vs
+// the Claude Code tracing plugin); read both spellings of each field.
+const MODEL_EXPR =
+  "COALESCE(JSON_VALUE(attributes, '$.model'), JSON_VALUE(attributes, '$.model_version'))";
+const PROMPT_TOK_EXPR =
+  "COALESCE(JSON_VALUE(attributes, '$.usage_metadata.prompt_tokens'), JSON_VALUE(attributes, '$.usage_metadata.prompt_token_count'))";
+const COMPLETION_TOK_EXPR =
+  "COALESCE(JSON_VALUE(attributes, '$.usage_metadata.completion_tokens'), JSON_VALUE(attributes, '$.usage_metadata.candidates_token_count'))";
+const TOTAL_TOK_EXPR =
+  "COALESCE(JSON_VALUE(attributes, '$.usage_metadata.total_tokens'), JSON_VALUE(attributes, '$.usage_metadata.total_token_count'))";
 
 // ---------------------------------------------------------------- BigQuery
 
@@ -100,9 +112,9 @@ async function bigQueryDashboard(
       COUNTIF(status = 'ERROR') AS errors,
       COUNTIF(event_type = 'LLM_RESPONSE') AS llm_calls,
       COALESCE(SUM(IF(event_type = 'LLM_RESPONSE',
-        COALESCE(CAST(JSON_VALUE(attributes, '$.usage_metadata.prompt_tokens') AS INT64), 0), 0)), 0) AS prompt_tokens,
+        COALESCE(CAST(${PROMPT_TOK_EXPR} AS INT64), 0), 0)), 0) AS prompt_tokens,
       COALESCE(SUM(IF(event_type = 'LLM_RESPONSE',
-        COALESCE(CAST(JSON_VALUE(attributes, '$.usage_metadata.completion_tokens') AS INT64), 0), 0)), 0) AS completion_tokens,
+        COALESCE(CAST(${COMPLETION_TOK_EXPR} AS INT64), 0), 0)), 0) AS completion_tokens,
       APPROX_QUANTILES(IF(event_type = 'LLM_RESPONSE',
         CAST(JSON_VALUE(latency_ms, '$.total_ms') AS FLOAT64), NULL), 100)[OFFSET(50)] AS p50_latency_ms,
       APPROX_QUANTILES(IF(event_type = 'LLM_RESPONSE',
@@ -114,7 +126,7 @@ async function bigQueryDashboard(
     WITH llm_responses AS (
       SELECT
         agent,
-        JSON_VALUE(attributes, '$.model') AS model_id,
+        ${MODEL_EXPR} AS model_id,
         CAST(JSON_VALUE(latency_ms, '$.total_ms') AS FLOAT64) AS total_latency_ms,
         CAST(JSON_VALUE(latency_ms, '$.time_to_first_token_ms') AS FLOAT64) AS ttft_ms
       FROM ${T}
@@ -139,15 +151,17 @@ async function bigQueryDashboard(
         JSON_VALUE(content, '$.tool') AS tool_name,
         JSON_VALUE(content, '$.tool_origin') AS tool_origin,
         CAST(JSON_VALUE(latency_ms, '$.total_ms') AS FLOAT64) AS tool_latency_ms,
-        status
+        -- ADK emits failures as separate TOOL_ERROR events; the tracing
+        -- plugin marks TOOL_COMPLETED rows with status='ERROR'
+        (status = 'ERROR' OR event_type = 'TOOL_ERROR') AS failed
       FROM ${T}
-      WHERE event_type = 'TOOL_COMPLETED' AND ${W}
+      WHERE event_type IN ('TOOL_COMPLETED', 'TOOL_ERROR') AND ${W}
     )
     SELECT
       tool_name, tool_origin,
       COUNT(*) AS total_calls,
-      COUNTIF(status = 'ERROR') AS failures,
-      ROUND(SAFE_DIVIDE(COUNTIF(status = 'ERROR'), COUNT(*)) * 100, 2) AS fail_rate_pct,
+      COUNTIF(failed) AS failures,
+      ROUND(SAFE_DIVIDE(COUNTIF(failed), COUNT(*)) * 100, 2) AS fail_rate_pct,
       ROUND(AVG(tool_latency_ms), 0) AS avg_latency_ms,
       APPROX_QUANTILES(tool_latency_ms, 100)[OFFSET(95)] AS p95_latency_ms
     FROM tool_calls
@@ -158,10 +172,10 @@ async function bigQueryDashboard(
   const modelsSql = `
     WITH llm_responses AS (
       SELECT
-        JSON_VALUE(attributes, '$.model') AS model_id,
-        CAST(JSON_VALUE(attributes, '$.usage_metadata.prompt_tokens') AS INT64) AS prompt_tokens,
-        CAST(JSON_VALUE(attributes, '$.usage_metadata.completion_tokens') AS INT64) AS completion_tokens,
-        CAST(JSON_VALUE(attributes, '$.usage_metadata.total_tokens') AS INT64) AS total_tokens,
+        ${MODEL_EXPR} AS model_id,
+        CAST(${PROMPT_TOK_EXPR} AS INT64) AS prompt_tokens,
+        CAST(${COMPLETION_TOK_EXPR} AS INT64) AS completion_tokens,
+        CAST(${TOTAL_TOK_EXPR} AS INT64) AS total_tokens,
         CAST(JSON_VALUE(latency_ms, '$.total_ms') AS FLOAT64) AS total_latency_ms,
         CAST(JSON_VALUE(latency_ms, '$.time_to_first_token_ms') AS FLOAT64) AS ttft_ms,
         status
@@ -187,9 +201,9 @@ async function bigQueryDashboard(
     WITH llm_responses AS (
       SELECT
         session_id,
-        JSON_VALUE(attributes, '$.model') AS model_id,
-        COALESCE(CAST(JSON_VALUE(attributes, '$.usage_metadata.prompt_tokens') AS INT64), 0) AS prompt_tokens,
-        COALESCE(CAST(JSON_VALUE(attributes, '$.usage_metadata.completion_tokens') AS INT64), 0) AS completion_tokens
+        ${MODEL_EXPR} AS model_id,
+        COALESCE(CAST(${PROMPT_TOK_EXPR} AS INT64), 0) AS prompt_tokens,
+        COALESCE(CAST(${COMPLETION_TOK_EXPR} AS INT64), 0) AS completion_tokens
       FROM ${T}
       WHERE event_type = 'LLM_RESPONSE' AND ${W}
     )
@@ -298,13 +312,13 @@ const metricArgs = {
     .int()
     .min(1)
     .max(2160)
-    .default(168)
-    .describe("Lookback window in hours (default 168 = 7 days, max 2160 = 90 days)"),
+    .default(CONFIG.defaultHours)
+    .describe(`Lookback window in hours (default ${CONFIG.defaultHours}, max 2160 = 90 days)`),
   agent: z.string().max(200).optional().describe("Optional: restrict to a single agent name"),
 };
 
 async function metricsHandler(args: { time_range_hours?: number; agent?: string }) {
-  const data = await loadDashboard(args.time_range_hours ?? 168, args.agent ?? null);
+  const data = await loadDashboard(args.time_range_hours ?? CONFIG.defaultHours, args.agent ?? null);
   return {
     content: [{ type: "text" as const, text: summarize(data) }],
     structuredContent: { data } as any,
@@ -386,7 +400,7 @@ app.get("/", async (_req, res) => {
 
 app.get("/api/dashboard", async (req, res) => {
   try {
-    const hours = Math.min(2160, Math.max(1, Math.trunc(Number(req.query.time_range_hours)) || 168));
+    const hours = Math.min(2160, Math.max(1, Math.trunc(Number(req.query.time_range_hours)) || CONFIG.defaultHours));
     const agentRaw = typeof req.query.agent === "string" ? req.query.agent.slice(0, 200) : "";
     const data = await loadDashboard(hours, agentRaw || null);
     res.json({ data });
