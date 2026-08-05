@@ -6,9 +6,14 @@
 //   query_agent_metrics   — same payload without UI; used by the iframe to refresh
 //   get_trace             — trace reconstruction for drill-down
 //
+// HTTP surface: GET / (dashboard webapp), GET /api/dashboard, GET /api/trace,
+// POST /mcp, GET /healthz.
+//
 // Config (env): BQAA_PROJECT, BQAA_DATASET, BQAA_TABLE, BQAA_MOCK=1,
-//               BQAA_MAX_BYTES_BILLED, PORT
+// BQAA_MAX_BYTES_BILLED (per refresh), BQAA_DEFAULT_HOURS, BQAA_AUTH_TOKEN,
+// BQAA_ALLOWED_ORIGINS, PORT. See README for details.
 
+import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -23,35 +28,47 @@ import {
   RESOURCE_MIME_TYPE,
 } from "@modelcontextprotocol/ext-apps/server";
 import { mockDashboard, mockTrace } from "./src/mock.js";
-import type { DashboardData, Granularity, TraceEvent } from "./src/types.js";
+import { buildDashboardSql, buildTraceSql, SECTIONS } from "./src/queries.js";
+import type { DashboardData, Granularity, OverviewStats, TraceEvent } from "./src/types.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// ---------------------------------------------------------------- config
+
+function intEnv(name: string, fallback: number, min: number, max: number): number {
+  const raw = process.env[name];
+  if (raw == null || raw === "") return fallback;
+  const v = Number(raw);
+  if (!Number.isInteger(v) || v < min || v > max) {
+    console.error(`Invalid ${name}=${JSON.stringify(raw)} — expected an integer in [${min}, ${max}]`);
+    process.exit(1);
+  }
+  return v;
+}
+
+const MAX_HOURS = 2160; // 90 days
 
 const CONFIG = {
   project: process.env.BQAA_PROJECT ?? "",
   dataset: process.env.BQAA_DATASET ?? "agent_analytics",
   table: process.env.BQAA_TABLE ?? "agent_events",
   mock: process.env.BQAA_MOCK === "1" || !process.env.BQAA_PROJECT,
-  maxBytesBilled: process.env.BQAA_MAX_BYTES_BILLED ?? "2000000000",
-  port: Number(process.env.PORT ?? 3001),
-  defaultHours: Number(process.env.BQAA_DEFAULT_HOURS ?? 168),
+  // Budget for ONE dashboard refresh (split across its queries), in bytes.
+  refreshBytesBudget: intEnv("BQAA_MAX_BYTES_BILLED", 2_000_000_000, 10_000_000, 1_000_000_000_000),
+  port: intEnv("PORT", 3001, 0, 65535),
+  defaultHours: intEnv("BQAA_DEFAULT_HOURS", 168, 1, MAX_HOURS),
+  authToken: process.env.BQAA_AUTH_TOKEN ?? "",
+  // Comma-separated Origin allowlist, or "*". Unset ⇒ same-origin only:
+  // no CORS headers, and cross-origin requests bearing an Origin are refused.
+  allowedOrigins: (process.env.BQAA_ALLOWED_ORIGINS ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean),
 };
-
-// The agent_events schema varies slightly by producer (ADK plugin versions vs
-// the Claude Code tracing plugin); read both spellings of each field.
-const MODEL_EXPR =
-  "COALESCE(JSON_VALUE(attributes, '$.model'), JSON_VALUE(attributes, '$.model_version'))";
-const PROMPT_TOK_EXPR =
-  "COALESCE(JSON_VALUE(attributes, '$.usage_metadata.prompt_tokens'), JSON_VALUE(attributes, '$.usage_metadata.prompt_token_count'))";
-const COMPLETION_TOK_EXPR =
-  "COALESCE(JSON_VALUE(attributes, '$.usage_metadata.completion_tokens'), JSON_VALUE(attributes, '$.usage_metadata.candidates_token_count'))";
-const TOTAL_TOK_EXPR =
-  "COALESCE(JSON_VALUE(attributes, '$.usage_metadata.total_tokens'), JSON_VALUE(attributes, '$.usage_metadata.total_token_count'))";
-
-// ---------------------------------------------------------------- BigQuery
 
 const PROJECT_RE = /^[A-Za-z0-9_.:-]+$/;
 const ID_RE = /^[A-Za-z0-9_]+$/;
+const TRACE_ID_RE = /^[A-Za-z0-9_-]{4,64}$/;
 
 function tableRef(): string {
   if (!PROJECT_RE.test(CONFIG.project)) throw new Error(`Invalid BQAA_PROJECT: ${CONFIG.project}`);
@@ -59,28 +76,53 @@ function tableRef(): string {
   if (!ID_RE.test(CONFIG.table)) throw new Error(`Invalid BQAA_TABLE: ${CONFIG.table}`);
   return "`" + `${CONFIG.project}.${CONFIG.dataset}.${CONFIG.table}` + "`";
 }
+if (!CONFIG.mock) tableRef(); // fail fast on invalid identifiers
+
+function uiBundlePath(): string {
+  // src layout: <root>/dist/mcp-app.html — container layout: <dist>/mcp-app.html
+  for (const p of [path.join(__dirname, "dist", "mcp-app.html"), path.join(__dirname, "mcp-app.html")]) {
+    if (existsSync(p)) return p;
+  }
+  return path.join(__dirname, "dist", "mcp-app.html");
+}
+
+// ---------------------------------------------------------------- BigQuery
 
 let bqClient: import("@google-cloud/bigquery").BigQuery | null = null;
 
-async function runQuery(sql: string, params: Record<string, unknown>): Promise<any[]> {
+interface QueryResult {
+  rows: any[];
+  bytes: number;
+}
+
+async function runQuery(
+  sql: string,
+  params: Record<string, unknown>,
+  maxBytes: number,
+): Promise<QueryResult> {
   if (!bqClient) {
     const { BigQuery } = await import("@google-cloud/bigquery");
     bqClient = new BigQuery({ projectId: CONFIG.project });
   }
-  const [rows] = await bqClient.query({
+  const [job] = await bqClient.createQueryJob({
     query: sql,
     params,
-    maximumBytesBilled: CONFIG.maxBytesBilled,
+    maximumBytesBilled: String(maxBytes),
   });
-  return rows;
+  const [rows] = await job.getQueryResults();
+  const [meta] = await job.getMetadata();
+  return { rows, bytes: Number(meta?.statistics?.totalBytesProcessed ?? 0) };
 }
 
-function whereClause(agent?: string | null): string {
-  // Time predicate is mandatory: the table is partitioned on `timestamp`.
-  let w = "timestamp BETWEEN @start AND @end";
-  if (agent) w += " AND agent = @agent";
-  return w;
-}
+const EMPTY_OVERVIEW: OverviewStats = {
+  total_events: null,
+  errors: null,
+  error_rate_pct: null,
+  sessions: null,
+  agents: null,
+  users: null,
+  p95_latency_ms: null,
+};
 
 async function bigQueryDashboard(
   start: Date,
@@ -88,151 +130,38 @@ async function bigQueryDashboard(
   granularity: Granularity,
   agent?: string | null,
 ): Promise<DashboardData> {
-  const T = tableRef();
-  const G = granularity === "hour" ? "HOUR" : "DAY";
-  const W = whereClause(agent);
+  const sql = buildDashboardSql({ table: tableRef(), granularity, agentFilter: !!agent });
   const params: Record<string, unknown> = { start: start.toISOString(), end: end.toISOString() };
   if (agent) params.agent = agent;
+  const agentsParams = { start: params.start, end: params.end };
 
-  const overviewSql = `
-    SELECT
-      COUNT(*) AS total_events,
-      COUNTIF(status = 'ERROR') AS errors,
-      ROUND(SAFE_DIVIDE(COUNTIF(status = 'ERROR'), COUNT(*)) * 100, 2) AS error_rate_pct,
-      COUNT(DISTINCT session_id) AS sessions,
-      COUNT(DISTINCT agent) AS agents,
-      COUNT(DISTINCT user_id) AS users,
-      APPROX_QUANTILES(CAST(JSON_VALUE(latency_ms, '$.total_ms') AS FLOAT64), 100)[OFFSET(95)] AS p95_latency_ms
-    FROM ${T} WHERE ${W}`;
+  // The refresh budget is split evenly across the panel queries so one
+  // dashboard load can never authorize more than BQAA_MAX_BYTES_BILLED total.
+  const perQueryBytes = Math.max(10_000_000, Math.floor(CONFIG.refreshBytesBudget / SECTIONS.length));
 
-  const timeseriesSql = `
-    SELECT
-      FORMAT_TIMESTAMP('%FT%TZ', TIMESTAMP_TRUNC(timestamp, ${G})) AS ts,
-      COUNT(*) AS events,
-      COUNTIF(status = 'ERROR') AS errors,
-      COUNTIF(event_type = 'LLM_RESPONSE') AS llm_calls,
-      COALESCE(SUM(IF(event_type = 'LLM_RESPONSE',
-        COALESCE(CAST(${PROMPT_TOK_EXPR} AS INT64), 0), 0)), 0) AS prompt_tokens,
-      COALESCE(SUM(IF(event_type = 'LLM_RESPONSE',
-        COALESCE(CAST(${COMPLETION_TOK_EXPR} AS INT64), 0), 0)), 0) AS completion_tokens,
-      APPROX_QUANTILES(IF(event_type = 'LLM_RESPONSE',
-        CAST(JSON_VALUE(latency_ms, '$.total_ms') AS FLOAT64), NULL), 100)[OFFSET(50)] AS p50_latency_ms,
-      APPROX_QUANTILES(IF(event_type = 'LLM_RESPONSE',
-        CAST(JSON_VALUE(latency_ms, '$.total_ms') AS FLOAT64), NULL), 100)[OFFSET(95)] AS p95_latency_ms
-    FROM ${T} WHERE ${W}
-    GROUP BY ts ORDER BY ts ASC`;
+  const settled = await Promise.allSettled(
+    SECTIONS.map((s) => runQuery(sql[s], s === "agents" ? agentsParams : params, perQueryBytes)),
+  );
 
-  const latencySql = `
-    WITH llm_responses AS (
-      SELECT
-        agent,
-        ${MODEL_EXPR} AS model_id,
-        CAST(JSON_VALUE(latency_ms, '$.total_ms') AS FLOAT64) AS total_latency_ms,
-        CAST(JSON_VALUE(latency_ms, '$.time_to_first_token_ms') AS FLOAT64) AS ttft_ms
-      FROM ${T}
-      WHERE event_type = 'LLM_RESPONSE' AND ${W}
-    )
-    SELECT
-      agent, model_id,
-      COUNT(*) AS calls,
-      ROUND(AVG(total_latency_ms), 0) AS avg_total_ms,
-      ROUND(AVG(ttft_ms), 0) AS avg_ttft_ms,
-      APPROX_QUANTILES(total_latency_ms, 100)[OFFSET(50)] AS p50_total_ms,
-      APPROX_QUANTILES(total_latency_ms, 100)[OFFSET(95)] AS p95_total_ms,
-      APPROX_QUANTILES(total_latency_ms, 100)[OFFSET(99)] AS p99_total_ms
-    FROM llm_responses
-    GROUP BY agent, model_id
-    ORDER BY p95_total_ms DESC
-    LIMIT 30`;
-
-  const toolsSql = `
-    WITH tool_calls AS (
-      SELECT
-        JSON_VALUE(content, '$.tool') AS tool_name,
-        JSON_VALUE(content, '$.tool_origin') AS tool_origin,
-        CAST(JSON_VALUE(latency_ms, '$.total_ms') AS FLOAT64) AS tool_latency_ms,
-        -- ADK emits failures as separate TOOL_ERROR events; the tracing
-        -- plugin marks TOOL_COMPLETED rows with status='ERROR'
-        (status = 'ERROR' OR event_type = 'TOOL_ERROR') AS failed
-      FROM ${T}
-      WHERE event_type IN ('TOOL_COMPLETED', 'TOOL_ERROR') AND ${W}
-    )
-    SELECT
-      tool_name, tool_origin,
-      COUNT(*) AS total_calls,
-      COUNTIF(failed) AS failures,
-      ROUND(SAFE_DIVIDE(COUNTIF(failed), COUNT(*)) * 100, 2) AS fail_rate_pct,
-      ROUND(AVG(tool_latency_ms), 0) AS avg_latency_ms,
-      APPROX_QUANTILES(tool_latency_ms, 100)[OFFSET(95)] AS p95_latency_ms
-    FROM tool_calls
-    GROUP BY tool_name, tool_origin
-    ORDER BY total_calls DESC
-    LIMIT 30`;
-
-  const modelsSql = `
-    WITH llm_responses AS (
-      SELECT
-        ${MODEL_EXPR} AS model_id,
-        CAST(${PROMPT_TOK_EXPR} AS INT64) AS prompt_tokens,
-        CAST(${COMPLETION_TOK_EXPR} AS INT64) AS completion_tokens,
-        CAST(${TOTAL_TOK_EXPR} AS INT64) AS total_tokens,
-        CAST(JSON_VALUE(latency_ms, '$.total_ms') AS FLOAT64) AS total_latency_ms,
-        CAST(JSON_VALUE(latency_ms, '$.time_to_first_token_ms') AS FLOAT64) AS ttft_ms,
-        status
-      FROM ${T}
-      WHERE event_type = 'LLM_RESPONSE' AND ${W}
-    )
-    SELECT
-      model_id,
-      COUNT(*) AS calls,
-      ROUND(SAFE_DIVIDE(COUNTIF(status = 'ERROR'), COUNT(*)) * 100, 2) AS error_rate_pct,
-      ROUND(AVG(total_tokens), 0) AS avg_total_tokens,
-      ROUND(AVG(prompt_tokens), 0) AS avg_prompt_tokens,
-      ROUND(AVG(completion_tokens), 0) AS avg_completion_tokens,
-      ROUND(AVG(total_latency_ms), 0) AS avg_latency_ms,
-      APPROX_QUANTILES(total_latency_ms, 100)[OFFSET(50)] AS p50_latency_ms,
-      APPROX_QUANTILES(total_latency_ms, 100)[OFFSET(95)] AS p95_latency_ms,
-      ROUND(AVG(ttft_ms), 0) AS avg_ttft_ms
-    FROM llm_responses
-    GROUP BY model_id
-    ORDER BY calls DESC`;
-
-  const sessionsSql = `
-    WITH llm_responses AS (
-      SELECT
-        session_id,
-        ${MODEL_EXPR} AS model_id,
-        COALESCE(CAST(${PROMPT_TOK_EXPR} AS INT64), 0) AS prompt_tokens,
-        COALESCE(CAST(${COMPLETION_TOK_EXPR} AS INT64), 0) AS completion_tokens
-      FROM ${T}
-      WHERE event_type = 'LLM_RESPONSE' AND ${W}
-    )
-    SELECT
-      session_id, model_id,
-      COUNT(*) AS llm_calls,
-      SUM(prompt_tokens) AS total_prompt_tokens,
-      SUM(completion_tokens) AS total_completion_tokens,
-      SUM(prompt_tokens) + SUM(completion_tokens) AS total_tokens
-    FROM llm_responses
-    GROUP BY session_id, model_id
-    ORDER BY total_tokens DESC
-    LIMIT 15`;
-
-  const agentsSql = `
-    SELECT DISTINCT agent FROM ${T}
-    WHERE timestamp BETWEEN @start AND @end AND agent IS NOT NULL
-    ORDER BY agent LIMIT 100`;
-
+  // One failed panel must not blank the dashboard: keep healthy sections,
+  // report the failed ones (truthfully) in meta.section_errors.
+  const sectionErrors: Record<string, string> = {};
+  let bytes = 0;
+  const rowsOf = (i: number): any[] | null => {
+    const r = settled[i];
+    if (r.status === "fulfilled") {
+      bytes += r.value.bytes;
+      return r.value.rows;
+    }
+    sectionErrors[SECTIONS[i]] = r.reason instanceof Error ? r.reason.message : String(r.reason);
+    return null;
+  };
   const [overviewRows, timeseries, latencyByAgent, toolStats, modelComparison, topSessions, agentRows] =
-    await Promise.all([
-      runQuery(overviewSql, params),
-      runQuery(timeseriesSql, params),
-      runQuery(latencySql, params),
-      runQuery(toolsSql, params),
-      runQuery(modelsSql, params),
-      runQuery(sessionsSql, params),
-      runQuery(agentsSql, { start: params.start, end: params.end }),
-    ]);
+    SECTIONS.map((_, i) => rowsOf(i));
+
+  if (Object.keys(sectionErrors).length === SECTIONS.length) {
+    throw new Error(`All dashboard queries failed: ${Object.values(sectionErrors)[0]}`);
+  }
 
   return {
     meta: {
@@ -241,48 +170,58 @@ async function bigQueryDashboard(
       end: end.toISOString(),
       granularity,
       agent: agent ?? null,
+      bytes_processed: bytes,
+      ...(Object.keys(sectionErrors).length ? { section_errors: sectionErrors } : {}),
     },
-    overview: overviewRows[0],
-    timeseries,
-    latencyByAgent,
-    toolStats,
-    modelComparison,
-    topSessions,
-    agentsList: agentRows.map((r: any) => r.agent),
+    overview: overviewRows?.[0] ?? EMPTY_OVERVIEW,
+    timeseries: timeseries ?? [],
+    latencyByAgent: latencyByAgent ?? [],
+    toolStats: toolStats ?? [],
+    modelComparison: modelComparison ?? [],
+    topSessions: topSessions ?? [],
+    agentsList: (agentRows ?? []).map((r: any) => r.agent),
   };
 }
+
+// Cache + coalescing: identical (window, agent) refreshes within the TTL share
+// one BigQuery round-trip, including concurrent ones.
+const CACHE_TTL_MS = 60_000;
+const dashboardCache = new Map<string, { promise: Promise<DashboardData>; expires: number }>();
 
 async function loadDashboard(timeRangeHours: number, agent?: string | null): Promise<DashboardData> {
   const end = new Date();
   const start = new Date(end.getTime() - timeRangeHours * 3_600_000);
   const granularity: Granularity = timeRangeHours <= 72 ? "hour" : "day";
   if (CONFIG.mock) return mockDashboard(start, end, granularity, agent);
-  return bigQueryDashboard(start, end, granularity, agent);
+
+  const key = `${timeRangeHours}|${agent ?? ""}`;
+  const cached = dashboardCache.get(key);
+  if (cached && cached.expires > Date.now()) {
+    const data = await cached.promise;
+    return { ...data, meta: { ...data.meta, cache_hit: true } };
+  }
+  const promise = bigQueryDashboard(start, end, granularity, agent);
+  dashboardCache.set(key, { promise, expires: Date.now() + CACHE_TTL_MS });
+  promise.catch(() => dashboardCache.delete(key)); // failures are not cacheable
+  return promise;
 }
 
 async function loadTrace(traceId: string, timeRangeHours: number): Promise<TraceEvent[]> {
+  if (!TRACE_ID_RE.test(traceId)) throw new Error("Invalid trace_id");
   if (CONFIG.mock) return mockTrace(traceId);
-  const T = tableRef();
   const end = new Date();
   const start = new Date(end.getTime() - timeRangeHours * 3_600_000);
-  return runQuery(
-    `SELECT
-       FORMAT_TIMESTAMP('%FT%E6SZ', timestamp) AS timestamp,
-       event_type, agent, invocation_id, span_id, parent_span_id,
-       JSON_VALUE(content, '$.response') AS llm_response,
-       JSON_VALUE(content, '$.tool') AS tool_name,
-       JSON_VALUE(content, '$.tool_origin') AS tool_origin,
-       CAST(JSON_VALUE(latency_ms, '$.total_ms') AS FLOAT64) AS latency_ms,
-       status, error_message
-     FROM ${T}
-     WHERE trace_id = @trace_id AND timestamp BETWEEN @start AND @end
-     ORDER BY timestamp ASC
-     LIMIT 500`,
+  const { rows } = await runQuery(
+    buildTraceSql(tableRef()),
     { trace_id: traceId, start: start.toISOString(), end: end.toISOString() },
+    Math.max(10_000_000, Math.floor(CONFIG.refreshBytesBudget / SECTIONS.length)),
   );
+  return rows;
 }
 
 // ---------------------------------------------------------------- summaries
+
+const n = (v: number | null | undefined): string => (v == null ? "n/a" : v.toLocaleString("en-US"));
 
 function summarize(d: DashboardData): string {
   const o = d.overview;
@@ -291,11 +230,13 @@ function summarize(d: DashboardData): string {
   const worstTool = [...d.toolStats].sort((a, b) => b.fail_rate_pct - a.fail_rate_pct)[0];
   const lines = [
     `Agent analytics, last ${hours}h (source: ${d.meta.source}${d.meta.agent ? `, agent=${d.meta.agent}` : ""}):`,
-    `- ${o.total_events.toLocaleString()} events, ${o.sessions.toLocaleString()} sessions, ${o.users.toLocaleString()} users, ${o.agents} agents`,
-    `- error rate ${o.error_rate_pct}%, p95 event latency ${o.p95_latency_ms ?? "n/a"} ms`,
+    `- ${n(o.total_events)} events, ${n(o.sessions)} sessions, ${n(o.users)} users, ${n(o.agents)} agents`,
+    `- error rate ${o.error_rate_pct ?? "n/a"}%, p95 event latency ${o.p95_latency_ms ?? "n/a"} ms`,
   ];
-  if (topModel) lines.push(`- busiest model: ${topModel.model_id} (${topModel.calls.toLocaleString()} calls, p95 ${topModel.p95_latency_ms ?? "n/a"} ms)`);
-  if (worstTool) lines.push(`- highest tool failure rate: ${worstTool.tool_name} at ${worstTool.fail_rate_pct}% of ${worstTool.total_calls.toLocaleString()} calls`);
+  if (topModel) lines.push(`- busiest model: ${topModel.model_id} (${n(topModel.calls)} calls, p95 ${topModel.p95_latency_ms ?? "n/a"} ms)`);
+  if (worstTool) lines.push(`- highest tool failure rate: ${worstTool.tool_name} at ${worstTool.fail_rate_pct}% of ${n(worstTool.total_calls)} calls`);
+  const failed = Object.keys(d.meta.section_errors ?? {});
+  if (failed.length) lines.push(`- WARNING: ${failed.length} panel(s) failed to load: ${failed.join(", ")}`);
   lines.push("The interactive dashboard has been rendered for the user.");
   return lines.join("\n");
 }
@@ -311,9 +252,9 @@ const metricArgs = {
     .number()
     .int()
     .min(1)
-    .max(2160)
+    .max(MAX_HOURS)
     .default(CONFIG.defaultHours)
-    .describe(`Lookback window in hours (default ${CONFIG.defaultHours}, max 2160 = 90 days)`),
+    .describe(`Lookback window in hours (default ${CONFIG.defaultHours}, max ${MAX_HOURS} = 90 days)`),
   agent: z.string().max(200).optional().describe("Optional: restrict to a single agent name"),
 };
 
@@ -357,13 +298,13 @@ server.registerTool(
     title: "Get trace",
     description: "Reconstruct a single trace (ordered agent_events) by trace_id for drill-down debugging.",
     inputSchema: {
-      trace_id: z.string().min(4).max(64).describe("OpenTelemetry trace id"),
-      time_range_hours: z.number().int().min(1).max(2160).default(168),
+      trace_id: z.string().regex(TRACE_ID_RE).describe("OpenTelemetry trace id"),
+      time_range_hours: z.number().int().min(1).max(MAX_HOURS).default(CONFIG.defaultHours),
     },
     outputSchema: { data: z.unknown() },
   },
   async (args) => {
-    const events = await loadTrace(args.trace_id, args.time_range_hours ?? 168);
+    const events = await loadTrace(args.trace_id, args.time_range_hours ?? CONFIG.defaultHours);
     return {
       content: [
         {
@@ -377,30 +318,87 @@ server.registerTool(
 );
 
 registerAppResource(server, resourceUri, resourceUri, { mimeType: RESOURCE_MIME_TYPE }, async () => {
-  const html = await fs.readFile(path.join(__dirname, "dist", "mcp-app.html"), "utf-8");
+  const html = await fs.readFile(uiBundlePath(), "utf-8");
   return { contents: [{ uri: resourceUri, mimeType: RESOURCE_MIME_TYPE, text: html }] };
 });
 
 // ---------------------------------------------------------------- transport
 
 const app = express();
-app.use(cors());
+
+function originAllowed(origin: string): boolean {
+  return CONFIG.allowedOrigins.includes("*") || CONFIG.allowedOrigins.includes(origin);
+}
+
+// MCP transport security: cross-origin callers must present an allowlisted
+// Origin. Same-origin browser requests and server-to-server clients send no
+// Origin header and pass through.
+function checkOrigin(req: express.Request, res: express.Response, next: express.NextFunction): void {
+  const origin = req.headers.origin;
+  if (origin && !originAllowed(origin)) {
+    res.status(403).json({ error: "Origin not allowed. Configure BQAA_ALLOWED_ORIGINS." });
+    return;
+  }
+  next();
+}
+
+function requireAuth(req: express.Request, res: express.Response, next: express.NextFunction): void {
+  if (CONFIG.authToken) {
+    const header = req.headers.authorization ?? "";
+    const queryToken = typeof req.query.token === "string" ? req.query.token : "";
+    if (header !== `Bearer ${CONFIG.authToken}` && queryToken !== CONFIG.authToken) {
+      res.status(401).json({ error: "Unauthorized. Send Authorization: Bearer <BQAA_AUTH_TOKEN>." });
+      return;
+    }
+  }
+  next();
+}
+
+app.use(
+  cors({
+    origin: (origin, cb) => cb(null, !origin || originAllowed(origin)),
+  }),
+);
 app.use(express.json({ limit: "2mb" }));
 
-// Browser-shareable view: serve the dashboard UI at the root, and let its
-// standalone mode pull live data over plain HTTP instead of the MCP bridge.
+// structured request log
+app.use((req, res, next) => {
+  const t0 = Date.now();
+  res.on("finish", () => {
+    console.log(
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        method: req.method,
+        path: req.path,
+        status: res.statusCode,
+        ms: Date.now() - t0,
+      }),
+    );
+  });
+  next();
+});
+
+// /healthz is intercepted by Google Frontend on run.app, so the canonical
+// health endpoint lives under /api/; /healthz still works locally.
+const health = (_req: express.Request, res: express.Response): void => {
+  res.json({ ok: true, mock: CONFIG.mock, uiBundle: existsSync(uiBundlePath()) });
+};
+app.get("/api/health", health);
+app.get("/healthz", health);
+
+// Browser-shareable view: the shell is static; all data endpoints are guarded.
 app.get("/", async (_req, res) => {
   try {
-    const html = await fs.readFile(path.join(__dirname, "dist", "mcp-app.html"), "utf-8");
+    const html = await fs.readFile(uiBundlePath(), "utf-8");
     res.type("html").send(html);
   } catch {
     res.status(500).send("UI bundle missing — run `npm run build` first.");
   }
 });
 
-app.get("/api/dashboard", async (req, res) => {
+app.get("/api/dashboard", checkOrigin, requireAuth, async (req, res) => {
   try {
-    const hours = Math.min(2160, Math.max(1, Math.trunc(Number(req.query.time_range_hours)) || CONFIG.defaultHours));
+    const hours = Math.min(MAX_HOURS, Math.max(1, Math.trunc(Number(req.query.time_range_hours)) || CONFIG.defaultHours));
     const agentRaw = typeof req.query.agent === "string" ? req.query.agent.slice(0, 200) : "";
     const data = await loadDashboard(hours, agentRaw || null);
     res.json({ data });
@@ -409,7 +407,22 @@ app.get("/api/dashboard", async (req, res) => {
   }
 });
 
-app.post("/mcp", async (req, res) => {
+app.get("/api/trace", checkOrigin, requireAuth, async (req, res) => {
+  try {
+    const traceId = typeof req.query.trace_id === "string" ? req.query.trace_id : "";
+    if (!TRACE_ID_RE.test(traceId)) {
+      res.status(400).json({ error: "Invalid trace_id" });
+      return;
+    }
+    const hours = Math.min(MAX_HOURS, Math.max(1, Math.trunc(Number(req.query.time_range_hours)) || CONFIG.defaultHours));
+    const data = await loadTrace(traceId, hours);
+    res.json({ data });
+  } catch (e) {
+    res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
+app.post("/mcp", checkOrigin, requireAuth, async (req, res) => {
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
     enableJsonResponse: true,
@@ -420,8 +433,15 @@ app.post("/mcp", async (req, res) => {
 });
 
 app.listen(CONFIG.port, () => {
+  const authNote = CONFIG.authToken ? "auth: bearer token" : "auth: NONE (set BQAA_AUTH_TOKEN)";
+  const originNote = CONFIG.allowedOrigins.length
+    ? `origins: ${CONFIG.allowedOrigins.join(",")}`
+    : "origins: same-origin only";
   console.log(
     `BQAA dashboard MCP server on http://localhost:${CONFIG.port}/mcp ` +
-      (CONFIG.mock ? "(mock data — set BQAA_PROJECT/BQAA_DATASET/BQAA_TABLE for BigQuery)" : `(BigQuery: ${CONFIG.project}.${CONFIG.dataset}.${CONFIG.table})`),
+      (CONFIG.mock
+        ? "(mock data — set BQAA_PROJECT/BQAA_DATASET/BQAA_TABLE for BigQuery)"
+        : `(BigQuery: ${CONFIG.project}.${CONFIG.dataset}.${CONFIG.table})`) +
+      ` [${authNote}; ${originNote}]`,
   );
 });

@@ -5,8 +5,19 @@
 
 import "./styles.css";
 import { App } from "@modelcontextprotocol/ext-apps";
-import { mockDashboard } from "./mock.js";
-import type { DashboardData, TimeBucket } from "./types.js";
+import { mockDashboard, mockTrace } from "./mock.js";
+import type { DashboardData, TimeBucket, TraceEvent } from "./types.js";
+
+// Optional bearer token for servers started with BQAA_AUTH_TOKEN, supplied to
+// the shared page as ?token=… (or #token=…).
+const AUTH_TOKEN =
+  new URLSearchParams(location.search).get("token") ??
+  new URLSearchParams(location.hash.replace(/^#/, "")).get("token") ??
+  "";
+
+function authHeaders(): Record<string, string> {
+  return AUTH_TOKEN ? { Authorization: `Bearer ${AUTH_TOKEN}` } : {};
+}
 
 // ---------------------------------------------------------------- formatting
 
@@ -128,13 +139,14 @@ function lineChart(
     height?: number;
     ariaLabel: string;
     areaFirst?: boolean; // ~10% wash under the first series
+    sectionError?: string;
   },
 ): void {
   const H = opts.height ?? 236;
   const W = Math.max(280, container.clientWidth || 560);
   const n = buckets.length;
   if (n === 0) {
-    container.appendChild(el("div", "empty", "No data in this window"));
+    emptyNote(container, opts.sectionError);
     return;
   }
 
@@ -150,7 +162,7 @@ function lineChart(
   };
   const pw = W - m.left - m.right;
   const ph = H - m.top - m.bottom;
-  const svg = svgEl("svg", { width: W, height: H, role: "img", "aria-label": opts.ariaLabel });
+  const svg = svgEl("svg", { width: W, height: H, viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": opts.ariaLabel });
 
   const x = (i: number) => m.left + (n === 1 ? pw / 2 : (i / (n - 1)) * pw);
   const y = (v: number) => m.top + ph - (v / maxVal) * ph;
@@ -312,13 +324,19 @@ function stackedColumns(
   container: HTMLElement,
   buckets: TimeBucket[],
   segments: ColumnSegment[],
-  opts: { yFmt: (v: number | null) => string; granularity: "hour" | "day"; height?: number; ariaLabel: string },
+  opts: {
+    yFmt: (v: number | null) => string;
+    granularity: "hour" | "day";
+    height?: number;
+    ariaLabel: string;
+    sectionError?: string;
+  },
 ): void {
   const H = opts.height ?? 210;
   const W = Math.max(280, container.clientWidth || 560);
   const n = buckets.length;
   if (n === 0) {
-    container.appendChild(el("div", "empty", "No data in this window"));
+    emptyNote(container, opts.sectionError);
     return;
   }
 
@@ -335,7 +353,7 @@ function stackedColumns(
   };
   const pw = W - m.left - m.right;
   const ph = H - m.top - m.bottom;
-  const svg = svgEl("svg", { width: W, height: H, role: "img", "aria-label": opts.ariaLabel });
+  const svg = svgEl("svg", { width: W, height: H, viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": opts.ariaLabel });
 
   const band = pw / n;
   const colW = Math.min(24, Math.max(3, band * 0.6));
@@ -430,9 +448,9 @@ interface HBarRow {
   tooltipRows: TooltipRow[];
 }
 
-function hBars(container: HTMLElement, rows: HBarRow[]): void {
+function hBars(container: HTMLElement, rows: HBarRow[], sectionError?: string): void {
   if (rows.length === 0) {
-    container.appendChild(el("div", "empty", "No data in this window"));
+    emptyNote(container, sectionError);
     return;
   }
   const max = Math.max(1, ...rows.map((r) => r.segs.reduce((a, s) => a + s.value, 0)));
@@ -468,11 +486,20 @@ function hBars(container: HTMLElement, rows: HBarRow[]): void {
 interface Col<T> {
   label: string;
   get: (r: T) => string;
+  cell?: (r: T) => HTMLElement; // custom cell content (e.g. drill-down button)
 }
 
-function table<T>(container: HTMLElement, cols: Col<T>[], rows: T[]): void {
+function emptyNote(container: HTMLElement, sectionError?: string): void {
+  container.appendChild(
+    sectionError
+      ? el("div", "empty error", `Query failed: ${sectionError}`)
+      : el("div", "empty", "No data in this window"),
+  );
+}
+
+function table<T>(container: HTMLElement, cols: Col<T>[], rows: T[], sectionError?: string): void {
   if (rows.length === 0) {
-    container.appendChild(el("div", "empty", "No data in this window"));
+    emptyNote(container, sectionError);
     return;
   }
   const scroll = el("div", "table-scroll");
@@ -485,7 +512,12 @@ function table<T>(container: HTMLElement, cols: Col<T>[], rows: T[]): void {
   const tbody = el("tbody");
   for (const r of rows) {
     const tr = el("tr");
-    for (const c of cols) tr.appendChild(el("td", undefined, c.get(r)));
+    for (const c of cols) {
+      const td = el("td");
+      if (c.cell) td.appendChild(c.cell(r));
+      else td.textContent = c.get(r);
+      tr.appendChild(td);
+    }
     tbody.appendChild(tr);
   }
   t.appendChild(tbody);
@@ -509,7 +541,7 @@ function sparkline(values: Array<number | null>): SVGSVGElement | null {
   const max = Math.max(1, ...pts);
   const x = (i: number) => 2 + (i / (N - 1)) * (W - 8);
   const y = (v: number) => H - 3 - (v / max) * (H - 7);
-  const svg = svgEl("svg", { width: W, height: H, "aria-hidden": "true" });
+  const svg = svgEl("svg", { width: W, height: H, viewBox: `0 0 ${W} ${H}`, "aria-hidden": "true" });
   svg.classList.add("spark");
   const path = svgEl("path", {
     d: pts.map((v, i) => `${i ? "L" : "M"}${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(""),
@@ -548,6 +580,34 @@ interface LegendItem {
   name: string;
   cssVar: string;
   kind: "line" | "rect";
+}
+
+// Every chart card can expose its exact numbers as an accessible table.
+interface ChartData {
+  head: string[];
+  rows: string[][];
+}
+
+function dataTable(dt: ChartData): HTMLElement {
+  const details = el("details", "data-table");
+  details.appendChild(el("summary", undefined, "Show data"));
+  const scroll = el("div", "table-scroll");
+  const t = el("table");
+  const thead = el("thead");
+  const hr = el("tr");
+  dt.head.forEach((h) => hr.appendChild(el("th", undefined, h)));
+  thead.appendChild(hr);
+  t.appendChild(thead);
+  const tbody = el("tbody");
+  dt.rows.forEach((r) => {
+    const tr = el("tr");
+    r.forEach((cell) => tr.appendChild(el("td", undefined, cell)));
+    tbody.appendChild(tr);
+  });
+  t.appendChild(tbody);
+  scroll.appendChild(t);
+  details.appendChild(scroll);
+  return details;
 }
 
 function chartCard(
@@ -608,8 +668,17 @@ function renderOverview(d: DashboardData, main: HTMLElement): void {
       granularity: d.meta.granularity,
       ariaLabel: "Events and errors over time",
       areaFirst: true,
+      sectionError: d.meta.section_errors?.timeseries,
     },
   );
+  if (ts.length) {
+    events.card.appendChild(
+      dataTable({
+        head: ["Bucket", "Events", "Errors"],
+        rows: ts.map((b) => [bucketLabel(b.ts, d.meta.granularity), fmtInt(b.events), fmtInt(b.errors)]),
+      }),
+    );
+  }
 
   const lat = chartCard("LLM latency over time", null, [
     { name: "p50", cssVar: "--s1", kind: "line" },
@@ -623,8 +692,21 @@ function renderOverview(d: DashboardData, main: HTMLElement): void {
       { name: "p50", cssVar: "--s1", values: ts.map((b) => b.p50_latency_ms) },
       { name: "p95", cssVar: "--s2", values: ts.map((b) => b.p95_latency_ms) },
     ],
-    { yFmt: fmtMs, granularity: d.meta.granularity, ariaLabel: "LLM latency percentiles over time" },
+    {
+      yFmt: fmtMs,
+      granularity: d.meta.granularity,
+      ariaLabel: "LLM latency percentiles over time",
+      sectionError: d.meta.section_errors?.timeseries,
+    },
   );
+  if (ts.length) {
+    lat.card.appendChild(
+      dataTable({
+        head: ["Bucket", "p50", "p95"],
+        rows: ts.map((b) => [bucketLabel(b.ts, d.meta.granularity), fmtMs(b.p50_latency_ms), fmtMs(b.p95_latency_ms)]),
+      }),
+    );
+  }
 }
 
 function renderLatency(d: DashboardData, main: HTMLElement): void {
@@ -672,6 +754,7 @@ function renderLatency(d: DashboardData, main: HTMLElement): void {
         { name: "avg TTFT", value: fmtMs(r.avg_ttft_ms) },
       ],
     })),
+    d.meta.section_errors?.latency,
   );
   main.appendChild(bars.card);
 
@@ -684,7 +767,7 @@ function renderLatency(d: DashboardData, main: HTMLElement): void {
     { label: "p50", get: (r) => fmtMs(r.p50_total_ms) },
     { label: "p95", get: (r) => fmtMs(r.p95_total_ms) },
     { label: "p99", get: (r) => fmtMs(r.p99_total_ms) },
-  ], rows);
+  ], rows, d.meta.section_errors?.latency);
   main.appendChild(tbl.card);
 }
 
@@ -713,10 +796,27 @@ function renderTokens(d: DashboardData, main: HTMLElement): void {
       { name: "Prompt", cssVar: "--s1", values: d.timeseries.map((b) => b.prompt_tokens) },
       { name: "Completion", cssVar: "--s2", values: d.timeseries.map((b) => b.completion_tokens) },
     ],
-    { yFmt: (v) => fmtCompact(v), granularity: d.meta.granularity, ariaLabel: "Prompt and completion tokens over time" },
+    {
+      yFmt: (v) => fmtCompact(v),
+      granularity: d.meta.granularity,
+      ariaLabel: "Prompt and completion tokens over time",
+      sectionError: d.meta.section_errors?.timeseries,
+    },
   );
+  if (d.timeseries.length) {
+    cols.card.appendChild(
+      dataTable({
+        head: ["Bucket", "Prompt", "Completion"],
+        rows: d.timeseries.map((b) => [
+          bucketLabel(b.ts, d.meta.granularity),
+          fmtInt(b.prompt_tokens),
+          fmtInt(b.completion_tokens),
+        ]),
+      }),
+    );
+  }
 
-  const models = chartCard("Model comparison", "LLM_RESPONSE events", [], "half");
+  const models = chartCard("Model comparison", "LLM_RESPONSE and LLM_ERROR events", [], "half");
   table(models.body, [
     { label: "Model", get: (r) => r.model_id ?? "?" },
     { label: "Calls", get: (r) => fmtInt(r.calls) },
@@ -726,7 +826,7 @@ function renderTokens(d: DashboardData, main: HTMLElement): void {
     { label: "Avg latency", get: (r) => fmtMs(r.avg_latency_ms) },
     { label: "p95", get: (r) => fmtMs(r.p95_latency_ms) },
     { label: "Avg TTFT", get: (r) => fmtMs(r.avg_ttft_ms) },
-  ], d.modelComparison);
+  ], d.modelComparison, d.meta.section_errors?.models);
   main.appendChild(models.card);
 
   const sessions = chartCard("Top sessions by tokens", "cost estimation: multiply by your per-model prices", [], "half");
@@ -737,7 +837,19 @@ function renderTokens(d: DashboardData, main: HTMLElement): void {
     { label: "Prompt", get: (r) => fmtCompact(r.total_prompt_tokens) },
     { label: "Completion", get: (r) => fmtCompact(r.total_completion_tokens) },
     { label: "Total", get: (r) => fmtCompact(r.total_tokens) },
-  ], d.topSessions);
+    {
+      label: "Trace",
+      get: (r) => r.trace_ids?.[0] ?? "—",
+      cell: (r) => {
+        const tid = r.trace_ids?.[0];
+        if (!tid) return el("span", undefined, "—");
+        const b = el("button", "link-btn", "View");
+        b.setAttribute("aria-label", `View trace for session ${r.session_id}`);
+        b.addEventListener("click", () => void showTrace(tid));
+        return b;
+      },
+    },
+  ], d.topSessions, d.meta.section_errors?.sessions);
   main.appendChild(sessions.card);
 }
 
@@ -754,7 +866,7 @@ function renderTools(d: DashboardData, main: HTMLElement): void {
     ),
   );
 
-  const bars = chartCard("Calls by tool", "TOOL_COMPLETED events", [
+  const bars = chartCard("Calls by tool", "TOOL_COMPLETED and TOOL_ERROR events", [
     { name: "Succeeded", cssVar: "--s1", kind: "rect" },
     { name: "Failed", cssVar: "--s8", kind: "rect" },
   ]);
@@ -776,6 +888,7 @@ function renderTools(d: DashboardData, main: HTMLElement): void {
         { name: "p95 latency", value: fmtMs(r.p95_latency_ms) },
       ],
     })),
+    d.meta.section_errors?.tools,
   );
   main.appendChild(bars.card);
 
@@ -788,7 +901,7 @@ function renderTools(d: DashboardData, main: HTMLElement): void {
     { label: "Fail %", get: (r) => fmtPct(r.fail_rate_pct) },
     { label: "Avg", get: (r) => fmtMs(r.avg_latency_ms) },
     { label: "p95", get: (r) => fmtMs(r.p95_latency_ms) },
-  ], rows);
+  ], rows, d.meta.section_errors?.tools);
   main.appendChild(tbl.card);
 }
 
@@ -830,7 +943,7 @@ function renderPulse(d: DashboardData): void {
   const max = Math.max(1, ...ts.map((b) => b.events));
   const x = (i: number) => (i / (n - 1)) * W;
   const y = (v: number) => top + ph - (v / max) * ph;
-  const svg = svgEl("svg", { width: W, height: H, role: "img", "aria-label": "Event volume over the selected window" });
+  const svg = svgEl("svg", { width: W, height: H, viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": "Event volume over the selected window" });
 
   let d1 = "";
   ts.forEach((b, i) => {
@@ -915,9 +1028,20 @@ function setData(d: DashboardData): void {
       `last ${hours % 24 === 0 && hours >= 48 ? `${hours / 24} days` : `${hours} h`} · by ${d.meta.granularity}`,
     ),
   );
-  footEl.textContent = `BigQuery Agent Analytics · ${fmtCompact(d.overview.total_events)} events in window · updated ${new Date(
-    d.meta.end,
-  ).toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}`;
+  const bytes = d.meta.bytes_processed;
+  const fmtBytes =
+    bytes == null
+      ? null
+      : bytes >= 1e9
+        ? `${(bytes / 1e9).toFixed(2)} GB`
+        : bytes >= 1e6
+          ? `${(bytes / 1e6).toFixed(1)} MB`
+          : `${Math.round(bytes / 1e3)} KB`;
+  footEl.textContent =
+    `BigQuery Agent Analytics · ${fmtCompact(d.overview.total_events)} events in window · updated ${new Date(
+      d.meta.end,
+    ).toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}` +
+    (fmtBytes ? ` · ${fmtBytes} scanned${d.meta.cache_hit ? " (cached)" : ""}` : "");
   renderPulse(d);
   const selected = agentEl.value;
   agentEl.replaceChildren();
@@ -930,8 +1054,15 @@ function setData(d: DashboardData): void {
     agentEl.appendChild(o);
   }
   agentEl.value = d.agentsList.includes(selected) ? selected : (d.meta.agent ?? "");
-  statusEl.textContent = "";
-  statusEl.classList.remove("error");
+  // one failed panel must not read as "no data" — say which panels failed
+  const failed = Object.keys(d.meta.section_errors ?? {});
+  if (failed.length) {
+    statusEl.textContent = `${failed.length} panel${failed.length > 1 ? "s" : ""} failed to load: ${failed.join(", ")}`;
+    statusEl.classList.add("error");
+  } else {
+    statusEl.textContent = "";
+    statusEl.classList.remove("error");
+  }
   renderView();
 }
 
@@ -954,23 +1085,29 @@ function extractData(result: any): DashboardData | null {
 
 let appBridge: App | null = null;
 
-// Standalone (no MCP host): served over HTTP the page can fetch live data from
-// its own server; opened from disk (file://) it falls back to sample data.
-async function fetchStandalone(hours: number | null, agent?: string): Promise<DashboardData> {
+// Standalone (no MCP host): served over HTTP the page fetches live data from
+// its own server, and a failed fetch is a real error — never silently
+// replaced with sample data. Only the from-disk (file://) preview uses mocks.
+async function fetchStandalone(
+  hours: number | null,
+  agent: string | undefined,
+  signal: AbortSignal,
+): Promise<DashboardData> {
   if (location.protocol.startsWith("http")) {
+    // hours === null → let the server apply its configured default window
+    const q = new URLSearchParams();
+    if (hours != null) q.set("time_range_hours", String(hours));
+    if (agent) q.set("agent", agent);
+    const res = await fetch(`api/dashboard?${q}`, { signal, headers: authHeaders() });
+    let body: any = null;
     try {
-      // hours === null → let the server apply its configured default window
-      const q = new URLSearchParams();
-      if (hours != null) q.set("time_range_hours", String(hours));
-      if (agent) q.set("agent", agent);
-      const res = await fetch(`api/dashboard?${q}`);
-      if (res.ok) {
-        const body = await res.json();
-        if (body?.data?.overview) return body.data as DashboardData;
-      }
+      body = await res.json();
     } catch {
-      /* fall through to sample data */
+      throw new Error(`HTTP ${res.status}: response was not JSON`);
     }
+    if (!res.ok) throw new Error(body?.error ?? `HTTP ${res.status}`);
+    if (!body?.data?.overview) throw new Error("malformed dashboard payload");
+    return body.data as DashboardData;
   }
   const h = hours ?? Number(rangeEl.value);
   const end = new Date();
@@ -980,29 +1117,115 @@ async function fetchStandalone(hours: number | null, agent?: string): Promise<Da
 
 let rangeTouched = false;
 
+// Only the most recent refresh may publish results: a slow older request must
+// never overwrite newer filters (monotonic sequence + abort for HTTP).
+let refreshSeq = 0;
+let inflightAbort: AbortController | null = null;
+
 async function refresh(): Promise<void> {
+  const seq = ++refreshSeq;
+  inflightAbort?.abort();
+  const abort = new AbortController();
+  inflightAbort = abort;
+
   const hours = Number(rangeEl.value);
   const agent = agentEl.value || undefined;
   mainEl.classList.add("loading");
   statusEl.textContent = "Refreshing…";
   statusEl.classList.remove("error");
   try {
+    let d: DashboardData | null;
     if (embedded && appBridge) {
       const result = await appBridge.callServerTool({
         name: "query_agent_metrics",
         arguments: { time_range_hours: hours, ...(agent ? { agent } : {}) },
       });
-      const d = extractData(result);
-      if (d) setData(d);
-      else throw new Error("no data in tool result");
+      d = extractData(result);
+      if (!d) throw new Error("no data in tool result");
     } else {
-      setData(await fetchStandalone(rangeTouched ? hours : null, agent));
+      d = await fetchStandalone(rangeTouched ? hours : null, agent, abort.signal);
     }
+    if (seq !== refreshSeq) return; // superseded by a newer request
+    setData(d);
   } catch (e) {
-    statusEl.textContent = `Refresh failed: ${e instanceof Error ? e.message : String(e)}`;
+    if (seq !== refreshSeq || (e instanceof DOMException && e.name === "AbortError")) return;
+    const detail = e instanceof Error ? e.message : String(e);
+    statusEl.textContent = data
+      ? `Refresh failed: ${detail} — showing previously loaded data`
+      : `Load failed: ${detail}`;
     statusEl.classList.add("error");
   } finally {
-    mainEl.classList.remove("loading");
+    if (seq === refreshSeq) mainEl.classList.remove("loading");
+  }
+}
+
+// ------------------------------------------------------------ trace drill-down
+
+async function fetchTrace(traceId: string): Promise<TraceEvent[]> {
+  const hours = Number(rangeEl.value);
+  if (embedded && appBridge) {
+    const result: any = await appBridge.callServerTool({
+      name: "get_trace",
+      arguments: { trace_id: traceId, time_range_hours: hours },
+    });
+    if (Array.isArray(result?.structuredContent?.data)) return result.structuredContent.data;
+    throw new Error("no trace data in tool result");
+  }
+  if (location.protocol.startsWith("http")) {
+    const q = new URLSearchParams({ trace_id: traceId, time_range_hours: String(hours) });
+    const res = await fetch(`api/trace?${q}`, { headers: authHeaders() });
+    const body: any = await res.json().catch(() => null);
+    if (!res.ok) throw new Error(body?.error ?? `HTTP ${res.status}`);
+    return body?.data ?? [];
+  }
+  return mockTrace(traceId);
+}
+
+async function showTrace(traceId: string): Promise<void> {
+  document.getElementById("trace-card")?.remove();
+  const { card, body } = chartCard(`Trace ${traceId}`, "ordered agent_events for this trace", []);
+  card.id = "trace-card";
+  const h2 = card.querySelector("h2")!;
+  const head = el("div", "trace-head");
+  h2.replaceWith(head);
+  head.appendChild(h2);
+  const close = el("button", "trace-close", "Close");
+  close.addEventListener("click", () => card.remove());
+  head.appendChild(close);
+  body.appendChild(el("div", "empty", "Loading trace…"));
+  mainEl.appendChild(card);
+  card.scrollIntoView({ behavior: "smooth", block: "nearest" });
+
+  try {
+    const events = await fetchTrace(traceId);
+    body.replaceChildren();
+    if (!events.length) {
+      body.appendChild(el("div", "empty", "No events found for this trace in the selected window"));
+      return;
+    }
+    const t0 = Date.parse(events[0].timestamp);
+    const list = el("div", "trace-timeline");
+    for (const e of events) {
+      const row = el("div", `trace-row${e.status === "ERROR" ? " error" : ""}`);
+      row.appendChild(el("span", "trace-t", `+${((Date.parse(e.timestamp) - t0) / 1000).toFixed(1)}s`));
+      row.appendChild(el("span", "trace-type", e.event_type));
+      const detail =
+        e.error_message ??
+        (e.tool_name
+          ? `${e.tool_name}${e.tool_origin ? ` (${e.tool_origin})` : ""}`
+          : (e.llm_response ?? e.agent ?? ""));
+      const detailEl = el("span", "trace-detail", detail ?? "");
+      if (detail) detailEl.title = detail;
+      row.appendChild(detailEl);
+      row.appendChild(el("span", "trace-lat", e.latency_ms != null ? fmtMs(e.latency_ms) : ""));
+      list.appendChild(row);
+    }
+    body.appendChild(list);
+  } catch (err) {
+    body.replaceChildren();
+    body.appendChild(
+      el("div", "empty error", `Trace load failed: ${err instanceof Error ? err.message : String(err)}`),
+    );
   }
 }
 
@@ -1013,13 +1236,22 @@ rangeEl.addEventListener("change", () => {
 agentEl.addEventListener("change", refresh);
 
 let resizeTimer: ReturnType<typeof setTimeout> | undefined;
-window.addEventListener("resize", () => {
+function scheduleRerender(): void {
   clearTimeout(resizeTimer);
   resizeTimer = setTimeout(() => {
     renderView();
     if (data) renderPulse(data);
   }, 150);
-});
+}
+window.addEventListener("resize", scheduleRerender);
+// MCP hosts can resize the iframe's content box without firing window.resize
+let lastMainW = mainEl.clientWidth;
+new ResizeObserver(() => {
+  const w = mainEl.clientWidth;
+  if (Math.abs(w - lastMainW) < 8) return;
+  lastMainW = w;
+  scheduleRerender();
+}).observe(mainEl);
 
 renderTabs();
 renderView();

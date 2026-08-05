@@ -9,15 +9,19 @@ export interface DashboardMeta {
   end: string; // ISO timestamp
   granularity: Granularity;
   agent: string | null; // active agent filter, if any
+  bytes_processed?: number | null; // total BigQuery bytes for this refresh
+  cache_hit?: boolean;
+  // Panels whose query failed this refresh; healthy panels still render.
+  section_errors?: Record<string, string>;
 }
 
 export interface OverviewStats {
-  total_events: number;
-  errors: number;
-  error_rate_pct: number;
-  sessions: number;
-  agents: number;
-  users: number;
+  total_events: number | null;
+  errors: number | null;
+  error_rate_pct: number | null;
+  sessions: number | null;
+  agents: number | null;
+  users: number | null;
   p95_latency_ms: number | null;
 }
 
@@ -73,6 +77,7 @@ export interface SessionTokenRow {
   total_prompt_tokens: number;
   total_completion_tokens: number;
   total_tokens: number;
+  trace_ids?: string[]; // sample trace ids for drill-down
 }
 
 export interface DashboardData {

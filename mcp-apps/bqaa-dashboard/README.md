@@ -18,8 +18,9 @@ Ask the host *"show me my agent dashboard"* and get four views in the chat:
 | **Tools** | succeeded/failed calls per tool; failure-rate and latency table |
 
 Global filters (time-range presets + agent) re-query BigQuery through the
-iframe → host `tools/call` bridge. Every chart has hover/keyboard tooltips and a
-table fallback; light and dark themes are both first-class.
+iframe → host `tools/call` bridge. Every chart has hover/keyboard tooltips and
+an accessible "Show data" table; top sessions drill down to a full trace
+timeline (`get_trace`). Light and dark themes are both first-class.
 
 ## Tools exposed
 
@@ -52,12 +53,20 @@ The MCP endpoint is `http://localhost:3001/mcp` (override with `PORT`).
 | `BQAA_DATASET` | `agent_analytics` | Dataset containing agent_events |
 | `BQAA_TABLE` | `agent_events` | Event table |
 | `BQAA_MOCK` | — | `1` forces deterministic sample data |
-| `BQAA_MAX_BYTES_BILLED` | `2000000000` | Per-query bytes-billed cap |
+| `BQAA_MAX_BYTES_BILLED` | `2000000000` | Bytes-billed budget for **one dashboard refresh** (split across its queries) |
+| `BQAA_DEFAULT_HOURS` | `168` | Default lookback window in hours (1–2160); validated at startup |
+| `BQAA_AUTH_TOKEN` | — | If set, `/mcp` and `/api/*` require `Authorization: Bearer <token>` (browser pages may pass `?token=`) |
+| `BQAA_ALLOWED_ORIGINS` | — | Comma-separated Origin allowlist (or `*`). Unset ⇒ same-origin only: cross-origin requests are refused |
 | `PORT` | `3001` | HTTP port |
 
 Guardrails: read-only parameterized `SELECT`s only, a mandatory `timestamp`
-predicate so the partitioned table is never full-scanned, and
-`maximumBytesBilled` on every job.
+predicate so the partitioned table is never full-scanned, a per-refresh
+`maximumBytesBilled` budget, a 60 s result cache with concurrent-request
+coalescing, and partial-failure handling (one failed panel query is reported in
+`meta.section_errors` instead of blanking the dashboard). The footer shows
+bytes scanned per refresh. `GET /api/health` reports readiness (`/healthz`
+works locally but is intercepted by Google Frontend on run.app); requests are
+logged as structured JSON.
 
 ### Connect to Claude
 
@@ -70,20 +79,31 @@ connector), then ask Claude to show your agent dashboard.
 
 ### Deploy to Cloud Run
 
+Private (IAM-authenticated) deployment is the default posture:
+
 ```bash
 gcloud run deploy bqaa-dashboard --source . --region us-central1 \
-  --allow-unauthenticated \
+  --no-allow-unauthenticated \
   --set-env-vars "BQAA_PROJECT=<project>,BQAA_DATASET=agent_analytics,BQAA_TABLE=agent_events"
 ```
 
 Grant the runtime service account `roles/bigquery.jobUser` and
-`roles/bigquery.dataViewer` (or dataset-scoped read access). The resulting
-`https://….run.app/mcp` URL can be added directly as a Claude custom connector.
+`roles/bigquery.dataViewer` (or dataset-scoped read access). Reach a private
+service through an identity-aware proxy / `gcloud run services proxy`, or grant
+`roles/run.invoker` to specific members.
 
-> **Note:** `--allow-unauthenticated` makes the MCP endpoint public — anyone
-> with the URL can query the configured table's aggregates and traces. Fine for
-> demo/test datasets; for production telemetry put the service behind IAP, an
-> API gateway, or MCP OAuth before exposing it.
+For a **demo on a test dataset only**, you can expose it publicly — combine
+`--allow-unauthenticated` with the app-level guards:
+
+```bash
+gcloud run deploy bqaa-dashboard --source . --region us-central1 \
+  --allow-unauthenticated \
+  --set-env-vars "BQAA_PROJECT=<project>,BQAA_DATASET=<demo_dataset>,BQAA_TABLE=agent_events,BQAA_AUTH_TOKEN=<random-token>,BQAA_ALLOWED_ORIGINS=*"
+```
+
+The `https://….run.app/mcp` URL can then be added as a Claude custom connector.
+Anyone with the URL + token can query the configured table's aggregates and
+traces — never point a public deployment at production telemetry.
 
 ### Test without a host
 
@@ -93,14 +113,28 @@ Grant the runtime service account `roles/bigquery.jobUser` and
   detects it has no host and renders the sample dataset (`#latency`, `#tokens`,
   `#tools` hashes select the initial tab).
 
+## Tests
+
+```bash
+npm test
+```
+
+Runs the SQL contract tests (schema aliases for both producers, `LLM_ERROR` /
+`TOOL_ERROR` inclusion, partition predicates, parameterization) and an
+integration suite that boots the server in mock mode and exercises `/healthz`,
+`/`, `/api/dashboard`, `/api/trace`, the MCP JSON-RPC surface, invalid
+arguments, bearer auth, the Origin allowlist, and startup config validation.
+
 ## Layout
 
 ```
-server.ts        MCP server: tools + ui:// resource + BigQuery/mock data layer
-mcp-app.html     UI shell and styles (light/dark via CSS custom properties)
-src/mcp-app.ts   Charts (inline SVG), tooltips, filters, host bridge
-src/mock.ts      Deterministic sample data (server mock mode + standalone preview)
+server.ts        MCP server: tools + ui:// resource + auth/origin/budget guards
+src/queries.ts   SQL contract (pure builders — unit-testable, shareable)
+mcp-app.html     UI shell (design system in src/styles.css)
+src/mcp-app.ts   Charts (inline SVG), tooltips, filters, drill-down, host bridge
+src/mock.ts      Deterministic sample data (server mock mode + file:// preview)
 src/types.ts     Shared payload types
+tests/           Contract + integration tests (`npm test`)
 ```
 
 ## Credits

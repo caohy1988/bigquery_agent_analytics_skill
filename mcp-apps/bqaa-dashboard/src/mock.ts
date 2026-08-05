@@ -146,6 +146,7 @@ export function mockDashboard(
       total_prompt_tokens: prompt,
       total_completion_tokens: completion,
       total_tokens: prompt + completion,
+      trace_ids: [`trace${(0x10000000 + Math.floor(rand() * 0xefffffff)).toString(16)}${i}`],
     });
   }
   topSessions.sort((a, b) => b.total_tokens - a.total_tokens);
