@@ -373,6 +373,28 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
+// Browser-shareable view: serve the dashboard UI at the root, and let its
+// standalone mode pull live data over plain HTTP instead of the MCP bridge.
+app.get("/", async (_req, res) => {
+  try {
+    const html = await fs.readFile(path.join(__dirname, "dist", "mcp-app.html"), "utf-8");
+    res.type("html").send(html);
+  } catch {
+    res.status(500).send("UI bundle missing — run `npm run build` first.");
+  }
+});
+
+app.get("/api/dashboard", async (req, res) => {
+  try {
+    const hours = Math.min(2160, Math.max(1, Math.trunc(Number(req.query.time_range_hours)) || 168));
+    const agentRaw = typeof req.query.agent === "string" ? req.query.agent.slice(0, 200) : "";
+    const data = await loadDashboard(hours, agentRaw || null);
+    res.json({ data });
+  } catch (e) {
+    res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
 app.post("/mcp", async (req, res) => {
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined,

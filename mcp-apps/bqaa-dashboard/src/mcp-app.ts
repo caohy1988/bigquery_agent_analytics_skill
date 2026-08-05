@@ -125,23 +125,30 @@ function lineChart(
 ): void {
   const H = opts.height ?? 210;
   const W = Math.max(280, container.clientWidth || 560);
-  const m = { top: 10, right: 46, bottom: 22, left: 46 };
-  const pw = W - m.left - m.right;
-  const ph = H - m.top - m.bottom;
   const n = buckets.length;
-  const svg = svgEl("svg", { width: W, height: H, role: "img", "aria-label": opts.ariaLabel });
-
   if (n === 0) {
     container.appendChild(el("div", "empty", "No data in this window"));
     return;
   }
 
   const maxVal = niceMax(Math.max(1, ...series.flatMap((s) => s.values.filter((v): v is number => v != null))));
+  // left margin sized to the widest y-tick label so units like "16.7 min" fit
+  const TICKS = 4;
+  const tickLabels = Array.from({ length: TICKS }, (_, k) => opts.yFmt((maxVal / TICKS) * (k + 1)));
+  const m = {
+    top: 10,
+    right: 46,
+    bottom: 22,
+    left: Math.max(40, 12 + Math.max(...tickLabels.map((t) => t.length)) * 6.6),
+  };
+  const pw = W - m.left - m.right;
+  const ph = H - m.top - m.bottom;
+  const svg = svgEl("svg", { width: W, height: H, role: "img", "aria-label": opts.ariaLabel });
+
   const x = (i: number) => m.left + (n === 1 ? pw / 2 : (i / (n - 1)) * pw);
   const y = (v: number) => m.top + ph - (v / maxVal) * ph;
 
   // gridlines + y ticks (clean numbers)
-  const TICKS = 4;
   for (let t = 1; t <= TICKS; t++) {
     const v = (maxVal / TICKS) * t;
     const gy = y(v);
@@ -149,7 +156,7 @@ function lineChart(
     line.setAttribute("class", "gridline");
     svg.appendChild(line);
     const label = svgEl("text", { x: m.left - 6, y: gy + 3, "text-anchor": "end" });
-    label.textContent = opts.yFmt(v);
+    label.textContent = tickLabels[t - 1];
     svg.appendChild(label);
   }
   const base = svgEl("line", { x1: m.left, x2: m.left + pw, y1: m.top + ph, y2: m.top + ph });
@@ -291,23 +298,31 @@ function stackedColumns(
 ): void {
   const H = opts.height ?? 210;
   const W = Math.max(280, container.clientWidth || 560);
-  const m = { top: 10, right: 10, bottom: 22, left: 46 };
-  const pw = W - m.left - m.right;
-  const ph = H - m.top - m.bottom;
   const n = buckets.length;
   if (n === 0) {
     container.appendChild(el("div", "empty", "No data in this window"));
     return;
   }
-  const svg = svgEl("svg", { width: W, height: H, role: "img", "aria-label": opts.ariaLabel });
 
   const totals = buckets.map((_, i) => segments.reduce((a, s) => a + (s.values[i] ?? 0), 0));
   const maxVal = niceMax(Math.max(1, ...totals));
+  // left margin sized to the widest y-tick label
+  const TICKS = 4;
+  const tickLabels = Array.from({ length: TICKS }, (_, k) => opts.yFmt((maxVal / TICKS) * (k + 1)));
+  const m = {
+    top: 10,
+    right: 10,
+    bottom: 22,
+    left: Math.max(40, 12 + Math.max(...tickLabels.map((t) => t.length)) * 6.6),
+  };
+  const pw = W - m.left - m.right;
+  const ph = H - m.top - m.bottom;
+  const svg = svgEl("svg", { width: W, height: H, role: "img", "aria-label": opts.ariaLabel });
+
   const band = pw / n;
   const colW = Math.min(24, Math.max(3, band * 0.6));
   const yOf = (v: number) => m.top + ph - (v / maxVal) * ph;
 
-  const TICKS = 4;
   for (let t = 1; t <= TICKS; t++) {
     const v = (maxVal / TICKS) * t;
     const gy = yOf(v);
@@ -315,7 +330,7 @@ function stackedColumns(
     line.setAttribute("class", "gridline");
     svg.appendChild(line);
     const label = svgEl("text", { x: m.left - 6, y: gy + 3, "text-anchor": "end" });
-    label.textContent = opts.yFmt(v);
+    label.textContent = tickLabels[t - 1];
     svg.appendChild(label);
   }
   const base = svgEl("line", { x1: m.left, x2: m.left + pw, y1: m.top + ph, y2: m.top + ph });
@@ -798,6 +813,27 @@ function extractData(result: any): DashboardData | null {
 
 let appBridge: App | null = null;
 
+// Standalone (no MCP host): served over HTTP the page can fetch live data from
+// its own server; opened from disk (file://) it falls back to sample data.
+async function fetchStandalone(hours: number, agent?: string): Promise<DashboardData> {
+  if (location.protocol.startsWith("http")) {
+    try {
+      const q = new URLSearchParams({ time_range_hours: String(hours) });
+      if (agent) q.set("agent", agent);
+      const res = await fetch(`api/dashboard?${q}`);
+      if (res.ok) {
+        const body = await res.json();
+        if (body?.data?.overview) return body.data as DashboardData;
+      }
+    } catch {
+      /* fall through to sample data */
+    }
+  }
+  const end = new Date();
+  const start = new Date(end.getTime() - hours * 3_600_000);
+  return mockDashboard(start, end, hours <= 72 ? "hour" : "day", agent ?? null);
+}
+
 async function refresh(): Promise<void> {
   const hours = Number(rangeEl.value);
   const agent = agentEl.value || undefined;
@@ -814,9 +850,7 @@ async function refresh(): Promise<void> {
       if (d) setData(d);
       else throw new Error("no data in tool result");
     } else {
-      const end = new Date();
-      const start = new Date(end.getTime() - hours * 3_600_000);
-      setData(mockDashboard(start, end, hours <= 72 ? "hour" : "day", agent ?? null));
+      setData(await fetchStandalone(hours, agent));
     }
   } catch (e) {
     statusEl.textContent = `Refresh failed: ${e instanceof Error ? e.message : String(e)}`;
