@@ -23,6 +23,23 @@ export interface OverviewStats {
   agents: number | null;
   users: number | null;
   p95_latency_ms: number | null;
+  last_event_ts?: string | null; // newest event in window — freshness indicator
+}
+
+export interface HitlRow {
+  agent: string | null;
+  request_type: string | null; // CREDENTIAL / CONFIRMATION / INPUT
+  total_requests: number;
+  completed: number;
+  avg_wait_sec: number | null;
+  max_wait_sec: number | null;
+}
+
+export interface DelegationRow {
+  parent_agent: string;
+  child_agent: string;
+  delegation_count: number;
+  unique_traces: number;
 }
 
 export interface TimeBucket {
@@ -83,12 +100,58 @@ export interface SessionTokenRow {
 export interface DashboardData {
   meta: DashboardMeta;
   overview: OverviewStats;
+  prevOverview?: OverviewStats | null; // same stats for the preceding window
   timeseries: TimeBucket[];
   latencyByAgent: AgentLatencyRow[];
   toolStats: ToolStatRow[];
   modelComparison: ModelComparisonRow[];
   topSessions: SessionTokenRow[];
+  hitl?: HitlRow[];
+  delegation?: DelegationRow[];
   agentsList: string[];
+}
+
+// ------------------------------------------------------------ custom widgets
+// Versioned widget contract: measure × dimension × filters × window.
+
+export const WIDGET_SPEC_VERSION = 1;
+
+export interface WidgetFilters {
+  agent?: string;
+  model?: string;
+  tool?: string;
+  status?: "OK" | "ERROR";
+}
+
+export interface WidgetSpec {
+  v?: number; // spec version, WIDGET_SPEC_VERSION
+  measure: string; // key in WIDGET_MEASURES
+  dimension: string; // key in WIDGET_DIMENSIONS
+  granularity?: Granularity; // only for dimension === "time"
+  filters?: WidgetFilters;
+  limit?: number; // categorical dimensions only, 1..100
+}
+
+export interface WidgetRow {
+  dim: string | null;
+  value: number | null;
+}
+
+export interface WidgetResult {
+  spec: Required<Pick<WidgetSpec, "measure" | "dimension">> & WidgetSpec;
+  window: { start: string; end: string };
+  rows: WidgetRow[];
+  bytes_processed?: number | null;
+  estimated_bytes?: number | null; // dry-run only
+  dry_run?: boolean;
+}
+
+export interface ErrorTraceRow {
+  trace_id: string;
+  last_ts: string;
+  agents: string | null;
+  error_events: number;
+  sample_errors: string | null;
 }
 
 export interface TraceEvent {

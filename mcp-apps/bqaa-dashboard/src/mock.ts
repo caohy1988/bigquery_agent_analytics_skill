@@ -5,12 +5,17 @@
 import type {
   AgentLatencyRow,
   DashboardData,
+  DelegationRow,
+  ErrorTraceRow,
   Granularity,
+  HitlRow,
   ModelComparisonRow,
   SessionTokenRow,
   TimeBucket,
   ToolStatRow,
   TraceEvent,
+  WidgetResult,
+  WidgetSpec,
 } from "./types.js";
 
 function mulberry32(seed: number): () => number {
@@ -154,6 +159,30 @@ export function mockDashboard(
   const allLatency = timeseries.map((b) => b.p95_latency_ms ?? 0).sort((a, b) => a - b);
   const p95 = allLatency[Math.floor(allLatency.length * 0.95)] ?? null;
 
+  const hitl: HitlRow[] = agents.slice(0, 2).flatMap((agent) =>
+    ["CONFIRMATION", "INPUT"].map((request_type) => {
+      const total = Math.round(4 + rand() * 30);
+      return {
+        agent,
+        request_type,
+        total_requests: total,
+        completed: Math.round(total * (0.82 + rand() * 0.18)),
+        avg_wait_sec: Math.round((10 + rand() * 240) * 10) / 10,
+        max_wait_sec: Math.round(300 + rand() * 3000),
+      };
+    }),
+  );
+
+  const delegation: DelegationRow[] =
+    agents.length > 1
+      ? agents.slice(1).map((child) => ({
+          parent_agent: agents[0],
+          child_agent: child,
+          delegation_count: Math.round(30 + rand() * 400),
+          unique_traces: Math.round(20 + rand() * 200),
+        }))
+      : [];
+
   return {
     meta: {
       source: "mock",
@@ -170,14 +199,70 @@ export function mockDashboard(
       agents: agents.length,
       users: Math.round(totalEvents / 130),
       p95_latency_ms: p95,
+      last_event_ts: timeseries.length ? timeseries[timeseries.length - 1].ts : null,
+    },
+    prevOverview: {
+      total_events: Math.round(totalEvents * 0.91),
+      errors: Math.round(totalErrors * 1.18),
+      error_rate_pct: totalEvents ? Math.round(((totalErrors * 1.18) / (totalEvents * 0.91)) * 10000) / 100 : 0,
+      sessions: Math.round(totalEvents / 41),
+      agents: agents.length,
+      users: Math.round(totalEvents / 138),
+      p95_latency_ms: p95 != null ? Math.round(p95 * 1.12) : null,
     },
     timeseries,
     latencyByAgent,
     toolStats,
     modelComparison,
     topSessions,
+    hitl,
+    delegation,
     agentsList: AGENTS,
   };
+}
+
+export function mockWidget(spec: WidgetSpec, start: Date, end: Date): WidgetResult {
+  const rand = mulberry32(spec.measure.length * 131 + spec.dimension.length * 17);
+  const scale =
+    spec.measure.includes("tokens") ? 250_000 : spec.measure.includes("ms") ? 4000 : spec.measure.includes("pct") ? 5 : 900;
+  let rows;
+  if (spec.dimension === "time") {
+    const stepMs = spec.granularity === "hour" ? 3_600_000 : 86_400_000;
+    rows = [];
+    for (let t = Math.floor(start.getTime() / stepMs) * stepMs; t < end.getTime(); t += stepMs) {
+      rows.push({ dim: new Date(t).toISOString(), value: Math.round(scale * (0.4 + rand())) });
+    }
+  } else {
+    const values: Record<string, string[]> = {
+      agent: AGENTS,
+      model: MODELS,
+      tool: TOOLS.map(([t]) => t),
+      user: ["user-a", "user-b", "user-c", "user-d"],
+      status: ["OK", "ERROR"],
+      event_type: ["LLM_RESPONSE", "LLM_REQUEST", "TOOL_COMPLETED", "TOOL_STARTING"],
+    };
+    rows = (values[spec.dimension] ?? ["a", "b"]).map((dim) => ({
+      dim,
+      value: Math.round(scale * (0.2 + rand())),
+    }));
+    rows.sort((a, b) => (b.value ?? 0) - (a.value ?? 0));
+  }
+  return {
+    spec: { v: 1, ...spec },
+    window: { start: start.toISOString(), end: end.toISOString() },
+    rows,
+  };
+}
+
+export function mockErrorTraces(): ErrorTraceRow[] {
+  const rand = mulberry32(77);
+  return Array.from({ length: 6 }, (_, i) => ({
+    trace_id: `trace${(0x20000000 + Math.floor(rand() * 0xdfffffff)).toString(16)}${i}`,
+    last_ts: new Date(Date.now() - i * 5_400_000).toISOString(),
+    agents: AGENTS[i % AGENTS.length],
+    error_events: 1 + Math.floor(rand() * 3),
+    sample_errors: ["TimeoutError: tool call exceeded 30s", "PermissionDenied: missing scope", "RateLimitError"][i % 3],
+  }));
 }
 
 export function mockTrace(traceId: string): TraceEvent[] {

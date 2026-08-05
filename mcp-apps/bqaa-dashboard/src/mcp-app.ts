@@ -5,15 +5,23 @@
 
 import "./styles.css";
 import { App } from "@modelcontextprotocol/ext-apps";
-import { mockDashboard, mockTrace } from "./mock.js";
-import type { DashboardData, TimeBucket, TraceEvent } from "./types.js";
+import { mockDashboard, mockTrace, mockWidget } from "./mock.js";
+import { WIDGET_DIMENSIONS, WIDGET_MEASURES } from "./queries.js";
+import type { DashboardData, OverviewStats, TimeBucket, TraceEvent, WidgetResult, WidgetSpec } from "./types.js";
+
+// Shareable page state lives in the hash: #view=tokens&range=720&agent=coder
+// (legacy #tokens-style hashes still work).
+function parseHashState(): Record<string, string> {
+  const raw = location.hash.replace(/^#/, "");
+  if (!raw) return {};
+  if (!raw.includes("=")) return { view: raw };
+  return Object.fromEntries(new URLSearchParams(raw));
+}
+const HASH_STATE = parseHashState();
 
 // Optional bearer token for servers started with BQAA_AUTH_TOKEN, supplied to
-// the shared page as ?token=… (or #token=…).
-const AUTH_TOKEN =
-  new URLSearchParams(location.search).get("token") ??
-  new URLSearchParams(location.hash.replace(/^#/, "")).get("token") ??
-  "";
+// the shared page as ?token=… (or in the hash state).
+const AUTH_TOKEN = new URLSearchParams(location.search).get("token") ?? HASH_STATE.token ?? "";
 
 function authHeaders(): Record<string, string> {
   return AUTH_TOKEN ? { Authorization: `Bearer ${AUTH_TOKEN}` } : {};
@@ -41,6 +49,40 @@ const fmtMs = (v: number | null | undefined): string => {
 };
 
 const fmtPct = (v: number | null | undefined): string => (v == null ? "—" : `${v}%`);
+
+const fmtUSD = (v: number | null | undefined): string => {
+  if (v == null) return "—";
+  if (v >= 1000) return `$${(v / 1000).toFixed(1)}K`;
+  if (v >= 1) return `$${v.toFixed(2)}`;
+  return `$${v.toFixed(4)}`;
+};
+
+function widgetValueFmt(measure: string): (v: number | null) => string {
+  const unit = WIDGET_MEASURES[measure]?.unit;
+  if (unit === "ms") return fmtMs;
+  if (unit === "pct") return (v) => fmtPct(v);
+  return (v) => fmtCompact(v);
+}
+
+function toCSV(head: string[], rows: string[][]): string {
+  const esc = (s: string): string => (/[",\n]/.test(s) ? `"${s.replaceAll('"', '""')}"` : s);
+  return [head, ...rows].map((r) => r.map(esc).join(",")).join("\n");
+}
+
+function csvButton(filename: string, get: () => { head: string[]; rows: string[][] }): HTMLElement {
+  const b = el("button", "link-btn", "CSV");
+  b.setAttribute("aria-label", `Download ${filename} as CSV`);
+  b.addEventListener("click", () => {
+    const { head, rows } = get();
+    const url = URL.createObjectURL(new Blob([toCSV(head, rows)], { type: "text/csv" }));
+    const a = el("a");
+    a.href = url;
+    a.download = filename;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+  });
+  return b;
+}
 
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
@@ -558,10 +600,42 @@ function sparkline(values: Array<number | null>): SVGSVGElement | null {
   return svg;
 }
 
-function tile(label: string, value: string, detail?: string, spark?: Array<number | null>): HTMLElement {
+// Period-over-period delta chip: signed % change vs the preceding window.
+// direction semantics: "bad" = an increase is a regression (errors, latency),
+// "neutral" = informational only (volume metrics).
+interface TileDelta {
+  cur: number | null | undefined;
+  prev: number | null | undefined;
+  upIs: "bad" | "neutral";
+}
+
+function deltaChip(d: TileDelta): HTMLElement | null {
+  if (d.cur == null || d.prev == null || d.prev === 0) return null;
+  const pct = ((d.cur - d.prev) / Math.abs(d.prev)) * 100;
+  if (!Number.isFinite(pct)) return null;
+  const up = pct >= 0;
+  const cls = d.upIs === "neutral" ? "neutral" : up ? "bad" : "good";
+  const chip = el("span", `chip ${cls}`, `${up ? "▲" : "▼"} ${Math.abs(pct) < 10 ? Math.abs(pct).toFixed(1) : Math.round(Math.abs(pct))}%`);
+  chip.title = "vs previous period";
+  return chip;
+}
+
+function tile(
+  label: string,
+  value: string,
+  detail?: string,
+  spark?: Array<number | null>,
+  delta?: TileDelta,
+): HTMLElement {
   const card = el("div", "card tile");
   card.appendChild(el("div", "label", label));
-  card.appendChild(el("div", "value", value));
+  const valueRow = el("div", "value-row");
+  valueRow.appendChild(el("div", "value", value));
+  if (delta) {
+    const chip = deltaChip(delta);
+    if (chip) valueRow.appendChild(chip);
+  }
+  card.appendChild(valueRow);
   if (detail) card.appendChild(el("div", "detail", detail));
   if (spark) {
     const s = sparkline(spark);
@@ -615,9 +689,17 @@ function chartCard(
   sub: string | null,
   legend: LegendItem[],
   span: "full" | "half" = "full",
+  csv?: { filename: string; get: () => { head: string[]; rows: string[][] } },
 ): { card: HTMLElement; body: HTMLElement } {
   const card = el("div", `card${span === "full" ? " span-full" : ""}`);
-  card.appendChild(el("h2", undefined, title));
+  if (csv) {
+    const head = el("div", "card-head");
+    head.appendChild(el("h2", undefined, title));
+    head.appendChild(csvButton(csv.filename, csv.get));
+    card.appendChild(head);
+  } else {
+    card.appendChild(el("h2", undefined, title));
+  }
   if (sub) card.appendChild(el("div", "sub", sub));
   if (legend.length >= 2) {
     const lg = el("div", "legend");
@@ -640,14 +722,31 @@ function chartCard(
 
 function renderOverview(d: DashboardData, main: HTMLElement): void {
   const o = d.overview;
+  const p: Partial<OverviewStats> = d.prevOverview ?? {};
   const ts = d.timeseries;
   main.appendChild(
     tileRow(
-      tile("Events", fmtCompact(o.total_events), undefined, ts.map((b) => b.events)),
-      tile("Sessions", fmtCompact(o.sessions)),
-      tile("Users", fmtCompact(o.users)),
-      tile("Error rate", fmtPct(o.error_rate_pct), `${fmtInt(o.errors)} errors`, ts.map((b) => b.errors)),
-      tile("P95 latency", fmtMs(o.p95_latency_ms), "all events", ts.map((b) => b.p95_latency_ms)),
+      tile("Events", fmtCompact(o.total_events), undefined, ts.map((b) => b.events), {
+        cur: o.total_events,
+        prev: p.total_events,
+        upIs: "neutral",
+      }),
+      tile("Sessions", fmtCompact(o.sessions), undefined, undefined, {
+        cur: o.sessions,
+        prev: p.sessions,
+        upIs: "neutral",
+      }),
+      tile("Users", fmtCompact(o.users), undefined, undefined, { cur: o.users, prev: p.users, upIs: "neutral" }),
+      tile("Error rate", fmtPct(o.error_rate_pct), `${fmtInt(o.errors)} errors`, ts.map((b) => b.errors), {
+        cur: o.error_rate_pct,
+        prev: p.error_rate_pct,
+        upIs: "bad",
+      }),
+      tile("P95 latency", fmtMs(o.p95_latency_ms), "all events", ts.map((b) => b.p95_latency_ms), {
+        cur: o.p95_latency_ms,
+        prev: p.p95_latency_ms,
+        upIs: "bad",
+      }),
     ),
   );
 
@@ -905,6 +1004,428 @@ function renderTools(d: DashboardData, main: HTMLElement): void {
   main.appendChild(tbl.card);
 }
 
+// ---------------------------------------------------------------- cost view
+// Cost = tokens × an editable price book. Prices are deliberately user-owned
+// (per-token rates vary by contract/region); defaults are labeled estimates.
+
+interface PriceBook {
+  [model: string]: { in: number; out: number }; // $ per 1M tokens
+}
+
+const DEFAULT_PRICES: PriceBook = {
+  "gemini-2.5-pro": { in: 1.25, out: 10 },
+  "gemini-2.5-flash": { in: 0.3, out: 2.5 },
+};
+
+function loadPrices(): PriceBook {
+  try {
+    return { ...DEFAULT_PRICES, ...JSON.parse(localStorage.getItem("bqaa-price-book") ?? "{}") };
+  } catch {
+    return { ...DEFAULT_PRICES };
+  }
+}
+
+function renderCost(d: DashboardData, main: HTMLElement): void {
+  const prices = loadPrices();
+  const rows = d.modelComparison.map((m) => {
+    const price = prices[m.model_id ?? ""] ?? { in: 0, out: 0 };
+    const promptTot = (m.avg_prompt_tokens ?? 0) * m.calls;
+    const completionTot = (m.avg_completion_tokens ?? 0) * m.calls;
+    const costIn = (promptTot / 1e6) * price.in;
+    const costOut = (completionTot / 1e6) * price.out;
+    return { model: m.model_id ?? "?", calls: m.calls, promptTot, completionTot, price, costIn, costOut, cost: costIn + costOut };
+  });
+  const totalIn = rows.reduce((a, r) => a + r.costIn, 0);
+  const totalOut = rows.reduce((a, r) => a + r.costOut, 0);
+  const total = totalIn + totalOut;
+  const unpriced = rows.filter((r) => r.price.in === 0 && r.price.out === 0 && (r.promptTot > 0 || r.completionTot > 0));
+
+  main.appendChild(
+    tileRow(
+      tile("Est. total cost", fmtUSD(total), "editable price book below"),
+      tile("Prompt cost", fmtUSD(totalIn)),
+      tile("Completion cost", fmtUSD(totalOut)),
+      tile("Cost / session", d.overview.sessions ? fmtUSD(total / d.overview.sessions) : "—", `${fmtCompact(d.overview.sessions)} sessions`),
+    ),
+  );
+
+  // spread total cost over time proportional to token volume per bucket
+  const allTokens = d.timeseries.reduce((a, b) => a + b.prompt_tokens + b.completion_tokens, 0);
+  const costSeries = d.timeseries.map((b) => (allTokens ? (total * (b.prompt_tokens + b.completion_tokens)) / allTokens : 0));
+  const trend = chartCard("Estimated cost over time", "apportioned by token volume", [], "full", {
+    filename: "cost-over-time.csv",
+    get: () => ({
+      head: ["Bucket", "Est. cost"],
+      rows: d.timeseries.map((b, i) => [bucketLabel(b.ts, d.meta.granularity), costSeries[i].toFixed(4)]),
+    }),
+  });
+  main.appendChild(trend.card);
+  lineChart(
+    trend.body,
+    d.timeseries,
+    [{ name: "Est. cost", cssVar: "--s1", values: costSeries }],
+    {
+      yFmt: (v) => fmtUSD(v),
+      granularity: d.meta.granularity,
+      ariaLabel: "Estimated cost over time",
+      areaFirst: true,
+      sectionError: d.meta.section_errors?.timeseries,
+    },
+  );
+
+  const byModel = chartCard("Cost by model", "estimates — tokens × your price book", [], "half", {
+    filename: "cost-by-model.csv",
+    get: () => ({
+      head: ["Model", "Calls", "Prompt tokens", "Completion tokens", "$/1M in", "$/1M out", "Est. cost"],
+      rows: rows.map((r) => [r.model, String(r.calls), String(r.promptTot), String(r.completionTot), String(r.price.in), String(r.price.out), r.cost.toFixed(4)]),
+    }),
+  });
+  table(byModel.body, [
+    { label: "Model", get: (r) => r.model },
+    { label: "Calls", get: (r) => fmtInt(r.calls) },
+    { label: "Prompt", get: (r) => fmtCompact(r.promptTot) },
+    { label: "Completion", get: (r) => fmtCompact(r.completionTot) },
+    { label: "Est. cost", get: (r) => fmtUSD(r.cost) },
+  ], rows, d.meta.section_errors?.models);
+  main.appendChild(byModel.card);
+
+  const editor = chartCard("Price book", "$ per 1M tokens — edit to match your contract; stored locally", [], "half");
+  const grid = el("div", "price-grid");
+  grid.appendChild(el("span", "price-head", "Model"));
+  grid.appendChild(el("span", "price-head", "$/1M prompt"));
+  grid.appendChild(el("span", "price-head", "$/1M completion"));
+  const inputs: Array<{ model: string; inEl: HTMLInputElement; outEl: HTMLInputElement }> = [];
+  for (const r of rows) {
+    grid.appendChild(el("span", "price-model", r.model));
+    const inEl = el("input") as HTMLInputElement;
+    inEl.type = "number";
+    inEl.step = "0.01";
+    inEl.min = "0";
+    inEl.value = String(r.price.in);
+    inEl.setAttribute("aria-label", `${r.model} prompt price per 1M tokens`);
+    const outEl = el("input") as HTMLInputElement;
+    outEl.type = "number";
+    outEl.step = "0.01";
+    outEl.min = "0";
+    outEl.value = String(r.price.out);
+    outEl.setAttribute("aria-label", `${r.model} completion price per 1M tokens`);
+    grid.appendChild(inEl);
+    grid.appendChild(outEl);
+    inputs.push({ model: r.model, inEl, outEl });
+  }
+  editor.body.appendChild(grid);
+  if (unpriced.length) {
+    editor.body.appendChild(el("div", "sub", `No price set for: ${unpriced.map((r) => r.model).join(", ")} — their cost counts as $0.`));
+  }
+  const save = el("button", "trace-close", "Apply prices");
+  save.addEventListener("click", () => {
+    const book: PriceBook = {};
+    for (const { model, inEl, outEl } of inputs) {
+      book[model] = { in: Math.max(0, Number(inEl.value) || 0), out: Math.max(0, Number(outEl.value) || 0) };
+    }
+    localStorage.setItem("bqaa-price-book", JSON.stringify(book));
+    renderView();
+  });
+  editor.body.appendChild(save);
+  main.appendChild(editor.card);
+}
+
+// ---------------------------------------------------------------- agents view
+
+function renderAgents(d: DashboardData, main: HTMLElement): void {
+  const deleg = d.delegation ?? [];
+  const hitl = d.hitl ?? [];
+  const delegTotal = deleg.reduce((a, r) => a + r.delegation_count, 0);
+  const hitlTotal = hitl.reduce((a, r) => a + r.total_requests, 0);
+  const hitlDone = hitl.reduce((a, r) => a + r.completed, 0);
+  main.appendChild(
+    tileRow(
+      tile("Agents", fmtCompact(d.overview.agents)),
+      tile("Delegations", fmtCompact(delegTotal), `${deleg.length} parent→child pairs`),
+      tile("HITL requests", fmtCompact(hitlTotal)),
+      tile("HITL completion", hitlTotal ? fmtPct(Math.round((hitlDone / hitlTotal) * 1000) / 10) : "—", hitlTotal ? `${fmtInt(hitlDone)} answered` : undefined),
+    ),
+  );
+
+  const bars = chartCard("Delegation map", "parent → child span relationships", [], "full", {
+    filename: "delegation.csv",
+    get: () => ({
+      head: ["Parent", "Child", "Delegations", "Unique traces"],
+      rows: deleg.map((r) => [r.parent_agent, r.child_agent, String(r.delegation_count), String(r.unique_traces)]),
+    }),
+  });
+  hBars(
+    bars.body,
+    deleg.slice(0, 12).map((r) => ({
+      label: `${r.parent_agent} → ${r.child_agent}`,
+      segs: [{ cssVar: "--s1", value: r.delegation_count }],
+      display: fmtCompact(r.delegation_count),
+      tooltipTitle: `${r.parent_agent} → ${r.child_agent}`,
+      tooltipRows: [
+        { name: "delegations", value: fmtInt(r.delegation_count), cssVar: "--s1" },
+        { name: "unique traces", value: fmtInt(r.unique_traces) },
+      ],
+    })),
+    d.meta.section_errors?.delegation,
+  );
+  main.appendChild(bars.card);
+
+  const tbl = chartCard("Human-in-the-loop", "requests vs completions by type", [], "full", {
+    filename: "hitl.csv",
+    get: () => ({
+      head: ["Agent", "Type", "Requests", "Completed", "Avg wait s", "Max wait s"],
+      rows: hitl.map((r) => [r.agent ?? "?", r.request_type ?? "?", String(r.total_requests), String(r.completed), String(r.avg_wait_sec ?? ""), String(r.max_wait_sec ?? "")]),
+    }),
+  });
+  table(tbl.body, [
+    { label: "Agent", get: (r) => r.agent ?? "?" },
+    { label: "Type", get: (r) => r.request_type ?? "?" },
+    { label: "Requests", get: (r) => fmtInt(r.total_requests) },
+    { label: "Completed", get: (r) => fmtInt(r.completed) },
+    { label: "Completion %", get: (r) => (r.total_requests ? fmtPct(Math.round((r.completed / r.total_requests) * 1000) / 10) : "—") },
+    { label: "Avg wait", get: (r) => (r.avg_wait_sec == null ? "—" : fmtMs(r.avg_wait_sec * 1000)) },
+    { label: "Max wait", get: (r) => (r.max_wait_sec == null ? "—" : fmtMs(r.max_wait_sec * 1000)) },
+  ], hitl, d.meta.section_errors?.hitl);
+  main.appendChild(tbl.card);
+}
+
+// ---------------------------------------------------------------- explore view
+// The Langfuse-style widget builder: measure × dimension × filters, with a
+// BigQuery dry-run cost preview before executing.
+
+interface ExploreState {
+  spec: WidgetSpec;
+  result: WidgetResult | null;
+  estimate: number | null;
+  note: string;
+}
+
+const explore: ExploreState = {
+  spec: { v: 1, measure: "events", dimension: "time", filters: {} },
+  result: null,
+  estimate: null,
+  note: "",
+};
+
+async function runWidget(dryRun: boolean): Promise<WidgetResult> {
+  const hours = Number(rangeEl.value);
+  const s = explore.spec;
+  const args: Record<string, unknown> = {
+    measure: s.measure,
+    dimension: s.dimension,
+    time_range_hours: hours,
+    ...(s.granularity ? { granularity: s.granularity } : {}),
+    ...(s.filters?.agent ? { agent: s.filters.agent } : {}),
+    ...(s.filters?.model ? { model: s.filters.model } : {}),
+    ...(s.filters?.tool ? { tool: s.filters.tool } : {}),
+    ...(s.filters?.status ? { status: s.filters.status } : {}),
+    ...(s.limit ? { limit: s.limit } : {}),
+    ...(dryRun ? { dry_run: true } : {}),
+  };
+  if (embedded && appBridge) {
+    const result: any = await appBridge.callServerTool({ name: "query_widget", arguments: args });
+    const data = result?.structuredContent?.data;
+    if (!data?.spec) throw new Error("no widget data in tool result");
+    return data as WidgetResult;
+  }
+  if (location.protocol.startsWith("http")) {
+    const q = new URLSearchParams();
+    for (const [k, v] of Object.entries(args)) q.set(k, k === "dry_run" ? "1" : String(v));
+    const res = await fetch(`api/widget?${q}`, { headers: authHeaders() });
+    const body: any = await res.json().catch(() => null);
+    if (!res.ok) throw new Error(body?.error ?? `HTTP ${res.status}`);
+    return body.data as WidgetResult;
+  }
+  const end = new Date();
+  const start = new Date(end.getTime() - hours * 3_600_000);
+  const result = mockWidget({ ...s, granularity: s.granularity ?? (hours <= 72 ? "hour" : "day") }, start, end);
+  return dryRun ? { ...result, rows: [], dry_run: true, estimated_bytes: 12_345_678 } : result;
+}
+
+function exploreSelect(
+  label: string,
+  options: Array<{ value: string; label: string }>,
+  value: string,
+  onChange: (v: string) => void,
+): HTMLElement {
+  const wrap = el("label", "explore-field");
+  wrap.appendChild(el("span", undefined, label));
+  const sel = el("select");
+  for (const o of options) {
+    const opt = el("option", undefined, o.label);
+    opt.value = o.value;
+    sel.appendChild(opt);
+  }
+  sel.value = value;
+  sel.addEventListener("change", () => onChange(sel.value));
+  wrap.appendChild(sel);
+  return wrap;
+}
+
+function renderExplore(d: DashboardData | null, main: HTMLElement): void {
+  const s = explore.spec;
+  const form = chartCard("Custom widget", "measure × dimension × filters — every query is parameterized and budget-capped", []);
+  const controls = el("div", "explore-form");
+
+  controls.appendChild(
+    exploreSelect("Measure", Object.entries(WIDGET_MEASURES).map(([value, m]) => ({ value, label: m.label })), s.measure, (v) => {
+      s.measure = v;
+      explore.estimate = null;
+      renderView();
+    }),
+  );
+  controls.appendChild(
+    exploreSelect("Dimension", Object.entries(WIDGET_DIMENSIONS).map(([value, m]) => ({ value, label: m.label })), s.dimension, (v) => {
+      s.dimension = v;
+      explore.estimate = null;
+      renderView();
+    }),
+  );
+  if (s.dimension === "time") {
+    controls.appendChild(
+      exploreSelect(
+        "Granularity",
+        [
+          { value: "", label: "Auto" },
+          { value: "hour", label: "Hourly" },
+          { value: "day", label: "Daily" },
+        ],
+        s.granularity ?? "",
+        (v) => {
+          s.granularity = v === "hour" || v === "day" ? v : undefined;
+          explore.estimate = null;
+          renderView();
+        },
+      ),
+    );
+  }
+  const opt = (vals: Array<string | null | undefined>): Array<{ value: string; label: string }> => [
+    { value: "", label: "Any" },
+    ...[...new Set(vals.filter((v): v is string => !!v))].map((v) => ({ value: v, label: v })),
+  ];
+  controls.appendChild(
+    exploreSelect("Agent", opt(d?.agentsList ?? []), s.filters?.agent ?? "", (v) => {
+      s.filters = { ...s.filters, agent: v || undefined };
+      explore.estimate = null;
+      renderView();
+    }),
+  );
+  controls.appendChild(
+    exploreSelect("Model", opt((d?.modelComparison ?? []).map((m) => m.model_id)), s.filters?.model ?? "", (v) => {
+      s.filters = { ...s.filters, model: v || undefined };
+      explore.estimate = null;
+      renderView();
+    }),
+  );
+  controls.appendChild(
+    exploreSelect("Tool", opt((d?.toolStats ?? []).map((t) => t.tool_name)), s.filters?.tool ?? "", (v) => {
+      s.filters = { ...s.filters, tool: v || undefined };
+      explore.estimate = null;
+      renderView();
+    }),
+  );
+  controls.appendChild(
+    exploreSelect(
+      "Status",
+      [
+        { value: "", label: "Any" },
+        { value: "OK", label: "OK" },
+        { value: "ERROR", label: "Error" },
+      ],
+      s.filters?.status ?? "",
+      (v) => {
+        s.filters = { ...s.filters, status: v === "OK" || v === "ERROR" ? v : undefined };
+        explore.estimate = null;
+        renderView();
+      },
+    ),
+  );
+  form.body.appendChild(controls);
+
+  const actions = el("div", "explore-actions");
+  const estimateBtn = el("button", "trace-close", "Estimate scan");
+  estimateBtn.addEventListener("click", async () => {
+    explore.note = "Estimating…";
+    renderView();
+    try {
+      const r = await runWidget(true);
+      explore.estimate = r.estimated_bytes ?? null;
+      explore.note = "";
+    } catch (e) {
+      explore.note = `Estimate failed: ${e instanceof Error ? e.message : String(e)}`;
+    }
+    renderView();
+  });
+  const runBtn = el("button", "run-btn", "Run query");
+  runBtn.addEventListener("click", async () => {
+    explore.note = "Running…";
+    renderView();
+    try {
+      explore.result = await runWidget(false);
+      explore.note = "";
+    } catch (e) {
+      explore.note = `Query failed: ${e instanceof Error ? e.message : String(e)}`;
+    }
+    renderView();
+  });
+  const copyBtn = el("button", "link-btn", "Copy widget JSON");
+  copyBtn.addEventListener("click", () => {
+    void navigator.clipboard?.writeText(JSON.stringify({ ...s, v: 1 }, null, 2));
+    explore.note = "Widget JSON copied";
+    renderView();
+  });
+  actions.appendChild(estimateBtn);
+  actions.appendChild(runBtn);
+  actions.appendChild(copyBtn);
+  if (explore.estimate != null) {
+    actions.appendChild(el("span", "sub", `~${(explore.estimate / 1e6).toFixed(1)} MB scan`));
+  }
+  if (explore.note) actions.appendChild(el("span", "sub", explore.note));
+  form.body.appendChild(actions);
+  main.appendChild(form.card);
+
+  const r = explore.result;
+  if (!r) return;
+  const fmt = widgetValueFmt(r.spec.measure);
+  const title = `${WIDGET_MEASURES[r.spec.measure]?.label ?? r.spec.measure} by ${WIDGET_DIMENSIONS[r.spec.dimension]?.label ?? r.spec.dimension}`;
+  const gran: "hour" | "day" = r.spec.granularity ?? "day";
+  const chart = chartCard(title, r.bytes_processed != null ? `${(r.bytes_processed / 1e6).toFixed(1)} MB scanned` : null, [], "full", {
+    filename: "widget.csv",
+    get: () => ({
+      head: [r.spec.dimension, r.spec.measure],
+      rows: r.rows.map((row) => [row.dim ?? "", String(row.value ?? "")]),
+    }),
+  });
+  main.appendChild(chart.card);
+  if (r.spec.dimension === "time") {
+    lineChart(
+      chart.body,
+      r.rows.map((row) => ({ ts: row.dim ?? "" }) as TimeBucket),
+      [{ name: title, cssVar: "--s1", values: r.rows.map((row) => row.value) }],
+      { yFmt: fmt, granularity: gran, ariaLabel: title, areaFirst: true },
+    );
+  } else {
+    const max = Math.max(1, ...r.rows.map((row) => row.value ?? 0));
+    void max;
+    hBars(
+      chart.body,
+      r.rows.slice(0, 20).map((row) => ({
+        label: row.dim ?? "(null)",
+        segs: [{ cssVar: "--s1", value: row.value ?? 0 }],
+        display: fmt(row.value),
+        tooltipTitle: row.dim ?? "(null)",
+        tooltipRows: [{ name: r.spec.measure, value: fmt(row.value), cssVar: "--s1" }],
+      })),
+    );
+  }
+  chart.card.appendChild(
+    dataTable({
+      head: [WIDGET_DIMENSIONS[r.spec.dimension]?.label ?? r.spec.dimension, WIDGET_MEASURES[r.spec.measure]?.label ?? r.spec.measure],
+      rows: r.rows.map((row) => [row.dim && r.spec.dimension === "time" ? bucketLabel(row.dim, gran) : (row.dim ?? "(null)"), fmt(row.value)]),
+    }),
+  );
+}
+
 // ---------------------------------------------------------------- app state
 
 const VIEWS = [
@@ -912,6 +1433,9 @@ const VIEWS = [
   { id: "latency", label: "Latency", render: renderLatency },
   { id: "tokens", label: "Tokens", render: renderTokens },
   { id: "tools", label: "Tools", render: renderTools },
+  { id: "cost", label: "Cost", render: renderCost },
+  { id: "agents", label: "Agents", render: renderAgents },
+  { id: "explore", label: "Explore", render: renderExplore as (d: DashboardData, main: HTMLElement) => void },
 ] as const;
 
 const mainEl = document.getElementById("view") as HTMLElement;
@@ -987,9 +1511,20 @@ function renderPulse(d: DashboardData): void {
 }
 
 let data: DashboardData | null = null;
-const initialView = VIEWS.find((v) => `#${v.id}` === location.hash)?.id;
+const initialView = VIEWS.find((v) => v.id === HASH_STATE.view)?.id;
 let currentView: (typeof VIEWS)[number]["id"] = initialView ?? "overview";
 const embedded = window.parent !== window;
+// agent filter arriving via a share link, applied on the first fetch
+let pendingAgent: string | undefined = HASH_STATE.agent || undefined;
+
+function syncHash(): void {
+  if (embedded) return; // hash state is for shareable browser URLs
+  const q = new URLSearchParams();
+  q.set("view", currentView);
+  q.set("range", rangeEl.value);
+  if (agentEl.value) q.set("agent", agentEl.value);
+  history.replaceState(null, "", `#${q}`);
+}
 
 function renderTabs(): void {
   tabsEl.replaceChildren();
@@ -1001,6 +1536,7 @@ function renderTabs(): void {
       currentView = v.id;
       renderTabs();
       renderView();
+      syncHash();
     });
     tabsEl.appendChild(b);
   }
@@ -1009,11 +1545,11 @@ function renderTabs(): void {
 function renderView(): void {
   hideTooltip();
   mainEl.replaceChildren();
-  if (!data) {
+  if (!data && !(currentView === "explore" && explore.result)) {
     mainEl.appendChild(el("div", "empty", "Waiting for data…"));
     return;
   }
-  VIEWS.find((v) => v.id === currentView)!.render(data, mainEl);
+  VIEWS.find((v) => v.id === currentView)!.render(data as DashboardData, mainEl);
 }
 
 function setData(d: DashboardData): void {
@@ -1028,6 +1564,19 @@ function setData(d: DashboardData): void {
       `last ${hours % 24 === 0 && hours >= 48 ? `${hours / 24} days` : `${hours} h`} · by ${d.meta.granularity}`,
     ),
   );
+  // data-freshness indicator from the newest event in the window
+  if (d.overview.last_event_ts) {
+    const ageMs = Date.now() - Date.parse(d.overview.last_event_ts);
+    const ageH = ageMs / 3_600_000;
+    const badge =
+      ageH < 2
+        ? el("span", "fresh good", "live")
+        : ageH < 48
+          ? el("span", "fresh ok", `updated ${Math.round(ageH)}h ago`)
+          : el("span", "fresh stale", `data ${Math.round(ageH / 24)}d old`);
+    badge.title = `newest event: ${d.overview.last_event_ts}`;
+    scopeEl.appendChild(badge);
+  }
   const bytes = d.meta.bytes_processed;
   const fmtBytes =
     bytes == null
@@ -1063,6 +1612,7 @@ function setData(d: DashboardData): void {
     statusEl.textContent = "";
     statusEl.classList.remove("error");
   }
+  syncHash();
   renderView();
 }
 
@@ -1129,7 +1679,8 @@ async function refresh(): Promise<void> {
   inflightAbort = abort;
 
   const hours = Number(rangeEl.value);
-  const agent = agentEl.value || undefined;
+  const agent = agentEl.value || pendingAgent || undefined;
+  pendingAgent = undefined;
   mainEl.classList.add("loading");
   statusEl.textContent = "Refreshing…";
   statusEl.classList.remove("error");
@@ -1253,12 +1804,30 @@ new ResizeObserver(() => {
   scheduleRerender();
 }).observe(mainEl);
 
+// share-link state: restore the time range before the first fetch
+if (HASH_STATE.range && [...rangeEl.options].some((o) => o.value === HASH_STATE.range)) {
+  rangeEl.value = HASH_STATE.range;
+  rangeTouched = true;
+}
+
 renderTabs();
 renderView();
 
 if (embedded) {
   const app = new App({ name: "BQAA Dashboard", version: "0.1.0" });
   app.ontoolresult = (result: any) => {
+    const payload = result?.structuredContent?.data;
+    // render_widget pushes a widget result: open Explore prefilled + rendered,
+    // then load the full dashboard in the background for the other tabs.
+    if (payload?.spec && Array.isArray(payload.rows)) {
+      explore.spec = { v: 1, filters: {}, ...payload.spec };
+      explore.result = payload as WidgetResult;
+      currentView = "explore";
+      renderTabs();
+      renderView();
+      if (!data) void refresh();
+      return;
+    }
     const d = extractData(result);
     if (d) setData(d); // setData syncs the range control to the data's window
   };

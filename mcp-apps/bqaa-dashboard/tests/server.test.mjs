@@ -106,7 +106,9 @@ test("MCP initialize, tools/list, tools/call, resources/read", async () => {
 
   const tools = await rpc(BASE, "tools/list", {});
   const names = tools.body.result.tools.map((t) => t.name);
-  assert.deepEqual(names.sort(), ["get_trace", "query_agent_metrics", "show_agent_dashboard"]);
+  for (const expected of ["get_trace", "query_agent_metrics", "show_agent_dashboard", "query_widget", "render_widget", "list_error_traces"]) {
+    assert.ok(names.includes(expected), `missing tool ${expected}`);
+  }
   const dash = tools.body.result.tools.find((t) => t.name === "show_agent_dashboard");
   assert.equal(dash._meta?.ui?.resourceUri, "ui://bqaa/dashboard.html");
 
@@ -177,4 +179,52 @@ test("invalid BQAA_DEFAULT_HOURS fails fast at startup", async () => {
   const code = await new Promise((resolve) => srv.child.on("exit", resolve));
   assert.notEqual(code, 0);
   assert.match(srv.logs(), /Invalid BQAA_DEFAULT_HOURS/);
+});
+
+// ---- parity + differentiator surfaces
+
+test("/api/widget runs a widget and validates inputs", async () => {
+  const bad = await fetch(`${BASE}/api/widget?measure=nope&dimension=time`);
+  assert.equal(bad.status, 400);
+  const ok = await fetch(`${BASE}/api/widget?measure=events&dimension=agent&time_range_hours=24`);
+  assert.equal(ok.status, 200);
+  const { data } = await ok.json();
+  assert.equal(data.spec.measure, "events");
+  assert.ok(Array.isArray(data.rows) && data.rows.length > 0);
+  assert.ok(data.rows[0].dim != null);
+});
+
+test("/api/widget dry_run returns an estimate and no rows", async () => {
+  const res = await fetch(`${BASE}/api/widget?measure=total_tokens&dimension=model&dry_run=1`);
+  const { data } = await res.json();
+  assert.equal(data.dry_run, true);
+  assert.equal(data.rows.length, 0);
+  assert.ok(data.estimated_bytes > 0);
+});
+
+test("dashboard payload includes prev_overview, hitl, delegation, freshness", async () => {
+  const res = await fetch(`${BASE}/api/dashboard?time_range_hours=24`);
+  const { data } = await res.json();
+  assert.ok(data.prevOverview?.total_events > 0);
+  assert.ok(Array.isArray(data.hitl) && data.hitl.length > 0);
+  assert.ok(Array.isArray(data.delegation) && data.delegation.length > 0);
+  assert.ok(data.overview.last_event_ts);
+});
+
+test("MCP exposes widget + error-trace tools; render_widget carries UI meta", async () => {
+  const tools = await rpc(BASE, "tools/list", {});
+  const byName = Object.fromEntries(tools.body.result.tools.map((t) => [t.name, t]));
+  assert.ok(byName.query_widget);
+  assert.ok(byName.list_error_traces);
+  assert.equal(byName.render_widget?._meta?.ui?.resourceUri, "ui://bqaa/dashboard.html");
+
+  const call = await rpc(BASE, "tools/call", {
+    name: "query_widget",
+    arguments: { measure: "p95_latency_ms", dimension: "agent", time_range_hours: 24 },
+  });
+  assert.ok(call.body.result.structuredContent?.data?.rows?.length > 0);
+
+  const traces = await rpc(BASE, "tools/call", { name: "list_error_traces", arguments: {} });
+  assert.ok(traces.body.result.structuredContent?.data?.length > 0);
+  assert.match(traces.body.result.content[0].text, /trace/);
 });

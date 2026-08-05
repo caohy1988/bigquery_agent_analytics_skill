@@ -27,9 +27,25 @@ import {
   registerAppResource,
   RESOURCE_MIME_TYPE,
 } from "@modelcontextprotocol/ext-apps/server";
-import { mockDashboard, mockTrace } from "./src/mock.js";
-import { buildDashboardSql, buildTraceSql, SECTIONS } from "./src/queries.js";
-import type { DashboardData, Granularity, OverviewStats, TraceEvent } from "./src/types.js";
+import { mockDashboard, mockErrorTraces, mockTrace, mockWidget } from "./src/mock.js";
+import {
+  buildDashboardSql,
+  buildErrorTracesSql,
+  buildTraceSql,
+  buildWidgetSql,
+  SECTIONS,
+  WIDGET_DIMENSIONS,
+  WIDGET_MEASURES,
+} from "./src/queries.js";
+import type {
+  DashboardData,
+  ErrorTraceRow,
+  Granularity,
+  OverviewStats,
+  TraceEvent,
+  WidgetResult,
+  WidgetSpec,
+} from "./src/types.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -114,6 +130,16 @@ async function runQuery(
   return { rows, bytes: Number(meta?.statistics?.totalBytesProcessed ?? 0) };
 }
 
+// Estimate a query's scan size without running it (BigQuery dry run).
+async function dryRunQuery(sql: string, params: Record<string, unknown>): Promise<number> {
+  if (!bqClient) {
+    const { BigQuery } = await import("@google-cloud/bigquery");
+    bqClient = new BigQuery({ projectId: CONFIG.project });
+  }
+  const [job] = await bqClient.createQueryJob({ query: sql, params, dryRun: true });
+  return Number(job.metadata?.statistics?.totalBytesProcessed ?? 0);
+}
+
 const EMPTY_OVERVIEW: OverviewStats = {
   total_events: null,
   errors: null,
@@ -133,15 +159,20 @@ async function bigQueryDashboard(
   const sql = buildDashboardSql({ table: tableRef(), granularity, agentFilter: !!agent });
   const params: Record<string, unknown> = { start: start.toISOString(), end: end.toISOString() };
   if (agent) params.agent = agent;
-  const agentsParams = { start: params.start, end: params.end };
+  // preceding window of equal length, for period-over-period deltas
+  const prevParams: Record<string, unknown> = {
+    start: new Date(start.getTime() - (end.getTime() - start.getTime())).toISOString(),
+    end: start.toISOString(),
+    ...(agent ? { agent } : {}),
+  };
+  const paramsFor = (s: (typeof SECTIONS)[number]): Record<string, unknown> =>
+    s === "prev_overview" ? prevParams : s === "agents" || s === "delegation" ? { start: params.start, end: params.end } : params;
 
   // The refresh budget is split evenly across the panel queries so one
   // dashboard load can never authorize more than BQAA_MAX_BYTES_BILLED total.
   const perQueryBytes = Math.max(10_000_000, Math.floor(CONFIG.refreshBytesBudget / SECTIONS.length));
 
-  const settled = await Promise.allSettled(
-    SECTIONS.map((s) => runQuery(sql[s], s === "agents" ? agentsParams : params, perQueryBytes)),
-  );
+  const settled = await Promise.allSettled(SECTIONS.map((s) => runQuery(sql[s], paramsFor(s), perQueryBytes)));
 
   // One failed panel must not blank the dashboard: keep healthy sections,
   // report the failed ones (truthfully) in meta.section_errors.
@@ -156,8 +187,18 @@ async function bigQueryDashboard(
     sectionErrors[SECTIONS[i]] = r.reason instanceof Error ? r.reason.message : String(r.reason);
     return null;
   };
-  const [overviewRows, timeseries, latencyByAgent, toolStats, modelComparison, topSessions, agentRows] =
-    SECTIONS.map((_, i) => rowsOf(i));
+  const [
+    overviewRows,
+    prevOverviewRows,
+    timeseries,
+    latencyByAgent,
+    toolStats,
+    modelComparison,
+    topSessions,
+    hitl,
+    delegation,
+    agentRows,
+  ] = SECTIONS.map((_, i) => rowsOf(i));
 
   if (Object.keys(sectionErrors).length === SECTIONS.length) {
     throw new Error(`All dashboard queries failed: ${Object.values(sectionErrors)[0]}`);
@@ -174,13 +215,52 @@ async function bigQueryDashboard(
       ...(Object.keys(sectionErrors).length ? { section_errors: sectionErrors } : {}),
     },
     overview: overviewRows?.[0] ?? EMPTY_OVERVIEW,
+    prevOverview: prevOverviewRows?.[0] ?? null,
     timeseries: timeseries ?? [],
     latencyByAgent: latencyByAgent ?? [],
     toolStats: toolStats ?? [],
     modelComparison: modelComparison ?? [],
     topSessions: topSessions ?? [],
+    hitl: hitl ?? [],
+    delegation: delegation ?? [],
     agentsList: (agentRows ?? []).map((r: any) => r.agent),
   };
+}
+
+// ------------------------------------------------------------ custom widgets
+
+const WIDGET_QUERY_BYTES = 200_000_000; // one widget query gets its own cap
+
+async function loadWidget(spec: WidgetSpec, timeRangeHours: number, dryRun: boolean): Promise<WidgetResult> {
+  const end = new Date();
+  const start = new Date(end.getTime() - timeRangeHours * 3_600_000);
+  const granularity: Granularity = spec.granularity ?? (timeRangeHours <= 72 ? "hour" : "day");
+  const fullSpec: WidgetSpec = { v: 1, ...spec, granularity };
+  if (CONFIG.mock) {
+    const result = mockWidget(fullSpec, start, end);
+    return dryRun ? { ...result, rows: [], dry_run: true, estimated_bytes: 12_345_678 } : result;
+  }
+  const built = buildWidgetSql(tableRef(), fullSpec);
+  const params = { start: start.toISOString(), end: end.toISOString(), ...built.filterParams };
+  const window = { start: start.toISOString(), end: end.toISOString() };
+  if (dryRun) {
+    const estimated = await dryRunQuery(built.sql, params);
+    return { spec: fullSpec as WidgetResult["spec"], window, rows: [], dry_run: true, estimated_bytes: estimated };
+  }
+  const { rows, bytes } = await runQuery(built.sql, params, WIDGET_QUERY_BYTES);
+  return { spec: fullSpec as WidgetResult["spec"], window, rows, bytes_processed: bytes };
+}
+
+async function loadErrorTraces(timeRangeHours: number, limit: number): Promise<ErrorTraceRow[]> {
+  if (CONFIG.mock) return mockErrorTraces().slice(0, limit);
+  const end = new Date();
+  const start = new Date(end.getTime() - timeRangeHours * 3_600_000);
+  const { rows } = await runQuery(
+    buildErrorTracesSql(tableRef()),
+    { start: start.toISOString(), end: end.toISOString(), limit },
+    WIDGET_QUERY_BYTES,
+  );
+  return rows;
 }
 
 // Cache + coalescing: identical (window, agent) refreshes within the TTL share
@@ -317,6 +397,115 @@ server.registerTool(
   },
 );
 
+// ---- custom widgets (measure × dimension × filters), conversational + UI
+
+const MEASURE_KEYS = Object.keys(WIDGET_MEASURES) as [string, ...string[]];
+const DIMENSION_KEYS = Object.keys(WIDGET_DIMENSIONS) as [string, ...string[]];
+
+const widgetArgs = {
+  measure: z.enum(MEASURE_KEYS).describe(`One of: ${MEASURE_KEYS.join(", ")}`),
+  dimension: z.enum(DIMENSION_KEYS).describe(`Group by: ${DIMENSION_KEYS.join(", ")}`),
+  time_range_hours: z.number().int().min(1).max(MAX_HOURS).default(CONFIG.defaultHours),
+  granularity: z.enum(["hour", "day"]).optional().describe("Bucket size when dimension=time"),
+  agent: z.string().max(200).optional(),
+  model: z.string().max(200).optional(),
+  tool: z.string().max(200).optional(),
+  status: z.enum(["OK", "ERROR"]).optional(),
+  limit: z.number().int().min(1).max(100).optional().describe("Top-N for categorical dimensions (default 20)"),
+  dry_run: z.boolean().default(false).describe("Estimate bytes scanned without running the query"),
+};
+
+type WidgetArgs = {
+  measure: string;
+  dimension: string;
+  time_range_hours?: number;
+  granularity?: Granularity;
+  agent?: string;
+  model?: string;
+  tool?: string;
+  status?: "OK" | "ERROR";
+  limit?: number;
+  dry_run?: boolean;
+};
+
+function widgetSpecOf(args: WidgetArgs): WidgetSpec {
+  return {
+    measure: args.measure,
+    dimension: args.dimension,
+    granularity: args.granularity,
+    limit: args.limit,
+    filters: { agent: args.agent, model: args.model, tool: args.tool, status: args.status },
+  };
+}
+
+function summarizeWidget(r: WidgetResult): string {
+  const label = `${WIDGET_MEASURES[r.spec.measure]?.label ?? r.spec.measure} by ${r.spec.dimension}`;
+  if (r.dry_run) {
+    return `Dry run for "${label}": would scan ~${((r.estimated_bytes ?? 0) / 1e6).toFixed(1)} MB.`;
+  }
+  const top = r.rows
+    .slice(0, 5)
+    .map((row) => `${row.dim ?? "(null)"}: ${row.value ?? "n/a"}`)
+    .join("; ");
+  return `${label} (${r.rows.length} rows): ${top}${r.rows.length > 5 ? "; …" : ""}`;
+}
+
+async function widgetHandler(args: WidgetArgs) {
+  const result = await loadWidget(widgetSpecOf(args), args.time_range_hours ?? CONFIG.defaultHours, !!args.dry_run);
+  return {
+    content: [{ type: "text" as const, text: summarizeWidget(result) }],
+    structuredContent: { data: result } as any,
+  };
+}
+
+server.registerTool(
+  "query_widget",
+  {
+    title: "Query a custom widget",
+    description:
+      "Run one custom analytics widget over agent_events: a measure (count/latency/tokens/error-rate/…) grouped by a dimension (time, agent, model, tool, user, status, event_type) with optional filters. Set dry_run=true to estimate bytes scanned first. Used by the dashboard's Explore tab and for ad-hoc questions.",
+    inputSchema: widgetArgs,
+    outputSchema: { data: z.unknown() },
+  },
+  widgetHandler,
+);
+
+registerAppTool(
+  server,
+  "render_widget",
+  {
+    title: "Render a custom widget",
+    description:
+      "Build a custom chart from natural language and render it interactively in the dashboard UI: pick a measure, a dimension, and filters. Use when the user asks to visualize a specific slice (e.g. 'show p95 latency by tool for errors').",
+    inputSchema: widgetArgs,
+    outputSchema: { data: z.unknown() },
+    _meta: { ui: { resourceUri } },
+  },
+  widgetHandler,
+);
+
+server.registerTool(
+  "list_error_traces",
+  {
+    title: "List recent error traces",
+    description:
+      "Return recent trace ids that contain errors, with sample error messages — use with get_trace to cite exact evidence when diagnosing failures.",
+    inputSchema: {
+      time_range_hours: z.number().int().min(1).max(MAX_HOURS).default(CONFIG.defaultHours),
+      limit: z.number().int().min(1).max(50).default(10),
+    },
+    outputSchema: { data: z.unknown() },
+  },
+  async (args) => {
+    const rows = await loadErrorTraces(args.time_range_hours ?? CONFIG.defaultHours, args.limit ?? 10);
+    const text = rows.length
+      ? `${rows.length} recent trace(s) with errors:\n` +
+        rows.map((r) => `- ${r.trace_id} (${r.last_ts}, agents: ${r.agents ?? "?"}) — ${r.sample_errors ?? ""}`).join("\n")
+      : "No traces with errors in this window.";
+    return { content: [{ type: "text" as const, text }], structuredContent: { data: rows } as any };
+  },
+);
+
 registerAppResource(server, resourceUri, resourceUri, { mimeType: RESOURCE_MIME_TYPE }, async () => {
   const html = await fs.readFile(uiBundlePath(), "utf-8");
   return { contents: [{ uri: resourceUri, mimeType: RESOURCE_MIME_TYPE, text: html }] };
@@ -416,6 +605,39 @@ app.get("/api/trace", checkOrigin, requireAuth, async (req, res) => {
     }
     const hours = Math.min(MAX_HOURS, Math.max(1, Math.trunc(Number(req.query.time_range_hours)) || CONFIG.defaultHours));
     const data = await loadTrace(traceId, hours);
+    res.json({ data });
+  } catch (e) {
+    res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
+app.get("/api/widget", checkOrigin, requireAuth, async (req, res) => {
+  try {
+    const q = req.query;
+    const str = (k: string): string | undefined =>
+      typeof q[k] === "string" && q[k] !== "" ? (q[k] as string).slice(0, 200) : undefined;
+    const measure = str("measure") ?? "";
+    const dimension = str("dimension") ?? "";
+    if (!WIDGET_MEASURES[measure] || !WIDGET_DIMENSIONS[dimension]) {
+      res.status(400).json({ error: `Unknown measure or dimension. Measures: ${MEASURE_KEYS.join(", ")}; dimensions: ${DIMENSION_KEYS.join(", ")}` });
+      return;
+    }
+    const hours = Math.min(MAX_HOURS, Math.max(1, Math.trunc(Number(q.time_range_hours)) || CONFIG.defaultHours));
+    const limitRaw = Math.trunc(Number(q.limit));
+    const status = str("status");
+    const spec: WidgetSpec = {
+      measure,
+      dimension,
+      granularity: str("granularity") === "hour" ? "hour" : str("granularity") === "day" ? "day" : undefined,
+      limit: Number.isInteger(limitRaw) && limitRaw > 0 ? Math.min(100, limitRaw) : undefined,
+      filters: {
+        agent: str("agent"),
+        model: str("model"),
+        tool: str("tool"),
+        status: status === "OK" || status === "ERROR" ? status : undefined,
+      },
+    };
+    const data = await loadWidget(spec, hours, q.dry_run === "1");
     res.json({ data });
   } catch (e) {
     res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
