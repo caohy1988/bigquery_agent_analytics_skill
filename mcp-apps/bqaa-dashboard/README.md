@@ -68,6 +68,23 @@ npx cloudflared tunnel --url http://localhost:3001
 Add the generated URL as a custom connector (Settings → Connectors → Add custom
 connector), then ask Claude to show your agent dashboard.
 
+### Deploy to Cloud Run
+
+```bash
+gcloud run deploy bqaa-dashboard --source . --region us-central1 \
+  --allow-unauthenticated \
+  --set-env-vars "BQAA_PROJECT=<project>,BQAA_DATASET=agent_analytics,BQAA_TABLE=agent_events"
+```
+
+Grant the runtime service account `roles/bigquery.jobUser` and
+`roles/bigquery.dataViewer` (or dataset-scoped read access). The resulting
+`https://….run.app/mcp` URL can be added directly as a Claude custom connector.
+
+> **Note:** `--allow-unauthenticated` makes the MCP endpoint public — anyone
+> with the URL can query the configured table's aggregates and traces. Fine for
+> demo/test datasets; for production telemetry put the service behind IAP, an
+> API gateway, or MCP OAuth before exposing it.
+
 ### Test without a host
 
 - `ext-apps` basic-host: `SERVERS='["http://localhost:3001/mcp"]' npm start`
