@@ -43,12 +43,20 @@ const LLM_LATENCY_EXPR = `IF(event_type = 'LLM_RESPONSE', ${LATENCY_EXPR}, NULL)
 export const ERROR_EXPR =
   "(status = 'ERROR' OR ENDS_WITH(event_type, '_ERROR') OR error_message IS NOT NULL)";
 
-// The refresh byte budget is split exactly across parts — no per-part floor,
-// so the aggregate can never exceed the configured budget.
+// BigQuery rejects maximumBytesBilled below 10 MiB, so a valid refresh budget
+// must give every query at least that much. The split is exact — no padding —
+// so the aggregate can never exceed the configured budget, and budgets too
+// small to satisfy the per-query minimum are rejected outright.
+export const BQ_MIN_BYTES_PER_QUERY = 10_485_760; // 10 MiB, BigQuery's floor
+
 export function splitBudget(totalBytes: number, parts: number): number {
   if (parts <= 0) throw new Error("parts must be positive");
   const per = Math.floor(totalBytes / parts);
-  if (per < 1) throw new Error(`Budget ${totalBytes} too small to split across ${parts} queries`);
+  if (per < BQ_MIN_BYTES_PER_QUERY) {
+    throw new Error(
+      `Budget ${totalBytes} splits to ${per} bytes/query across ${parts} queries — below BigQuery's ${BQ_MIN_BYTES_PER_QUERY}-byte minimum for maximumBytesBilled`,
+    );
+  }
   return per;
 }
 

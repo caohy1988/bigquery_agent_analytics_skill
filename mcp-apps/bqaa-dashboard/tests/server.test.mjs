@@ -332,3 +332,80 @@ test("resources/read serves the built bundle, not the raw Vite shell", async () 
   assert.ok(!html.includes('src="/src/mcp-app.ts"'), "must serve the bundled dist, not the dev shell");
   assert.match(html, /viz-root/);
 });
+
+// ---- production BigQuery branches via the injectable fake client (#8)
+
+const FAKE_ENV = { BQAA_MOCK: "", BQAA_PROJECT: "fake-proj", BQAA_FAKE_BQ: "ok" };
+
+test("production path: real query pipeline succeeds, bills bytes, and caches (#8)", async () => {
+  const port = PORT + 104;
+  const srv = startServer(FAKE_ENV, port);
+  try {
+    await waitFor(`http://localhost:${port}/healthz`);
+    const res = await fetch(`http://localhost:${port}/api/dashboard?time_range_hours=24`);
+    assert.equal(res.status, 200);
+    const { data } = await res.json();
+    assert.equal(data.meta.section_errors, undefined);
+    assert.ok(data.meta.bytes_processed > 0, "bytes accounting must run");
+    assert.equal(data.overview.total_events, 1000);
+    const again = await fetch(`http://localhost:${port}/api/dashboard?time_range_hours=24`);
+    const second = await again.json();
+    assert.equal(second.data.meta.cache_hit, true, "healthy results are cacheable");
+  } finally {
+    srv.child.kill();
+  }
+});
+
+test("production path: partial failure reports the section and is NOT cached (#2)", async () => {
+  const port = PORT + 105;
+  const srv = startServer({ ...FAKE_ENV, BQAA_FAKE_BQ: "fail_one" }, port);
+  try {
+    await waitFor(`http://localhost:${port}/healthz`);
+    const res = await fetch(`http://localhost:${port}/api/dashboard?time_range_hours=24`);
+    const { data } = await res.json();
+    assert.match(data.meta.section_errors?.models ?? "", /synthetic models-section failure/);
+    assert.ok(data.overview.total_events > 0, "healthy sections still render");
+    // degraded results must not be served from cache: the retry re-executes
+    const again = await fetch(`http://localhost:${port}/api/dashboard?time_range_hours=24`);
+    const second = await again.json();
+    assert.notEqual(second.data.meta.cache_hit, true, "partial results must be evicted from cache");
+  } finally {
+    srv.child.kill();
+  }
+});
+
+test("production path: stalled job hits the deadline, is cancelled, and releases its slot (#9)", async () => {
+  const port = PORT + 106;
+  const srv = startServer({ ...FAKE_ENV, BQAA_FAKE_BQ: "stall", BQAA_QUERY_TIMEOUT_MS: "600" }, port);
+  try {
+    await waitFor(`http://localhost:${port}/healthz`);
+    const res = await fetch(`http://localhost:${port}/api/dashboard?time_range_hours=24`);
+    const { data } = await res.json();
+    assert.match(data.meta.section_errors?.overview ?? "", /timed out/);
+    // the stalled job was cancelled and its slot released — the server keeps serving
+    await new Promise((r) => setTimeout(r, 200));
+    assert.match(srv.logs(), /FAKE_BQ_JOB_CANCELLED/);
+    const widget = await fetch(`http://localhost:${port}/api/widget?measure=events&dimension=agent`);
+    assert.equal(widget.status, 200);
+  } finally {
+    srv.child.kill();
+  }
+});
+
+test("budget below BigQuery's 10-query minimum fails fast at startup (#4)", async () => {
+  const srv = startServer({ ...FAKE_ENV, BQAA_MAX_BYTES_BILLED: "10000000" }, PORT + 107);
+  const code = await new Promise((resolve) => srv.child.on("exit", resolve));
+  assert.notEqual(code, 0);
+  assert.match(srv.logs(), /Invalid BQAA_MAX_BYTES_BILLED/);
+});
+
+test("ask_data accepts bounded history (#16)", async () => {
+  const call = await rpc(BASE, "tools/call", {
+    name: "ask_data",
+    arguments: {
+      question: "What about the second-worst tool?",
+      history: [{ question: "Which tool fails most?", answer: "fetch_invoice at 7.1%" }],
+    },
+  });
+  assert.ok(call.body.result.structuredContent?.data?.answer);
+});

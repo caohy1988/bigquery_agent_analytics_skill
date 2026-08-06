@@ -144,10 +144,13 @@ test("one canonical error predicate is used on every surface (#10)", () => {
   assert.ok(WIDGET_MEASURES.tool_failures.sql.includes(ERROR_EXPR));
 });
 
-test("refresh budget splits exactly with no floor (#1)", () => {
-  assert.equal(splitBudget(10_000_000, 10), 1_000_000);
+test("refresh budget splits exactly and respects BigQuery's 10 MiB per-query floor", () => {
+  assert.equal(splitBudget(2_000_000_000, 10), 200_000_000);
   assert.equal(splitBudget(2_000_000_000, 10) * 10 <= 2_000_000_000, true);
-  assert.throws(() => splitBudget(5, 10));
+  // exact boundary: 10 x 10,485,760 is the smallest valid refresh budget
+  assert.equal(splitBudget(10 * 10_485_760, 10), 10_485_760);
+  assert.throws(() => splitBudget(10 * 10_485_760 - 1, 10), /minimum/);
+  assert.throws(() => splitBudget(10_000_000, 10), /minimum/);
 });
 
 test("delegation deduplicates spans before joining (#11)", () => {

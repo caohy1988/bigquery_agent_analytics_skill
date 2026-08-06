@@ -25,6 +25,7 @@ export interface CaConfig {
   dataset: string;
   table: string;
   location?: string; // default "global"
+  maxBilledBytes?: number; // BigQuery byte cap applied to CA-generated queries
 }
 
 const SYSTEM_INSTRUCTION =
@@ -59,6 +60,11 @@ export async function askConversational(
       messages,
       inlineContext: {
         systemInstruction: SYSTEM_INSTRUCTION,
+        // The Ask path must honor the same cost boundary as the dashboard:
+        // cap the bytes CA-generated queries may bill.
+        ...(cfg.maxBilledBytes
+          ? { options: { datasource: { bigQueryMaxBilledBytes: String(cfg.maxBilledBytes) } } }
+          : {}),
         datasourceReferences: {
           bq: {
             tableReferences: [{ projectId: cfg.project, datasetId: cfg.dataset, tableId: cfg.table }],

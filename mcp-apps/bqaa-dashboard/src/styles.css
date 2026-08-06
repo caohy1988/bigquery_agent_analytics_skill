@@ -538,13 +538,14 @@ details.data-table[open] summary { color: var(--ink-2); }
 /* price book editor */
 .price-grid {
   display: grid;
-  grid-template-columns: minmax(120px, 1fr) 110px 110px;
+  /* every column can shrink — the grid must fit 320px hosts without clipping */
+  grid-template-columns: minmax(72px, 1.4fr) minmax(64px, 1fr) minmax(64px, 1fr);
   gap: 6px 10px;
   align-items: center;
   margin-bottom: 10px;
 }
-.price-head { color: var(--muted); font-size: 10.5px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; }
-.price-model { color: var(--ink-2); font-size: 12px; }
+.price-head { color: var(--muted); font-size: 10.5px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.price-model { color: var(--ink-2); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .price-grid input {
   font: inherit;
   color: var(--ink);
@@ -553,6 +554,7 @@ details.data-table[open] summary { color: var(--ink-2); }
   border-radius: 7px;
   padding: 5px 8px;
   width: 100%;
+  min-width: 0; /* let the grid track shrink below the input's intrinsic size */
   font-variant-numeric: tabular-nums;
 }
 .foot {

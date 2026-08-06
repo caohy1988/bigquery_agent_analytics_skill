@@ -30,6 +30,7 @@ import {
 import { askConversational } from "./src/ca.js";
 import { mockAsk, mockDashboard, mockErrorTraces, mockTrace, mockWidget } from "./src/mock.js";
 import {
+  BQ_MIN_BYTES_PER_QUERY,
   buildDashboardSql,
   buildErrorTracesSql,
   buildTraceSql,
@@ -75,7 +76,16 @@ const CONFIG = {
   table: process.env.BQAA_TABLE ?? "agent_events",
   mock: process.env.BQAA_MOCK === "1" || !process.env.BQAA_PROJECT,
   // Budget for ONE dashboard refresh (split across its queries), in bytes.
-  refreshBytesBudget: intEnv("BQAA_MAX_BYTES_BILLED", 2_000_000_000, 10_000_000, 1_000_000_000_000),
+  // Minimum = SECTIONS x BigQuery's 10 MiB floor for maximumBytesBilled —
+  // anything smaller would make every panel query invalid.
+  refreshBytesBudget: intEnv(
+    "BQAA_MAX_BYTES_BILLED",
+    2_000_000_000,
+    SECTIONS.length * BQ_MIN_BYTES_PER_QUERY,
+    1_000_000_000_000,
+  ),
+  // Application deadline for a single BigQuery query (job is cancelled on expiry).
+  queryTimeoutMs: intEnv("BQAA_QUERY_TIMEOUT_MS", 90_000, 500, 600_000),
   port: intEnv("PORT", 3001, 0, 65535),
   defaultHours: intEnv("BQAA_DEFAULT_HOURS", 168, 1, MAX_HOURS),
   authToken: process.env.BQAA_AUTH_TOKEN ?? "",
@@ -139,28 +149,54 @@ async function runQuery(
   maxBytes: number,
 ): Promise<QueryResult> {
   return withJobSlot(async () => {
-    if (!bqClient) {
-      const { BigQuery } = await import("@google-cloud/bigquery");
-      bqClient = new BigQuery({ projectId: CONFIG.project });
-    }
-    const [job] = await bqClient.createQueryJob({
+    const client = await bigQueryClient();
+    const [job] = await client.createQueryJob({
       query: sql,
       params,
       maximumBytesBilled: String(maxBytes),
     });
-    const [rows] = await job.getQueryResults();
-    const [meta] = await job.getMetadata();
-    return { rows, bytes: Number(meta?.statistics?.totalBytesProcessed ?? 0) };
+    try {
+      // #9: an application deadline so a stalled job cannot hold its slot
+      const [rows] = await withDeadline<[any[]]>(job.getQueryResults(), CONFIG.queryTimeoutMs);
+      const [meta] = await job.getMetadata();
+      return { rows, bytes: Number(meta?.statistics?.totalBytesProcessed ?? 0) };
+    } catch (e) {
+      if (e instanceof Error && e.message.includes("timed out")) {
+        void (job as any).cancel?.().catch(() => {});
+      }
+      throw e;
+    }
   });
+}
+
+async function bigQueryClient(): Promise<any> {
+  if (!bqClient) {
+    if (process.env.BQAA_FAKE_BQ) {
+      // test seam: production branches run against a controllable fake
+      const { makeFakeBigQuery } = await import("./src/fakebq.js");
+      bqClient = makeFakeBigQuery(process.env.BQAA_FAKE_BQ) as any;
+    } else {
+      const { BigQuery } = await import("@google-cloud/bigquery");
+      bqClient = new BigQuery({ projectId: CONFIG.project });
+    }
+  }
+  return bqClient;
+}
+
+function withDeadline<T>(p: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout>;
+  return Promise.race([
+    p,
+    new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`BigQuery query timed out after ${ms} ms`)), ms);
+    }),
+  ]).finally(() => clearTimeout(timer)) as Promise<T>;
 }
 
 // Estimate a query's scan size without running it (BigQuery dry run).
 async function dryRunQuery(sql: string, params: Record<string, unknown>): Promise<number> {
-  if (!bqClient) {
-    const { BigQuery } = await import("@google-cloud/bigquery");
-    bqClient = new BigQuery({ projectId: CONFIG.project });
-  }
-  const [job] = await bqClient.createQueryJob({ query: sql, params, dryRun: true });
+  const client = await bigQueryClient();
+  const [job] = await client.createQueryJob({ query: sql, params, dryRun: true });
   return Number(job.metadata?.statistics?.totalBytesProcessed ?? 0);
 }
 
@@ -277,13 +313,32 @@ async function loadWidget(spec: WidgetSpec, timeRangeHours: number, dryRun: bool
 
 // ------------------------------------------------ conversational layer (BQCA)
 
+// Ask runs Conversational Analytics work in our project: bound how many run
+// at once, and cap the bytes its generated queries may bill (#5).
+const MAX_CONCURRENT_ASK = 3;
+let inflightAsk = 0;
+
 async function ask(question: string, history: AskExchange[]): Promise<AskResult> {
   if (CONFIG.mock) return mockAsk(question);
-  return askConversational(
-    { project: CONFIG.project, dataset: CONFIG.dataset, table: CONFIG.table, location: process.env.BQAA_CA_LOCATION },
-    question,
-    history,
-  );
+  if (inflightAsk >= MAX_CONCURRENT_ASK) {
+    throw new Error("Server busy: too many concurrent Ask requests — retry shortly");
+  }
+  inflightAsk++;
+  try {
+    return await askConversational(
+      {
+        project: CONFIG.project,
+        dataset: CONFIG.dataset,
+        table: CONFIG.table,
+        location: process.env.BQAA_CA_LOCATION,
+        maxBilledBytes: CONFIG.refreshBytesBudget,
+      },
+      question,
+      history,
+    );
+  } finally {
+    inflightAsk--;
+  }
 }
 
 async function loadErrorTraces(timeRangeHours: number, limit: number): Promise<ErrorTraceRow[]> {
@@ -342,8 +397,19 @@ async function loadDashboard(timeRangeHours: number, agent?: string | null): Pro
     return { ...data, meta: { ...data.meta, cache_hit: true } };
   }
   const promise = bigQueryDashboard(start, end, granularity, agent);
-  cacheSet(key, { promise, expires: Date.now() + CACHE_TTL_MS });
-  promise.catch(() => dashboardCache.delete(key)); // failures are not cacheable
+  const entry = { promise, expires: Date.now() + CACHE_TTL_MS };
+  cacheSet(key, entry);
+  promise
+    .then((d) => {
+      // #2: a degraded (partial-failure) result must not be served from cache
+      // for the full TTL — evict it so the next refresh retries immediately.
+      if (Object.keys(d.meta.section_errors ?? {}).length && dashboardCache.get(key) === entry) {
+        dashboardCache.delete(key);
+      }
+    })
+    .catch(() => {
+      if (dashboardCache.get(key) === entry) dashboardCache.delete(key); // failures are not cacheable
+    });
   return promise;
 }
 
@@ -565,11 +631,16 @@ server.registerTool(
       "Ask a natural-language analytics question about the agent_events table. Answered by BigQuery Conversational Analytics (Gemini Data Analytics): it plans, writes and runs SQL, and returns an answer with the generated SQL and result rows. Slower than the widget tools (~30-60s) but handles open-ended questions.",
     inputSchema: {
       question: z.string().min(3).max(2000).describe("The analytics question, in natural language"),
+      history: z
+        .array(z.object({ question: z.string().max(2000), answer: z.string().max(4000) }))
+        .max(3)
+        .optional()
+        .describe("Up to 3 prior question/answer exchanges, for follow-up context"),
     },
     outputSchema: { data: z.unknown() },
   },
   async (args) => {
-    const result = await ask(args.question, []);
+    const result = await ask(args.question, args.history ?? []);
     return {
       content: [{ type: "text" as const, text: result.answer + (result.sql ? `\n\nGenerated SQL:\n${result.sql}` : "") }],
       structuredContent: { data: result } as any,

@@ -1304,6 +1304,7 @@ let exploreOpSeq = 0;
 
 function exploreSpecChanged(): void {
   exploreOpSeq++; // cancels any in-flight op's right to publish
+  widgetAbort?.abort(); // and stops its HTTP request outright (#15)
   explore.estimate = null;
   explore.result = null;
 }
@@ -1315,6 +1316,9 @@ let effectiveHours: number | null = null;
 function currentHours(): number {
   return effectiveHours ?? Number(rangeEl.value);
 }
+
+// #15: superseded standalone widget requests are aborted, not just ignored
+let widgetAbort: AbortController | null = null;
 
 async function runWidget(dryRun: boolean): Promise<WidgetResult> {
   const hours = currentHours();
@@ -1338,9 +1342,12 @@ async function runWidget(dryRun: boolean): Promise<WidgetResult> {
     return data as WidgetResult;
   }
   if (location.protocol.startsWith("http")) {
+    widgetAbort?.abort();
+    const abort = new AbortController();
+    widgetAbort = abort;
     const q = new URLSearchParams();
     for (const [k, v] of Object.entries(args)) q.set(k, k === "dry_run" ? "1" : String(v));
-    const res = await fetch(`api/widget?${q}`, { headers: authHeaders() });
+    const res = await fetch(`api/widget?${q}`, { headers: authHeaders(), signal: abort.signal });
     const body: any = await res.json().catch(() => null);
     if (!res.ok) throw new Error(body?.error ?? `HTTP ${res.status}`);
     return body.data as WidgetResult;
@@ -1602,7 +1609,7 @@ async function submitQuestion(question: string): Promise<void> {
     let result: AskResult;
     const history = askState.exchanges.slice(-3).map((e) => ({ question: e.question, answer: e.answer }));
     if (embedded && appBridge) {
-      const r: any = await appBridge.callServerTool({ name: "ask_data", arguments: { question: q } });
+      const r: any = await appBridge.callServerTool({ name: "ask_data", arguments: { question: q, history } });
       const d = r?.structuredContent?.data;
       if (!d?.answer) throw new Error("no answer in tool result");
       result = d as AskResult;
@@ -1862,6 +1869,10 @@ function renderTabs(): void {
 function renderView(): void {
   hideTooltip();
   mainEl.replaceChildren();
+  if (authRequired) {
+    renderLoginPrompt(); // #17: survives resize-triggered re-renders
+    return;
+  }
   if (!data && !(currentView === "explore" && explore.result) && currentView !== "ask") {
     mainEl.appendChild(el("div", "empty", "Waiting for data…"));
     return;
@@ -1990,8 +2001,12 @@ async function fetchStandalone(
 }
 
 // Token sign-in for protected servers: the token is exchanged for an HttpOnly
-// cookie via POST /auth/login and never appears in a URL.
+// cookie via POST /auth/login and never appears in a URL. The prompt is app
+// STATE (#17) — a resize/re-render rebuilds it instead of erasing it.
+let authRequired = false;
+
 function renderLoginPrompt(): void {
+  authRequired = true;
   statusEl.textContent = "";
   statusEl.classList.remove("error");
   mainEl.classList.remove("loading");
@@ -2008,6 +2023,7 @@ function renderLoginPrompt(): void {
     btn.disabled = true;
     const ok = await loginWithToken(input.value).catch(() => false);
     if (ok) {
+      authRequired = false;
       void refresh();
     } else {
       btn.disabled = false;
@@ -2039,7 +2055,7 @@ async function refresh(): Promise<void> {
   const abort = new AbortController();
   inflightAbort = abort;
 
-  const hours = Number(rangeEl.value);
+  const hours = currentHours(); // #18: honor a non-preset effective window
   const agent = agentEl.value || pendingAgent || undefined;
   pendingAgent = undefined;
   mainEl.classList.add("loading");
@@ -2077,7 +2093,7 @@ async function refresh(): Promise<void> {
 
 // ------------------------------------------------------------ trace drill-down
 
-async function fetchTrace(traceId: string): Promise<{ events: TraceEvent[]; truncated: boolean }> {
+async function fetchTrace(traceId: string, signal?: AbortSignal): Promise<{ events: TraceEvent[]; truncated: boolean }> {
   const hours = currentHours();
   if (embedded && appBridge) {
     const result: any = await appBridge.callServerTool({
@@ -2091,7 +2107,7 @@ async function fetchTrace(traceId: string): Promise<{ events: TraceEvent[]; trun
   }
   if (location.protocol.startsWith("http")) {
     const q = new URLSearchParams({ trace_id: traceId, time_range_hours: String(hours) });
-    const res = await fetch(`api/trace?${q}`, { headers: authHeaders() });
+    const res = await fetch(`api/trace?${q}`, { headers: authHeaders(), signal });
     const body: any = await res.json().catch(() => null);
     if (!res.ok) throw new Error(body?.error ?? `HTTP ${res.status}`);
     return { events: body?.data ?? [], truncated: !!body?.truncated };
@@ -2109,6 +2125,9 @@ interface TraceCardState {
   error: string | null;
 }
 let traceCard: TraceCardState | null = null;
+// #6: a trace fetched under an old window must not publish under a new one
+let traceGen = 0;
+let traceAbort: AbortController | null = null;
 
 // canonical error semantics on the client, matching the SQL predicate (#10)
 function isErrorEvent(e: TraceEvent): boolean {
@@ -2166,26 +2185,41 @@ function renderTraceCard(main: HTMLElement): void {
 }
 
 async function showTrace(traceId: string): Promise<void> {
+  const gen = ++traceGen;
+  traceAbort?.abort();
+  const abort = new AbortController();
+  traceAbort = abort;
   traceCard = { traceId, view: currentView, events: null, truncated: false, error: null };
   renderView();
   document.getElementById("trace-card")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
   try {
-    const { events, truncated } = await fetchTrace(traceId);
-    if (traceCard?.traceId !== traceId) return; // closed or replaced meanwhile
+    const { events, truncated } = await fetchTrace(traceId, abort.signal);
+    if (gen !== traceGen || traceCard?.traceId !== traceId) return; // window changed or replaced
     traceCard = { ...traceCard, events, truncated };
   } catch (err) {
-    if (traceCard?.traceId !== traceId) return;
+    if (gen !== traceGen || traceCard?.traceId !== traceId) return;
+    if (err instanceof DOMException && err.name === "AbortError") return;
     traceCard = { ...traceCard, error: err instanceof Error ? err.message : String(err) };
   }
   renderView();
 }
 
+function invalidateTrace(): void {
+  traceGen++;
+  traceAbort?.abort();
+  traceCard = null; // an open trace belongs to the previous window
+}
+
 rangeEl.addEventListener("change", () => {
   rangeTouched = true;
   effectiveHours = null; // user picked a preset — it wins
+  invalidateTrace();
   void refresh();
 });
-agentEl.addEventListener("change", refresh);
+agentEl.addEventListener("change", () => {
+  invalidateTrace();
+  void refresh();
+});
 
 let resizeTimer: ReturnType<typeof setTimeout> | undefined;
 function scheduleRerender(): void {
