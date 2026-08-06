@@ -126,10 +126,13 @@ export function mockDashboard(
   const modelComparison: ModelComparisonRow[] = MODELS.map((model) => {
     const calls = Math.round(llmCallsTotal * (model.endsWith("flash") ? 0.64 : 0.36));
     const base = model.endsWith("pro") ? 2100 : 950;
+    const share = model.endsWith("flash") ? 0.64 : 0.36;
     return {
       model_id: model,
       calls,
       error_rate_pct: Math.round((0.4 + rand() * 2.2) * 100) / 100,
+      total_prompt_tokens: Math.round(promptTotal * share),
+      total_completion_tokens: Math.round(completionTotal * share),
       avg_total_tokens: Math.round(2800 + rand() * 900),
       avg_prompt_tokens: Math.round(2300 + rand() * 700),
       avg_completion_tokens: Math.round(420 + rand() * 180),

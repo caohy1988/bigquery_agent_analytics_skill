@@ -262,3 +262,73 @@ test("MCP ask_data tool answers questions", async () => {
   assert.ok(d?.answer);
   assert.match(call.body.result.content[0].text, /failure|fail/i);
 });
+
+// ---- fresh-review fixes
+
+test("concurrent MCP calls all succeed with request-local servers (#5)", async () => {
+  const results = await Promise.all(
+    Array.from({ length: 8 }, () =>
+      rpc(BASE, "tools/call", { name: "query_agent_metrics", arguments: { time_range_hours: 24 } }),
+    ),
+  );
+  for (const r of results) {
+    assert.equal(r.status, 200);
+    assert.ok(r.body?.result?.structuredContent?.data?.overview, "each concurrent call must return data");
+  }
+});
+
+test("URL tokens are rejected; cookie login works (#6)", async () => {
+  const port = PORT + 103;
+  const srv = startServer({ BQAA_AUTH_TOKEN: "s3cret" }, port);
+  try {
+    await waitFor(`http://localhost:${port}/healthz`);
+    // token in the URL must NOT authenticate
+    const urlToken = await fetch(`http://localhost:${port}/api/dashboard?token=s3cret`);
+    assert.equal(urlToken.status, 401);
+    // wrong login rejected
+    const badLogin = await fetch(`http://localhost:${port}/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token: "nope" }),
+    });
+    assert.equal(badLogin.status, 401);
+    // correct login issues an HttpOnly cookie that authenticates
+    const login = await fetch(`http://localhost:${port}/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token: "s3cret" }),
+    });
+    assert.equal(login.status, 204);
+    const cookie = login.headers.get("set-cookie") ?? "";
+    assert.match(cookie, /HttpOnly/);
+    const withCookie = await fetch(`http://localhost:${port}/api/dashboard`, {
+      headers: { Cookie: cookie.split(";")[0] },
+    });
+    assert.equal(withCookie.status, 200);
+  } finally {
+    srv.child.kill();
+  }
+});
+
+test("readiness reports the data backend; payload carries exact sums and truncation (#26,#7,#23)", async () => {
+  const health = await fetch(`${BASE}/api/health`);
+  assert.equal(health.status, 200);
+  const h = await health.json();
+  assert.equal(h.bigquery, "mock");
+
+  const res = await fetch(`${BASE}/api/dashboard?time_range_hours=24`);
+  const { data } = await res.json();
+  assert.ok(data.modelComparison[0].total_prompt_tokens > 0, "exact prompt-token sums required for cost");
+  assert.ok(data.modelComparison[0].total_completion_tokens > 0);
+
+  const trace = await fetch(`${BASE}/api/trace?trace_id=abcd1234abcd1234`);
+  const t = await trace.json();
+  assert.equal(typeof t.truncated, "boolean");
+});
+
+test("resources/read serves the built bundle, not the raw Vite shell", async () => {
+  const res = await rpc(BASE, "resources/read", { uri: "ui://bqaa/dashboard.html" });
+  const html = res.body.result.contents[0].text;
+  assert.ok(!html.includes('src="/src/mcp-app.ts"'), "must serve the bundled dist, not the dev shell");
+  assert.match(html, /viz-root/);
+});

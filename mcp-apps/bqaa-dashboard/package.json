@@ -9,7 +9,8 @@
     "serve": "tsx server.ts",
     "start": "npm run build && npm run serve",
     "test": "node --import tsx --test tests/*.test.mjs",
-    "build:server": "esbuild server.ts --bundle --platform=node --format=esm --packages=external --outfile=dist/server.mjs"
+    "build:server": "esbuild server.ts --bundle --platform=node --format=esm --packages=external --outfile=dist/server.mjs",
+    "pretest": "npm run build"
   },
   "dependencies": {
     "@google-cloud/bigquery": "^9.0.0",

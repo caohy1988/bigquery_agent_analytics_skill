@@ -178,6 +178,8 @@ html, body { height: 100%; }
   background: var(--surface-1);
 }
 .pulse .shell { padding-top: 6px; padding-bottom: 4px; }
+.pulse .pulse-data { border-top: none; margin-top: 0; }
+.pulse .pulse-data summary { padding: 2px 0 6px; font-size: 10.5px; }
 .pulse-label {
   position: absolute;
   top: 7px;
@@ -197,7 +199,12 @@ html, body { height: 100%; }
   gap: 4px;
   padding-top: 10px;
   border-bottom: 1px solid var(--grid);
+  /* narrow MCP hosts: the tab row scrolls inside itself, never the page */
+  overflow-x: auto;
+  scrollbar-width: none;
 }
+.tabs::-webkit-scrollbar { display: none; }
+.tabs button { flex: none; white-space: nowrap; }
 .tabs button {
   font: 500 13px var(--font-body);
   color: var(--ink-2);

@@ -8,14 +8,19 @@ VS Code Copilot, Goose, …) via the
 
 Design/discussion: [GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK#396](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/issues/396)
 
-Ask the host *"show me my agent dashboard"* and get four views in the chat:
+Ask the host *"show me my agent dashboard"* — or open the URL in a browser —
+and get eight views:
 
 | View | Contents |
 |---|---|
-| **Overview** | events / sessions / users / error-rate / p95 stat tiles; events & errors over time; LLM p50/p95 latency over time |
+| **Overview** | stat tiles with period-over-period deltas and sparklines; events & errors over time; LLM p50/p95 latency over time |
+| **Ask** | natural-language questions answered by BigQuery Conversational Analytics (answer + generated SQL + rows + follow-ups) |
 | **Latency** | p95 by agent × model bars; avg / TTFT / p50 / p95 / p99 table |
-| **Tokens** | prompt vs completion stacked columns; model comparison; top sessions by tokens |
+| **Tokens** | prompt vs completion stacked columns; model comparison; top sessions by tokens with trace drill-down |
 | **Tools** | succeeded/failed calls per tool; failure-rate and latency table |
+| **Cost** | editable per-model price book × exact token sums; cost over time and by model |
+| **Agents** | HITL requests/completions/wait times; agent delegation map |
+| **Explore** | custom widget builder (measure × dimension × filters) with dry-run scan estimates |
 
 Global filters (time-range presets + agent) re-query BigQuery through the
 iframe → host `tools/call` bridge. Every chart has hover/keyboard tooltips and
@@ -29,8 +34,15 @@ timeline (`get_trace`). Light and dark themes are both first-class.
   plus the full structured payload.
 - `query_agent_metrics(time_range_hours, agent?)` — same payload, no UI; used by
   the dashboard for refresh/filtering and usable by the model for text answers.
+- `query_widget` / `render_widget(measure, dimension, filters…, dry_run?)` — one
+  custom widget as data, or rendered interactively in the host UI. The Explore
+  tab's "Copy widget JSON" emits exactly this argument shape.
+- `ask_data(question)` — open-ended questions via BigQuery Conversational
+  Analytics (plans, writes and runs SQL; ~30–60 s).
 - `get_trace(trace_id, time_range_hours)` — ordered trace reconstruction for
-  drill-down.
+  drill-down; reports truncation when a trace exceeds 500 events.
+- `list_error_traces(time_range_hours, limit)` — recent trace ids with errors,
+  for evidence-cited root-cause analysis.
 
 ## Run it
 
@@ -55,7 +67,7 @@ The MCP endpoint is `http://localhost:3001/mcp` (override with `PORT`).
 | `BQAA_MOCK` | — | `1` forces deterministic sample data |
 | `BQAA_MAX_BYTES_BILLED` | `2000000000` | Bytes-billed budget for **one dashboard refresh** (split across its queries) |
 | `BQAA_DEFAULT_HOURS` | `168` | Default lookback window in hours (1–2160); validated at startup |
-| `BQAA_AUTH_TOKEN` | — | If set, `/mcp` and `/api/*` require `Authorization: Bearer <token>` (browser pages may pass `?token=`) |
+| `BQAA_AUTH_TOKEN` | — | If set, `/mcp` and `/api/*` require `Authorization: Bearer <token>`; browsers sign in via `POST /auth/login`, which sets an HttpOnly cookie (tokens are never accepted in URLs) |
 | `BQAA_ALLOWED_ORIGINS` | — | Comma-separated Origin allowlist (or `*`). Unset ⇒ same-origin only: cross-origin requests are refused |
 | `PORT` | `3001` | HTTP port |
 
@@ -63,10 +75,12 @@ Guardrails: read-only parameterized `SELECT`s only, a mandatory `timestamp`
 predicate so the partitioned table is never full-scanned, a per-refresh
 `maximumBytesBilled` budget, a 60 s result cache with concurrent-request
 coalescing, and partial-failure handling (one failed panel query is reported in
-`meta.section_errors` instead of blanking the dashboard). The footer shows
-bytes scanned per refresh. `GET /api/health` reports readiness (`/healthz`
-works locally but is intercepted by Google Frontend on run.app); requests are
-logged as structured JSON.
+`meta.section_errors` instead of blanking the dashboard, and dependent KPIs
+show an explicit unavailable state). A global cap bounds concurrent BigQuery
+jobs and the result cache is a bounded LRU. The footer shows bytes scanned per
+refresh. `GET /healthz` is liveness; `GET /api/health` is readiness and proves
+BigQuery access with a cached dry run (503 when the backend is unreachable).
+Requests are logged as structured JSON.
 
 ### Connect to Claude
 
@@ -101,7 +115,9 @@ gcloud run deploy bqaa-dashboard --source . --region us-central1 \
   --set-env-vars "BQAA_PROJECT=<project>,BQAA_DATASET=<demo_dataset>,BQAA_TABLE=agent_events,BQAA_AUTH_TOKEN=<random-token>,BQAA_ALLOWED_ORIGINS=*"
 ```
 
-The `https://….run.app/mcp` URL can then be added as a Claude custom connector.
+The `https://….run.app/mcp` URL can then be added as a custom connector in any
+MCP host (send the token as an `Authorization: Bearer` header); browsers sign
+in once via the token prompt.
 Anyone with the URL + token can query the configured table's aggregates and
 traces — never point a public deployment at production telemetry.
 

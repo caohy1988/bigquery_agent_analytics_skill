@@ -78,6 +78,8 @@ export interface ModelComparisonRow {
   model_id: string | null;
   calls: number;
   error_rate_pct: number;
+  total_prompt_tokens: number; // exact sums — cost must never be avg × calls
+  total_completion_tokens: number;
   avg_total_tokens: number | null;
   avg_prompt_tokens: number | null;
   avg_completion_tokens: number | null;
@@ -169,6 +171,11 @@ export interface ErrorTraceRow {
   agents: string | null;
   error_events: number;
   sample_errors: string | null;
+}
+
+export interface TraceResult {
+  events: TraceEvent[];
+  truncated: boolean; // true when the trace has more events than the cap
 }
 
 export interface TraceEvent {

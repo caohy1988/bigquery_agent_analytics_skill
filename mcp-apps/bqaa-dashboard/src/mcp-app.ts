@@ -27,12 +27,23 @@ function parseHashState(): Record<string, string> {
 }
 const HASH_STATE = parseHashState();
 
-// Optional bearer token for servers started with BQAA_AUTH_TOKEN, supplied to
-// the shared page as ?token=… (or in the hash state).
-const AUTH_TOKEN = new URLSearchParams(location.search).get("token") ?? HASH_STATE.token ?? "";
-
+// Auth: never in URLs. Servers started with BQAA_AUTH_TOKEN issue an HttpOnly
+// cookie via POST /auth/login; the page prompts for the token on a 401.
 function authHeaders(): Record<string, string> {
-  return AUTH_TOKEN ? { Authorization: `Bearer ${AUTH_TOKEN}` } : {};
+  return {}; // the HttpOnly cookie rides along automatically
+}
+
+async function loginWithToken(token: string): Promise<boolean> {
+  const res = await fetch("auth/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ token }),
+  });
+  return res.ok;
+}
+
+function isUnauthorized(message: string): boolean {
+  return /unauthorized|401/i.test(message);
 }
 
 // ---------------------------------------------------------------- formatting
@@ -73,7 +84,11 @@ function widgetValueFmt(measure: string): (v: number | null) => string {
 }
 
 function toCSV(head: string[], rows: string[][]): string {
-  const esc = (s: string): string => (/[",\n]/.test(s) ? `"${s.replaceAll('"', '""')}"` : s);
+  const esc = (s: string): string => {
+    // formula-leading cells would execute in spreadsheet apps — neutralize
+    const guarded = /^[=+\-@\t\r]/.test(s) ? `'${s}` : s;
+    return /[",\n]/.test(guarded) ? `"${guarded.replaceAll('"', '""')}"` : guarded;
+  };
   return [head, ...rows].map((r) => r.map(esc).join(",")).join("\n");
 }
 
@@ -652,6 +667,20 @@ function tile(
   return card;
 }
 
+// #2: a failed section must never render as an authoritative zero — KPIs
+// derived from it show an explicit unavailable state instead.
+function unavailableTile(label: string): HTMLElement {
+  return tile(label, "—", "unavailable — query failed");
+}
+
+function sectionsFailed(d: DashboardData, ...names: string[]): string | null {
+  for (const n of names) {
+    const e = d.meta.section_errors?.[n];
+    if (e) return e;
+  }
+  return null;
+}
+
 function tileRow(...tiles: HTMLElement[]): HTMLElement {
   const row = el("div", "tile-row");
   tiles.forEach((t) => row.appendChild(t));
@@ -670,9 +699,22 @@ interface ChartData {
   rows: string[][];
 }
 
+// #22: open/closed disclosure state survives re-renders (resize, refresh)
+const openDisclosures = new Set<string>();
+
+function statefulDetails(cls: string, summaryText: string, key: string): HTMLElement {
+  const details = el("details", cls);
+  details.appendChild(el("summary", undefined, summaryText));
+  if (openDisclosures.has(key)) (details as HTMLDetailsElement).open = true;
+  details.addEventListener("toggle", () => {
+    if ((details as HTMLDetailsElement).open) openDisclosures.add(key);
+    else openDisclosures.delete(key);
+  });
+  return details;
+}
+
 function dataTable(dt: ChartData): HTMLElement {
-  const details = el("details", "data-table");
-  details.appendChild(el("summary", undefined, "Show data"));
+  const details = statefulDetails("data-table", "Show data", `${currentView}:${dt.head.join("|")}`);
   const scroll = el("div", "table-scroll");
   const t = el("table");
   const thead = el("thead");
@@ -882,13 +924,21 @@ function renderTokens(d: DashboardData, main: HTMLElement): void {
   const prompt = d.timeseries.reduce((a, b) => a + b.prompt_tokens, 0);
   const completion = d.timeseries.reduce((a, b) => a + b.completion_tokens, 0);
   const llmCalls = d.timeseries.reduce((a, b) => a + b.llm_calls, 0);
+  const tsErr = sectionsFailed(d, "timeseries");
   main.appendChild(
-    tileRow(
-      tile("Total tokens", fmtCompact(prompt + completion), undefined, d.timeseries.map((b) => b.prompt_tokens + b.completion_tokens)),
-      tile("Prompt tokens", fmtCompact(prompt), undefined, d.timeseries.map((b) => b.prompt_tokens)),
-      tile("Completion tokens", fmtCompact(completion), undefined, d.timeseries.map((b) => b.completion_tokens)),
-      tile("Avg tokens / call", llmCalls ? fmtCompact((prompt + completion) / llmCalls) : "—", `${fmtCompact(llmCalls)} LLM calls`),
-    ),
+    tsErr
+      ? tileRow(
+          unavailableTile("Total tokens"),
+          unavailableTile("Prompt tokens"),
+          unavailableTile("Completion tokens"),
+          unavailableTile("Avg tokens / call"),
+        )
+      : tileRow(
+          tile("Total tokens", fmtCompact(prompt + completion), undefined, d.timeseries.map((b) => b.prompt_tokens + b.completion_tokens)),
+          tile("Prompt tokens", fmtCompact(prompt), undefined, d.timeseries.map((b) => b.prompt_tokens)),
+          tile("Completion tokens", fmtCompact(completion), undefined, d.timeseries.map((b) => b.completion_tokens)),
+          tile("Avg tokens / call", llmCalls ? fmtCompact((prompt + completion) / llmCalls) : "—", `${fmtCompact(llmCalls)} LLM calls`),
+        ),
   );
 
   const cols = chartCard("Token usage over time", null, [
@@ -1035,10 +1085,12 @@ function loadPrices(): PriceBook {
 
 function renderCost(d: DashboardData, main: HTMLElement): void {
   const prices = loadPrices();
+  const modelsErr = sectionsFailed(d, "models");
+  // exact token sums from the models section — never average × attempts
   const rows = d.modelComparison.map((m) => {
     const price = prices[m.model_id ?? ""] ?? { in: 0, out: 0 };
-    const promptTot = (m.avg_prompt_tokens ?? 0) * m.calls;
-    const completionTot = (m.avg_completion_tokens ?? 0) * m.calls;
+    const promptTot = m.total_prompt_tokens ?? 0;
+    const completionTot = m.total_completion_tokens ?? 0;
     const costIn = (promptTot / 1e6) * price.in;
     const costOut = (completionTot / 1e6) * price.out;
     return { model: m.model_id ?? "?", calls: m.calls, promptTot, completionTot, price, costIn, costOut, cost: costIn + costOut };
@@ -1049,12 +1101,19 @@ function renderCost(d: DashboardData, main: HTMLElement): void {
   const unpriced = rows.filter((r) => r.price.in === 0 && r.price.out === 0 && (r.promptTot > 0 || r.completionTot > 0));
 
   main.appendChild(
-    tileRow(
-      tile("Est. total cost", fmtUSD(total), "editable price book below"),
-      tile("Prompt cost", fmtUSD(totalIn)),
-      tile("Completion cost", fmtUSD(totalOut)),
-      tile("Cost / session", d.overview.sessions ? fmtUSD(total / d.overview.sessions) : "—", `${fmtCompact(d.overview.sessions)} sessions`),
-    ),
+    modelsErr
+      ? tileRow(
+          unavailableTile("Est. total cost"),
+          unavailableTile("Prompt cost"),
+          unavailableTile("Completion cost"),
+          unavailableTile("Cost / session"),
+        )
+      : tileRow(
+          tile("Est. total cost", fmtUSD(total), "editable price book below"),
+          tile("Prompt cost", fmtUSD(totalIn)),
+          tile("Completion cost", fmtUSD(totalOut)),
+          tile("Cost / session", d.overview.sessions ? fmtUSD(total / d.overview.sessions) : "—", `${fmtCompact(d.overview.sessions)} sessions`),
+        ),
   );
 
   // spread total cost over time proportional to token volume per bucket
@@ -1080,6 +1139,14 @@ function renderCost(d: DashboardData, main: HTMLElement): void {
       sectionError: d.meta.section_errors?.timeseries,
     },
   );
+  if (d.timeseries.length) {
+    trend.card.appendChild(
+      dataTable({
+        head: ["Bucket", "Est. cost"],
+        rows: d.timeseries.map((b, i) => [bucketLabel(b.ts, d.meta.granularity), fmtUSD(costSeries[i])]),
+      }),
+    );
+  }
 
   const byModel = chartCard("Cost by model", "estimates — tokens × your price book", [], "half", {
     filename: "cost-by-model.csv",
@@ -1127,7 +1194,9 @@ function renderCost(d: DashboardData, main: HTMLElement): void {
   }
   const save = el("button", "trace-close", "Apply prices");
   save.addEventListener("click", () => {
-    const book: PriceBook = {};
+    // merge visible edits into the existing book — filtered views must not
+    // silently delete prices for models that are not on screen
+    const book: PriceBook = loadPrices();
     for (const { model, inEl, outEl } of inputs) {
       book[model] = { in: Math.max(0, Number(inEl.value) || 0), out: Math.max(0, Number(outEl.value) || 0) };
     }
@@ -1146,12 +1215,18 @@ function renderAgents(d: DashboardData, main: HTMLElement): void {
   const delegTotal = deleg.reduce((a, r) => a + r.delegation_count, 0);
   const hitlTotal = hitl.reduce((a, r) => a + r.total_requests, 0);
   const hitlDone = hitl.reduce((a, r) => a + r.completed, 0);
+  const delegErr = sectionsFailed(d, "delegation");
+  const hitlErr = sectionsFailed(d, "hitl");
   main.appendChild(
     tileRow(
       tile("Agents", fmtCompact(d.overview.agents)),
-      tile("Delegations", fmtCompact(delegTotal), `${deleg.length} parent→child pairs`),
-      tile("HITL requests", fmtCompact(hitlTotal)),
-      tile("HITL completion", hitlTotal ? fmtPct(Math.round((hitlDone / hitlTotal) * 1000) / 10) : "—", hitlTotal ? `${fmtInt(hitlDone)} answered` : undefined),
+      delegErr
+        ? unavailableTile("Delegations")
+        : tile("Delegations", fmtCompact(delegTotal), `${deleg.length} parent→child pairs`),
+      hitlErr ? unavailableTile("HITL requests") : tile("HITL requests", fmtCompact(hitlTotal)),
+      hitlErr
+        ? unavailableTile("HITL completion")
+        : tile("HITL completion", hitlTotal ? fmtPct(Math.round((hitlDone / hitlTotal) * 1000) / 10) : "—", hitlTotal ? `${fmtInt(hitlDone)} answered` : undefined),
     ),
   );
 
@@ -1176,6 +1251,14 @@ function renderAgents(d: DashboardData, main: HTMLElement): void {
     })),
     d.meta.section_errors?.delegation,
   );
+  if (deleg.length) {
+    bars.card.appendChild(
+      dataTable({
+        head: ["Parent", "Child", "Delegations", "Unique traces"],
+        rows: deleg.map((r) => [r.parent_agent, r.child_agent, fmtInt(r.delegation_count), fmtInt(r.unique_traces)]),
+      }),
+    );
+  }
   main.appendChild(bars.card);
 
   const tbl = chartCard("Human-in-the-loop", "requests vs completions by type", [], "full", {
@@ -1215,8 +1298,26 @@ const explore: ExploreState = {
   note: "",
 };
 
+// #8: only the most recent Estimate/Run may publish into explore state — a
+// slow older response must never overwrite a newer selection's results.
+let exploreOpSeq = 0;
+
+function exploreSpecChanged(): void {
+  exploreOpSeq++; // cancels any in-flight op's right to publish
+  explore.estimate = null;
+  explore.result = null;
+}
+
+// #9/#21: the effective window can differ from the preset control (e.g. a
+// render_widget push or a non-preset host window) — queries must follow it.
+let effectiveHours: number | null = null;
+
+function currentHours(): number {
+  return effectiveHours ?? Number(rangeEl.value);
+}
+
 async function runWidget(dryRun: boolean): Promise<WidgetResult> {
-  const hours = Number(rangeEl.value);
+  const hours = currentHours();
   const s = explore.spec;
   const args: Record<string, unknown> = {
     measure: s.measure,
@@ -1278,14 +1379,14 @@ function renderExplore(d: DashboardData | null, main: HTMLElement): void {
   controls.appendChild(
     exploreSelect("Measure", Object.entries(WIDGET_MEASURES).map(([value, m]) => ({ value, label: m.label })), s.measure, (v) => {
       s.measure = v;
-      explore.estimate = null;
+      exploreSpecChanged();
       renderView();
     }),
   );
   controls.appendChild(
     exploreSelect("Dimension", Object.entries(WIDGET_DIMENSIONS).map(([value, m]) => ({ value, label: m.label })), s.dimension, (v) => {
       s.dimension = v;
-      explore.estimate = null;
+      exploreSpecChanged();
       renderView();
     }),
   );
@@ -1301,7 +1402,7 @@ function renderExplore(d: DashboardData | null, main: HTMLElement): void {
         s.granularity ?? "",
         (v) => {
           s.granularity = v === "hour" || v === "day" ? v : undefined;
-          explore.estimate = null;
+          exploreSpecChanged();
           renderView();
         },
       ),
@@ -1314,21 +1415,21 @@ function renderExplore(d: DashboardData | null, main: HTMLElement): void {
   controls.appendChild(
     exploreSelect("Agent", opt(d?.agentsList ?? []), s.filters?.agent ?? "", (v) => {
       s.filters = { ...s.filters, agent: v || undefined };
-      explore.estimate = null;
+      exploreSpecChanged();
       renderView();
     }),
   );
   controls.appendChild(
     exploreSelect("Model", opt((d?.modelComparison ?? []).map((m) => m.model_id)), s.filters?.model ?? "", (v) => {
       s.filters = { ...s.filters, model: v || undefined };
-      explore.estimate = null;
+      exploreSpecChanged();
       renderView();
     }),
   );
   controls.appendChild(
     exploreSelect("Tool", opt((d?.toolStats ?? []).map((t) => t.tool_name)), s.filters?.tool ?? "", (v) => {
       s.filters = { ...s.filters, tool: v || undefined };
-      explore.estimate = null;
+      exploreSpecChanged();
       renderView();
     }),
   );
@@ -1343,7 +1444,7 @@ function renderExplore(d: DashboardData | null, main: HTMLElement): void {
       s.filters?.status ?? "",
       (v) => {
         s.filters = { ...s.filters, status: v === "OK" || v === "ERROR" ? v : undefined };
-        explore.estimate = null;
+        exploreSpecChanged();
         renderView();
       },
     ),
@@ -1353,33 +1454,53 @@ function renderExplore(d: DashboardData | null, main: HTMLElement): void {
   const actions = el("div", "explore-actions");
   const estimateBtn = el("button", "trace-close", "Estimate scan");
   estimateBtn.addEventListener("click", async () => {
+    const op = ++exploreOpSeq;
     explore.note = "Estimating…";
     renderView();
     try {
       const r = await runWidget(true);
+      if (op !== exploreOpSeq) return; // superseded
       explore.estimate = r.estimated_bytes ?? null;
       explore.note = "";
     } catch (e) {
+      if (op !== exploreOpSeq) return;
       explore.note = `Estimate failed: ${e instanceof Error ? e.message : String(e)}`;
     }
     renderView();
   });
   const runBtn = el("button", "run-btn", "Run query");
   runBtn.addEventListener("click", async () => {
+    const op = ++exploreOpSeq;
     explore.note = "Running…";
     renderView();
     try {
-      explore.result = await runWidget(false);
+      const result = await runWidget(false);
+      if (op !== exploreOpSeq) return; // superseded
+      explore.result = result;
       explore.note = "";
     } catch (e) {
+      if (op !== exploreOpSeq) return;
       explore.note = `Query failed: ${e instanceof Error ? e.message : String(e)}`;
     }
     renderView();
   });
   const copyBtn = el("button", "link-btn", "Copy widget JSON");
   copyBtn.addEventListener("click", () => {
-    void navigator.clipboard?.writeText(JSON.stringify({ ...s, v: 1 }, null, 2));
-    explore.note = "Widget JSON copied";
+    // the copied shape IS the query_widget / render_widget tool-argument shape,
+    // so it can be replayed directly by any MCP client
+    const args = {
+      measure: s.measure,
+      dimension: s.dimension,
+      time_range_hours: currentHours(),
+      ...(s.granularity ? { granularity: s.granularity } : {}),
+      ...(s.filters?.agent ? { agent: s.filters.agent } : {}),
+      ...(s.filters?.model ? { model: s.filters.model } : {}),
+      ...(s.filters?.tool ? { tool: s.filters.tool } : {}),
+      ...(s.filters?.status ? { status: s.filters.status } : {}),
+      ...(s.limit ? { limit: s.limit } : {}),
+    };
+    void navigator.clipboard?.writeText(JSON.stringify(args, null, 2));
+    explore.note = "Copied as query_widget tool arguments";
     renderView();
   });
   actions.appendChild(estimateBtn);
@@ -1573,8 +1694,7 @@ function renderAsk(d: DashboardData | null, main: HTMLElement): void {
     if (ex.steps.length) card.appendChild(el("div", "sub", `${ex.steps.length} analysis steps · ${ex.steps.slice(0, 3).join(" · ")}`));
     card.appendChild(renderAnswer(ex.answer));
     if (ex.sql) {
-      const det = el("details", "data-table");
-      det.appendChild(el("summary", undefined, "Generated SQL"));
+      const det = statefulDetails("data-table", "Generated SQL", `ask-sql:${ex.question}`);
       const pre = el("pre", "ask-sql");
       pre.textContent = ex.sql;
       det.appendChild(pre);
@@ -1685,6 +1805,26 @@ function renderPulse(d: DashboardData): void {
   overlay.addEventListener("pointerleave", hideTooltip);
   svg.appendChild(overlay);
   pulseEl.appendChild(svg);
+  const details = statefulDetails("data-table pulse-data", "Show data", "pulse:data");
+  const scroll = el("div", "table-scroll");
+  const t = el("table");
+  const thead = el("thead");
+  const hr = el("tr");
+  ["Bucket", "Events", "Errors"].forEach((h) => hr.appendChild(el("th", undefined, h)));
+  thead.appendChild(hr);
+  t.appendChild(thead);
+  const tbody = el("tbody");
+  ts.forEach((b) => {
+    const tr = el("tr");
+    [bucketLabel(b.ts, d.meta.granularity), fmtInt(b.events), fmtInt(b.errors)].forEach((c) =>
+      tr.appendChild(el("td", undefined, c)),
+    );
+    tbody.appendChild(tr);
+  });
+  t.appendChild(tbody);
+  scroll.appendChild(t);
+  details.appendChild(scroll);
+  pulseEl.appendChild(details);
 }
 
 let data: DashboardData | null = null;
@@ -1727,13 +1867,20 @@ function renderView(): void {
     return;
   }
   VIEWS.find((v) => v.id === currentView)!.render(data as DashboardData, mainEl);
+  renderTraceCard(mainEl); // #22: survives re-renders
 }
 
 function setData(d: DashboardData): void {
   data = d;
   const hours = Math.round((Date.parse(d.meta.end) - Date.parse(d.meta.start)) / 3_600_000);
-  // reflect the data's actual window in the range control when it matches a preset
-  if ([...rangeEl.options].some((o) => o.value === String(hours))) rangeEl.value = String(hours);
+  // reflect the data's actual window in the range control when it matches a
+  // preset; otherwise remember it so widget/trace/ask queries stay in sync
+  if ([...rangeEl.options].some((o) => o.value === String(hours))) {
+    rangeEl.value = String(hours);
+    effectiveHours = null;
+  } else {
+    effectiveHours = hours;
+  }
   scopeEl.replaceChildren();
   scopeEl.appendChild(el("span", "pill", d.meta.source === "mock" ? "sample data" : d.meta.source));
   scopeEl.appendChild(
@@ -1842,6 +1989,43 @@ async function fetchStandalone(
   return mockDashboard(start, end, h <= 72 ? "hour" : "day", agent ?? null);
 }
 
+// Token sign-in for protected servers: the token is exchanged for an HttpOnly
+// cookie via POST /auth/login and never appears in a URL.
+function renderLoginPrompt(): void {
+  statusEl.textContent = "";
+  statusEl.classList.remove("error");
+  mainEl.classList.remove("loading");
+  mainEl.replaceChildren();
+  const { card, body } = chartCard("Sign in", "this dashboard requires an access token", []);
+  const row = el("div", "ask-row");
+  const input = el("input", "ask-input") as HTMLInputElement;
+  input.type = "password";
+  input.placeholder = "Access token";
+  input.setAttribute("aria-label", "Access token");
+  const btn = el("button", "run-btn", "Sign in");
+  const note = el("div", "sub", "");
+  const submit = async (): Promise<void> => {
+    btn.disabled = true;
+    const ok = await loginWithToken(input.value).catch(() => false);
+    if (ok) {
+      void refresh();
+    } else {
+      btn.disabled = false;
+      note.textContent = "Invalid token — try again.";
+    }
+  };
+  btn.addEventListener("click", () => void submit());
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") void submit();
+  });
+  row.appendChild(input);
+  row.appendChild(btn);
+  body.appendChild(row);
+  body.appendChild(note);
+  mainEl.appendChild(card);
+  input.focus();
+}
+
 let rangeTouched = false;
 
 // Only the most recent refresh may publish results: a slow older request must
@@ -1878,6 +2062,10 @@ async function refresh(): Promise<void> {
   } catch (e) {
     if (seq !== refreshSeq || (e instanceof DOMException && e.name === "AbortError")) return;
     const detail = e instanceof Error ? e.message : String(e);
+    if (!embedded && isUnauthorized(detail)) {
+      renderLoginPrompt();
+      return;
+    }
     statusEl.textContent = data
       ? `Refresh failed: ${detail} — showing previously loaded data`
       : `Load failed: ${detail}`;
@@ -1889,14 +2077,16 @@ async function refresh(): Promise<void> {
 
 // ------------------------------------------------------------ trace drill-down
 
-async function fetchTrace(traceId: string): Promise<TraceEvent[]> {
-  const hours = Number(rangeEl.value);
+async function fetchTrace(traceId: string): Promise<{ events: TraceEvent[]; truncated: boolean }> {
+  const hours = currentHours();
   if (embedded && appBridge) {
     const result: any = await appBridge.callServerTool({
       name: "get_trace",
       arguments: { trace_id: traceId, time_range_hours: hours },
     });
-    if (Array.isArray(result?.structuredContent?.data)) return result.structuredContent.data;
+    const d = result?.structuredContent?.data;
+    if (Array.isArray(d?.events)) return { events: d.events, truncated: !!d.truncated };
+    if (Array.isArray(d)) return { events: d, truncated: false }; // older servers
     throw new Error("no trace data in tool result");
   }
   if (location.protocol.startsWith("http")) {
@@ -1904,37 +2094,54 @@ async function fetchTrace(traceId: string): Promise<TraceEvent[]> {
     const res = await fetch(`api/trace?${q}`, { headers: authHeaders() });
     const body: any = await res.json().catch(() => null);
     if (!res.ok) throw new Error(body?.error ?? `HTTP ${res.status}`);
-    return body?.data ?? [];
+    return { events: body?.data ?? [], truncated: !!body?.truncated };
   }
-  return mockTrace(traceId);
+  return { events: mockTrace(traceId), truncated: false };
 }
 
-async function showTrace(traceId: string): Promise<void> {
-  document.getElementById("trace-card")?.remove();
-  const { card, body } = chartCard(`Trace ${traceId}`, "ordered agent_events for this trace", []);
+// #22: the open trace lives in state and is re-rendered after any full
+// re-render (resize, refresh) instead of being silently destroyed.
+interface TraceCardState {
+  traceId: string;
+  view: string; // the tab the trace was opened from
+  events: TraceEvent[] | null; // null while loading
+  truncated: boolean;
+  error: string | null;
+}
+let traceCard: TraceCardState | null = null;
+
+// canonical error semantics on the client, matching the SQL predicate (#10)
+function isErrorEvent(e: TraceEvent): boolean {
+  return e.status === "ERROR" || e.event_type.endsWith("_ERROR") || e.error_message != null;
+}
+
+function renderTraceCard(main: HTMLElement): void {
+  const t = traceCard;
+  if (!t || t.view !== currentView) return;
+  const { card, body } = chartCard(`Trace ${t.traceId}`, "ordered agent_events for this trace", []);
   card.id = "trace-card";
   const h2 = card.querySelector("h2")!;
   const head = el("div", "trace-head");
   h2.replaceWith(head);
   head.appendChild(h2);
   const close = el("button", "trace-close", "Close");
-  close.addEventListener("click", () => card.remove());
+  close.addEventListener("click", () => {
+    traceCard = null;
+    card.remove();
+  });
   head.appendChild(close);
-  body.appendChild(el("div", "empty", "Loading trace…"));
-  mainEl.appendChild(card);
-  card.scrollIntoView({ behavior: "smooth", block: "nearest" });
 
-  try {
-    const events = await fetchTrace(traceId);
-    body.replaceChildren();
-    if (!events.length) {
-      body.appendChild(el("div", "empty", "No events found for this trace in the selected window"));
-      return;
-    }
-    const t0 = Date.parse(events[0].timestamp);
+  if (t.error) {
+    body.appendChild(el("div", "empty error", `Trace load failed: ${t.error}`));
+  } else if (!t.events) {
+    body.appendChild(el("div", "empty", "Loading trace…"));
+  } else if (!t.events.length) {
+    body.appendChild(el("div", "empty", "No events found for this trace in the selected window"));
+  } else {
+    const t0 = Date.parse(t.events[0].timestamp);
     const list = el("div", "trace-timeline");
-    for (const e of events) {
-      const row = el("div", `trace-row${e.status === "ERROR" ? " error" : ""}`);
+    for (const e of t.events) {
+      const row = el("div", `trace-row${isErrorEvent(e) ? " error" : ""}`);
       row.appendChild(el("span", "trace-t", `+${((Date.parse(e.timestamp) - t0) / 1000).toFixed(1)}s`));
       row.appendChild(el("span", "trace-type", e.event_type));
       const detail =
@@ -1949,16 +2156,33 @@ async function showTrace(traceId: string): Promise<void> {
       list.appendChild(row);
     }
     body.appendChild(list);
-  } catch (err) {
-    body.replaceChildren();
-    body.appendChild(
-      el("div", "empty error", `Trace load failed: ${err instanceof Error ? err.message : String(err)}`),
-    );
+    if (t.truncated) {
+      body.appendChild(
+        el("div", "sub", `Showing the first ${t.events.length} events — the trace is longer; narrow the time window for the rest.`),
+      );
+    }
   }
+  main.appendChild(card);
+}
+
+async function showTrace(traceId: string): Promise<void> {
+  traceCard = { traceId, view: currentView, events: null, truncated: false, error: null };
+  renderView();
+  document.getElementById("trace-card")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  try {
+    const { events, truncated } = await fetchTrace(traceId);
+    if (traceCard?.traceId !== traceId) return; // closed or replaced meanwhile
+    traceCard = { ...traceCard, events, truncated };
+  } catch (err) {
+    if (traceCard?.traceId !== traceId) return;
+    traceCard = { ...traceCard, error: err instanceof Error ? err.message : String(err) };
+  }
+  renderView();
 }
 
 rangeEl.addEventListener("change", () => {
   rangeTouched = true;
+  effectiveHours = null; // user picked a preset — it wins
   void refresh();
 });
 agentEl.addEventListener("change", refresh);
@@ -1997,16 +2221,32 @@ if (embedded) {
     // render_widget pushes a widget result: open Explore prefilled + rendered,
     // then load the full dashboard in the background for the other tabs.
     if (payload?.spec && Array.isArray(payload.rows)) {
+      exploreOpSeq++; // supersede any in-flight Explore op
       explore.spec = { v: 1, filters: {}, ...payload.spec };
       explore.result = payload as WidgetResult;
+      // #9: keep the pushed widget's window as the effective one
+      if (payload.window?.start && payload.window?.end) {
+        const h = Math.round((Date.parse(payload.window.end) - Date.parse(payload.window.start)) / 3_600_000);
+        if ([...rangeEl.options].some((o) => o.value === String(h))) {
+          rangeEl.value = String(h);
+          effectiveHours = null;
+        } else {
+          effectiveHours = h;
+        }
+      }
       currentView = "explore";
       renderTabs();
       renderView();
       if (!data) void refresh();
       return;
     }
+    // #15: a host push is the newest truth — invalidate in-flight refreshes
     const d = extractData(result);
-    if (d) setData(d); // setData syncs the range control to the data's window
+    if (d) {
+      refreshSeq++;
+      inflightAbort?.abort();
+      setData(d);
+    }
   };
   appBridge = app;
   app

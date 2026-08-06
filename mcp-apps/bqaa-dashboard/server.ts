@@ -35,6 +35,7 @@ import {
   buildTraceSql,
   buildWidgetSql,
   SECTIONS,
+  splitBudget,
   WIDGET_DIMENSIONS,
   WIDGET_MEASURES,
 } from "./src/queries.js";
@@ -46,6 +47,7 @@ import type {
   Granularity,
   OverviewStats,
   TraceEvent,
+  TraceResult,
   WidgetResult,
   WidgetSpec,
 } from "./src/types.js";
@@ -109,6 +111,23 @@ function uiBundlePath(): string {
 
 let bqClient: import("@google-cloud/bigquery").BigQuery | null = null;
 
+// Global cap on simultaneous BigQuery jobs: past it, requests fail fast
+// instead of piling unbounded work onto the project.
+const MAX_CONCURRENT_JOBS = 20;
+let inflightJobs = 0;
+
+async function withJobSlot<T>(fn: () => Promise<T>): Promise<T> {
+  if (inflightJobs >= MAX_CONCURRENT_JOBS) {
+    throw new Error("Server busy: too many concurrent BigQuery jobs — retry shortly");
+  }
+  inflightJobs++;
+  try {
+    return await fn();
+  } finally {
+    inflightJobs--;
+  }
+}
+
 interface QueryResult {
   rows: any[];
   bytes: number;
@@ -119,18 +138,20 @@ async function runQuery(
   params: Record<string, unknown>,
   maxBytes: number,
 ): Promise<QueryResult> {
-  if (!bqClient) {
-    const { BigQuery } = await import("@google-cloud/bigquery");
-    bqClient = new BigQuery({ projectId: CONFIG.project });
-  }
-  const [job] = await bqClient.createQueryJob({
-    query: sql,
-    params,
-    maximumBytesBilled: String(maxBytes),
+  return withJobSlot(async () => {
+    if (!bqClient) {
+      const { BigQuery } = await import("@google-cloud/bigquery");
+      bqClient = new BigQuery({ projectId: CONFIG.project });
+    }
+    const [job] = await bqClient.createQueryJob({
+      query: sql,
+      params,
+      maximumBytesBilled: String(maxBytes),
+    });
+    const [rows] = await job.getQueryResults();
+    const [meta] = await job.getMetadata();
+    return { rows, bytes: Number(meta?.statistics?.totalBytesProcessed ?? 0) };
   });
-  const [rows] = await job.getQueryResults();
-  const [meta] = await job.getMetadata();
-  return { rows, bytes: Number(meta?.statistics?.totalBytesProcessed ?? 0) };
 }
 
 // Estimate a query's scan size without running it (BigQuery dry run).
@@ -171,9 +192,9 @@ async function bigQueryDashboard(
   const paramsFor = (s: (typeof SECTIONS)[number]): Record<string, unknown> =>
     s === "prev_overview" ? prevParams : s === "agents" || s === "delegation" ? { start: params.start, end: params.end } : params;
 
-  // The refresh budget is split evenly across the panel queries so one
+  // The refresh budget is split exactly across the panel queries so one
   // dashboard load can never authorize more than BQAA_MAX_BYTES_BILLED total.
-  const perQueryBytes = Math.max(10_000_000, Math.floor(CONFIG.refreshBytesBudget / SECTIONS.length));
+  const perQueryBytes = splitBudget(CONFIG.refreshBytesBudget, SECTIONS.length);
 
   const settled = await Promise.allSettled(SECTIONS.map((s) => runQuery(sql[s], paramsFor(s), perQueryBytes)));
 
@@ -232,7 +253,7 @@ async function bigQueryDashboard(
 
 // ------------------------------------------------------------ custom widgets
 
-const WIDGET_QUERY_BYTES = 200_000_000; // one widget query gets its own cap
+const WIDGET_QUERY_BYTES = Math.min(200_000_000, CONFIG.refreshBytesBudget); // single-query ops
 
 async function loadWidget(spec: WidgetSpec, timeRangeHours: number, dryRun: boolean): Promise<WidgetResult> {
   const end = new Date();
@@ -278,9 +299,35 @@ async function loadErrorTraces(timeRangeHours: number, limit: number): Promise<E
 }
 
 // Cache + coalescing: identical (window, agent) refreshes within the TTL share
-// one BigQuery round-trip, including concurrent ones.
+// one BigQuery round-trip, including concurrent ones. The cache is a bounded
+// LRU — arbitrary agent filters cannot grow it without limit, and expired
+// entries are evicted on access.
 const CACHE_TTL_MS = 60_000;
+const CACHE_MAX_ENTRIES = 50;
 const dashboardCache = new Map<string, { promise: Promise<DashboardData>; expires: number }>();
+
+function cacheGet(key: string): { promise: Promise<DashboardData>; expires: number } | null {
+  const entry = dashboardCache.get(key);
+  if (!entry) return null;
+  if (entry.expires <= Date.now()) {
+    dashboardCache.delete(key);
+    return null;
+  }
+  dashboardCache.delete(key); // re-insert as most recently used
+  dashboardCache.set(key, entry);
+  return entry;
+}
+
+function cacheSet(key: string, entry: { promise: Promise<DashboardData>; expires: number }): void {
+  const now = Date.now();
+  for (const [k, e] of dashboardCache) if (e.expires <= now) dashboardCache.delete(k);
+  while (dashboardCache.size >= CACHE_MAX_ENTRIES) {
+    const oldest = dashboardCache.keys().next().value;
+    if (oldest == null) break;
+    dashboardCache.delete(oldest);
+  }
+  dashboardCache.set(key, entry);
+}
 
 async function loadDashboard(timeRangeHours: number, agent?: string | null): Promise<DashboardData> {
   const end = new Date();
@@ -289,28 +336,31 @@ async function loadDashboard(timeRangeHours: number, agent?: string | null): Pro
   if (CONFIG.mock) return mockDashboard(start, end, granularity, agent);
 
   const key = `${timeRangeHours}|${agent ?? ""}`;
-  const cached = dashboardCache.get(key);
-  if (cached && cached.expires > Date.now()) {
+  const cached = cacheGet(key);
+  if (cached) {
     const data = await cached.promise;
     return { ...data, meta: { ...data.meta, cache_hit: true } };
   }
   const promise = bigQueryDashboard(start, end, granularity, agent);
-  dashboardCache.set(key, { promise, expires: Date.now() + CACHE_TTL_MS });
+  cacheSet(key, { promise, expires: Date.now() + CACHE_TTL_MS });
   promise.catch(() => dashboardCache.delete(key)); // failures are not cacheable
   return promise;
 }
 
-async function loadTrace(traceId: string, timeRangeHours: number): Promise<TraceEvent[]> {
+const TRACE_EVENT_CAP = 500;
+
+async function loadTrace(traceId: string, timeRangeHours: number): Promise<TraceResult> {
   if (!TRACE_ID_RE.test(traceId)) throw new Error("Invalid trace_id");
-  if (CONFIG.mock) return mockTrace(traceId);
+  if (CONFIG.mock) return { events: mockTrace(traceId), truncated: false };
   const end = new Date();
   const start = new Date(end.getTime() - timeRangeHours * 3_600_000);
+  // fetch cap+1 so truncation is reported instead of silently dropping events
   const { rows } = await runQuery(
     buildTraceSql(tableRef()),
-    { trace_id: traceId, start: start.toISOString(), end: end.toISOString() },
-    Math.max(10_000_000, Math.floor(CONFIG.refreshBytesBudget / SECTIONS.length)),
+    { trace_id: traceId, start: start.toISOString(), end: end.toISOString(), limit: TRACE_EVENT_CAP + 1 },
+    WIDGET_QUERY_BYTES,
   );
-  return rows;
+  return { events: rows.slice(0, TRACE_EVENT_CAP), truncated: rows.length > TRACE_EVENT_CAP };
 }
 
 // ---------------------------------------------------------------- summaries
@@ -337,8 +387,6 @@ function summarize(d: DashboardData): string {
 
 // ---------------------------------------------------------------- MCP server
 
-const server = new McpServer({ name: "BigQuery Agent Analytics Dashboard", version: "0.1.0" });
-
 const resourceUri = "ui://bqaa/dashboard.html";
 
 const metricArgs = {
@@ -359,57 +407,6 @@ async function metricsHandler(args: { time_range_hours?: number; agent?: string 
     structuredContent: { data } as any,
   };
 }
-
-registerAppTool(
-  server,
-  "show_agent_dashboard",
-  {
-    title: "Agent Analytics Dashboard",
-    description:
-      "Render an interactive dashboard (overview, latency, tokens, tools) over the BigQuery Agent Analytics agent_events table. Use when the user wants to see, explore, or monitor agent metrics visually.",
-    inputSchema: metricArgs,
-    outputSchema: { data: z.unknown() },
-    _meta: { ui: { resourceUri } },
-  },
-  metricsHandler,
-);
-
-server.registerTool(
-  "query_agent_metrics",
-  {
-    title: "Query agent metrics",
-    description:
-      "Return the aggregated agent-analytics payload (overview, timeseries, latency by agent, token usage, tool stats) as structured data without rendering UI. Used by the dashboard for refresh/filtering; also useful for text answers.",
-    inputSchema: metricArgs,
-    outputSchema: { data: z.unknown() },
-  },
-  metricsHandler,
-);
-
-server.registerTool(
-  "get_trace",
-  {
-    title: "Get trace",
-    description: "Reconstruct a single trace (ordered agent_events) by trace_id for drill-down debugging.",
-    inputSchema: {
-      trace_id: z.string().regex(TRACE_ID_RE).describe("OpenTelemetry trace id"),
-      time_range_hours: z.number().int().min(1).max(MAX_HOURS).default(CONFIG.defaultHours),
-    },
-    outputSchema: { data: z.unknown() },
-  },
-  async (args) => {
-    const events = await loadTrace(args.trace_id, args.time_range_hours ?? CONFIG.defaultHours);
-    return {
-      content: [
-        {
-          type: "text" as const,
-          text: `Trace ${args.trace_id}: ${events.length} events, ${events.filter((e) => e.status === "ERROR").length} errors.`,
-        },
-      ],
-      structuredContent: { data: events } as any,
-    };
-  },
-);
 
 // ---- custom widgets (measure × dimension × filters), conversational + UI
 
@@ -471,6 +468,68 @@ async function widgetHandler(args: WidgetArgs) {
     structuredContent: { data: result } as any,
   };
 }
+
+
+// Each stateless HTTP request gets its own McpServer: a shared instance
+// re-binds its transport on connect(), so concurrent RPCs would race.
+function buildMcpServer(): McpServer {
+  const server = new McpServer({ name: "BigQuery Agent Analytics Dashboard", version: "0.1.0" });
+
+registerAppTool(
+  server,
+  "show_agent_dashboard",
+  {
+    title: "Agent Analytics Dashboard",
+    description:
+      "Render an interactive dashboard (overview, latency, tokens, tools) over the BigQuery Agent Analytics agent_events table. Use when the user wants to see, explore, or monitor agent metrics visually.",
+    inputSchema: metricArgs,
+    outputSchema: { data: z.unknown() },
+    _meta: { ui: { resourceUri } },
+  },
+  metricsHandler,
+);
+
+server.registerTool(
+  "query_agent_metrics",
+  {
+    title: "Query agent metrics",
+    description:
+      "Return the aggregated agent-analytics payload (overview, timeseries, latency by agent, token usage, tool stats) as structured data without rendering UI. Used by the dashboard for refresh/filtering; also useful for text answers.",
+    inputSchema: metricArgs,
+    outputSchema: { data: z.unknown() },
+  },
+  metricsHandler,
+);
+
+server.registerTool(
+  "get_trace",
+  {
+    title: "Get trace",
+    description: "Reconstruct a single trace (ordered agent_events) by trace_id for drill-down debugging.",
+    inputSchema: {
+      trace_id: z.string().regex(TRACE_ID_RE).describe("OpenTelemetry trace id"),
+      time_range_hours: z.number().int().min(1).max(MAX_HOURS).default(CONFIG.defaultHours),
+    },
+    outputSchema: { data: z.unknown() },
+  },
+  async (args) => {
+    const trace = await loadTrace(args.trace_id, args.time_range_hours ?? CONFIG.defaultHours);
+    const errorCount = trace.events.filter(
+      (e) => e.status === "ERROR" || e.event_type.endsWith("_ERROR") || e.error_message != null,
+    ).length;
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text:
+            `Trace ${args.trace_id}: ${trace.events.length} events, ${errorCount} errors.` +
+            (trace.truncated ? ` TRUNCATED at ${trace.events.length} events — narrow the window for the full trace.` : ""),
+        },
+      ],
+      structuredContent: { data: trace } as any,
+    };
+  },
+);
 
 server.registerTool(
   "query_widget",
@@ -545,6 +604,9 @@ registerAppResource(server, resourceUri, resourceUri, { mimeType: RESOURCE_MIME_
   return { contents: [{ uri: resourceUri, mimeType: RESOURCE_MIME_TYPE, text: html }] };
 });
 
+  return server;
+}
+
 // ---------------------------------------------------------------- transport
 
 const app = express();
@@ -570,12 +632,19 @@ function checkOrigin(req: express.Request, res: express.Response, next: express.
   next();
 }
 
+// Credentials are accepted from the Authorization header (MCP clients) or an
+// HttpOnly cookie set via POST /auth/login (browser pages) — never from URLs,
+// per the MCP authorization spec.
+function cookieToken(req: express.Request): string {
+  const m = /(?:^|;\s*)bqaa_token=([^;]+)/.exec(req.headers.cookie ?? "");
+  return m ? decodeURIComponent(m[1]) : "";
+}
+
 function requireAuth(req: express.Request, res: express.Response, next: express.NextFunction): void {
   if (CONFIG.authToken) {
     const header = req.headers.authorization ?? "";
-    const queryToken = typeof req.query.token === "string" ? req.query.token : "";
-    if (header !== `Bearer ${CONFIG.authToken}` && queryToken !== CONFIG.authToken) {
-      res.status(401).json({ error: "Unauthorized. Send Authorization: Bearer <BQAA_AUTH_TOKEN>." });
+    if (header !== `Bearer ${CONFIG.authToken}` && cookieToken(req) !== CONFIG.authToken) {
+      res.status(401).json({ error: "Unauthorized. Send Authorization: Bearer <token>, or sign in at /auth/login." });
       return;
     }
   }
@@ -606,13 +675,38 @@ app.use((req, res, next) => {
   next();
 });
 
-// /healthz is intercepted by Google Frontend on run.app, so the canonical
-// health endpoint lives under /api/; /healthz still works locally.
-const health = (_req: express.Request, res: express.Response): void => {
+// /healthz is liveness only (also: GFE intercepts it on run.app). Readiness
+// lives at /api/health and actually proves BigQuery access with a cached,
+// zero-cost dry run — green must mean "can serve data".
+let bqProbe: { ok: boolean; detail: string; checked: number } = { ok: true, detail: "unchecked", checked: 0 };
+
+async function probeBigQuery(): Promise<{ ok: boolean; detail: string }> {
+  if (CONFIG.mock) return { ok: true, detail: "mock" };
+  if (Date.now() - bqProbe.checked < 60_000) return bqProbe;
+  try {
+    const end = new Date();
+    const start = new Date(end.getTime() - 3_600_000);
+    await dryRunQuery(`SELECT 1 FROM ${tableRef()} WHERE timestamp BETWEEN @start AND @end LIMIT 1`, {
+      start: start.toISOString(),
+      end: end.toISOString(),
+    });
+    bqProbe = { ok: true, detail: "ok", checked: Date.now() };
+  } catch (e) {
+    bqProbe = { ok: false, detail: e instanceof Error ? e.message : String(e), checked: Date.now() };
+  }
+  return bqProbe;
+}
+
+app.get("/healthz", (_req, res) => {
   res.json({ ok: true, mock: CONFIG.mock, uiBundle: existsSync(uiBundlePath()) });
-};
-app.get("/api/health", health);
-app.get("/healthz", health);
+});
+
+app.get("/api/health", async (_req, res) => {
+  const bundle = existsSync(uiBundlePath());
+  const bq = await probeBigQuery();
+  const ok = bundle && bq.ok;
+  res.status(ok ? 200 : 503).json({ ok, mock: CONFIG.mock, uiBundle: bundle, bigquery: bq.detail });
+});
 
 // Browser-shareable view: the shell is static; all data endpoints are guarded.
 app.get("/", async (_req, res) => {
@@ -622,6 +716,26 @@ app.get("/", async (_req, res) => {
   } catch {
     res.status(500).send("UI bundle missing — run `npm run build` first.");
   }
+});
+
+// Browser sign-in: exchanges the token once (in a POST body) for an HttpOnly
+// cookie, so the secret never appears in a URL or in page JavaScript.
+app.post("/auth/login", checkOrigin, (req, res) => {
+  if (!CONFIG.authToken) {
+    res.status(204).end();
+    return;
+  }
+  const token = typeof req.body?.token === "string" ? req.body.token : "";
+  if (token !== CONFIG.authToken) {
+    res.status(401).json({ error: "Invalid token" });
+    return;
+  }
+  const secure = req.secure ? "; Secure" : "";
+  res.setHeader(
+    "Set-Cookie",
+    `bqaa_token=${encodeURIComponent(token)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=604800${secure}`,
+  );
+  res.status(204).end();
 });
 
 app.get("/api/dashboard", checkOrigin, requireAuth, async (req, res) => {
@@ -643,8 +757,8 @@ app.get("/api/trace", checkOrigin, requireAuth, async (req, res) => {
       return;
     }
     const hours = Math.min(MAX_HOURS, Math.max(1, Math.trunc(Number(req.query.time_range_hours)) || CONFIG.defaultHours));
-    const data = await loadTrace(traceId, hours);
-    res.json({ data });
+    const trace = await loadTrace(traceId, hours);
+    res.json({ data: trace.events, truncated: trace.truncated });
   } catch (e) {
     res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
   }
@@ -703,12 +817,16 @@ app.post("/api/ask", checkOrigin, requireAuth, async (req, res) => {
 });
 
 app.post("/mcp", checkOrigin, requireAuth, async (req, res) => {
+  const mcp = buildMcpServer();
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
     enableJsonResponse: true,
   });
-  res.on("close", () => transport.close());
-  await server.connect(transport);
+  res.on("close", () => {
+    void transport.close();
+    void mcp.close();
+  });
+  await mcp.connect(transport);
   await transport.handleRequest(req, res, req.body);
 });
 

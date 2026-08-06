@@ -42,14 +42,17 @@ test("schema aliases cover both producers (canonical ADK + tracing plugin)", () 
 
 test("tool stats include separate TOOL_ERROR failure events", () => {
   assert.match(sql.tools, /'TOOL_COMPLETED', 'TOOL_ERROR'/);
-  assert.match(sql.tools, /event_type = 'TOOL_ERROR'/);
+  assert.ok(sql.tools.includes(ERROR_EXPR), "tools must use the canonical error predicate");
 });
 
-test("model comparison includes canonical LLM_ERROR events", () => {
+test("model comparison includes canonical LLM_ERROR events and exact sums", () => {
   assert.match(sql.models, /'LLM_RESPONSE', 'LLM_ERROR'/);
-  assert.match(sql.models, /event_type = 'LLM_ERROR'/);
+  assert.ok(sql.models.includes(ERROR_EXPR), "models must use the canonical error predicate");
   // latency/token averages must come from successful responses only
   assert.match(sql.models, /IF\(event_type = 'LLM_RESPONSE'/);
+  // cost needs exact sums, never average × attempts
+  assert.match(sql.models, /SUM\(prompt_tokens\)/);
+  assert.match(sql.models, /SUM\(completion_tokens\)/);
 });
 
 test("top sessions expose drillable trace ids", () => {
@@ -122,4 +125,43 @@ test("error-traces query is parameterized and errors-only", () => {
   assert.match(t, /status = 'ERROR'/);
   assert.match(t, /LIMIT @limit/);
   assert.match(t, /timestamp BETWEEN @start AND @end/);
+});
+
+
+// ---- fresh-review fixes: canonical errors, budget, delegation, sessions
+
+import { ERROR_EXPR, splitBudget } from "../src/queries.js";
+
+test("one canonical error predicate is used on every surface (#10)", () => {
+  assert.match(ERROR_EXPR, /status = 'ERROR'/);
+  assert.match(ERROR_EXPR, /ENDS_WITH\(event_type, '_ERROR'\)/);
+  assert.match(ERROR_EXPR, /error_message IS NOT NULL/);
+  for (const section of ["overview", "timeseries", "tools", "models"]) {
+    assert.ok(sql[section].includes(ERROR_EXPR), `${section} must use ERROR_EXPR`);
+  }
+  assert.ok(buildErrorTracesSql("`p.d.t`").includes(ERROR_EXPR));
+  assert.ok(WIDGET_MEASURES.errors.sql.includes(ERROR_EXPR));
+  assert.ok(WIDGET_MEASURES.tool_failures.sql.includes(ERROR_EXPR));
+});
+
+test("refresh budget splits exactly with no floor (#1)", () => {
+  assert.equal(splitBudget(10_000_000, 10), 1_000_000);
+  assert.equal(splitBudget(2_000_000_000, 10) * 10 <= 2_000_000_000, true);
+  assert.throws(() => splitBudget(5, 10));
+});
+
+test("delegation deduplicates spans before joining (#11)", () => {
+  assert.match(sql.delegation, /GROUP BY trace_id, span_id/);
+  assert.match(sql.delegation, /ANY_VALUE\(agent\)/);
+  assert.match(sql.delegation, /a\.parent_span_id = b\.span_id/);
+});
+
+test("top sessions aggregate whole sessions, models as a label (#28)", () => {
+  assert.match(sql.sessions, /GROUP BY session_id\n/);
+  assert.ok(!/GROUP BY session_id, model_id/.test(sql.sessions));
+  assert.match(sql.sessions, /STRING_AGG\(DISTINCT model_id/);
+});
+
+test("trace query limit is parameterized for truncation detection (#23)", () => {
+  assert.match(buildTraceSql("`p.d.t`"), /LIMIT @limit/);
 });

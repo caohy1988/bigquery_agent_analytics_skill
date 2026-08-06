@@ -36,6 +36,22 @@ export type Section = (typeof SECTIONS)[number];
 const LATENCY_EXPR = "CAST(JSON_VALUE(latency_ms, '$.total_ms') AS FLOAT64)";
 const LLM_LATENCY_EXPR = `IF(event_type = 'LLM_RESPONSE', ${LATENCY_EXPR}, NULL)`;
 
+// Canonical error predicate (SDK contract): an event is an error if its type
+// is *_ERROR, its status says so, or it carries an error message. Every
+// surface (overview, timeseries, tools, models, widgets, error traces) must
+// use this one definition so metrics cannot drift.
+export const ERROR_EXPR =
+  "(status = 'ERROR' OR ENDS_WITH(event_type, '_ERROR') OR error_message IS NOT NULL)";
+
+// The refresh byte budget is split exactly across parts — no per-part floor,
+// so the aggregate can never exceed the configured budget.
+export function splitBudget(totalBytes: number, parts: number): number {
+  if (parts <= 0) throw new Error("parts must be positive");
+  const per = Math.floor(totalBytes / parts);
+  if (per < 1) throw new Error(`Budget ${totalBytes} too small to split across ${parts} queries`);
+  return per;
+}
+
 // ------------------------------------------------------------ widget contract
 // The Langfuse-style widget model: measure × dimension × filters. Every entry
 // is a whitelisted SQL fragment — specs select by KEY, so user/model input is
@@ -43,10 +59,10 @@ const LLM_LATENCY_EXPR = `IF(event_type = 'LLM_RESPONSE', ${LATENCY_EXPR}, NULL)
 
 export const WIDGET_MEASURES: Record<string, { label: string; sql: string; unit: "count" | "pct" | "ms" | "tokens" }> = {
   events: { label: "Events", sql: "COUNT(*)", unit: "count" },
-  errors: { label: "Errors", sql: "COUNTIF(status = 'ERROR')", unit: "count" },
+  errors: { label: "Errors", sql: `COUNTIF(${ERROR_EXPR})`, unit: "count" },
   error_rate_pct: {
     label: "Error rate %",
-    sql: "ROUND(SAFE_DIVIDE(COUNTIF(status = 'ERROR'), COUNT(*)) * 100, 2)",
+    sql: `ROUND(SAFE_DIVIDE(COUNTIF(${ERROR_EXPR}), COUNT(*)) * 100, 2)`,
     unit: "pct",
   },
   sessions: { label: "Sessions", sql: "COUNT(DISTINCT session_id)", unit: "count" },
@@ -86,7 +102,7 @@ export const WIDGET_MEASURES: Record<string, { label: string; sql: string; unit:
   tool_calls: { label: "Tool calls", sql: "COUNTIF(event_type IN ('TOOL_COMPLETED', 'TOOL_ERROR'))", unit: "count" },
   tool_failures: {
     label: "Tool failures",
-    sql: "COUNTIF(event_type = 'TOOL_ERROR' OR (event_type = 'TOOL_COMPLETED' AND status = 'ERROR'))",
+    sql: `COUNTIF(event_type IN ('TOOL_COMPLETED', 'TOOL_ERROR') AND ${ERROR_EXPR})`,
     unit: "count",
   },
 };
@@ -173,8 +189,8 @@ export function buildDashboardSql(opts: DashboardSqlOptions): Record<Section, st
   const overviewSql = `
     SELECT
       COUNT(*) AS total_events,
-      COUNTIF(status = 'ERROR') AS errors,
-      ROUND(SAFE_DIVIDE(COUNTIF(status = 'ERROR'), COUNT(*)) * 100, 2) AS error_rate_pct,
+      COUNTIF(${ERROR_EXPR}) AS errors,
+      ROUND(SAFE_DIVIDE(COUNTIF(${ERROR_EXPR}), COUNT(*)) * 100, 2) AS error_rate_pct,
       COUNT(DISTINCT session_id) AS sessions,
       COUNT(DISTINCT agent) AS agents,
       COUNT(DISTINCT user_id) AS users,
@@ -191,7 +207,7 @@ export function buildDashboardSql(opts: DashboardSqlOptions): Record<Section, st
     SELECT
       FORMAT_TIMESTAMP('%FT%TZ', TIMESTAMP_TRUNC(timestamp, ${G})) AS ts,
       COUNT(*) AS events,
-      COUNTIF(status = 'ERROR') AS errors,
+      COUNTIF(${ERROR_EXPR}) AS errors,
       COUNTIF(event_type = 'LLM_RESPONSE') AS llm_calls,
       COALESCE(SUM(IF(event_type = 'LLM_RESPONSE',
         COALESCE(CAST(${PROMPT_TOK_EXPR} AS INT64), 0), 0)), 0) AS prompt_tokens,
@@ -233,7 +249,7 @@ export function buildDashboardSql(opts: DashboardSqlOptions): Record<Section, st
         JSON_VALUE(content, '$.tool') AS tool_name,
         JSON_VALUE(content, '$.tool_origin') AS tool_origin,
         CAST(JSON_VALUE(latency_ms, '$.total_ms') AS FLOAT64) AS tool_latency_ms,
-        (status = 'ERROR' OR event_type = 'TOOL_ERROR') AS failed
+        ${ERROR_EXPR} AS failed
       FROM ${T}
       WHERE event_type IN ('TOOL_COMPLETED', 'TOOL_ERROR') AND ${W}
     )
@@ -257,7 +273,7 @@ export function buildDashboardSql(opts: DashboardSqlOptions): Record<Section, st
     WITH llm_events AS (
       SELECT
         ${MODEL_EXPR} AS model_id,
-        (status = 'ERROR' OR event_type = 'LLM_ERROR') AS failed,
+        ${ERROR_EXPR} AS failed,
         IF(event_type = 'LLM_RESPONSE', CAST(${PROMPT_TOK_EXPR} AS INT64), NULL) AS prompt_tokens,
         IF(event_type = 'LLM_RESPONSE', CAST(${COMPLETION_TOK_EXPR} AS INT64), NULL) AS completion_tokens,
         IF(event_type = 'LLM_RESPONSE', CAST(${TOTAL_TOK_EXPR} AS INT64), NULL) AS total_tokens,
@@ -272,6 +288,8 @@ export function buildDashboardSql(opts: DashboardSqlOptions): Record<Section, st
       COALESCE(model_id, '(unknown)') AS model_id,
       COUNT(*) AS calls,
       ROUND(SAFE_DIVIDE(COUNTIF(failed), COUNT(*)) * 100, 2) AS error_rate_pct,
+      COALESCE(SUM(prompt_tokens), 0) AS total_prompt_tokens,
+      COALESCE(SUM(completion_tokens), 0) AS total_completion_tokens,
       ROUND(AVG(total_tokens), 0) AS avg_total_tokens,
       ROUND(AVG(prompt_tokens), 0) AS avg_prompt_tokens,
       ROUND(AVG(completion_tokens), 0) AS avg_completion_tokens,
@@ -283,6 +301,8 @@ export function buildDashboardSql(opts: DashboardSqlOptions): Record<Section, st
     GROUP BY model_id
     ORDER BY calls DESC`,
 
+    // Sessions rank as whole sessions; models are a breakdown label, so a
+    // multi-model session is one row, not several competing partial rows.
     sessions: `
     WITH llm_responses AS (
       SELECT
@@ -295,14 +315,15 @@ export function buildDashboardSql(opts: DashboardSqlOptions): Record<Section, st
       WHERE event_type = 'LLM_RESPONSE' AND ${W}
     )
     SELECT
-      session_id, model_id,
+      session_id,
+      STRING_AGG(DISTINCT model_id ORDER BY model_id LIMIT 2) AS model_id,
       COUNT(*) AS llm_calls,
       SUM(prompt_tokens) AS total_prompt_tokens,
       SUM(completion_tokens) AS total_completion_tokens,
       SUM(prompt_tokens) + SUM(completion_tokens) AS total_tokens,
       ARRAY_AGG(DISTINCT trace_id IGNORE NULLS LIMIT 3) AS trace_ids
     FROM llm_responses
-    GROUP BY session_id, model_id
+    GROUP BY session_id
     ORDER BY total_tokens DESC
     LIMIT 15`,
 
@@ -342,19 +363,30 @@ export function buildDashboardSql(opts: DashboardSqlOptions): Record<Section, st
     ORDER BY total_requests DESC
     LIMIT 30`,
 
+    // Producers emit several events per span, so spans are deduplicated
+    // before the parent join: one delegation = one unique child span.
     delegation: `
-    WITH agent_tree AS (
+    WITH spans AS (
+      SELECT
+        trace_id,
+        span_id,
+        ANY_VALUE(agent) AS agent,
+        ANY_VALUE(parent_span_id) AS parent_span_id
+      FROM ${T}
+      WHERE timestamp BETWEEN @start AND @end
+        AND span_id IS NOT NULL
+      GROUP BY trace_id, span_id
+    ),
+    agent_tree AS (
       SELECT
         a.trace_id,
         a.agent AS child_agent,
         b.agent AS parent_agent
-      FROM ${T} a
-      INNER JOIN ${T} b
+      FROM spans a
+      INNER JOIN spans b
         ON a.parent_span_id = b.span_id
         AND a.trace_id = b.trace_id
-      WHERE a.timestamp BETWEEN @start AND @end
-        AND b.timestamp BETWEEN @start AND @end
-        AND a.agent IS NOT NULL
+      WHERE a.agent IS NOT NULL
         AND b.agent IS NOT NULL
         AND a.agent != b.agent
     )
@@ -382,14 +414,14 @@ export function buildErrorTracesSql(table: string): string {
       trace_id,
       FORMAT_TIMESTAMP('%FT%TZ', MAX(timestamp)) AS last_ts,
       STRING_AGG(DISTINCT agent LIMIT 5) AS agents,
-      COUNTIF(status = 'ERROR') AS error_events,
+      COUNTIF(${ERROR_EXPR}) AS error_events,
       STRING_AGG(DISTINCT SUBSTR(COALESCE(error_message, event_type), 1, 160) LIMIT 3) AS sample_errors
     FROM ${table}
     WHERE timestamp BETWEEN @start AND @end
       AND trace_id IS NOT NULL
       AND trace_id IN (
         SELECT DISTINCT trace_id FROM ${table}
-        WHERE status = 'ERROR' AND trace_id IS NOT NULL
+        WHERE ${ERROR_EXPR} AND trace_id IS NOT NULL
           AND timestamp BETWEEN @start AND @end
       )
     GROUP BY trace_id
@@ -410,5 +442,5 @@ export function buildTraceSql(table: string): string {
     FROM ${table}
     WHERE trace_id = @trace_id AND timestamp BETWEEN @start AND @end
     ORDER BY timestamp ASC
-    LIMIT 500`;
+    LIMIT @limit`;
 }
