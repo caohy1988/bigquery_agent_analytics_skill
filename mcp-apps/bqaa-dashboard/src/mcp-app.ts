@@ -5,9 +5,17 @@
 
 import "./styles.css";
 import { App } from "@modelcontextprotocol/ext-apps";
-import { mockDashboard, mockTrace, mockWidget } from "./mock.js";
+import { mockAsk, mockDashboard, mockTrace, mockWidget } from "./mock.js";
 import { WIDGET_DIMENSIONS, WIDGET_MEASURES } from "./queries.js";
-import type { DashboardData, OverviewStats, TimeBucket, TraceEvent, WidgetResult, WidgetSpec } from "./types.js";
+import type {
+  AskResult,
+  DashboardData,
+  OverviewStats,
+  TimeBucket,
+  TraceEvent,
+  WidgetResult,
+  WidgetSpec,
+} from "./types.js";
 
 // Shareable page state lives in the hash: #view=tokens&range=720&agent=coder
 // (legacy #tokens-style hashes still work).
@@ -1426,10 +1434,179 @@ function renderExplore(d: DashboardData | null, main: HTMLElement): void {
   );
 }
 
+// ---------------------------------------------------------------- ask view
+// The conversation layer: natural-language questions answered by BigQuery
+// Conversational Analytics server-side — works with no MCP host at all.
+
+const askState: { exchanges: AskResult[]; pending: string | null; note: string; draft: string } = {
+  exchanges: [],
+  pending: null,
+  note: "",
+  draft: "", // survives re-renders so a background refresh never eats typing
+};
+
+// Minimal, injection-safe renderer for the API's markdown-ish answers:
+// headings, bullets, **bold**, `code` — everything else is plain text.
+function renderAnswer(text: string): HTMLElement {
+  const wrap = el("div", "ans");
+  for (const rawLine of text.split("\n")) {
+    let line = rawLine.trimEnd();
+    if (!line.trim()) continue;
+    let cls = "ans-p";
+    if (/^#{2,4} /.test(line)) {
+      cls = "ans-h";
+      line = line.replace(/^#{2,4} /, "");
+    } else if (/^\s*[-*] /.test(line)) {
+      cls = "ans-li";
+      line = line.replace(/^\s*[-*] /, "");
+    }
+    const p = el("div", cls);
+    for (const tok of line.split(/(\*\*[^*]+\*\*|`[^`]+`)/g)) {
+      if (tok.startsWith("**") && tok.endsWith("**")) p.appendChild(el("strong", undefined, tok.slice(2, -2)));
+      else if (tok.startsWith("`") && tok.endsWith("`")) p.appendChild(el("code", undefined, tok.slice(1, -1)));
+      else if (tok) p.appendChild(document.createTextNode(tok));
+    }
+    wrap.appendChild(p);
+  }
+  return wrap;
+}
+
+async function submitQuestion(question: string): Promise<void> {
+  const q = question.trim();
+  if (!q || askState.pending) return;
+  askState.pending = q;
+  askState.note = "";
+  renderView();
+  try {
+    let result: AskResult;
+    const history = askState.exchanges.slice(-3).map((e) => ({ question: e.question, answer: e.answer }));
+    if (embedded && appBridge) {
+      const r: any = await appBridge.callServerTool({ name: "ask_data", arguments: { question: q } });
+      const d = r?.structuredContent?.data;
+      if (!d?.answer) throw new Error("no answer in tool result");
+      result = d as AskResult;
+    } else if (location.protocol.startsWith("http")) {
+      const res = await fetch("api/ask", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ question: q, history }),
+      });
+      const body: any = await res.json().catch(() => null);
+      if (!res.ok) throw new Error(body?.error ?? `HTTP ${res.status}`);
+      result = body.data as AskResult;
+    } else {
+      await new Promise((r) => setTimeout(r, 600));
+      result = mockAsk(q);
+    }
+    askState.exchanges.push(result);
+  } catch (e) {
+    askState.note = `Ask failed: ${e instanceof Error ? e.message : String(e)}`;
+  } finally {
+    askState.pending = null;
+    renderView();
+  }
+}
+
+function fmtCell(v: unknown): string {
+  if (v == null) return "—";
+  if (typeof v === "number") {
+    if (Number.isInteger(v)) return v.toLocaleString("en-US");
+    return Math.abs(v) < 1 ? v.toFixed(4) : v.toLocaleString("en-US", { maximumFractionDigits: 2 });
+  }
+  return String(v);
+}
+
+function renderAsk(d: DashboardData | null, main: HTMLElement): void {
+  void d;
+  const form = chartCard(
+    "Ask your agent data",
+    "natural language → SQL → answer, via BigQuery Conversational Analytics (no MCP host needed)",
+    [],
+  );
+  const row = el("div", "ask-row");
+  const input = el("input", "ask-input") as HTMLInputElement;
+  input.type = "text";
+  input.placeholder = "e.g. Which tool has the highest failure rate, and is it getting worse week over week?";
+  input.setAttribute("aria-label", "Question about the agent_events table");
+  input.disabled = !!askState.pending;
+  input.value = askState.draft;
+  input.addEventListener("input", () => {
+    askState.draft = input.value;
+  });
+  const btn = el("button", "run-btn", askState.pending ? "Analyzing…" : "Ask");
+  btn.disabled = !!askState.pending;
+  const go = (): void => {
+    const q = input.value;
+    askState.draft = "";
+    input.value = "";
+    void submitQuestion(q);
+  };
+  btn.addEventListener("click", go);
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") go();
+  });
+  row.appendChild(input);
+  row.appendChild(btn);
+  form.body.appendChild(row);
+  if (askState.pending) {
+    form.body.appendChild(el("div", "sub", `Analyzing "${askState.pending}" — BQ Conversational Analytics plans and runs SQL, ~30–60 s…`));
+  }
+  if (askState.note) form.body.appendChild(el("div", "empty error", askState.note));
+  if (!askState.exchanges.length && !askState.pending) {
+    const hints = el("div", "ask-hints");
+    for (const h of [
+      "Which tool has the highest failure rate?",
+      "How many tokens did each model use per day last month?",
+      "Which agent is slowest at p95, and why?",
+    ]) {
+      const chip = el("button", "chip-btn", h);
+      chip.addEventListener("click", () => void submitQuestion(h));
+      hints.appendChild(chip);
+    }
+    form.body.appendChild(hints);
+  }
+  main.appendChild(form.card);
+
+  for (const ex of [...askState.exchanges].reverse()) {
+    const card = el("div", "card span-full ask-exchange");
+    card.appendChild(el("div", "ask-q", ex.question));
+    if (ex.steps.length) card.appendChild(el("div", "sub", `${ex.steps.length} analysis steps · ${ex.steps.slice(0, 3).join(" · ")}`));
+    card.appendChild(renderAnswer(ex.answer));
+    if (ex.sql) {
+      const det = el("details", "data-table");
+      det.appendChild(el("summary", undefined, "Generated SQL"));
+      const pre = el("pre", "ask-sql");
+      pre.textContent = ex.sql;
+      det.appendChild(pre);
+      card.appendChild(det);
+    }
+    if (ex.rows.length) {
+      const cols = ex.schema.length ? ex.schema : Object.keys(ex.rows[0]);
+      card.appendChild(
+        dataTable({
+          head: cols,
+          rows: ex.rows.slice(0, 30).map((r) => cols.map((c) => fmtCell((r as Record<string, unknown>)[c]))),
+        }),
+      );
+    }
+    if (ex.followups.length) {
+      const chips = el("div", "ask-hints");
+      for (const f of ex.followups) {
+        const chip = el("button", "chip-btn", f);
+        chip.addEventListener("click", () => void submitQuestion(f));
+        chips.appendChild(chip);
+      }
+      card.appendChild(chips);
+    }
+    main.appendChild(card);
+  }
+}
+
 // ---------------------------------------------------------------- app state
 
 const VIEWS = [
   { id: "overview", label: "Overview", render: renderOverview },
+  { id: "ask", label: "Ask", render: renderAsk as (d: DashboardData, main: HTMLElement) => void },
   { id: "latency", label: "Latency", render: renderLatency },
   { id: "tokens", label: "Tokens", render: renderTokens },
   { id: "tools", label: "Tools", render: renderTools },
@@ -1545,7 +1722,7 @@ function renderTabs(): void {
 function renderView(): void {
   hideTooltip();
   mainEl.replaceChildren();
-  if (!data && !(currentView === "explore" && explore.result)) {
+  if (!data && !(currentView === "explore" && explore.result) && currentView !== "ask") {
     mainEl.appendChild(el("div", "empty", "Waiting for data…"));
     return;
   }

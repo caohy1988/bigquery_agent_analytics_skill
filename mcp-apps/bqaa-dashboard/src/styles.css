@@ -473,6 +473,61 @@ details.data-table[open] summary { color: var(--ink-2); }
 }
 .run-btn:hover { filter: brightness(1.07); }
 
+/* ask (conversational layer) */
+.ask-row { display: flex; gap: 10px; margin: 4px 0 10px; }
+.ask-input {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  color: var(--ink);
+  background: var(--page);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  padding: 8px 12px;
+}
+.ask-input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+.ask-hints { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+.chip-btn {
+  font: 500 12px var(--font-body);
+  color: var(--ink-2);
+  background: color-mix(in srgb, var(--ink) 5%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 99px;
+  padding: 5px 12px;
+  cursor: pointer;
+  text-align: left;
+}
+.chip-btn:hover { color: var(--ink); border-color: var(--axis); }
+.ask-exchange .ask-q {
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 14px;
+  letter-spacing: -0.01em;
+  margin-bottom: 6px;
+}
+.ans { display: flex; flex-direction: column; gap: 5px; margin: 6px 0 2px; }
+.ans .ans-h { font-weight: 600; margin-top: 6px; }
+.ans .ans-li { padding-left: 14px; position: relative; color: var(--ink-2); }
+.ans .ans-li::before { content: "•"; position: absolute; left: 2px; color: var(--muted); }
+.ans .ans-p { color: var(--ink-2); }
+.ans strong { color: var(--ink); }
+.ans code, .ask-sql {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11.5px;
+}
+.ans code { background: color-mix(in srgb, var(--ink) 6%, transparent); padding: 1px 5px; border-radius: 4px; }
+.ask-sql {
+  background: var(--page);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-top: 6px;
+  overflow-x: auto;
+  white-space: pre;
+  color: var(--ink-2);
+  line-height: 1.5;
+}
+
 /* price book editor */
 .price-grid {
   display: grid;

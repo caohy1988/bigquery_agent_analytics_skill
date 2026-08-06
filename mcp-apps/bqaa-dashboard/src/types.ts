@@ -146,6 +146,23 @@ export interface WidgetResult {
   dry_run?: boolean;
 }
 
+// ---------------------------------------------- conversational layer (BQCA)
+
+export interface AskExchange {
+  question: string;
+  answer: string;
+}
+
+export interface AskResult {
+  question: string;
+  answer: string; // FINAL_RESPONSE text (markdown-ish)
+  steps: string[]; // brief THOUGHT titles, for progress transparency
+  sql: string | null; // last executed SQL
+  schema: string[]; // result column names
+  rows: Array<Record<string, unknown>>; // last query result (capped)
+  followups: string[];
+}
+
 export interface ErrorTraceRow {
   trace_id: string;
   last_ts: string;

@@ -4,6 +4,7 @@
 
 import type {
   AgentLatencyRow,
+  AskResult,
   DashboardData,
   DelegationRow,
   ErrorTraceRow,
@@ -309,4 +310,25 @@ export function mockTrace(traceId: string): TraceEvent[] {
   t += 900;
   push({ event_type: "LLM_RESPONSE", span_id: "s2", parent_span_id: "s1", llm_response: "Final answer.", latency_ms: 900 });
   return events;
+}
+
+export function mockAsk(question: string): AskResult {
+  return {
+    question,
+    answer:
+      "**fetch_invoice** has the highest failure rate at **7.1%** of started executions (196 errors out of 2,759 starts), followed by check_inventory at 6.9%.\n\n(Sample answer — connect a BigQuery project to ask real questions.)",
+    steps: ["Analyzing context", "Running a query", "Tool failure analysis"],
+    sql: "WITH tool_stats AS (\n  SELECT LAX_STRING(content.tool) AS tool_name,\n    COUNTIF(event_type = 'TOOL_STARTING') AS starting_count,\n    COUNTIF(event_type = 'TOOL_ERROR') AS error_count\n  FROM `project.dataset.agent_events`\n  WHERE timestamp > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)\n  GROUP BY tool_name\n)\nSELECT tool_name, error_count / starting_count AS failure_rate\nFROM tool_stats ORDER BY failure_rate DESC",
+    schema: ["tool_name", "starting_count", "error_count", "failure_rate"],
+    rows: [
+      { tool_name: "fetch_invoice", starting_count: 2759, error_count: 196, failure_rate: 0.071 },
+      { tool_name: "check_inventory", starting_count: 2768, error_count: 191, failure_rate: 0.069 },
+      { tool_name: "search_kb", starting_count: 2834, error_count: 195, failure_rate: 0.068 },
+    ],
+    followups: [
+      "What are the most common error messages for fetch_invoice?",
+      "What is the failure rate broken down by agent?",
+      "Show me the daily trend of failures.",
+    ],
+  };
 }

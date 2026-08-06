@@ -27,7 +27,8 @@ import {
   registerAppResource,
   RESOURCE_MIME_TYPE,
 } from "@modelcontextprotocol/ext-apps/server";
-import { mockDashboard, mockErrorTraces, mockTrace, mockWidget } from "./src/mock.js";
+import { askConversational } from "./src/ca.js";
+import { mockAsk, mockDashboard, mockErrorTraces, mockTrace, mockWidget } from "./src/mock.js";
 import {
   buildDashboardSql,
   buildErrorTracesSql,
@@ -38,6 +39,8 @@ import {
   WIDGET_MEASURES,
 } from "./src/queries.js";
 import type {
+  AskExchange,
+  AskResult,
   DashboardData,
   ErrorTraceRow,
   Granularity,
@@ -249,6 +252,17 @@ async function loadWidget(spec: WidgetSpec, timeRangeHours: number, dryRun: bool
   }
   const { rows, bytes } = await runQuery(built.sql, params, WIDGET_QUERY_BYTES);
   return { spec: fullSpec as WidgetResult["spec"], window, rows, bytes_processed: bytes };
+}
+
+// ------------------------------------------------ conversational layer (BQCA)
+
+async function ask(question: string, history: AskExchange[]): Promise<AskResult> {
+  if (CONFIG.mock) return mockAsk(question);
+  return askConversational(
+    { project: CONFIG.project, dataset: CONFIG.dataset, table: CONFIG.table, location: process.env.BQAA_CA_LOCATION },
+    question,
+    history,
+  );
 }
 
 async function loadErrorTraces(timeRangeHours: number, limit: number): Promise<ErrorTraceRow[]> {
@@ -485,6 +499,26 @@ registerAppTool(
 );
 
 server.registerTool(
+  "ask_data",
+  {
+    title: "Ask the agent_events table",
+    description:
+      "Ask a natural-language analytics question about the agent_events table. Answered by BigQuery Conversational Analytics (Gemini Data Analytics): it plans, writes and runs SQL, and returns an answer with the generated SQL and result rows. Slower than the widget tools (~30-60s) but handles open-ended questions.",
+    inputSchema: {
+      question: z.string().min(3).max(2000).describe("The analytics question, in natural language"),
+    },
+    outputSchema: { data: z.unknown() },
+  },
+  async (args) => {
+    const result = await ask(args.question, []);
+    return {
+      content: [{ type: "text" as const, text: result.answer + (result.sql ? `\n\nGenerated SQL:\n${result.sql}` : "") }],
+      structuredContent: { data: result } as any,
+    };
+  },
+);
+
+server.registerTool(
   "list_error_traces",
   {
     title: "List recent error traces",
@@ -514,19 +548,24 @@ registerAppResource(server, resourceUri, resourceUri, { mimeType: RESOURCE_MIME_
 // ---------------------------------------------------------------- transport
 
 const app = express();
+app.set("trust proxy", true); // Cloud Run terminates TLS; honor X-Forwarded-Proto
 
 function originAllowed(origin: string): boolean {
   return CONFIG.allowedOrigins.includes("*") || CONFIG.allowedOrigins.includes(origin);
 }
 
 // MCP transport security: cross-origin callers must present an allowlisted
-// Origin. Same-origin browser requests and server-to-server clients send no
-// Origin header and pass through.
+// Origin. Same-origin requests always pass (browsers DO send Origin on
+// same-origin POSTs), as do server-to-server clients with no Origin header.
 function checkOrigin(req: express.Request, res: express.Response, next: express.NextFunction): void {
   const origin = req.headers.origin;
-  if (origin && !originAllowed(origin)) {
-    res.status(403).json({ error: "Origin not allowed. Configure BQAA_ALLOWED_ORIGINS." });
-    return;
+  if (origin) {
+    const host = req.get("host");
+    const sameOrigin = origin === `${req.protocol}://${host}` || origin === `https://${host}`;
+    if (!sameOrigin && !originAllowed(origin)) {
+      res.status(403).json({ error: "Origin not allowed. Configure BQAA_ALLOWED_ORIGINS." });
+      return;
+    }
   }
   next();
 }
@@ -638,6 +677,25 @@ app.get("/api/widget", checkOrigin, requireAuth, async (req, res) => {
       },
     };
     const data = await loadWidget(spec, hours, q.dry_run === "1");
+    res.json({ data });
+  } catch (e) {
+    res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
+app.post("/api/ask", checkOrigin, requireAuth, async (req, res) => {
+  try {
+    const question = typeof req.body?.question === "string" ? req.body.question.trim() : "";
+    if (question.length < 3 || question.length > 2000) {
+      res.status(400).json({ error: "question must be 3-2000 characters" });
+      return;
+    }
+    const history: AskExchange[] = Array.isArray(req.body?.history)
+      ? req.body.history
+          .filter((h: any) => typeof h?.question === "string" && typeof h?.answer === "string")
+          .slice(-3)
+      : [];
+    const data = await ask(question, history);
     res.json({ data });
   } catch (e) {
     res.status(500).json({ error: e instanceof Error ? e.message : String(e) });

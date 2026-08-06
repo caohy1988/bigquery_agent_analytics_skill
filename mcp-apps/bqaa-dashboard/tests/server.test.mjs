@@ -166,9 +166,14 @@ test("cross-origin requests require an allowlisted Origin", async () => {
     });
     assert.equal(ok.status, 200);
     assert.equal(ok.headers.get("access-control-allow-origin"), "https://ok.example");
-    // no Origin header (same-origin / server-to-server) passes
+    // no Origin header (server-to-server) passes
     const plain = await fetch(`http://localhost:${port}/api/dashboard`);
     assert.equal(plain.status, 200);
+    // same-origin requests always pass (browsers send Origin on POSTs)
+    const sameOrigin = await fetch(`http://localhost:${port}/api/dashboard`, {
+      headers: { Origin: `http://localhost:${port}` },
+    });
+    assert.equal(sameOrigin.status, 200);
   } finally {
     srv.child.kill();
   }
@@ -227,4 +232,33 @@ test("MCP exposes widget + error-trace tools; render_widget carries UI meta", as
   const traces = await rpc(BASE, "tools/call", { name: "list_error_traces", arguments: {} });
   assert.ok(traces.body.result.structuredContent?.data?.length > 0);
   assert.match(traces.body.result.content[0].text, /trace/);
+});
+
+test("/api/ask answers via the conversational layer (mock) and validates input", async () => {
+  const bad = await fetch(`${BASE}/api/ask`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ question: "hi" }),
+  });
+  assert.equal(bad.status, 400);
+  const ok = await fetch(`${BASE}/api/ask`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ question: "Which tool fails most?" }),
+  });
+  assert.equal(ok.status, 200);
+  const { data } = await ok.json();
+  assert.ok(data.answer.length > 10);
+  assert.ok(data.sql);
+  assert.ok(Array.isArray(data.rows) && data.rows.length > 0);
+});
+
+test("MCP ask_data tool answers questions", async () => {
+  const call = await rpc(BASE, "tools/call", {
+    name: "ask_data",
+    arguments: { question: "Which tool fails most?" },
+  });
+  const d = call.body.result.structuredContent?.data;
+  assert.ok(d?.answer);
+  assert.match(call.body.result.content[0].text, /failure|fail/i);
 });
