@@ -7,6 +7,7 @@ VS Code Copilot, Goose, …) via the
 [MCP Apps extension](https://modelcontextprotocol.io/extensions/apps/overview).
 
 Design/discussion: [GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK#396](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/issues/396)
+· Detailed design & implementation: [DESIGN.md](./DESIGN.md)
 
 Ask the host *"show me my agent dashboard"* — or open the URL in a browser —
 and get eight views:
