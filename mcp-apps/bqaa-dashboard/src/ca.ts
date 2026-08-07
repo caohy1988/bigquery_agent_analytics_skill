@@ -25,7 +25,11 @@ export interface CaConfig {
   dataset: string;
   table: string;
   location?: string; // default "global"
-  maxBilledBytes?: number; // BigQuery byte cap applied to CA-generated queries
+  // Per-QUERY byte cap on each CA-generated BigQuery query. CA may generate
+  // and retry several queries per question, so this is NOT an aggregate
+  // per-request budget — bound aggregate spend with project/user quotas.
+  maxBilledBytes?: number;
+  scope?: { startIso: string; endIso: string; agent?: string }; // active filters
 }
 
 const SYSTEM_INSTRUCTION =
@@ -39,6 +43,7 @@ export async function askConversational(
   cfg: CaConfig,
   question: string,
   history: AskExchange[] = [],
+  callerSignal?: AbortSignal,
 ): Promise<AskResult> {
   const location = cfg.location ?? "global";
   const parent = `projects/${cfg.project}/locations/${location}`;
@@ -49,17 +54,35 @@ export async function askConversational(
   }
   messages.push({ userMessage: { text: question.slice(0, 2000) } });
 
+  // #20: one deadline covers the WHOLE request — including ADC token
+  // acquisition, which would otherwise be able to hold Ask slots forever.
+  const timeout = AbortSignal.timeout(150_000);
+  const signal = callerSignal ? AbortSignal.any([timeout, callerSignal]) : timeout;
+  const token = await Promise.race([
+    accessToken(),
+    new Promise<never>((_, reject) => {
+      signal.addEventListener("abort", () => reject(new Error("Ask aborted while acquiring credentials")), { once: true });
+    }),
+  ]);
+
+  // #5: pin the analysis to the filters the user is looking at
+  const scopeInstruction = cfg.scope
+    ? ` SCOPE: unless the user explicitly asks otherwise, restrict every query to timestamp BETWEEN '${cfg.scope.startIso}' AND '${cfg.scope.endIso}'` +
+      (cfg.scope.agent ? ` AND agent = '${cfg.scope.agent.replaceAll("'", "")}'` : "") +
+      "."
+    : "";
+
   const res = await fetch(`https://geminidataanalytics.googleapis.com/v1beta/${parent}:chat`, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${await accessToken()}`,
+      Authorization: `Bearer ${token}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
       parent,
       messages,
       inlineContext: {
-        systemInstruction: SYSTEM_INSTRUCTION,
+        systemInstruction: SYSTEM_INSTRUCTION + scopeInstruction,
         // The Ask path must honor the same cost boundary as the dashboard:
         // cap the bytes CA-generated queries may bill.
         ...(cfg.maxBilledBytes
@@ -72,7 +95,7 @@ export async function askConversational(
         },
       },
     }),
-    signal: AbortSignal.timeout(150_000),
+    signal,
   });
 
   const raw = await res.text();

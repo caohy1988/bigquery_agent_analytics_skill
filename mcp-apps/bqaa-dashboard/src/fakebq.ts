@@ -4,9 +4,11 @@
 // real BigQuery backend. Never used unless the env var is set.
 //
 // Scenarios:
-//   ok        — every query succeeds with plausible rows
-//   fail_one  — the models-section query rejects; everything else succeeds
-//   stall     — the overview query never resolves (exercises the deadline)
+//   ok           — every query succeeds with plausible rows
+//   fail_one     — the models-section query rejects; everything else succeeds
+//   stall        — the overview query's results never resolve (deadline test)
+//   stall_create — the overview query's job CREATION never resolves, proving
+//                  the deadline covers the whole lifecycle, not just polling
 
 import { BQ_MIN_BYTES_PER_QUERY } from "./queries.js";
 
@@ -77,6 +79,9 @@ function rowsFor(query: string): any[] {
 export function makeFakeBigQuery(scenario: string): { createQueryJob: (opts: FakeJobOpts) => Promise<any[]> } {
   return {
     async createQueryJob(opts: FakeJobOpts) {
+      if (scenario === "stall_create" && opts.query.includes("AS total_events")) {
+        await new Promise(() => {}); // job creation hangs forever
+      }
       if (opts.dryRun) {
         return [{ metadata: { statistics: { totalBytesProcessed: "1234567" } } }];
       }

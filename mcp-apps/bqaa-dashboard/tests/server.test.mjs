@@ -348,6 +348,7 @@ test("production path: real query pipeline succeeds, bills bytes, and caches (#8
     assert.equal(data.meta.section_errors, undefined);
     assert.ok(data.meta.bytes_processed > 0, "bytes accounting must run");
     assert.equal(data.overview.total_events, 1000);
+    assert.match(data.meta.source, /FAKE_BQ/, "synthetic data must be labeled as such (#3)");
     const again = await fetch(`http://localhost:${port}/api/dashboard?time_range_hours=24`);
     const second = await again.json();
     assert.equal(second.data.meta.cache_hit, true, "healthy results are cacheable");
@@ -406,6 +407,101 @@ test("ask_data accepts bounded history (#16)", async () => {
       question: "What about the second-worst tool?",
       history: [{ question: "Which tool fails most?", answer: "fetch_invoice at 7.1%" }],
     },
+  });
+  assert.ok(call.body.result.structuredContent?.data?.answer);
+});
+
+// ---- fourth-review fixes
+
+import http from "node:http";
+
+function rawRequest(port, { origin, host, path: reqPath = "/api/dashboard" }) {
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      { hostname: "127.0.0.1", port, path: reqPath, method: "GET", setHost: false,
+        headers: { Host: host, Origin: origin } },
+      (res) => resolve(res.statusCode),
+    );
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+test("forged Host matching Origin no longer passes as same-origin (#10)", async () => {
+  const port = PORT + 108;
+  const srv = startServer({ BQAA_ALLOWED_ORIGINS: "https://ok.example" }, port);
+  try {
+    await waitFor(`http://localhost:${port}/healthz`);
+    // attacker forges BOTH Origin and Host to the same value → must be refused
+    const forged = await rawRequest(port, { origin: "https://attacker.test", host: "attacker.test" });
+    assert.equal(forged, 403);
+    // the operator-configured canonical origin IS trusted
+    const srv2 = startServer({ BQAA_CANONICAL_ORIGIN: "https://myapp.example" }, port + 100);
+    try {
+      await waitFor(`http://localhost:${port + 100}/healthz`);
+      const canonical = await fetch(`http://localhost:${port + 100}/api/dashboard`, {
+        headers: { Origin: "https://myapp.example" },
+      });
+      assert.equal(canonical.status, 200);
+    } finally {
+      srv2.child.kill();
+    }
+  } finally {
+    srv.child.kill();
+  }
+});
+
+test("BQAA_FAKE_BQ is refused in production builds (#3)", async () => {
+  const srv = startServer({ ...FAKE_ENV, NODE_ENV: "production" }, PORT + 109);
+  const code = await new Promise((resolve) => srv.child.on("exit", resolve));
+  assert.notEqual(code, 0);
+  assert.match(srv.logs(), /test-only/);
+});
+
+test("HTTP widget arguments share MCP validation (#4)", async () => {
+  const badGranularity = await fetch(`${BASE}/api/widget?measure=events&dimension=time&granularity=weekly`);
+  assert.equal(badGranularity.status, 400);
+  const badLimit = await fetch(`${BASE}/api/widget?measure=events&dimension=agent&limit=abc`);
+  assert.equal(badLimit.status, 400);
+  const badDryRun = await fetch(`${BASE}/api/widget?measure=events&dimension=agent&dry_run=maybe`);
+  assert.equal(badDryRun.status, 400);
+  const trueDryRun = await fetch(`${BASE}/api/widget?measure=events&dimension=agent&dry_run=true`);
+  assert.equal(trueDryRun.status, 200);
+  const { data } = await trueDryRun.json();
+  assert.equal(data.dry_run, true, "dry_run=true must be a dry run, not a billable query");
+});
+
+test("deadline covers job CREATION, not just polling (#1)", async () => {
+  const port = PORT + 110;
+  const srv = startServer({ ...FAKE_ENV, BQAA_FAKE_BQ: "stall_create", BQAA_QUERY_TIMEOUT_MS: "600" }, port);
+  try {
+    await waitFor(`http://localhost:${port}/healthz`);
+    const res = await fetch(`http://localhost:${port}/api/dashboard?time_range_hours=24`);
+    const { data } = await res.json();
+    assert.match(data.meta.section_errors?.overview ?? "", /timed out/);
+    // slot released: subsequent work still runs
+    const widget = await fetch(`http://localhost:${port}/api/widget?measure=events&dimension=agent`);
+    assert.equal(widget.status, 200);
+  } finally {
+    srv.child.kill();
+  }
+});
+
+test("malformed JSON keeps the API error contract (#19)", async () => {
+  const res = await fetch(`${BASE}/api/ask`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{not json",
+  });
+  assert.equal(res.status, 400);
+  const body = await res.json();
+  assert.match(body.error, /Malformed JSON/);
+});
+
+test("ask_data accepts scope arguments (#5)", async () => {
+  const call = await rpc(BASE, "tools/call", {
+    name: "ask_data",
+    arguments: { question: "Which tool fails most?", time_range_hours: 24, agent: "coder" },
   });
   assert.ok(call.body.result.structuredContent?.data?.answer);
 });

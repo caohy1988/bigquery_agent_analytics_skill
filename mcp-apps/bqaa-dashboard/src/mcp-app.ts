@@ -874,17 +874,25 @@ function renderLatency(d: DashboardData, main: HTMLElement): void {
     return den ? num / den : null;
   };
   const slowest = rows[0];
+  const latErr = sectionsFailed(d, "latency");
   main.appendChild(
-    tileRow(
-      tile("LLM calls", fmtCompact(calls)),
-      tile("Avg latency", fmtMs(wavg((r) => r.avg_total_ms))),
-      tile("Avg TTFT", fmtMs(wavg((r) => r.avg_ttft_ms))),
-      tile(
-        "Slowest p95",
-        fmtMs(slowest?.p95_total_ms),
-        slowest ? `${slowest.agent} · ${slowest.model_id ?? "?"}` : undefined,
-      ),
-    ),
+    latErr
+      ? tileRow(
+          unavailableTile("LLM calls"),
+          unavailableTile("Avg latency"),
+          unavailableTile("Avg TTFT"),
+          unavailableTile("Slowest p95"),
+        )
+      : tileRow(
+          tile("LLM calls", fmtCompact(calls)),
+          tile("Avg latency", fmtMs(wavg((r) => r.avg_total_ms))),
+          tile("Avg TTFT", fmtMs(wavg((r) => r.avg_ttft_ms))),
+          tile(
+            "Slowest p95",
+            fmtMs(slowest?.p95_total_ms),
+            slowest ? `${slowest.agent} · ${slowest.model_id ?? "?"}` : undefined,
+          ),
+        ),
   );
 
   const bars = chartCard("p95 latency by agent and model", "LLM_RESPONSE events, sorted by p95", []);
@@ -1015,12 +1023,15 @@ function renderTools(d: DashboardData, main: HTMLElement): void {
   const calls = rows.reduce((a, r) => a + r.total_calls, 0);
   const failures = rows.reduce((a, r) => a + r.failures, 0);
   const slowest = [...rows].sort((a, b) => (b.p95_latency_ms ?? 0) - (a.p95_latency_ms ?? 0))[0];
+  const toolsErr = sectionsFailed(d, "tools");
   main.appendChild(
-    tileRow(
-      tile("Tool calls", fmtCompact(calls)),
-      tile("Failures", fmtCompact(failures), calls ? `${((failures / calls) * 100).toFixed(2)}% of calls` : undefined),
-      tile("Slowest tool p95", fmtMs(slowest?.p95_latency_ms), slowest?.tool_name ?? undefined),
-    ),
+    toolsErr
+      ? tileRow(unavailableTile("Tool calls"), unavailableTile("Failures"), unavailableTile("Slowest tool p95"))
+      : tileRow(
+          tile("Tool calls", fmtCompact(calls)),
+          tile("Failures", fmtCompact(failures), calls ? `${((failures / calls) * 100).toFixed(2)}% of calls` : undefined),
+          tile("Slowest tool p95", fmtMs(slowest?.p95_latency_ms), slowest?.tool_name ?? undefined),
+        ),
   );
 
   const bars = chartCard("Calls by tool", "TOOL_COMPLETED and TOOL_ERROR events", [
@@ -1608,8 +1619,10 @@ async function submitQuestion(question: string): Promise<void> {
   try {
     let result: AskResult;
     const history = askState.exchanges.slice(-3).map((e) => ({ question: e.question, answer: e.answer }));
+    // #5: the answer must match the filters on screen
+    const scope = { time_range_hours: currentHours(), ...(agentEl.value ? { agent: agentEl.value } : {}) };
     if (embedded && appBridge) {
-      const r: any = await appBridge.callServerTool({ name: "ask_data", arguments: { question: q, history } });
+      const r: any = await appBridge.callServerTool({ name: "ask_data", arguments: { question: q, history, ...scope } });
       const d = r?.structuredContent?.data;
       if (!d?.answer) throw new Error("no answer in tool result");
       result = d as AskResult;
@@ -1617,7 +1630,7 @@ async function submitQuestion(question: string): Promise<void> {
       const res = await fetch("api/ask", {
         method: "POST",
         headers: { "Content-Type": "application/json", ...authHeaders() },
-        body: JSON.stringify({ question: q, history }),
+        body: JSON.stringify({ question: q, history, ...scope }),
       });
       const body: any = await res.json().catch(() => null);
       if (!res.ok) throw new Error(body?.error ?? `HTTP ${res.status}`);
@@ -1864,6 +1877,9 @@ function renderTabs(): void {
     });
     tabsEl.appendChild(b);
   }
+  // #14: a directly-navigated tab (hash, host push) must be scrolled into view
+  const active = tabsEl.querySelector('button[aria-selected="true"]');
+  (active as HTMLElement | null)?.scrollIntoView?.({ inline: "nearest", block: "nearest" });
 }
 
 function renderView(): void {
@@ -1927,7 +1943,6 @@ function setData(d: DashboardData): void {
     ).toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}` +
     (fmtBytes ? ` · ${fmtBytes} scanned${d.meta.cache_hit ? " (cached)" : ""}` : "");
   renderPulse(d);
-  const selected = agentEl.value;
   agentEl.replaceChildren();
   const all = el("option", undefined, "All agents");
   all.value = "";
@@ -1937,7 +1952,15 @@ function setData(d: DashboardData): void {
     o.value = a;
     agentEl.appendChild(o);
   }
-  agentEl.value = d.agentsList.includes(selected) ? selected : (d.meta.agent ?? "");
+  // #12: the payload's own scope is authoritative — the selector must show
+  // the agent this data was actually filtered by, not a stale prior choice
+  const dataAgent = d.meta.agent ?? "";
+  if (dataAgent && !d.agentsList.includes(dataAgent)) {
+    const extra = el("option", undefined, dataAgent);
+    extra.value = dataAgent;
+    agentEl.appendChild(extra);
+  }
+  agentEl.value = dataAgent;
   // one failed panel must not read as "no data" — say which panels failed
   const failed = Object.keys(d.meta.section_errors ?? {});
   if (failed.length) {
@@ -2004,6 +2027,7 @@ async function fetchStandalone(
 // cookie via POST /auth/login and never appears in a URL. The prompt is app
 // STATE (#17) — a resize/re-render rebuilds it instead of erasing it.
 let authRequired = false;
+let loginDraft = ""; // #15: a half-typed token survives resize re-renders
 
 function renderLoginPrompt(): void {
   authRequired = true;
@@ -2017,6 +2041,10 @@ function renderLoginPrompt(): void {
   input.type = "password";
   input.placeholder = "Access token";
   input.setAttribute("aria-label", "Access token");
+  input.value = loginDraft;
+  input.addEventListener("input", () => {
+    loginDraft = input.value;
+  });
   const btn = el("button", "run-btn", "Sign in");
   const note = el("div", "sub", "");
   const submit = async (): Promise<void> => {
@@ -2024,6 +2052,7 @@ function renderLoginPrompt(): void {
     const ok = await loginWithToken(input.value).catch(() => false);
     if (ok) {
       authRequired = false;
+      loginDraft = "";
       void refresh();
     } else {
       btn.disabled = false;
@@ -2210,15 +2239,23 @@ function invalidateTrace(): void {
   traceCard = null; // an open trace belongs to the previous window
 }
 
+// #16: rapid filter changes coalesce into one refresh instead of racing
+// several 10-query loads against the job-slot cap.
+let refreshDebounce: ReturnType<typeof setTimeout> | undefined;
+function scheduleRefresh(): void {
+  clearTimeout(refreshDebounce);
+  refreshDebounce = setTimeout(() => void refresh(), 250);
+}
+
 rangeEl.addEventListener("change", () => {
   rangeTouched = true;
   effectiveHours = null; // user picked a preset — it wins
   invalidateTrace();
-  void refresh();
+  scheduleRefresh();
 });
 agentEl.addEventListener("change", () => {
   invalidateTrace();
-  void refresh();
+  scheduleRefresh();
 });
 
 let resizeTimer: ReturnType<typeof setTimeout> | undefined;
@@ -2253,12 +2290,13 @@ if (embedded) {
   app.ontoolresult = (result: any) => {
     const payload = result?.structuredContent?.data;
     // render_widget pushes a widget result: open Explore prefilled + rendered,
-    // then load the full dashboard in the background for the other tabs.
+    // then sync the dashboard to the same scope for every other tab (#17).
     if (payload?.spec && Array.isArray(payload.rows)) {
       exploreOpSeq++; // supersede any in-flight Explore op
+      invalidateTrace(); // #7: an open trace belongs to the previous scope
       explore.spec = { v: 1, filters: {}, ...payload.spec };
       explore.result = payload as WidgetResult;
-      // #9: keep the pushed widget's window as the effective one
+      // keep the pushed widget's window as the effective one
       if (payload.window?.start && payload.window?.end) {
         const h = Math.round((Date.parse(payload.window.end) - Date.parse(payload.window.start)) / 3_600_000);
         if ([...rangeEl.options].some((o) => o.value === String(h))) {
@@ -2268,17 +2306,21 @@ if (embedded) {
           effectiveHours = h;
         }
       }
+      // promote the pushed agent filter so curated tabs match the widget
+      if (payload.spec.filters?.agent) pendingAgent = payload.spec.filters.agent;
       currentView = "explore";
       renderTabs();
       renderView();
-      if (!data) void refresh();
+      void refresh(); // always re-sync the dashboard to the pushed scope
       return;
     }
-    // #15: a host push is the newest truth — invalidate in-flight refreshes
+    // a host push is the newest truth — invalidate in-flight refreshes and
+    // any trace whose scope no longer matches (#7)
     const d = extractData(result);
     if (d) {
       refreshSeq++;
       inflightAbort?.abort();
+      invalidateTrace();
       setData(d);
     }
   };

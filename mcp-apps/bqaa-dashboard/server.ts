@@ -89,6 +89,12 @@ const CONFIG = {
   port: intEnv("PORT", 3001, 0, 65535),
   defaultHours: intEnv("BQAA_DEFAULT_HOURS", 168, 1, MAX_HOURS),
   authToken: process.env.BQAA_AUTH_TOKEN ?? "",
+  // The service's own public origin (e.g. https://app.example.run.app) —
+  // the only non-loopback origin granted the same-origin exemption.
+  canonicalOrigin: (process.env.BQAA_CANONICAL_ORIGIN ?? "").replace(/\/+$/, ""),
+  // Set BQAA_CA_DISABLED=1 for strict BigQuery-only deployments: disables the
+  // Ask path (which sends questions + schema context to Gemini Data Analytics).
+  caDisabled: process.env.BQAA_CA_DISABLED === "1",
   // Comma-separated Origin allowlist, or "*". Unset ⇒ same-origin only:
   // no CORS headers, and cross-origin requests bearing an Origin are refused.
   allowedOrigins: (process.env.BQAA_ALLOWED_ORIGINS ?? "")
@@ -147,34 +153,62 @@ async function runQuery(
   sql: string,
   params: Record<string, unknown>,
   maxBytes: number,
+  signal?: AbortSignal, // caller abort (per-request ops only, never shared/cached work)
 ): Promise<QueryResult> {
+  if (signal?.aborted) throw new Error("request aborted");
   return withJobSlot(async () => {
-    const client = await bigQueryClient();
-    const [job] = await client.createQueryJob({
-      query: sql,
-      params,
-      maximumBytesBilled: String(maxBytes),
-    });
-    try {
-      // #9: an application deadline so a stalled job cannot hold its slot
-      const [rows] = await withDeadline<[any[]]>(job.getQueryResults(), CONFIG.queryTimeoutMs);
+    // One absolute deadline covers the COMPLETE lifecycle — client/ADC setup,
+    // job creation, result polling, and metadata — so no phase can hold a
+    // slot indefinitely. If a job surfaces after expiry it is cancelled, and
+    // the slot is retained until that bounded cancellation settles.
+    let jobRef: any = null;
+    let onAbort: (() => void) | null = null;
+    const work = (async () => {
+      const client = await bigQueryClient();
+      const [job] = await client.createQueryJob({
+        query: sql,
+        params,
+        maximumBytesBilled: String(maxBytes),
+      });
+      jobRef = job;
+      if (signal) {
+        onAbort = () => void job.cancel?.().catch(() => {});
+        if (signal.aborted) onAbort();
+        else signal.addEventListener("abort", onAbort, { once: true });
+      }
+      const [rows] = await job.getQueryResults();
       const [meta] = await job.getMetadata();
-      return { rows, bytes: Number(meta?.statistics?.totalBytesProcessed ?? 0) };
+      return { rows, bytes: Number(meta?.statistics?.totalBytesProcessed ?? 0) } as QueryResult;
+    })();
+    try {
+      return await withDeadline<QueryResult>(work, CONFIG.queryTimeoutMs);
     } catch (e) {
-      if (e instanceof Error && e.message.includes("timed out")) {
-        void (job as any).cancel?.().catch(() => {});
+      work.catch(() => {}); // the abandoned lifecycle must not become unhandled
+      if (e instanceof Error && e.message.includes("timed out") && jobRef) {
+        // hold the admission slot until cancellation is confirmed (bounded)
+        await withDeadline(Promise.resolve(jobRef.cancel?.()), 5_000).catch(() => {});
       }
       throw e;
+    } finally {
+      if (signal && onAbort) signal.removeEventListener("abort", onAbort);
     }
   });
 }
 
+// Test seam: BQAA_FAKE_BQ swaps in a controllable fake client. It is refused
+// outright in production builds, and every payload it produces is labeled —
+// synthetic rows must be impossible to mistake for live telemetry.
+const FAKE_BQ = process.env.NODE_ENV !== "production" ? (process.env.BQAA_FAKE_BQ ?? "") : "";
+if (process.env.BQAA_FAKE_BQ && process.env.NODE_ENV === "production") {
+  console.error("BQAA_FAKE_BQ is test-only and cannot be enabled in production builds");
+  process.exit(1);
+}
+
 async function bigQueryClient(): Promise<any> {
   if (!bqClient) {
-    if (process.env.BQAA_FAKE_BQ) {
-      // test seam: production branches run against a controllable fake
+    if (FAKE_BQ) {
       const { makeFakeBigQuery } = await import("./src/fakebq.js");
-      bqClient = makeFakeBigQuery(process.env.BQAA_FAKE_BQ) as any;
+      bqClient = makeFakeBigQuery(FAKE_BQ) as any;
     } else {
       const { BigQuery } = await import("@google-cloud/bigquery");
       bqClient = new BigQuery({ projectId: CONFIG.project });
@@ -195,9 +229,16 @@ function withDeadline<T>(p: Promise<T>, ms: number): Promise<T> {
 
 // Estimate a query's scan size without running it (BigQuery dry run).
 async function dryRunQuery(sql: string, params: Record<string, unknown>): Promise<number> {
-  const client = await bigQueryClient();
-  const [job] = await client.createQueryJob({ query: sql, params, dryRun: true });
-  return Number(job.metadata?.statistics?.totalBytesProcessed ?? 0);
+  return withJobSlot(() =>
+    withDeadline(
+      (async () => {
+        const client = await bigQueryClient();
+        const [job] = await client.createQueryJob({ query: sql, params, dryRun: true });
+        return Number(job.metadata?.statistics?.totalBytesProcessed ?? 0);
+      })(),
+      CONFIG.queryTimeoutMs,
+    ),
+  );
 }
 
 const EMPTY_OVERVIEW: OverviewStats = {
@@ -266,7 +307,7 @@ async function bigQueryDashboard(
 
   return {
     meta: {
-      source: `${CONFIG.project}.${CONFIG.dataset}.${CONFIG.table}`,
+      source: `${CONFIG.project}.${CONFIG.dataset}.${CONFIG.table}${FAKE_BQ ? ` [FAKE_BQ:${FAKE_BQ} — synthetic test data]` : ""}`,
       start: start.toISOString(),
       end: end.toISOString(),
       granularity,
@@ -291,7 +332,12 @@ async function bigQueryDashboard(
 
 const WIDGET_QUERY_BYTES = Math.min(200_000_000, CONFIG.refreshBytesBudget); // single-query ops
 
-async function loadWidget(spec: WidgetSpec, timeRangeHours: number, dryRun: boolean): Promise<WidgetResult> {
+async function loadWidget(
+  spec: WidgetSpec,
+  timeRangeHours: number,
+  dryRun: boolean,
+  signal?: AbortSignal,
+): Promise<WidgetResult> {
   const end = new Date();
   const start = new Date(end.getTime() - timeRangeHours * 3_600_000);
   const granularity: Granularity = spec.granularity ?? (timeRangeHours <= 72 ? "hour" : "day");
@@ -307,7 +353,7 @@ async function loadWidget(spec: WidgetSpec, timeRangeHours: number, dryRun: bool
     const estimated = await dryRunQuery(built.sql, params);
     return { spec: fullSpec as WidgetResult["spec"], window, rows: [], dry_run: true, estimated_bytes: estimated };
   }
-  const { rows, bytes } = await runQuery(built.sql, params, WIDGET_QUERY_BYTES);
+  const { rows, bytes } = await runQuery(built.sql, params, WIDGET_QUERY_BYTES, signal);
   return { spec: fullSpec as WidgetResult["spec"], window, rows, bytes_processed: bytes };
 }
 
@@ -318,23 +364,43 @@ async function loadWidget(spec: WidgetSpec, timeRangeHours: number, dryRun: bool
 const MAX_CONCURRENT_ASK = 3;
 let inflightAsk = 0;
 
-async function ask(question: string, history: AskExchange[]): Promise<AskResult> {
+interface AskScope {
+  time_range_hours?: number;
+  agent?: string;
+}
+
+async function ask(question: string, history: AskExchange[], scope: AskScope, signal?: AbortSignal): Promise<AskResult> {
   if (CONFIG.mock) return mockAsk(question);
+  if (CONFIG.caDisabled) {
+    throw new Error("Conversational analytics is disabled on this deployment (BQAA_CA_DISABLED=1)");
+  }
   if (inflightAsk >= MAX_CONCURRENT_ASK) {
     throw new Error("Server busy: too many concurrent Ask requests — retry shortly");
   }
   inflightAsk++;
   try {
+    // #5: the answer must match the filters the user is looking at
+    const hours = Math.min(MAX_HOURS, Math.max(1, scope.time_range_hours ?? CONFIG.defaultHours));
+    const end = new Date();
+    const start = new Date(end.getTime() - hours * 3_600_000);
     return await askConversational(
       {
         project: CONFIG.project,
         dataset: CONFIG.dataset,
         table: CONFIG.table,
         location: process.env.BQAA_CA_LOCATION,
+        // per-QUERY cap on CA-generated SQL (CA may run several queries per
+        // question); aggregate spend control belongs to project/user quotas
         maxBilledBytes: CONFIG.refreshBytesBudget,
+        scope: {
+          startIso: start.toISOString(),
+          endIso: end.toISOString(),
+          agent: scope.agent?.slice(0, 200),
+        },
       },
       question,
       history,
+      signal,
     );
   } finally {
     inflightAsk--;
@@ -415,7 +481,7 @@ async function loadDashboard(timeRangeHours: number, agent?: string | null): Pro
 
 const TRACE_EVENT_CAP = 500;
 
-async function loadTrace(traceId: string, timeRangeHours: number): Promise<TraceResult> {
+async function loadTrace(traceId: string, timeRangeHours: number, signal?: AbortSignal): Promise<TraceResult> {
   if (!TRACE_ID_RE.test(traceId)) throw new Error("Invalid trace_id");
   if (CONFIG.mock) return { events: mockTrace(traceId), truncated: false };
   const end = new Date();
@@ -425,6 +491,7 @@ async function loadTrace(traceId: string, timeRangeHours: number): Promise<Trace
     buildTraceSql(tableRef()),
     { trace_id: traceId, start: start.toISOString(), end: end.toISOString(), limit: TRACE_EVENT_CAP + 1 },
     WIDGET_QUERY_BYTES,
+    signal,
   );
   return { events: rows.slice(0, TRACE_EVENT_CAP), truncated: rows.length > TRACE_EVENT_CAP };
 }
@@ -636,11 +703,16 @@ server.registerTool(
         .max(3)
         .optional()
         .describe("Up to 3 prior question/answer exchanges, for follow-up context"),
+      time_range_hours: z.number().int().min(1).max(MAX_HOURS).optional().describe("Restrict analysis to this window"),
+      agent: z.string().max(200).optional().describe("Restrict analysis to one agent"),
     },
     outputSchema: { data: z.unknown() },
   },
   async (args) => {
-    const result = await ask(args.question, args.history ?? []);
+    const result = await ask(args.question, args.history ?? [], {
+      time_range_hours: args.time_range_hours,
+      agent: args.agent,
+    });
     return {
       content: [{ type: "text" as const, text: result.answer + (result.sql ? `\n\nGenerated SQL:\n${result.sql}` : "") }],
       structuredContent: { data: result } as any,
@@ -687,16 +759,23 @@ function originAllowed(origin: string): boolean {
   return CONFIG.allowedOrigins.includes("*") || CONFIG.allowedOrigins.includes(origin);
 }
 
-// MCP transport security: cross-origin callers must present an allowlisted
-// Origin. Same-origin requests always pass (browsers DO send Origin on
-// same-origin POSTs), as do server-to-server clients with no Origin header.
+// MCP transport security: cross-origin callers must present an allowed
+// Origin (DNS-rebinding defense per the MCP spec). The Host header is
+// requester-controlled and is NEVER used to derive trust — the same-origin
+// exemption applies only to the operator-configured canonical origin, or to
+// loopback origins in local development. Server-to-server clients send no
+// Origin header and pass through.
+const LOOPBACK_ORIGIN_RE = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/;
+
 function checkOrigin(req: express.Request, res: express.Response, next: express.NextFunction): void {
   const origin = req.headers.origin;
   if (origin) {
-    const host = req.get("host");
-    const sameOrigin = origin === `${req.protocol}://${host}` || origin === `https://${host}`;
-    if (!sameOrigin && !originAllowed(origin)) {
-      res.status(403).json({ error: "Origin not allowed. Configure BQAA_ALLOWED_ORIGINS." });
+    const trusted =
+      originAllowed(origin) ||
+      (CONFIG.canonicalOrigin !== "" && origin === CONFIG.canonicalOrigin) ||
+      LOOPBACK_ORIGIN_RE.test(origin);
+    if (!trusted) {
+      res.status(403).json({ error: "Origin not allowed. Configure BQAA_ALLOWED_ORIGINS or BQAA_CANONICAL_ORIGIN." });
       return;
     }
   }
@@ -724,7 +803,14 @@ function requireAuth(req: express.Request, res: express.Response, next: express.
 
 app.use(
   cors({
-    origin: (origin, cb) => cb(null, !origin || originAllowed(origin)),
+    origin: (origin, cb) =>
+      cb(
+        null,
+        !origin ||
+          originAllowed(origin) ||
+          (CONFIG.canonicalOrigin !== "" && origin === CONFIG.canonicalOrigin) ||
+          LOOPBACK_ORIGIN_RE.test(origin),
+      ),
   }),
 );
 app.use(express.json({ limit: "2mb" }));
@@ -772,11 +858,15 @@ app.get("/healthz", (_req, res) => {
   res.json({ ok: true, mock: CONFIG.mock, uiBundle: existsSync(uiBundlePath()) });
 });
 
+// Readiness is deliberately unauthenticated (load balancers need it) but
+// REDACTED: backend detail goes to logs, never to anonymous callers.
 app.get("/api/health", async (_req, res) => {
   const bundle = existsSync(uiBundlePath());
   const bq = await probeBigQuery();
   const ok = bundle && bq.ok;
-  res.status(ok ? 200 : 503).json({ ok, mock: CONFIG.mock, uiBundle: bundle, bigquery: bq.detail });
+  if (!bq.ok) console.error(JSON.stringify({ ts: new Date().toISOString(), readiness: "bigquery", detail: bq.detail }));
+  const bigquery = CONFIG.mock ? "mock" : bq.ok ? "ok" : "unavailable";
+  res.status(ok ? 200 : 503).json({ ok, mock: CONFIG.mock, uiBundle: bundle, bigquery });
 });
 
 // Browser-shareable view: the shell is static; all data endpoints are guarded.
@@ -809,6 +899,17 @@ app.post("/auth/login", checkOrigin, (req, res) => {
   res.status(204).end();
 });
 
+// #16: per-request operations propagate a client disconnect as an abort so
+// abandoned work can cancel its BigQuery job. Never used for the shared
+// (cached/coalesced) dashboard pipeline, which other callers may be awaiting.
+function requestAbort(req: express.Request, res: express.Response): AbortSignal {
+  const ac = new AbortController();
+  req.on("close", () => {
+    if (!res.writableEnded) ac.abort();
+  });
+  return ac.signal;
+}
+
 app.get("/api/dashboard", checkOrigin, requireAuth, async (req, res) => {
   try {
     const hours = Math.min(MAX_HOURS, Math.max(1, Math.trunc(Number(req.query.time_range_hours)) || CONFIG.defaultHours));
@@ -828,40 +929,53 @@ app.get("/api/trace", checkOrigin, requireAuth, async (req, res) => {
       return;
     }
     const hours = Math.min(MAX_HOURS, Math.max(1, Math.trunc(Number(req.query.time_range_hours)) || CONFIG.defaultHours));
-    const trace = await loadTrace(traceId, hours);
+    const trace = await loadTrace(traceId, hours, requestAbort(req, res));
     res.json({ data: trace.events, truncated: trace.truncated });
   } catch (e) {
     res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
   }
 });
 
+// #4: HTTP widget requests validate through the SAME zod schema as the MCP
+// tool — invalid values are 400s, never silently coerced into different
+// queries, and dry_run accepts true/1 (anything else is rejected).
+const widgetArgsSchema = z.object(widgetArgs);
+
 app.get("/api/widget", checkOrigin, requireAuth, async (req, res) => {
   try {
     const q = req.query;
-    const str = (k: string): string | undefined =>
-      typeof q[k] === "string" && q[k] !== "" ? (q[k] as string).slice(0, 200) : undefined;
-    const measure = str("measure") ?? "";
-    const dimension = str("dimension") ?? "";
-    if (!WIDGET_MEASURES[measure] || !WIDGET_DIMENSIONS[dimension]) {
-      res.status(400).json({ error: `Unknown measure or dimension. Measures: ${MEASURE_KEYS.join(", ")}; dimensions: ${DIMENSION_KEYS.join(", ")}` });
+    const str = (k: string): string | undefined => (typeof q[k] === "string" && q[k] !== "" ? (q[k] as string) : undefined);
+    const num = (k: string): number | string | undefined => {
+      const v = str(k);
+      if (v === undefined) return undefined;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : v; // non-numeric falls through to zod for a 400
+    };
+    const bool = (k: string): boolean | string | undefined => {
+      const v = str(k);
+      if (v === undefined) return undefined;
+      if (v === "1" || v === "true") return true;
+      if (v === "0" || v === "false") return false;
+      return v; // invalid → zod 400
+    };
+    const parsed = widgetArgsSchema.safeParse({
+      measure: str("measure"),
+      dimension: str("dimension"),
+      time_range_hours: num("time_range_hours"),
+      granularity: str("granularity"),
+      agent: str("agent"),
+      model: str("model"),
+      tool: str("tool"),
+      status: str("status"),
+      limit: num("limit"),
+      dry_run: bool("dry_run"),
+    });
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ") });
       return;
     }
-    const hours = Math.min(MAX_HOURS, Math.max(1, Math.trunc(Number(q.time_range_hours)) || CONFIG.defaultHours));
-    const limitRaw = Math.trunc(Number(q.limit));
-    const status = str("status");
-    const spec: WidgetSpec = {
-      measure,
-      dimension,
-      granularity: str("granularity") === "hour" ? "hour" : str("granularity") === "day" ? "day" : undefined,
-      limit: Number.isInteger(limitRaw) && limitRaw > 0 ? Math.min(100, limitRaw) : undefined,
-      filters: {
-        agent: str("agent"),
-        model: str("model"),
-        tool: str("tool"),
-        status: status === "OK" || status === "ERROR" ? status : undefined,
-      },
-    };
-    const data = await loadWidget(spec, hours, q.dry_run === "1");
+    const a = parsed.data as WidgetArgs;
+    const data = await loadWidget(widgetSpecOf(a), a.time_range_hours ?? CONFIG.defaultHours, !!a.dry_run, requestAbort(req, res));
     res.json({ data });
   } catch (e) {
     res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
@@ -880,7 +994,12 @@ app.post("/api/ask", checkOrigin, requireAuth, async (req, res) => {
           .filter((h: any) => typeof h?.question === "string" && typeof h?.answer === "string")
           .slice(-3)
       : [];
-    const data = await ask(question, history);
+    const hoursRaw = Math.trunc(Number(req.body?.time_range_hours));
+    const scope: AskScope = {
+      time_range_hours: Number.isInteger(hoursRaw) && hoursRaw > 0 ? Math.min(MAX_HOURS, hoursRaw) : undefined,
+      agent: typeof req.body?.agent === "string" && req.body.agent ? req.body.agent.slice(0, 200) : undefined,
+    };
+    const data = await ask(question, history, scope, requestAbort(req, res));
     res.json({ data });
   } catch (e) {
     res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
@@ -899,6 +1018,24 @@ app.post("/mcp", checkOrigin, requireAuth, async (req, res) => {
   });
   await mcp.connect(transport);
   await transport.handleRequest(req, res, req.body);
+});
+
+// #19: body-parse failures and unhandled route errors keep the JSON contract
+app.use((err: any, _req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (res.headersSent) {
+    next(err);
+    return;
+  }
+  if (err?.type === "entity.too.large") {
+    res.status(413).json({ error: "Request body too large (limit 2 MB)" });
+    return;
+  }
+  if (err instanceof SyntaxError && "body" in err) {
+    res.status(400).json({ error: "Malformed JSON body" });
+    return;
+  }
+  console.error(JSON.stringify({ ts: new Date().toISOString(), unhandled: err instanceof Error ? err.message : String(err) }));
+  res.status(500).json({ error: "Internal server error" });
 });
 
 app.listen(CONFIG.port, () => {

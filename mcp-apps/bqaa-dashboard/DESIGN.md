@@ -11,9 +11,14 @@ MCP client. Upstream design discussion:
   (widget → trace drill-down), and the
   [Looker Agent Analytics block](https://marketplace.looker.com/marketplace/detail/agent_analytics)
   (curated views over `agent_events`).
-- Differentiators: in-chat rendering (MCP Apps), BigQuery-local data ownership
-  (no telemetry egress), dry-run cost previews, evidence-cited root cause, and
-  a hosted conversational layer (BigQuery Conversational Analytics) that works
+- Differentiators: in-chat rendering (MCP Apps), BigQuery-local data
+  ownership — dashboards, widgets, and traces read `agent_events` in place and
+  never copy telemetry to a third-party service. The one qualified exception
+  is the optional Ask path: questions, schema context, and query results flow
+  through Google's Gemini Data Analytics service (still inside Google Cloud's
+  processing boundary, but beyond BigQuery itself); strict BigQuery-only
+  deployments disable it with `BQAA_CA_DISABLED=1`. Plus dry-run cost
+  previews, evidence-cited root cause, and a conversational layer that works
   without any AI host.
 
 ## 1. Architecture
@@ -158,8 +163,11 @@ POST https://geminidataanalytics.googleapis.com/v1beta/projects/{p}/locations/gl
   `FINAL_RESPONSE` text → `answer`; `THOUGHT` titles → `steps` (progress
   transparency); `FOLLOWUP_QUESTIONS` → suggestion chips;
   `data.generatedSql` → `sql`; `data.result` → `schema` + `rows` (≤100).
-- **Guardrails**: 150 s request timeout, 3-concurrent admission cap, byte cap
-  on CA-generated queries via `bigQueryMaxBilledBytes`.
+- **Guardrails**: one 150 s deadline covering ADC token acquisition and the
+  request itself, a 3-concurrent admission cap, and `bigQueryMaxBilledBytes`
+  as a **per-generated-query** cap (CA may write and retry several queries per
+  question — aggregate spend control belongs to BigQuery project/user quotas).
+  `BQAA_CA_DISABLED=1` turns the Ask path off entirely.
 - **Three doors, one brain**: MCP tool `ask_data`, HTTP `POST /api/ask`
   (webapp Ask tab), and mock mode (`mockAsk`) for tests/preview.
 
@@ -174,13 +182,13 @@ per-tool failure-rate analysis with LAX_STRING extraction, self-written).
 | Concern | Mechanism |
 |---|---|
 | Query spend | `BQAA_MAX_BYTES_BILLED` is the budget for one refresh, split **exactly** across the section queries. BigQuery rejects `maximumBytesBilled` < 10 MiB, so the accepted minimum is `SECTIONS × 10,485,760` (enforced at startup and in `splitBudget`). Widget/trace/CA queries are capped by the same budget. |
-| Runaway work | Global cap of 20 concurrent BigQuery jobs (fail-fast), 3 concurrent Ask requests; per-query deadline `BQAA_QUERY_TIMEOUT_MS` (default 90 s) with **job cancellation** and slot release on expiry. |
+| Runaway work | Global cap of 20 concurrent BigQuery jobs (fail-fast), 3 concurrent Ask requests; one absolute deadline (`BQAA_QUERY_TIMEOUT_MS`, default 90 s) covers the whole query lifecycle — client/ADC setup, job creation, polling, metadata — with **awaited, bounded job cancellation** before the slot is released. Dry runs go through the same admission and deadline. Client disconnects propagate as aborts that cancel per-request jobs. |
 | Caching | 60 s bounded LRU (50 entries) with promise coalescing; **degraded (partial-failure) results are evicted immediately** so recovery is fast; failures are never cached. |
 | Partial failure | Sections run under `Promise.allSettled`; healthy panels render, failed ones surface per-panel (`meta.section_errors`), in dependent KPIs as explicit "unavailable" states (never authoritative zeros), and in the model-facing summary. |
 | Injection | SQL identifiers validated by regex at startup; all values bind as parameters; widget measures/dimensions/filters are whitelist-keyed; CSV cells neutralize spreadsheet formulas; DOM writes use `textContent`. |
 | AuthN | Optional `BQAA_AUTH_TOKEN`: MCP clients send `Authorization: Bearer`; browsers exchange the token once at `POST /auth/login` for an HttpOnly `SameSite=Strict` cookie. Tokens are **never accepted in URLs** (MCP auth spec). |
-| Origin policy | Same-origin always allowed (browsers send `Origin` on POSTs); cross-origin requires the `BQAA_ALLOWED_ORIGINS` allowlist; CORS reflects only allowlisted origins. |
-| Health | `/healthz` liveness; `/api/health` readiness proves BigQuery access via a cached zero-cost dry run (503 on failure). |
+| Origin policy | Trust is never derived from the requester-controlled `Host` header. Allowed origins are: the `BQAA_ALLOWED_ORIGINS` allowlist, the operator-configured `BQAA_CANONICAL_ORIGIN` (the service's own URL), and loopback origins for local development. CORS reflects only those. |
+| Health | `/healthz` liveness; `/api/health` readiness proves BigQuery access via a cached zero-cost dry run (503 on failure). Readiness is deliberately unauthenticated (for load balancers) but **redacted** — backend detail is logged, never returned. |
 | Truthfulness | Live-data failures keep last-known data with an explicit error banner; sample data only ever backs `file://` preview or explicit mock mode. |
 
 ## 6. UI implementation (`src/mcp-app.ts`, `src/styles.css`)
@@ -229,7 +237,8 @@ single CSP-safe file and the chart set is small and bespoke.
   validation fail-fast, concurrent MCP calls (request-local server proof),
   bundled-resource serving, ask history.
 - **Production-branch tests** via `BQAA_FAKE_BQ` (`src/fakebq.ts`), an
-  injectable BigQuery fake with scenarios `ok` / `fail_one` / `stall`:
+  injectable BigQuery fake (test-only: refused in production builds, and every
+  payload it produces is labeled as synthetic in `meta.source`) with scenarios `ok` / `fail_one` / `stall`:
   executes the real query pipeline — byte accounting + caching, partial-result
   eviction, deadline → job cancellation → slot release, and billed-byte
   validation at job creation.

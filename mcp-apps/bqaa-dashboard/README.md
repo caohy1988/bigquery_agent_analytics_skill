@@ -70,7 +70,9 @@ The MCP endpoint is `http://localhost:3001/mcp` (override with `PORT`).
 | `BQAA_DEFAULT_HOURS` | `168` | Default lookback window in hours (1–2160); validated at startup |
 | `BQAA_QUERY_TIMEOUT_MS` | `90000` | Application deadline per BigQuery query; the job is cancelled and its slot released on expiry |
 | `BQAA_AUTH_TOKEN` | — | If set, `/mcp` and `/api/*` require `Authorization: Bearer <token>`; browsers sign in via `POST /auth/login`, which sets an HttpOnly cookie (tokens are never accepted in URLs) |
-| `BQAA_ALLOWED_ORIGINS` | — | Comma-separated Origin allowlist (or `*`). Unset ⇒ same-origin only: cross-origin requests are refused |
+| `BQAA_ALLOWED_ORIGINS` | — | Comma-separated Origin allowlist (or `*`). Trust is never derived from the Host header |
+| `BQAA_CANONICAL_ORIGIN` | — | The service's own public origin (e.g. `https://app.run.app`) — granted the same-origin exemption; loopback origins are always allowed for local dev |
+| `BQAA_CA_DISABLED` | — | `1` disables the Ask path for strict BigQuery-only deployments (Conversational Analytics processes questions/results inside Google Cloud but beyond BigQuery) |
 | `PORT` | `3001` | HTTP port |
 
 Guardrails: read-only parameterized `SELECT`s only, a mandatory `timestamp`
@@ -81,8 +83,9 @@ coalescing, and partial-failure handling (one failed panel query is reported in
 show an explicit unavailable state). A global cap bounds concurrent BigQuery
 jobs and the result cache is a bounded LRU. The footer shows bytes scanned per
 refresh. `GET /healthz` is liveness; `GET /api/health` is readiness and proves
-BigQuery access with a cached dry run (503 when the backend is unreachable).
-Requests are logged as structured JSON.
+BigQuery access with a cached dry run (503 when the backend is unreachable);
+it is unauthenticated by design (load balancers) and redacted — backend detail
+is logged, never returned. Requests are logged as structured JSON.
 
 ### Connect to Claude
 
