@@ -153,12 +153,30 @@ function uiBundlePath(): string {
 let bqClient: import("@google-cloud/bigquery").BigQuery | null = null;
 
 // Global cap on simultaneous BigQuery jobs: past it, requests fail fast
-// instead of piling unbounded work onto the project.
+// instead of piling unbounded work onto the project. Abandoned creations —
+// jobs whose createQueryJob was still pending when their request's deadline
+// or abort fired — keep counting against the cap until they settle (with a
+// safety-valve timeout), so the advertised cap covers the FULL lifecycle (#2).
 const MAX_CONCURRENT_JOBS = 20;
 let inflightJobs = 0;
+let abandonedCreations = 0;
+
+function trackAbandonedCreation(work: Promise<unknown>): void {
+  abandonedCreations++;
+  let released = false;
+  const release = (): void => {
+    if (!released) {
+      released = true;
+      abandonedCreations--;
+    }
+  };
+  work.then(release, release);
+  const valve = setTimeout(release, CONFIG.queryTimeoutMs * 2);
+  (valve as any).unref?.();
+}
 
 async function withJobSlot<T>(fn: () => Promise<T>): Promise<T> {
-  if (inflightJobs >= MAX_CONCURRENT_JOBS) {
+  if (inflightJobs + abandonedCreations >= MAX_CONCURRENT_JOBS) {
     throw new Error("Server busy: too many concurrent BigQuery jobs — retry shortly");
   }
   inflightJobs++;
@@ -183,12 +201,12 @@ async function runQuery(
   if (signal?.aborted) throw new Error("request aborted");
   return withJobSlot(async () => {
     // One absolute deadline covers the COMPLETE lifecycle — client/ADC setup,
-    // job creation, result polling, and metadata — so no phase can hold a
-    // slot indefinitely. If a job surfaces after expiry it is cancelled, and
-    // the slot is retained until that bounded cancellation settles.
+    // job creation, result polling, and metadata. Caller aborts and deadline
+    // expiry are TERMINAL: polling is raced against them (#6), a job that
+    // surfaces after either fires cancels itself without polling (#1), and
+    // an abandoned creation keeps counting against admission (#2).
     let jobRef: any = null;
-    let onAbort: (() => void) | null = null;
-    let expired = false; // #1: a job that surfaces after expiry must self-cancel
+    let expired = false;
     const work = (async () => {
       const client = await bigQueryClient();
       const [job] = await client.createQueryJob({
@@ -198,32 +216,35 @@ async function runQuery(
       });
       jobRef = job;
       if (expired) {
-        // the deadline already fired while creation was in flight: cancel the
-        // late job and never poll it
+        // deadline/abort already fired while creation was in flight: cancel
+        // the late job and never poll it
         await withDeadline(Promise.resolve(job.cancel?.()), 5_000).catch(() => {});
-        throw new Error(`BigQuery query timed out after ${CONFIG.queryTimeoutMs} ms (job created after expiry)`);
-      }
-      if (signal) {
-        onAbort = () => void job.cancel?.().catch(() => {});
-        if (signal.aborted) onAbort();
-        else signal.addEventListener("abort", onAbort, { once: true });
+        throw new Error(`BigQuery query abandoned after ${CONFIG.queryTimeoutMs} ms (job created after expiry)`);
       }
       const [rows] = await job.getQueryResults();
       const [meta] = await job.getMetadata();
       return { rows, bytes: Number(meta?.statistics?.totalBytesProcessed ?? 0) } as QueryResult;
     })();
+    const abortPromise: Promise<never> | null = signal
+      ? new Promise((_, reject) => {
+          const fail = (): void => reject(new Error("request aborted"));
+          if (signal.aborted) fail();
+          else signal.addEventListener("abort", fail, { once: true });
+        })
+      : null;
     try {
-      return await withDeadline<QueryResult>(work, CONFIG.queryTimeoutMs);
+      const raced = abortPromise ? Promise.race([work, abortPromise]) : work;
+      return await withDeadline<QueryResult>(raced, CONFIG.queryTimeoutMs);
     } catch (e) {
-      expired = true;
+      expired = true; // stops a late creation from ever polling
       work.catch(() => {}); // the abandoned lifecycle must not become unhandled
-      if (e instanceof Error && e.message.includes("timed out") && jobRef) {
-        // hold the admission slot until cancellation is confirmed (bounded)
+      if (jobRef) {
+        // terminal branch: hold the slot until cancellation settles (bounded)
         await withDeadline(Promise.resolve(jobRef.cancel?.()), 5_000).catch(() => {});
+      } else {
+        trackAbandonedCreation(work); // creation still pending — keep it counted
       }
       throw e;
-    } finally {
-      if (signal && onAbort) signal.removeEventListener("abort", onAbort);
     }
   });
 }
@@ -402,6 +423,7 @@ async function ask(question: string, history: AskExchange[], scope: AskScope, si
     throw new Error("Conversational analytics is disabled on this deployment (BQAA_CA_DISABLED=1)");
   }
   if (CONFIG.mock) return mockAsk(question);
+  if (signal?.aborted) throw new Error("Ask aborted before start"); // #8: never consume a slot for dead work
   if (inflightAsk >= MAX_CONCURRENT_ASK) {
     throw new Error("Server busy: too many concurrent Ask requests — retry shortly");
   }
@@ -468,6 +490,11 @@ const dashboardCache = new Map<string, CacheEntry>();
 function cacheGet(key: string): CacheEntry | null {
   const entry = dashboardCache.get(key);
   if (!entry) return null;
+  // #3: an aborted pipeline is dead — never hand it to a new caller
+  if (entry.abort.signal.aborted) {
+    dashboardCache.delete(key);
+    return null;
+  }
   if (entry.settled && entry.expires <= Date.now()) {
     dashboardCache.delete(key);
     return null;
@@ -497,12 +524,16 @@ function cacheSet(key: string, entry: CacheEntry): void {
 
 // #14/#11: callers subscribe to the shared pipeline; a caller abort only
 // cancels the underlying BigQuery work when NO other subscriber remains.
-function subscribe(entry: CacheEntry, signal?: AbortSignal): void {
+function subscribe(entry: CacheEntry, key: string, signal?: AbortSignal): void {
   if (!signal || entry.settled) return;
   entry.subscribers++;
   const release = (): void => {
     entry.subscribers--;
-    if (entry.subscribers <= 0 && !entry.settled) entry.abort.abort();
+    if (entry.subscribers <= 0 && !entry.settled) {
+      // #3: evict BEFORE aborting so a same-tick retry can never latch on
+      if (dashboardCache.get(key) === entry) dashboardCache.delete(key);
+      entry.abort.abort();
+    }
   };
   if (signal.aborted) release();
   else signal.addEventListener("abort", release, { once: true });
@@ -521,7 +552,7 @@ async function loadDashboard(
   const key = `${timeRangeHours}|${agent ?? ""}`;
   const cached = cacheGet(key);
   if (cached) {
-    subscribe(cached, signal);
+    subscribe(cached, key, signal);
     const data = await cached.promise;
     return { ...data, meta: { ...data.meta, cache_hit: true } };
   }
@@ -535,7 +566,7 @@ async function loadDashboard(
   };
   entry.promise = bigQueryDashboard(start, end, granularity, agent, abort.signal);
   cacheSet(key, entry);
-  subscribe(entry, signal);
+  subscribe(entry, key, signal);
   entry.promise
     .then((d) => {
       entry.settled = true;

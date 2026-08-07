@@ -13,6 +13,20 @@ const MAX_ROWS = 100;
 // Exact BigQuery string literal for a user-supplied value: quotes, backslashes,
 // and newlines are escaped rather than stripped, so an agent named with an
 // apostrophe scopes to precisely that agent instead of a silently different one.
+// #4: the requested scope is NON-OVERRIDABLE — the UI labels answers with
+// this scope, so the analysis must never silently escape it. Questions that
+// ask beyond the scope are answered within it, with the restriction stated.
+export function buildScopeInstruction(scope?: { startIso: string; endIso: string; agent?: string }): string {
+  if (!scope) return "";
+  return (
+    ` SCOPE (MANDATORY): every SQL query you run MUST include the predicate` +
+    ` timestamp BETWEEN '${scope.startIso}' AND '${scope.endIso}'` +
+    (scope.agent ? ` AND agent = ${sqlStringLiteral(scope.agent)}` : "") +
+    `. This applies even if the question asks for other ranges, agents, or the whole table —` +
+    ` in that case answer within this scope and state that the analysis was restricted to it.`
+  );
+}
+
 export function sqlStringLiteral(value: string): string {
   return `'${value
     .replaceAll("\\", "\\\\")
@@ -67,21 +81,22 @@ export async function askConversational(
 
   // #20: one deadline covers the WHOLE request — including ADC token
   // acquisition, which would otherwise be able to hold Ask slots forever.
+  // #8: an already-aborted signal must reject NOW, before credentials — a
+  // listener alone would never fire for a pre-aborted signal.
+  if (callerSignal?.aborted) throw new Error("Ask aborted before start");
   const timeout = AbortSignal.timeout(150_000);
   const signal = callerSignal ? AbortSignal.any([timeout, callerSignal]) : timeout;
+  if (signal.aborted) throw new Error("Ask aborted before start");
   const token = await Promise.race([
     accessToken(),
     new Promise<never>((_, reject) => {
-      signal.addEventListener("abort", () => reject(new Error("Ask aborted while acquiring credentials")), { once: true });
+      const fail = (): void => reject(new Error("Ask aborted while acquiring credentials"));
+      if (signal.aborted) fail();
+      else signal.addEventListener("abort", fail, { once: true });
     }),
   ]);
 
-  // #5: pin the analysis to the filters the user is looking at
-  const scopeInstruction = cfg.scope
-    ? ` SCOPE: unless the user explicitly asks otherwise, restrict every query to timestamp BETWEEN '${cfg.scope.startIso}' AND '${cfg.scope.endIso}'` +
-      (cfg.scope.agent ? ` AND agent = ${sqlStringLiteral(cfg.scope.agent)}` : "") +
-      "."
-    : "";
+  const scopeInstruction = buildScopeInstruction(cfg.scope);
 
   const res = await fetch(`https://geminidataanalytics.googleapis.com/v1beta/${parent}:chat`, {
     method: "POST",
@@ -126,7 +141,7 @@ export async function askConversational(
   } catch {
     throw new Error("Conversational Analytics returned a non-JSON stream");
   }
-  return parseMessages(question, parsed);
+  return withScope(parseMessages(question, parsed), cfg.scope);
 }
 
 export function parseMessages(question: string, parsed: any[]): AskResult {
@@ -161,4 +176,8 @@ export function parseMessages(question: string, parsed: any[]): AskResult {
     rows,
     followups: followups.filter(Boolean).slice(0, 3),
   };
+}
+
+export function withScope(result: AskResult, scope?: { startIso: string; endIso: string; agent?: string }): AskResult {
+  return scope ? { ...result, scope } : result;
 }

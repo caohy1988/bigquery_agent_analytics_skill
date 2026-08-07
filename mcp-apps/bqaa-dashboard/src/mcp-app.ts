@@ -1132,13 +1132,23 @@ function renderCost(d: DashboardData, main: HTMLElement): void {
   // spread total cost over time proportional to token volume per bucket
   const allTokens = d.timeseries.reduce((a, b) => a + b.prompt_tokens + b.completion_tokens, 0);
   const costSeries = d.timeseries.map((b) => (allTokens ? (total * (b.prompt_tokens + b.completion_tokens)) / allTokens : 0));
-  const trend = chartCard("Estimated cost over time", "apportioned by token volume", [], "full", {
-    filename: "cost-over-time.csv",
-    get: () => ({
-      head: ["Bucket", "Est. cost"],
-      rows: d.timeseries.map((b, i) => [bucketLabel(b.ts, d.meta.granularity), costSeries[i].toFixed(4)]),
-    }),
-  });
+  // #11: a CSV of zeros computed from failed pricing data would be a false
+  // export — the action only exists when the pricing inputs are available
+  const trend = chartCard(
+    "Estimated cost over time",
+    "apportioned by token volume",
+    [],
+    "full",
+    modelsErr
+      ? undefined
+      : {
+          filename: "cost-over-time.csv",
+          get: () => ({
+            head: ["Bucket", "Est. cost"],
+            rows: d.timeseries.map((b, i) => [bucketLabel(b.ts, d.meta.granularity), costSeries[i].toFixed(4)]),
+          }),
+        },
+  );
   main.appendChild(trend.card);
   if (modelsErr) {
     // #4: without model pricing data the trend would be a plausible $0 chart
@@ -1176,13 +1186,21 @@ function renderCostRest(
   modelsErr: string | null,
 ): void {
   const unpriced = rows.filter((r) => r.price.in === 0 && r.price.out === 0 && (r.promptTot > 0 || r.completionTot > 0));
-  const byModel = chartCard("Cost by model", "estimates — tokens × your price book", [], "half", {
-    filename: "cost-by-model.csv",
-    get: () => ({
-      head: ["Model", "Calls", "Prompt tokens", "Completion tokens", "$/1M in", "$/1M out", "Est. cost"],
-      rows: rows.map((r) => [r.model, String(r.calls), String(r.promptTot), String(r.completionTot), String(r.price.in), String(r.price.out), r.cost.toFixed(4)]),
-    }),
-  });
+  const byModel = chartCard(
+    "Cost by model",
+    "estimates — tokens × your price book",
+    [],
+    "half",
+    modelsErr
+      ? undefined
+      : {
+          filename: "cost-by-model.csv",
+          get: () => ({
+            head: ["Model", "Calls", "Prompt tokens", "Completion tokens", "$/1M in", "$/1M out", "Est. cost"],
+            rows: rows.map((r) => [r.model, String(r.calls), String(r.promptTot), String(r.completionTot), String(r.price.in), String(r.price.out), r.cost.toFixed(4)]),
+          }),
+        },
+  );
   table(byModel.body, [
     { label: "Model", get: (r) => r.model },
     { label: "Calls", get: (r) => fmtInt(r.calls) },
@@ -1601,12 +1619,20 @@ const askState: { exchanges: AskResult[]; pending: string | null; note: string; 
   draft: "", // survives re-renders so a background refresh never eats typing
 };
 
-// #5(r5): an Ask answer computed under old filters must not publish under new
-// ones — scope changes bump the generation and stale completions are dropped.
+// #5(r5/r6): an Ask answer computed under old filters must not publish under
+// new ones — and the obsolete request itself is CANCELLED, so the input is
+// never blocked waiting for work whose answer would be discarded anyway.
 let askGen = 0;
+let askOp = 0;
+let askAbort: AbortController | null = null;
 
 function invalidateAskScope(): void {
   askGen++;
+  askAbort?.abort(); // stop the obsolete HTTP request outright
+  if (askState.pending) {
+    askState.pending = null; // unblock the input immediately
+    askState.note = "Analysis cancelled — the filters changed.";
+  }
 }
 
 // Minimal, injection-safe renderer for the API's markdown-ish answers:
@@ -1643,6 +1669,9 @@ async function submitQuestion(question: string): Promise<void> {
   renderView();
   // #5: the answer must match the filters on screen; stale completions are dropped
   const gen = askGen;
+  const op = ++askOp;
+  const abort = new AbortController();
+  askAbort = abort;
   const scope = { time_range_hours: currentHours(), ...(agentEl.value ? { agent: agentEl.value } : {}) };
   const scopeLabel = `last ${scope.time_range_hours}h${scope.agent ? ` · agent ${scope.agent}` : ""}`;
   try {
@@ -1658,6 +1687,7 @@ async function submitQuestion(question: string): Promise<void> {
         method: "POST",
         headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify({ question: q, history, ...scope }),
+        signal: abort.signal,
       });
       const body: any = await res.json().catch(() => null);
       if (!res.ok) throw new Error(body?.error ?? `HTTP ${res.status}`);
@@ -1672,9 +1702,12 @@ async function submitQuestion(question: string): Promise<void> {
       askState.exchanges.push({ ...result, question: `${result.question}  (${scopeLabel})` });
     }
   } catch (e) {
+    if (e instanceof DOMException && e.name === "AbortError") return; // cancelled by a scope change
     if (gen === askGen) askState.note = `Ask failed: ${e instanceof Error ? e.message : String(e)}`;
   } finally {
-    askState.pending = null;
+    // #5(r6): only this operation may clear pending — a stale finally must
+    // never clobber a newer question's state
+    if (op === askOp && askState.pending === q) askState.pending = null;
     renderView();
   }
 }
@@ -2111,8 +2144,17 @@ let rangeTouched = false;
 // never overwrite newer filters (monotonic sequence + abort for HTTP).
 let refreshSeq = 0;
 let inflightAbort: AbortController | null = null;
+// #9: host tool calls cannot be cancelled, so embedded refreshes are
+// single-flight — while one is in flight, newer scopes queue (latest only)
+// and rerun after it settles instead of stacking 10-query loads.
+let embeddedRefreshBusy = false;
+let embeddedRefreshQueued = false;
 
 async function refresh(): Promise<void> {
+  if (embedded && embeddedRefreshBusy) {
+    embeddedRefreshQueued = true; // controls/pendingAgent stay untouched for the rerun
+    return;
+  }
   const seq = ++refreshSeq;
   inflightAbort?.abort();
   const abort = new AbortController();
@@ -2130,11 +2172,20 @@ async function refresh(): Promise<void> {
   try {
     let d: DashboardData | null;
     if (embedded && appBridge) {
-      const result = await appBridge.callServerTool({
-        name: "query_agent_metrics",
-        arguments: { time_range_hours: hours, ...(agent ? { agent } : {}) },
-      });
-      d = extractData(result);
+      embeddedRefreshBusy = true;
+      try {
+        const result = await appBridge.callServerTool({
+          name: "query_agent_metrics",
+          arguments: { time_range_hours: hours, ...(agent ? { agent } : {}) },
+        });
+        d = extractData(result);
+      } finally {
+        embeddedRefreshBusy = false;
+        if (embeddedRefreshQueued) {
+          embeddedRefreshQueued = false;
+          setTimeout(() => void refresh(), 0); // rerun with the latest scope
+        }
+      }
       if (!d) throw new Error("no data in tool result");
     } else {
       d = await fetchStandalone(rangeTouched ? hours : null, agent, abort.signal);

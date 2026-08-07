@@ -11,6 +11,8 @@
 //                  the deadline covers the whole lifecycle, not just polling
 //   slow_create  — the overview job's creation resolves AFTER the deadline;
 //                  the late job must be cancelled and never polled
+//   slow_create_all — EVERY job's creation is slow; used to prove abandoned
+//                  creations keep counting against the admission cap
 
 import { BQ_MIN_BYTES_PER_QUERY } from "./queries.js";
 
@@ -84,7 +86,8 @@ export function makeFakeBigQuery(scenario: string): { createQueryJob: (opts: Fak
       if (scenario === "stall_create" && opts.query.includes("AS total_events")) {
         await new Promise(() => {}); // job creation hangs forever
       }
-      const lateCreate = scenario === "slow_create" && opts.query.includes("AS total_events");
+      const lateCreate =
+        (scenario === "slow_create" && opts.query.includes("AS total_events")) || scenario === "slow_create_all";
       if (lateCreate) {
         await new Promise((r) => setTimeout(r, 1500)); // resolves after the test deadline
       }

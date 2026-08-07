@@ -603,3 +603,70 @@ test("the Ask disable flag outranks mock mode (#12-r5)", async () => {
     srv.child.kill();
   }
 });
+
+// ---- sixth-review merge items
+
+test("disconnect during slow creation cancels the late job and never polls it (#6-r6)", async () => {
+  const port = PORT + 117;
+  const srv = startServer({ ...FAKE_ENV, BQAA_FAKE_BQ: "slow_create", BQAA_QUERY_TIMEOUT_MS: "60000" }, port);
+  try {
+    await waitFor(`http://localhost:${port}/healthz`);
+    const ac = new AbortController();
+    const req = fetch(`http://localhost:${port}/api/dashboard?time_range_hours=24`, { signal: ac.signal }).catch(() => null);
+    await new Promise((r) => setTimeout(r, 300)); // creations in flight
+    ac.abort();
+    await req;
+    await new Promise((r) => setTimeout(r, 1800)); // late creations land and self-cancel
+    assert.match(srv.logs(), /FAKE_BQ_JOB_CANCELLED/, "late job must be cancelled after disconnect");
+    assert.ok(!srv.logs().includes("FAKE_BQ_LATE_POLL"), "a cancelled lifecycle must never poll");
+  } finally {
+    srv.child.kill();
+  }
+});
+
+test("abandoned creations keep counting against admission (#2-r6)", async () => {
+  const port = PORT + 118;
+  const srv = startServer({ ...FAKE_ENV, BQAA_FAKE_BQ: "slow_create_all", BQAA_QUERY_TIMEOUT_MS: "500" }, port);
+  try {
+    await waitFor(`http://localhost:${port}/healthz`);
+    // 3 distinct refreshes = 30 lifecycles; ~20 admitted then time out into
+    // abandoned-creation accounting, the rest fail admission immediately
+    const refreshes = [24, 48, 72].map((h) =>
+      fetch(`http://localhost:${port}/api/dashboard?time_range_hours=${h}`).then((r) => r.json()),
+    );
+    await new Promise((r) => setTimeout(r, 700)); // deadlines fired, creations still pending
+    const widget = await fetch(`http://localhost:${port}/api/widget?measure=events&dimension=agent`);
+    const widgetBody = await widget.json();
+    assert.match(widgetBody?.data ? "" : (widgetBody.error ?? ""), /busy/i, "abandoned creations must occupy the cap");
+    await Promise.all(refreshes);
+    await new Promise((r) => setTimeout(r, 1600)); // abandoned creations settle
+    // in this scenario every creation is slow, so the recovery probe itself
+    // times out — recovery means it is ADMITTED (timeout), no longer refused (busy)
+    const after = await fetch(`http://localhost:${port}/api/widget?measure=events&dimension=agent`);
+    const afterBody = await after.json();
+    assert.ok(!/busy/i.test(afterBody.error ?? ""), "admission must recover once abandoned work settles");
+    assert.match(afterBody.error ?? "", /timed out|abandoned/, "the recovered slot runs and hits its own deadline");
+  } finally {
+    srv.child.kill();
+  }
+});
+
+test("an aborted dashboard pipeline is never reused by a retry (#3-r6)", async () => {
+  const port = PORT + 119;
+  const srv = startServer({ ...FAKE_ENV, BQAA_FAKE_BQ: "slow_create_all", BQAA_QUERY_TIMEOUT_MS: "5000" }, port);
+  try {
+    await waitFor(`http://localhost:${port}/healthz`);
+    const ac = new AbortController();
+    const first = fetch(`http://localhost:${port}/api/dashboard?time_range_hours=24`, { signal: ac.signal }).catch(() => null);
+    await new Promise((r) => setTimeout(r, 200));
+    ac.abort(); // last subscriber gone → pipeline aborted and evicted
+    await first;
+    const retry = await fetch(`http://localhost:${port}/api/dashboard?time_range_hours=24`);
+    assert.equal(retry.status, 200);
+    const { data } = await retry.json();
+    assert.notEqual(data.meta.cache_hit, true, "retry must get a fresh pipeline, not the aborted one");
+    assert.equal(data.overview.total_events, 1000, "fresh pipeline must produce real results");
+  } finally {
+    srv.child.kill();
+  }
+});
