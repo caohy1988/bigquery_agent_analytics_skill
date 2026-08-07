@@ -557,6 +557,21 @@ function subscribe(entry: CacheEntry, key: string, signal?: AbortSignal): void {
   else signal.addEventListener("abort", release, { once: true });
 }
 
+// #4(r8): a disconnected caller must release its own handler promptly while
+// the SHARED pipeline keeps running for remaining subscribers — the race
+// frees the caller; the last-subscriber rule (in subscribe) owns cancellation.
+function awaitForCaller<T>(p: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return p;
+  return Promise.race([
+    p,
+    new Promise<never>((_, reject) => {
+      const fail = (): void => reject(new Error("request aborted"));
+      if (signal.aborted) fail();
+      else signal.addEventListener("abort", fail, { once: true });
+    }),
+  ]);
+}
+
 async function loadDashboard(
   timeRangeHours: number,
   agent?: string | null,
@@ -571,7 +586,7 @@ async function loadDashboard(
   const cached = cacheGet(key);
   if (cached) {
     subscribe(cached, key, signal);
-    const data = await cached.promise;
+    const data = await awaitForCaller(cached.promise, signal);
     return { ...data, meta: { ...data.meta, cache_hit: true } };
   }
   const abort = new AbortController();
@@ -598,7 +613,7 @@ async function loadDashboard(
       entry.settled = true;
       if (dashboardCache.get(key) === entry) dashboardCache.delete(key); // failures are not cacheable
     });
-  return entry.promise;
+  return awaitForCaller(entry.promise, signal); // #4(r8): caller-scoped release
 }
 
 const TRACE_EVENT_CAP = 500;

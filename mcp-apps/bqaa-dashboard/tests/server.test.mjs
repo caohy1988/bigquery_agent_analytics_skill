@@ -707,3 +707,39 @@ test("mock Ask is scope-consistent with explicit provenance (#7-r7)", async () =
   assert.equal(data.scope?.verified, true);
   assert.match(data.answer, /mock data/i, "sample provenance must be explicit");
 });
+
+// ---- eighth-review merge items
+
+test("mock Ask values are scope-derived — disjoint scopes differ (#6-r8)", async () => {
+  const askWith = async (body) => {
+    const res = await fetch(`${BASE}/api/ask`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question: "Which tool fails most?", ...body }),
+    });
+    return (await res.json()).data;
+  };
+  const a = await askWith({ time_range_hours: 24, agent: "coder" });
+  const b = await askWith({ time_range_hours: 720 });
+  assert.notDeepEqual(a.rows, b.rows, "disjoint scopes must not return byte-identical sample rows");
+  assert.match(a.sql, /agent = 'coder'/);
+  assert.equal(a.scope?.verified, true);
+});
+
+test("a disconnected coalesced caller releases while the survivor completes (#4-r8)", async () => {
+  const port = PORT + 121;
+  const srv = startServer({ ...FAKE_ENV, BQAA_FAKE_BQ: "slow_create_all", BQAA_QUERY_TIMEOUT_MS: "5000" }, port);
+  try {
+    await waitFor(`http://localhost:${port}/healthz`);
+    const ac = new AbortController();
+    const doomed = fetch(`http://localhost:${port}/api/dashboard?time_range_hours=24`, { signal: ac.signal }).catch(() => "aborted");
+    const survivor = fetch(`http://localhost:${port}/api/dashboard?time_range_hours=24`).then((r) => r.json());
+    await new Promise((r) => setTimeout(r, 300));
+    ac.abort(); // NOT the last subscriber — shared work must survive
+    assert.equal(await doomed, "aborted");
+    const { data } = await survivor;
+    assert.equal(data.overview.total_events, 1000, "the surviving subscriber must still get real results");
+  } finally {
+    srv.child.kill();
+  }
+});

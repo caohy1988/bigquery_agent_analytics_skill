@@ -315,23 +315,43 @@ export function mockTrace(traceId: string): TraceEvent[] {
   return events;
 }
 
+function stringSeed(s: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
 export function mockAsk(question: string, scope?: { startIso: string; endIso: string; agent?: string }): AskResult {
-  // #7(r7): the sample answer is scope-consistent — its SQL carries the
-  // caller's actual window/agent, and provenance is explicit.
+  // #6(r8): sample VALUES derive deterministically from the scope — disjoint
+  // windows/agents produce different numbers, so a fixed fixture can never
+  // masquerade as two different slices. SQL carries the actual predicates.
   const windowPredicate = scope
     ? `timestamp BETWEEN '${scope.startIso}' AND '${scope.endIso}'${scope.agent ? ` AND agent = '${scope.agent}'` : ""}`
     : "timestamp > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)";
+  const randAsk = mulberry32(stringSeed(scope ? `${scope.startIso}|${scope.endIso}|${scope.agent ?? ""}` : "unscoped"));
+  const mk = (base: number): { starting: number; errors: number; rate: number } => {
+    const starting = Math.round(base * (0.5 + randAsk()));
+    const errors = Math.round(starting * (0.04 + randAsk() * 0.05));
+    return { starting, errors, rate: Math.round((errors / starting) * 1000) / 1000 };
+  };
+  const a = mk(2800);
+  const b = mk(2700);
+  const c = mk(2600);
   return {
     question,
     answer:
-      "**fetch_invoice** has the highest failure rate at **7.1%** of started executions (196 errors out of 2,759 starts), followed by check_inventory at 6.9%.\n\n(Sample answer from mock data — connect a BigQuery project to ask real questions.)",
+      `**fetch_invoice** has the highest failure rate at **${(a.rate * 100).toFixed(1)}%** of started executions (${a.errors} errors out of ${a.starting.toLocaleString("en-US")} starts), followed by check_inventory at ${(b.rate * 100).toFixed(1)}%.\n\n` +
+      `(Sample answer from mock data${scope ? ", generated for your selected scope" : ""} — connect a BigQuery project to ask real questions.)`,
     steps: ["Analyzing context", "Running a query", "Tool failure analysis"],
     sql: `WITH tool_stats AS (\n  SELECT LAX_STRING(content.tool) AS tool_name,\n    COUNTIF(event_type = 'TOOL_STARTING') AS starting_count,\n    COUNTIF(event_type = 'TOOL_ERROR') AS error_count\n  FROM \`project.dataset.agent_events\`\n  WHERE ${windowPredicate}\n  GROUP BY tool_name\n)\nSELECT tool_name, error_count / starting_count AS failure_rate\nFROM tool_stats ORDER BY failure_rate DESC`,
     schema: ["tool_name", "starting_count", "error_count", "failure_rate"],
     rows: [
-      { tool_name: "fetch_invoice", starting_count: 2759, error_count: 196, failure_rate: 0.071 },
-      { tool_name: "check_inventory", starting_count: 2768, error_count: 191, failure_rate: 0.069 },
-      { tool_name: "search_kb", starting_count: 2834, error_count: 195, failure_rate: 0.068 },
+      { tool_name: "fetch_invoice", starting_count: a.starting, error_count: a.errors, failure_rate: a.rate },
+      { tool_name: "check_inventory", starting_count: b.starting, error_count: b.errors, failure_rate: b.rate },
+      { tool_name: "search_kb", starting_count: c.starting, error_count: c.errors, failure_rate: c.rate },
     ],
     followups: [
       "What are the most common error messages for fetch_invoice?",

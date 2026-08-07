@@ -1715,11 +1715,20 @@ async function submitQuestion(question: string): Promise<void> {
         if (!d?.answer) throw new Error("no answer in tool result");
         result = d as AskResult;
       } finally {
-        embeddedAskBusy = false;
         if (embeddedAskQueued) {
+          // #7(r8): keep the dispatcher reserved across the dequeue gap, and
+          // dispatch whatever is LATEST at fire time — a question submitted in
+          // the gap replaces the queued one instead of being overtaken by it
           const next = embeddedAskQueued;
           embeddedAskQueued = null;
-          setTimeout(() => void submitQuestion(next), 0);
+          setTimeout(() => {
+            embeddedAskBusy = false;
+            const latest = embeddedAskQueued ?? next;
+            embeddedAskQueued = null;
+            void submitQuestion(latest);
+          }, 0);
+        } else {
+          embeddedAskBusy = false;
         }
       }
     } else if (location.protocol.startsWith("http")) {
@@ -1734,7 +1743,14 @@ async function submitQuestion(question: string): Promise<void> {
       result = body.data as AskResult;
     } else {
       await new Promise((r) => setTimeout(r, 600));
-      result = mockAsk(q);
+      // #5(r8): the sample must reflect the labeled scope, even from file://
+      const end = new Date();
+      const start = new Date(end.getTime() - scope.time_range_hours * 3_600_000);
+      result = mockAsk(q, {
+        startIso: start.toISOString(),
+        endIso: end.toISOString(),
+        ...(scope.agent ? { agent: scope.agent } : {}),
+      });
     }
     if (gen !== askGen) {
       askState.note = "Answer discarded — the filters changed while it was being computed.";
@@ -2381,6 +2397,7 @@ let refreshDebounce: ReturnType<typeof setTimeout> | undefined;
 function scheduleRefresh(): void {
   refreshSeq++; // stale publication is dead from this instant
   inflightAbort?.abort(); // standalone work stops before the debounce, too
+  pendingAgent = undefined; // #3(r8): a LOCAL choice outranks any queued host push
   clearTimeout(refreshDebounce);
   refreshDebounce = setTimeout(() => void refresh(), 250);
 }

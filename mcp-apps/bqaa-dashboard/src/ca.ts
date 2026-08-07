@@ -148,9 +148,17 @@ export function parseMessages(question: string, parsed: any[]): AskResult {
   const answers: string[] = [];
   const steps: string[] = [];
   const followups: string[] = [];
-  let sql: string | null = null;
-  let schema: string[] = [];
-  let rows: Array<Record<string, unknown>> = [];
+  // #1(r8): SQL/result provenance is preserved as PAIRS. CA runs several
+  // queries per question; displayed rows must come from the same query as the
+  // displayed SQL, and scope verification must cover every data-bearing pair.
+  interface QueryPair {
+    sql: string | null;
+    schema: string[];
+    rows: Array<Record<string, unknown>>;
+    hasResult: boolean;
+  }
+  const pairs: QueryPair[] = [];
+  let current: QueryPair | null = null;
 
   for (const m of parsed) {
     const sm = m?.systemMessage;
@@ -161,20 +169,36 @@ export function parseMessages(question: string, parsed: any[]): AskResult {
       else if (sm.text.textType === "FOLLOWUP_QUESTIONS") followups.push(...parts);
       else if (sm.text.textType === "THOUGHT" && parts.length) steps.push(parts[0].slice(0, 120));
     }
-    if (sm.data?.generatedSql) sql = sm.data.generatedSql;
+    if (sm.data?.generatedSql) {
+      current = { sql: sm.data.generatedSql, schema: [], rows: [], hasResult: false };
+      pairs.push(current);
+    }
     if (sm.data?.result) {
-      schema = (sm.data.result.schema?.fields ?? []).map((f: any) => f.name);
-      rows = (sm.data.result.data ?? []).slice(0, MAX_ROWS);
+      if (!current || current.hasResult) {
+        // a result with no owning SQL is an ambiguous stream — keep it as a
+        // pair with sql:null so verification fails closed
+        current = { sql: null, schema: [], rows: [], hasResult: false };
+        pairs.push(current);
+      }
+      current.schema = (sm.data.result.schema?.fields ?? []).map((f: any) => f.name);
+      current.rows = (sm.data.result.data ?? []).slice(0, MAX_ROWS);
+      current.hasResult = true;
     }
   }
+
+  const dataPairs = pairs.filter((p) => p.hasResult);
+  const display = dataPairs.length ? dataPairs[dataPairs.length - 1] : null;
+  const lastSql = [...pairs].reverse().find((p) => p.sql)?.sql ?? null;
   return {
     question,
     answer: answers.join("\n\n").trim() || "The analysis completed without a final text answer.",
     steps,
-    sql,
-    schema,
-    rows,
+    // the displayed SQL is the one that PRODUCED the displayed rows
+    sql: display ? display.sql : lastSql,
+    schema: display?.schema ?? [],
+    rows: display?.rows ?? [],
     followups: followups.filter(Boolean).slice(0, 3),
+    queries: pairs.map((p) => ({ sql: p.sql, row_count: p.hasResult ? p.rows.length : 0, data_bearing: p.hasResult })),
   };
 }
 
@@ -182,20 +206,46 @@ export function parseMessages(question: string, parsed: any[]): AskResult {
 // the generated SQL is checked for the scope's predicates, and the result
 // reports verified: true only when every check passes. Unverifiable or
 // missing-predicate SQL is reported truthfully as NOT verified.
+// #2(r8): substring checks verified comments, projected literals, and
+// prefix-matched agents. This validation is structural and FAIL-CLOSED:
+// comments are stripped, the time bound must be an actual
+// `timestamp BETWEEN '<start>' AND '<end>'` predicate with exactly the
+// scope's literals, and every `agent = '<value>'` predicate must equal the
+// scope's agent exactly — any other agent predicate, or none, fails.
 export function verifyScope(
   sql: string | null,
   scope?: { startIso: string; endIso: string; agent?: string },
 ): boolean {
   if (!scope) return true;
   if (!sql) return false; // nothing to verify against
-  const hasWindow = sql.includes(scope.startIso) && sql.includes(scope.endIso) && /timestamp/i.test(sql);
-  const hasAgent = !scope.agent || sql.includes(scope.agent);
-  return hasWindow && hasAgent;
+  const stripped = sql.replace(/--[^\n]*/g, " ").replace(/\/\*[\s\S]*?\*\//g, " ");
+  const timeRe =
+    /\btimestamp\b\s+BETWEEN\s+(?:TIMESTAMP\s*\(\s*)?'([^']+)'\s*\)?\s+AND\s+(?:TIMESTAMP\s*\(\s*)?'([^']+)'\s*\)?/i;
+  const tm = timeRe.exec(stripped);
+  if (!tm || tm[1] !== scope.startIso || tm[2] !== scope.endIso) return false;
+  if (scope.agent) {
+    const agentRe = /\bagent\b\s*=\s*'((?:[^'\\]|\\.)*)'/gi;
+    let matchedScope = false;
+    let m: RegExpExecArray | null;
+    while ((m = agentRe.exec(stripped))) {
+      const value = m[1].replaceAll("\\'", "'").replaceAll("\\\\", "\\");
+      if (value === scope.agent) matchedScope = true;
+      else return false; // a predicate on a DIFFERENT agent can never verify
+    }
+    if (!matchedScope) return false;
+  }
+  return true;
 }
 
 export function withScope(result: AskResult, scope?: { startIso: string; endIso: string; agent?: string }): AskResult {
   if (!scope) return result;
-  const verified = verifyScope(result.sql, scope);
+  // #1(r8): EVERY data-bearing query must pass — one unscoped result row set
+  // poisons the whole answer. Streams with results but no owning SQL fail
+  // closed; a purely textual answer verifies against the final SQL if any.
+  const dataPairs = (result.queries ?? []).filter((q) => q.data_bearing);
+  const verified = dataPairs.length
+    ? dataPairs.every((q) => q.sql != null && verifyScope(q.sql, scope))
+    : verifyScope(result.sql, scope);
   return {
     ...result,
     scope: { ...scope, verified },

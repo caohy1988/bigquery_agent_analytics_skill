@@ -164,9 +164,11 @@ export interface AskResult {
   schema: string[]; // result column names
   rows: Array<Record<string, unknown>>; // last query result (capped)
   followups: string[];
-  // The REQUESTED scope, with verified=true only when the generated SQL was
-  // confirmed to contain its predicates — never assumed.
+  // The REQUESTED scope, with verified=true only when EVERY data-bearing
+  // generated query was structurally confirmed to contain its predicates.
   scope?: { startIso: string; endIso: string; agent?: string; verified?: boolean };
+  // Full query provenance: one entry per CA-generated query, in order.
+  queries?: Array<{ sql: string | null; row_count: number; data_bearing: boolean }>;
 }
 
 export interface ErrorTraceRow {
