@@ -743,6 +743,16 @@ async function widgetHandler(args: WidgetArgs, extra?: { signal?: AbortSignal })
 
 // Each stateless HTTP request gets its own McpServer: a shared instance
 // re-binds its transport on connect(), so concurrent RPCs would race.
+// Every tool is a read-only query over agent_events — no writes, no side
+// effects, same result for the same arguments. Hosts (Gemini Enterprise,
+// Claude, etc.) read these hints to skip per-action confirmation prompts.
+const READ_ONLY_ANNOTATIONS = {
+  readOnlyHint: true,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: false,
+} as const;
+
 function buildMcpServer(): McpServer {
   const server = new McpServer({ name: "BigQuery Agent Analytics Dashboard", version: "0.1.0" });
 
@@ -755,6 +765,7 @@ registerAppTool(
       "Render an interactive dashboard (overview, latency, tokens, tools) over the BigQuery Agent Analytics agent_events table. Use when the user wants to see, explore, or monitor agent metrics visually.",
     inputSchema: metricArgs,
     outputSchema: { data: z.unknown() },
+    annotations: READ_ONLY_ANNOTATIONS,
     _meta: { ui: { resourceUri } },
   },
   metricsHandler,
@@ -768,6 +779,7 @@ server.registerTool(
       "Return the aggregated agent-analytics payload (overview, timeseries, latency by agent, token usage, tool stats) as structured data without rendering UI. Used by the dashboard for refresh/filtering; also useful for text answers.",
     inputSchema: metricArgs,
     outputSchema: { data: z.unknown() },
+    annotations: READ_ONLY_ANNOTATIONS,
   },
   metricsHandler,
 );
@@ -782,6 +794,7 @@ server.registerTool(
       time_range_hours: z.number().int().min(1).max(MAX_HOURS).default(CONFIG.defaultHours),
     },
     outputSchema: { data: z.unknown() },
+    annotations: READ_ONLY_ANNOTATIONS,
   },
   async (args, extra) => {
     const trace = await loadTrace(args.trace_id, args.time_range_hours ?? CONFIG.defaultHours, extra?.signal);
@@ -810,6 +823,7 @@ server.registerTool(
       "Run one custom analytics widget over agent_events: a measure (count/latency/tokens/error-rate/…) grouped by a dimension (time, agent, model, tool, user, status, event_type) with optional filters. Set dry_run=true to estimate bytes scanned first. Used by the dashboard's Explore tab and for ad-hoc questions.",
     inputSchema: widgetArgs,
     outputSchema: { data: z.unknown() },
+    annotations: READ_ONLY_ANNOTATIONS,
   },
   widgetHandler,
 );
@@ -823,6 +837,7 @@ registerAppTool(
       "Build a custom chart from natural language and render it interactively in the dashboard UI: pick a measure, a dimension, and filters. Use when the user asks to visualize a specific slice (e.g. 'show p95 latency by tool for errors').",
     inputSchema: widgetArgs,
     outputSchema: { data: z.unknown() },
+    annotations: READ_ONLY_ANNOTATIONS,
     _meta: { ui: { resourceUri } },
   },
   widgetHandler,
@@ -845,6 +860,7 @@ server.registerTool(
       agent: z.string().max(200).optional().describe("Restrict analysis to one agent"),
     },
     outputSchema: { data: z.unknown() },
+    annotations: READ_ONLY_ANNOTATIONS,
   },
   async (args, extra) => {
     const result = await ask(
@@ -872,6 +888,7 @@ registerAppTool(
       time_range_hours: z.number().int().min(1).max(MAX_HOURS).default(CONFIG.defaultHours),
     },
     outputSchema: { data: z.unknown() },
+    annotations: READ_ONLY_ANNOTATIONS,
     _meta: { ui: { resourceUri } },
   },
   async (args, extra) => {
@@ -909,6 +926,7 @@ server.registerTool(
       limit: z.number().int().min(1).max(50).default(10),
     },
     outputSchema: { data: z.unknown() },
+    annotations: READ_ONLY_ANNOTATIONS,
   },
   async (args, extra) => {
     const rows = await loadErrorTraces(args.time_range_hours ?? CONFIG.defaultHours, args.limit ?? 10, extra?.signal);

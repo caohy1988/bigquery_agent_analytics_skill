@@ -746,6 +746,16 @@ test("a disconnected coalesced caller releases while the survivor completes (#4-
 
 // ---- render_trace: the waterfall is model-invokable
 
+test("every tool declares read-only annotations so hosts can skip confirmation", async () => {
+  const tools = await rpc(BASE, "tools/list", {});
+  const list = tools.body.result.tools;
+  assert.equal(list.length, 8);
+  for (const t of list) {
+    assert.equal(t.annotations?.readOnlyHint, true, `${t.name} must be marked read-only`);
+    assert.equal(t.annotations?.destructiveHint, false, `${t.name} must be marked non-destructive`);
+  }
+});
+
 test("render_trace carries UI metadata and a renderable trace payload", async () => {
   const tools = await rpc(BASE, "tools/list", {});
   const rt = tools.body.result.tools.find((t) => t.name === "render_trace");
