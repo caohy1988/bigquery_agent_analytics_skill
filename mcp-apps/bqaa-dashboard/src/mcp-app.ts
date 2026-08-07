@@ -1384,6 +1384,8 @@ function currentHours(): number {
 
 // #15: superseded standalone widget requests are aborted, not just ignored
 let widgetAbort: AbortController | null = null;
+// #13(r9): embedded widget calls are uncancellable — allow only one in flight
+let embeddedWidgetBusy = false;
 
 async function runWidget(dryRun: boolean): Promise<WidgetResult> {
   const hours = currentHours();
@@ -1401,10 +1403,17 @@ async function runWidget(dryRun: boolean): Promise<WidgetResult> {
     ...(dryRun ? { dry_run: true } : {}),
   };
   if (embedded && appBridge) {
-    const result: any = await appBridge.callServerTool({ name: "query_widget", arguments: args });
-    const data = result?.structuredContent?.data;
-    if (!data?.spec) throw new Error("no widget data in tool result");
-    return data as WidgetResult;
+    // #13(r9): host calls cannot be cancelled — bound them to one in flight
+    if (embeddedWidgetBusy) throw new Error("A widget request is already running — wait for it to settle");
+    embeddedWidgetBusy = true;
+    try {
+      const result: any = await appBridge.callServerTool({ name: "query_widget", arguments: args });
+      const data = result?.structuredContent?.data;
+      if (!data?.spec) throw new Error("no widget data in tool result");
+      return data as WidgetResult;
+    } finally {
+      embeddedWidgetBusy = false;
+    }
   }
   if (location.protocol.startsWith("http")) {
     widgetAbort?.abort();
@@ -2018,6 +2027,7 @@ function renderView(): void {
   }
   if (!data && !(currentView === "explore" && explore.result) && currentView !== "ask") {
     mainEl.appendChild(el("div", "empty", "Waiting for data…"));
+    renderTraceCard(mainEl); // #4(r9): a pushed waterfall must not be hidden by a failed refresh
     return;
   }
   VIEWS.find((v) => v.id === currentView)!.render(data as DashboardData, mainEl);
@@ -2343,9 +2353,13 @@ function renderWaterfall(container: HTMLElement, events: TraceEvent[]): void {
   const axis = el("div", "wf-axis");
   axis.appendChild(el("span", "wf-axis-label", ""));
   const ticksWrap = el("div", "wf-ticks");
-  for (let t = 0; t <= 4; t++) {
-    const tick = el("span", "wf-tick", fmtMs((totalMs / 4) * t));
-    tick.style.left = `${t * 25}%`;
+  // #7(r9): tick density follows the available width so labels never overlap
+  const width = mainEl.clientWidth || 800;
+  const divisions = width < 420 ? 2 : width < 700 ? 3 : 4;
+  for (let t = 0; t <= divisions; t++) {
+    const tick = el("span", "wf-tick", fmtMs((totalMs / divisions) * t));
+    tick.style.left = `${(t / divisions) * 100}%`;
+    if (t === divisions) tick.classList.add("last"); // anchored inside the track
     ticksWrap.appendChild(tick);
   }
   axis.appendChild(ticksWrap);
@@ -2448,7 +2462,17 @@ function renderTraceCard(main: HTMLElement): void {
   main.appendChild(card);
 }
 
+// #3(r9): host tool calls cannot be cancelled, so embedded trace loads are
+// single-flight — rapid clicks queue only the LATEST trace id instead of
+// stacking concurrent get_trace jobs against the shared admission cap.
+let embeddedTraceBusy = false;
+let embeddedTraceQueued: string | null = null;
+
 async function showTrace(traceId: string): Promise<void> {
+  if (embedded && embeddedTraceBusy) {
+    embeddedTraceQueued = traceId;
+    return;
+  }
   const gen = ++traceGen;
   traceAbort?.abort();
   const abort = new AbortController();
@@ -2456,6 +2480,7 @@ async function showTrace(traceId: string): Promise<void> {
   traceCard = { traceId, view: currentView, events: null, truncated: false, error: null };
   renderView();
   document.getElementById("trace-card")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  if (embedded) embeddedTraceBusy = true;
   try {
     const { events, truncated } = await fetchTrace(traceId, abort.signal);
     if (gen !== traceGen || traceCard?.traceId !== traceId) return; // window changed or replaced
@@ -2464,6 +2489,21 @@ async function showTrace(traceId: string): Promise<void> {
     if (gen !== traceGen || traceCard?.traceId !== traceId) return;
     if (err instanceof DOMException && err.name === "AbortError") return;
     traceCard = { ...traceCard, error: err instanceof Error ? err.message : String(err) };
+  } finally {
+    if (embedded) {
+      if (embeddedTraceQueued) {
+        const next = embeddedTraceQueued;
+        embeddedTraceQueued = null;
+        setTimeout(() => {
+          embeddedTraceBusy = false;
+          const latest = embeddedTraceQueued ?? next;
+          embeddedTraceQueued = null;
+          void showTrace(latest);
+        }, 0);
+      } else {
+        embeddedTraceBusy = false;
+      }
+    }
   }
   renderView();
 }
@@ -2485,6 +2525,7 @@ function scheduleRefresh(): void {
   refreshSeq++; // stale publication is dead from this instant
   inflightAbort?.abort(); // standalone work stops before the debounce, too
   pendingAgent = undefined; // #3(r8): a LOCAL choice outranks any queued host push
+  exploreSpecChanged(); // #15(r9): Explore results computed under the old scope are stale
   clearTimeout(refreshDebounce);
   refreshDebounce = setTimeout(() => void refresh(), 250);
 }
@@ -2562,6 +2603,17 @@ if (embedded) {
     if (payload?.trace_id && Array.isArray(payload.events)) {
       traceGen++; // supersede any in-flight local trace fetch
       traceAbort?.abort();
+      // #1(r9): adopt the pushed trace's window so the surrounding dashboard
+      // is labeled and refreshed with the SAME scope the trace was fetched in
+      const h = Math.trunc(Number(payload.time_range_hours));
+      if (Number.isInteger(h) && h > 0) {
+        if ([...rangeEl.options].some((o) => o.value === String(h))) {
+          rangeEl.value = String(h);
+          effectiveHours = null;
+        } else {
+          effectiveHours = h;
+        }
+      }
       traceCard = {
         traceId: payload.trace_id,
         view: currentView,

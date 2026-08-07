@@ -2,6 +2,7 @@
 // BQAA_MOCK=1 (or no BQAA_PROJECT is set) and by the UI's standalone preview.
 // Browser-safe: no Node APIs.
 
+import { sqlStringLiteral } from "./sqltext.js";
 import type {
   AgentLatencyRow,
   AskResult,
@@ -226,7 +227,11 @@ export function mockDashboard(
 }
 
 export function mockWidget(spec: WidgetSpec, start: Date, end: Date): WidgetResult {
-  const rand = mulberry32(spec.measure.length * 131 + spec.dimension.length * 17);
+  // #8(r9): the seed covers the FULL normalized spec — filters included — and
+  // categorical rows honor a matching dimension filter instead of ignoring it
+  const rand = mulberry32(
+    stringSeed(JSON.stringify({ m: spec.measure, d: spec.dimension, g: spec.granularity, f: spec.filters ?? {} })),
+  );
   const scale =
     spec.measure.includes("tokens") ? 250_000 : spec.measure.includes("ms") ? 4000 : spec.measure.includes("pct") ? 5 : 900;
   let rows;
@@ -245,7 +250,9 @@ export function mockWidget(spec: WidgetSpec, start: Date, end: Date): WidgetResu
       status: ["OK", "ERROR"],
       event_type: ["LLM_RESPONSE", "LLM_REQUEST", "TOOL_COMPLETED", "TOOL_STARTING"],
     };
-    rows = (values[spec.dimension] ?? ["a", "b"]).map((dim) => ({
+    const filterValue = (spec.filters as Record<string, string | undefined> | undefined)?.[spec.dimension];
+    const candidates = filterValue ? [filterValue] : (values[spec.dimension] ?? ["a", "b"]);
+    rows = candidates.map((dim) => ({
       dim,
       value: Math.round(scale * (0.2 + rand())),
     }));
@@ -329,7 +336,7 @@ export function mockAsk(question: string, scope?: { startIso: string; endIso: st
   // windows/agents produce different numbers, so a fixed fixture can never
   // masquerade as two different slices. SQL carries the actual predicates.
   const windowPredicate = scope
-    ? `timestamp BETWEEN '${scope.startIso}' AND '${scope.endIso}'${scope.agent ? ` AND agent = '${scope.agent}'` : ""}`
+    ? `timestamp BETWEEN '${scope.startIso}' AND '${scope.endIso}'${scope.agent ? ` AND agent = ${sqlStringLiteral(scope.agent)}` : ""}`
     : "timestamp > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)";
   const randAsk = mulberry32(stringSeed(scope ? `${scope.startIso}|${scope.endIso}|${scope.agent ?? ""}` : "unscoped"));
   const mk = (base: number): { starting: number; errors: number; rate: number } => {
@@ -337,24 +344,27 @@ export function mockAsk(question: string, scope?: { startIso: string; endIso: st
     const errors = Math.round(starting * (0.04 + randAsk() * 0.05));
     return { starting, errors, rate: Math.round((errors / starting) * 1000) / 1000 };
   };
-  const a = mk(2800);
-  const b = mk(2700);
-  const c = mk(2600);
+  // #10(r9): ONE sorted row set drives the rows, the prose, and the SQL —
+  // the sample can never contradict itself
+  const sampleRows = ["fetch_invoice", "check_inventory", "search_kb"]
+    .map((tool_name, i) => {
+      const { starting, errors, rate } = mk(2800 - i * 100);
+      return { tool_name, starting_count: starting, error_count: errors, failure_rate: rate };
+    })
+    .sort((x, y) => y.failure_rate - x.failure_rate);
+  const top = sampleRows[0];
+  const second = sampleRows[1];
   return {
     question,
     answer:
-      `**fetch_invoice** has the highest failure rate at **${(a.rate * 100).toFixed(1)}%** of started executions (${a.errors} errors out of ${a.starting.toLocaleString("en-US")} starts), followed by check_inventory at ${(b.rate * 100).toFixed(1)}%.\n\n` +
+      `**${top.tool_name}** has the highest failure rate at **${(top.failure_rate * 100).toFixed(1)}%** of started executions (${top.error_count} errors out of ${top.starting_count.toLocaleString("en-US")} starts), followed by ${second.tool_name} at ${(second.failure_rate * 100).toFixed(1)}%.\n\n` +
       `(Sample answer from mock data${scope ? ", generated for your selected scope" : ""} — connect a BigQuery project to ask real questions.)`,
     steps: ["Analyzing context", "Running a query", "Tool failure analysis"],
-    sql: `WITH tool_stats AS (\n  SELECT LAX_STRING(content.tool) AS tool_name,\n    COUNTIF(event_type = 'TOOL_STARTING') AS starting_count,\n    COUNTIF(event_type = 'TOOL_ERROR') AS error_count\n  FROM \`project.dataset.agent_events\`\n  WHERE ${windowPredicate}\n  GROUP BY tool_name\n)\nSELECT tool_name, error_count / starting_count AS failure_rate\nFROM tool_stats ORDER BY failure_rate DESC`,
+    sql: `WITH tool_stats AS (\n  SELECT LAX_STRING(content.tool) AS tool_name,\n    COUNTIF(event_type = 'TOOL_STARTING') AS starting_count,\n    COUNTIF(event_type = 'TOOL_ERROR') AS error_count\n  FROM \`project.dataset.agent_events\`\n  WHERE ${windowPredicate}\n  GROUP BY tool_name\n)\nSELECT tool_name, starting_count, error_count, error_count / starting_count AS failure_rate\nFROM tool_stats ORDER BY failure_rate DESC`,
     schema: ["tool_name", "starting_count", "error_count", "failure_rate"],
-    rows: [
-      { tool_name: "fetch_invoice", starting_count: a.starting, error_count: a.errors, failure_rate: a.rate },
-      { tool_name: "check_inventory", starting_count: b.starting, error_count: b.errors, failure_rate: b.rate },
-      { tool_name: "search_kb", starting_count: c.starting, error_count: c.errors, failure_rate: c.rate },
-    ],
+    rows: sampleRows,
     followups: [
-      "What are the most common error messages for fetch_invoice?",
+      `What are the most common error messages for ${top.tool_name}?`,
       "What is the failure rate broken down by agent?",
       "Show me the daily trend of failures.",
     ],

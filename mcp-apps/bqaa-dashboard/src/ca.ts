@@ -10,9 +10,9 @@ import type { AskExchange, AskResult } from "./types.js";
 
 const MAX_ROWS = 100;
 
-// Exact BigQuery string literal for a user-supplied value: quotes, backslashes,
-// and newlines are escaped rather than stripped, so an agent named with an
-// apostrophe scopes to precisely that agent instead of a silently different one.
+import { sqlStringLiteral } from "./sqltext.js"; // shared with the mock layer (#9-r9)
+export { sqlStringLiteral };
+
 // #4: the requested scope is NON-OVERRIDABLE — the UI labels answers with
 // this scope, so the analysis must never silently escape it. Questions that
 // ask beyond the scope are answered within it, with the restriction stated.
@@ -25,14 +25,6 @@ export function buildScopeInstruction(scope?: { startIso: string; endIso: string
     `. This applies even if the question asks for other ranges, agents, or the whole table —` +
     ` in that case answer within this scope and state that the analysis was restricted to it.`
   );
-}
-
-export function sqlStringLiteral(value: string): string {
-  return `'${value
-    .replaceAll("\\", "\\\\")
-    .replaceAll("'", "\\'")
-    .replaceAll("\n", "\\n")
-    .replaceAll("\r", "\\r")}'`;
 }
 
 let auth: GoogleAuth | null = null;
@@ -158,7 +150,12 @@ export function parseMessages(question: string, parsed: any[]): AskResult {
     hasResult: boolean;
   }
   const pairs: QueryPair[] = [];
-  let current: QueryPair | null = null;
+  let current: QueryPair | null = null; // arrival-order fallback pointer
+  // #5(r9): the Message contract defines groupId for logically related
+  // messages — interleaved query groups must pair by IDENTITY, never by
+  // arrival order. Arrival pairing remains only for streams with no groupIds,
+  // and anything ambiguous pairs as sql:null so verification fails closed.
+  const byGroup = new Map<string, QueryPair>();
 
   for (const m of parsed) {
     const sm = m?.systemMessage;
@@ -169,20 +166,45 @@ export function parseMessages(question: string, parsed: any[]): AskResult {
       else if (sm.text.textType === "FOLLOWUP_QUESTIONS") followups.push(...parts);
       else if (sm.text.textType === "THOUGHT" && parts.length) steps.push(parts[0].slice(0, 120));
     }
+    // the documented location is SystemMessage.groupId; tolerate wrapper-level
+    const gidRaw = sm.groupId ?? m?.groupId;
+    const gid: string | null = gidRaw != null ? String(gidRaw) : null;
     if (sm.data?.generatedSql) {
-      current = { sql: sm.data.generatedSql, schema: [], rows: [], hasResult: false };
-      pairs.push(current);
-    }
-    if (sm.data?.result) {
-      if (!current || current.hasResult) {
-        // a result with no owning SQL is an ambiguous stream — keep it as a
-        // pair with sql:null so verification fails closed
-        current = { sql: null, schema: [], rows: [], hasResult: false };
+      if (gid != null) {
+        let p = byGroup.get(gid);
+        if (!p || p.hasResult) {
+          p = { sql: null, schema: [], rows: [], hasResult: false };
+          byGroup.set(gid, p);
+          pairs.push(p);
+        }
+        // a second SQL in the same open group makes ownership ambiguous
+        p.sql = p.sql == null ? sm.data.generatedSql : null;
+      } else {
+        current = { sql: sm.data.generatedSql, schema: [], rows: [], hasResult: false };
         pairs.push(current);
       }
-      current.schema = (sm.data.result.schema?.fields ?? []).map((f: any) => f.name);
-      current.rows = (sm.data.result.data ?? []).slice(0, MAX_ROWS);
-      current.hasResult = true;
+    }
+    if (sm.data?.result) {
+      let target: QueryPair;
+      if (gid != null) {
+        const p = byGroup.get(gid);
+        if (p && !p.hasResult) {
+          target = p;
+        } else {
+          // result with no open owning group — ambiguous, fail closed
+          target = { sql: null, schema: [], rows: [], hasResult: false };
+          byGroup.set(gid, target);
+          pairs.push(target);
+        }
+      } else if (current && !current.hasResult) {
+        target = current;
+      } else {
+        target = { sql: null, schema: [], rows: [], hasResult: false };
+        pairs.push(target);
+      }
+      target.schema = (sm.data.result.schema?.fields ?? []).map((f: any) => f.name);
+      target.rows = (sm.data.result.data ?? []).slice(0, MAX_ROWS);
+      target.hasResult = true;
     }
   }
 
@@ -206,12 +228,16 @@ export function parseMessages(question: string, parsed: any[]): AskResult {
 // the generated SQL is checked for the scope's predicates, and the result
 // reports verified: true only when every check passes. Unverifiable or
 // missing-predicate SQL is reported truthfully as NOT verified.
-// #2(r8): substring checks verified comments, projected literals, and
-// prefix-matched agents. This validation is structural and FAIL-CLOSED:
-// comments are stripped, the time bound must be an actual
-// `timestamp BETWEEN '<start>' AND '<end>'` predicate with exactly the
-// scope's literals, and every `agent = '<value>'` predicate must equal the
-// scope's agent exactly — any other agent predicate, or none, fails.
+// #2(r9): verification is a deliberately SMALL grammar that must PROVE the
+// scope dominates the query, and rejects anything unprovable:
+//   1. comments are stripped; triple-quoted strings are unprovable → fail
+//   2. string literals are tokenized out, so literal CONTENT can never fake a
+//      predicate — predicates must appear in code with literal tokens
+//   3. constructs that can widen or split the scan are unprovable → fail:
+//      OR, UNION, multiple statements, or non-equality agent operators
+//   4. the time bound must be `timestamp BETWEEN <start> AND <end>` with the
+//      scope's exact literals; every `agent = <literal>` must equal the
+//      scope's agent, and at least one must exist
 export function verifyScope(
   sql: string | null,
   scope?: { startIso: string; endIso: string; agent?: string },
@@ -219,17 +245,31 @@ export function verifyScope(
   if (!scope) return true;
   if (!sql) return false; // nothing to verify against
   const stripped = sql.replace(/--[^\n]*/g, " ").replace(/\/\*[\s\S]*?\*\//g, " ");
-  const timeRe =
-    /\btimestamp\b\s+BETWEEN\s+(?:TIMESTAMP\s*\(\s*)?'([^']+)'\s*\)?\s+AND\s+(?:TIMESTAMP\s*\(\s*)?'([^']+)'\s*\)?/i;
-  const tm = timeRe.exec(stripped);
-  if (!tm || tm[1] !== scope.startIso || tm[2] !== scope.endIso) return false;
+  if (stripped.includes("'''") || stripped.includes('"""')) return false; // triple-quoted: unprovable
+  // tokenize single-quoted string literals out of the code
+  const literals: string[] = [];
+  const code = stripped.replace(/'((?:[^'\\]|\\.)*)'/g, (_all, inner: string) => {
+    literals.push(inner.replaceAll("\\'", "'").replaceAll("\\\\", "\\"));
+    return `\u0000${literals.length - 1}\u0000`;
+  });
+  if (code.includes("'")) return false; // unbalanced/odd quoting: unprovable
+  if (/\bOR\b/i.test(code)) return false; // OR can widen the scan
+  if (/\bUNION\b/i.test(code)) return false; // UNION can add unscoped branches
+  if (/;\s*\S/.test(code)) return false; // multiple statements
+  if (/\bagent\b\s*(?:!=|<>|\bNOT\b|\bIN\b|\bLIKE\b)/i.test(code)) return false; // only equality is provable
+  const lit = "\u0000(\\d+)\u0000";
+  const timeRe = new RegExp(
+    `\\btimestamp\\b\\s+BETWEEN\\s+(?:TIMESTAMP\\s*\\(\\s*)?${lit}\\s*\\)?\\s+AND\\s+(?:TIMESTAMP\\s*\\(\\s*)?${lit}\\s*\\)?`,
+    "i",
+  );
+  const tm = timeRe.exec(code);
+  if (!tm || literals[Number(tm[1])] !== scope.startIso || literals[Number(tm[2])] !== scope.endIso) return false;
   if (scope.agent) {
-    const agentRe = /\bagent\b\s*=\s*'((?:[^'\\]|\\.)*)'/gi;
+    const agentRe = new RegExp(`\\bagent\\b\\s*=\\s*${lit}`, "gi");
     let matchedScope = false;
     let m: RegExpExecArray | null;
-    while ((m = agentRe.exec(stripped))) {
-      const value = m[1].replaceAll("\\'", "'").replaceAll("\\\\", "\\");
-      if (value === scope.agent) matchedScope = true;
+    while ((m = agentRe.exec(code))) {
+      if (literals[Number(m[1])] === scope.agent) matchedScope = true;
       else return false; // a predicate on a DIFFERENT agent can never verify
     }
     if (!matchedScope) return false;

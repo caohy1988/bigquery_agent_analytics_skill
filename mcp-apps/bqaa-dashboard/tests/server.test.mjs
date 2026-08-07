@@ -758,5 +758,19 @@ test("render_trace carries UI metadata and a renderable trace payload", async ()
   assert.equal(d?.trace_id, "abcd1234abcd1234", "payload must identify the trace for the UI");
   assert.ok(Array.isArray(d?.events) && d.events.length > 0);
   assert.equal(typeof d?.truncated, "boolean");
-  assert.match(call.body.result.content[0].text, /waterfall has been rendered/);
+  assert.match(call.body.result.content[0].text, /Compatible MCP App hosts will render the waterfall/);
+});
+
+test("render_trace payload carries the requested window so the UI adopts it (#1-r9)", async () => {
+  const call = await rpc(BASE, "tools/call", {
+    name: "render_trace",
+    arguments: { trace_id: "abcd1234abcd1234", time_range_hours: 72 },
+  });
+  const d = call.body.result.structuredContent?.data;
+  assert.equal(d?.time_range_hours, 72, "non-default window must ride along with the trace");
+  const dflt = await rpc(BASE, "tools/call", {
+    name: "render_trace",
+    arguments: { trace_id: "abcd1234abcd1234" },
+  });
+  assert.equal(typeof dflt.body.result.structuredContent?.data?.time_range_hours, "number", "default window is explicit, not implied");
 });

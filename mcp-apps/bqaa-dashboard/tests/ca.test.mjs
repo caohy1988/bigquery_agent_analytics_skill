@@ -157,3 +157,56 @@ test("structural validation rejects lookalike text (#2-r8)", () => {
   const wrapped = `SELECT 1 FROM t WHERE timestamp BETWEEN TIMESTAMP('${scope.startIso}') AND TIMESTAMP('${scope.endIso}') AND agent = 'billing'`;
   assert.equal(verifyScope(wrapped, scope), true);
 });
+
+test("fail-closed grammar rejects OR/UNION/multi-statement/quoting tricks (#2-r9)", () => {
+  const scope = { startIso: "2026-08-06T00:00:00Z", endIso: "2026-08-07T00:00:00Z", agent: "billing" };
+  const good = `SELECT 1 FROM t WHERE timestamp BETWEEN '${scope.startIso}' AND '${scope.endIso}' AND agent = 'billing'`;
+  assert.equal(verifyScope(good, scope), true);
+  // OR TRUE nullifies every predicate — grammar must reject any top-level OR
+  assert.equal(verifyScope(`${good} OR TRUE`, scope), false);
+  // UNION smuggles an unscoped branch
+  assert.equal(verifyScope(`${good} UNION ALL SELECT 1 FROM t`, scope), false);
+  // second statement after ; is unverifiable
+  assert.equal(verifyScope(`${good}; SELECT 2 FROM t`, scope), false);
+  // triple-quoted strings defeat the literal tokenizer — fail closed
+  const tq = "'''";
+  assert.equal(verifyScope(`SELECT ${tq}x${tq} FROM t WHERE timestamp BETWEEN '${scope.startIso}' AND '${scope.endIso}' AND agent = 'billing'`, scope), false);
+  // negated agent forms must fail even with the equality present
+  assert.equal(verifyScope(`${good} AND agent != 'other'`, scope), false);
+  assert.equal(verifyScope(`${good} AND agent NOT IN ('other')`, scope), false);
+  // BETWEEN literals must exactly equal the scope window
+  assert.equal(verifyScope(good.replace(scope.endIso, "2026-08-08T00:00:00Z"), scope), false);
+});
+
+test("groupId pairs SQL with its own result in interleaved streams (#5-r9)", () => {
+  const stream = [
+    { systemMessage: { groupId: "g1", data: { generatedSql: "SELECT a" } } },
+    { systemMessage: { groupId: "g2", data: { generatedSql: "SELECT b" } } },
+    // results arrive out of order — g2's rows first
+    { systemMessage: { groupId: "g2", data: { result: { schema: { fields: [{ name: "x" }] }, data: [{ x: 2 }] } } } },
+    { systemMessage: { groupId: "g1", data: { result: { schema: { fields: [{ name: "x" }] }, data: [{ x: 1 }] } } } },
+    { systemMessage: { text: { parts: ["done"], textType: "FINAL_RESPONSE" } } },
+  ];
+  const r = parseMessages("q", stream);
+  // arrival-order pairing would attach x:2 to "SELECT b" and orphan x:1 into a
+  // third sql:null pair; groupId pairing keeps exactly two owned pairs
+  assert.deepEqual(
+    r.queries.map((q) => [q.sql, q.data_bearing]),
+    [["SELECT a", true], ["SELECT b", true]],
+    "each result found its own SQL despite out-of-order arrival",
+  );
+  assert.equal(r.sql, "SELECT b", "display pair is the last data-bearing query");
+  assert.equal(r.rows[0].x, 2, "display rows come from that same pair");
+});
+
+test("a result without any owning group fails closed as sql:null (#5-r9)", () => {
+  const stream = [
+    { systemMessage: { groupId: "ghost", data: { result: { schema: { fields: [{ name: "x" }] }, data: [{ x: 9 }] } } } },
+    { systemMessage: { text: { parts: ["ans"], textType: "FINAL_RESPONSE" } } },
+  ];
+  const r = parseMessages("q", stream);
+  assert.equal(r.queries.length, 1);
+  assert.equal(r.queries[0].sql, null, "orphan result has no provable SQL");
+  const scoped = withScope(r, { startIso: "2026-08-06T00:00:00Z", endIso: "2026-08-07T00:00:00Z" });
+  assert.equal(scoped.scope.verified, false, "unowned data can never verify");
+});

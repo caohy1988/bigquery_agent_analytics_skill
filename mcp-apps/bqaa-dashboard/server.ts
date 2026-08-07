@@ -651,7 +651,7 @@ function summarize(d: DashboardData): string {
   if (worstTool) lines.push(`- highest tool failure rate: ${worstTool.tool_name} at ${worstTool.fail_rate_pct}% of ${n(worstTool.total_calls)} calls`);
   const failed = Object.keys(d.meta.section_errors ?? {});
   if (failed.length) lines.push(`- WARNING: ${failed.length} panel(s) failed to load: ${failed.join(", ")}`);
-  lines.push("The interactive dashboard has been rendered for the user.");
+  lines.push("Compatible MCP App hosts will render the interactive dashboard.");
   return lines.join("\n");
 }
 
@@ -875,7 +875,8 @@ registerAppTool(
     _meta: { ui: { resourceUri } },
   },
   async (args, extra) => {
-    const trace = await loadTrace(args.trace_id, args.time_range_hours ?? CONFIG.defaultHours, extra?.signal);
+    const hours = args.time_range_hours ?? CONFIG.defaultHours;
+    const trace = await loadTrace(args.trace_id, hours, extra?.signal);
     const errorCount = trace.events.filter(
       (e) => e.status === "ERROR" || e.event_type.endsWith("_ERROR") || e.error_message != null,
     ).length;
@@ -884,12 +885,15 @@ registerAppTool(
         {
           type: "text" as const,
           text:
-            `${SYNTHETIC() ? "(synthetic sample data) " : ""}Trace ${args.trace_id}: ${trace.events.length} events, ${errorCount} errors.` +
+            `${SYNTHETIC() ? "(synthetic sample data) " : ""}Trace ${args.trace_id}: ${trace.events.length} events, ${errorCount} errors (window: last ${hours}h).` +
             (trace.truncated ? " TRUNCATED — narrow the window for the full trace." : "") +
-            " The waterfall has been rendered for the user.",
+            // #6(r9): the server cannot know whether this caller renders UI
+            " Compatible MCP App hosts will render the waterfall.",
         },
       ],
-      structuredContent: { data: { trace_id: args.trace_id, ...trace } } as any,
+      // #1(r9): the requested window travels with the payload so the App can
+      // adopt it instead of silently keeping a different dashboard scope
+      structuredContent: { data: { trace_id: args.trace_id, time_range_hours: hours, ...trace } } as any,
     };
   },
 );

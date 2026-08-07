@@ -38,7 +38,6 @@ function kindOf(eventTypes: string[]): SpanKind {
 
 export function buildSpans(events: TraceEvent[]): { spans: TraceSpan[]; totalMs: number } {
   if (!events.length) return { spans: [], totalMs: 0 };
-  const t0 = Math.min(...events.map((e) => Date.parse(e.timestamp)));
 
   // group by span_id; span-less events become their own instant rows
   const groups = new Map<string, TraceEvent[]>();
@@ -58,31 +57,75 @@ export function buildSpans(events: TraceEvent[]): { spans: TraceSpan[]; totalMs:
   for (const [id, g] of groups) {
     parentOf.set(id, g.find((e) => e.parent_span_id)?.parent_span_id ?? null);
   }
-  const depthOf = (id: string, seen = new Set<string>()): number => {
-    const parent = parentOf.get(id);
-    if (!parent || !groups.has(parent) || seen.has(id) || seen.size >= MAX_DEPTH) return 0;
-    seen.add(id);
-    return Math.min(MAX_DEPTH, 1 + depthOf(parent, seen));
+  // #11(r9): cyclic parent links are malformed hierarchy — every member of a
+  // cycle gets depth 0, and callers never add to a cycle-poisoned value.
+  const depthCache = new Map<string, number>();
+  const depthOf = (id: string): number => {
+    if (depthCache.has(id)) return depthCache.get(id)!;
+    const chain: string[] = [];
+    const seen = new Set<string>();
+    let cur: string | null = id;
+    while (cur && groups.has(cur) && !depthCache.has(cur)) {
+      if (seen.has(cur)) {
+        for (const c of chain) depthCache.set(c, 0); // whole cycle → 0
+        break;
+      }
+      seen.add(cur);
+      chain.push(cur);
+      const parent: string | null = parentOf.get(cur) ?? null;
+      cur = parent && groups.has(parent) ? parent : null;
+      if (cur === null) depthCache.set(chain[chain.length - 1], 0);
+    }
+    for (let i = chain.length - 1; i >= 0; i--) {
+      const c = chain[i];
+      if (depthCache.has(c)) continue;
+      const parent = parentOf.get(c)!;
+      depthCache.set(c, Math.min(MAX_DEPTH, (depthCache.get(parent) ?? 0) + 1));
+    }
+    return depthCache.get(id) ?? 0;
   };
 
-  const spans: TraceSpan[] = [];
+  // #12(r9): compute ABSOLUTE inferred bounds first — a completion-only span
+  // whose back-computed start precedes every logged event must move the trace
+  // origin, not be clamped into a zero-length bar.
+  interface RawBounds {
+    startAbs: number;
+    endAbs: number;
+  }
+  const boundsOf = new Map<string, RawBounds>();
   for (const [id, g] of groups) {
     const times = g.map((e) => Date.parse(e.timestamp));
     const starts = g.filter((e) => START_TYPES.test(e.event_type));
     const latency = g.map((e) => e.latency_ms).find((l) => l != null) ?? null;
-    let startMs: number;
-    let endMs: number;
     if (starts.length) {
-      startMs = Math.min(...starts.map((e) => Date.parse(e.timestamp))) - t0;
-      endMs = Math.max(...times) - t0;
+      boundsOf.set(id, {
+        startAbs: Math.min(...starts.map((e) => Date.parse(e.timestamp))),
+        endAbs: Math.max(...times),
+      });
     } else if (latency != null) {
-      // completion-only logging: the event marks the END of the span
-      endMs = Math.max(...times) - t0;
-      startMs = Math.max(0, endMs - latency);
+      const endAbs = Math.max(...times);
+      boundsOf.set(id, { startAbs: endAbs - latency, endAbs });
     } else {
-      startMs = Math.min(...times) - t0;
-      endMs = startMs;
+      const at = Math.min(...times);
+      boundsOf.set(id, { startAbs: at, endAbs: at });
     }
+  }
+  const orphanBounds = orphans.map((e) => {
+    const at = Date.parse(e.timestamp);
+    // spanless completion events get the same latency fallback
+    return e.latency_ms != null ? { startAbs: at - e.latency_ms, endAbs: at } : { startAbs: at, endAbs: at };
+  });
+  const t0 = Math.min(
+    ...events.map((e) => Date.parse(e.timestamp)),
+    ...[...boundsOf.values()].map((b) => b.startAbs),
+    ...orphanBounds.map((b) => b.startAbs),
+  );
+
+  const spans: TraceSpan[] = [];
+  for (const [id, g] of groups) {
+    const { startAbs, endAbs } = boundsOf.get(id)!;
+    const startMs = startAbs - t0;
+    const endMs = endAbs - t0;
     const types = g.map((e) => e.event_type);
     const kind = kindOf(types);
     const tool = g.map((e) => e.tool_name).find(Boolean) ?? null;
@@ -104,21 +147,21 @@ export function buildSpans(events: TraceEvent[]): { spans: TraceSpan[]; totalMs:
         "",
     });
   }
-  for (const e of orphans) {
-    const at = Date.parse(e.timestamp) - t0;
+  orphans.forEach((e, i) => {
+    const { startAbs, endAbs } = orphanBounds[i];
     spans.push({
       id: null,
       name: e.tool_name ?? e.event_type,
       kind: kindOf([e.event_type]),
       agent: e.agent,
-      startMs: at,
-      endMs: e.latency_ms != null ? at : at,
+      startMs: startAbs - t0,
+      endMs: endAbs - t0,
       depth: 0,
       error: isErrorEvent(e),
-      instant: true,
+      instant: endAbs <= startAbs,
       detail: e.error_message ?? "",
     });
-  }
+  });
 
   spans.sort((a, b) => a.startMs - b.startMs || a.endMs - b.endMs);
   const totalMs = Math.max(1, ...spans.map((s) => s.endMs), Math.max(...events.map((e) => Date.parse(e.timestamp))) - t0);

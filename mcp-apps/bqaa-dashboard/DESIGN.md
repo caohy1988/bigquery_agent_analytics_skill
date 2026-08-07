@@ -29,7 +29,7 @@ MCP client. Upstream design discussion:
  Browser ── GET / ──►  static UI bundle (dist/mcp-app.html)         │
  Browser ── /api/* ─►  dashboard / widget / trace / ask JSON        │
  MCP host ─ /mcp ───►  buildMcpServer() per request                 │
-                    │   ├─ 7 tools (zod schemas)                    │
+                    │   ├─ 8 tools (zod schemas)                    │
                     │   └─ ui://bqaa/dashboard.html resource        │
                     │                                               │
                     │  src/queries.ts   SQL contract (pure)         │
@@ -82,6 +82,8 @@ Built on `@modelcontextprotocol/sdk` + `@modelcontextprotocol/ext-apps`.
   - `ask_data(question, history?)` — conversational analytics (§4).
   - `get_trace(trace_id, time_range_hours)` — ordered trace reconstruction,
     with explicit truncation reporting past 500 events.
+  - `render_trace(trace_id, time_range_hours)` — the same trace rendered as an
+    interactive waterfall in MCP-App hosts, carrying its requested window.
   - `list_error_traces(time_range_hours, limit)` — recent trace ids containing
     errors with sample messages; pairs with `get_trace` for evidence-cited
     root-cause ("the timeout is real: trace `ac99…`, TOOL_ERROR, 'upstream

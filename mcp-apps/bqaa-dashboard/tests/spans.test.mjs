@@ -70,3 +70,37 @@ test("spans sort by start time and empty input is safe", () => {
   ]);
   assert.deepEqual(spans.map((s) => s.name), ["earlier", "later"]);
 });
+
+test("cyclic parent chains collapse to depth 0 (#11-r9)", () => {
+  const { spans } = buildSpans([
+    ev({ span_id: "self", parent_span_id: "self", event_type: "TOOL_STARTING", tool_name: "s" }),
+    ev({ span_id: "A", parent_span_id: "B", event_type: "TOOL_STARTING", tool_name: "a", timestamp: "2026-08-07T00:00:01Z" }),
+    ev({ span_id: "B", parent_span_id: "A", event_type: "TOOL_STARTING", tool_name: "b", timestamp: "2026-08-07T00:00:02Z" }),
+  ]);
+  const by = Object.fromEntries(spans.map((sp) => [sp.id, sp.depth]));
+  assert.equal(by.self, 0, "self-cycle is not a level of nesting");
+  assert.equal(by.A, 0, "two-node cycle member A");
+  assert.equal(by.B, 0, "two-node cycle member B");
+});
+
+test("a lone completion-only span keeps its full duration (#12-r9)", () => {
+  const { spans, totalMs } = buildSpans([
+    ev({ span_id: "L", event_type: "LLM_RESPONSE", timestamp: "2026-08-07T00:00:05Z", latency_ms: 1500 }),
+  ]);
+  assert.equal(spans.length, 1);
+  assert.equal(spans[0].startMs, 0, "trace origin moves back to the inferred start");
+  assert.equal(spans[0].endMs, 1500);
+  assert.equal(spans[0].instant, false);
+  assert.equal(totalMs, 1500);
+});
+
+test("spanless events with latency render as bars, not instants (#12-r9)", () => {
+  const { spans } = buildSpans([
+    ev({ span_id: "s1", event_type: "TOOL_STARTING", tool_name: "t", timestamp: "2026-08-07T00:00:00Z" }),
+    ev({ event_type: "LLM_RESPONSE", timestamp: "2026-08-07T00:00:04Z", latency_ms: 3000 }),
+  ]);
+  const orphan = spans.find((sp) => sp.id === null);
+  assert.equal(orphan.instant, false, "latency gives the orphan a measurable duration");
+  assert.equal(orphan.endMs - orphan.startMs, 3000);
+  assert.equal(orphan.startMs, 1000, "start back-computed from ts - latency");
+});
