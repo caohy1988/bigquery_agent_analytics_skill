@@ -161,6 +161,12 @@ const MAX_CONCURRENT_JOBS = 20;
 let inflightJobs = 0;
 let abandonedCreations = 0;
 
+// #5(r11): ownership is held until the creation RPC actually SETTLES — no
+// timer valve. A timer that released the slot while createQueryJob was still
+// pending let repeated stalls exceed the documented 20-job cap. The trade is
+// explicit: a transport-level permanent hang now consumes its slot until the
+// process recycles, because the cap is a promise about concurrently live
+// BigQuery work, not about our bookkeeping.
 function trackAbandonedCreation(work: Promise<unknown>): void {
   abandonedCreations++;
   let released = false;
@@ -171,8 +177,6 @@ function trackAbandonedCreation(work: Promise<unknown>): void {
     }
   };
   work.then(release, release);
-  const valve = setTimeout(release, CONFIG.queryTimeoutMs * 2);
-  (valve as any).unref?.();
 }
 
 async function withJobSlot<T>(fn: () => Promise<T>): Promise<T> {
@@ -476,7 +480,7 @@ async function ask(question: string, history: AskExchange[], scope: AskScope, si
 }
 
 async function loadErrorTraces(timeRangeHours: number, limit: number, signal?: AbortSignal): Promise<ErrorTraceRow[]> {
-  if (CONFIG.mock) return mockErrorTraces().slice(0, limit);
+  if (CONFIG.mock) return mockErrorTraces(timeRangeHours).slice(0, limit); // #6(r11): window applies before limit
   const end = new Date();
   const start = new Date(end.getTime() - timeRangeHours * 3_600_000);
   const { rows } = await runQuery(

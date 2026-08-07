@@ -286,3 +286,59 @@ test("group ambiguity is sticky - a third SQL cannot restore trust (#4-r10)", ()
   const r2 = withScope(parseMessages("q", later), scope);
   assert.equal(r2.scope?.verified, false, "poisoning survives result boundaries");
 });
+
+// ---- eleventh-review: lexer boundary, table binding, gid-less ambiguity
+
+test("comment quotes cannot hide widening SQL from the lexer (#3-r11)", () => {
+  const scope = { startIso: "2026-08-06T00:00:00Z", endIso: "2026-08-07T00:00:00Z" };
+  const conj = `timestamp BETWEEN '${scope.startIso}' AND '${scope.endIso}'`;
+  // two line comments each containing a quote: a regex pass that tokenizes
+  // literals first would swallow the active OR TRUE between them
+  const hidden = `SELECT 1 FROM t WHERE ${conj} -- x'\nOR TRUE -- '\n`;
+  assert.equal(verifyScope(hidden, scope), false, "OR TRUE between comment quotes must stay visible");
+  // a quote inside a comment must not unbalance an otherwise good query
+  const benign = `SELECT 1 FROM t WHERE ${conj} -- O'Brien wrote this\n`;
+  assert.equal(verifyScope(benign, scope), true, "comment content is ignored, not lexed as SQL");
+});
+
+test("certification binds to the configured table (#2-r11)", () => {
+  const scope = { startIso: "2026-08-06T00:00:00Z", endIso: "2026-08-07T00:00:00Z" };
+  const conj = `timestamp BETWEEN '${scope.startIso}' AND '${scope.endIso}'`;
+  const table = "proj.data.agent_events";
+  assert.equal(verifyScope(`SELECT 1 FROM \`proj.data.agent_events\` WHERE ${conj}`, scope, table), true);
+  assert.equal(verifyScope(`SELECT 1 FROM agent_events WHERE ${conj}`, scope, table), true, "short spelling of the same table");
+  assert.equal(
+    verifyScope(`SELECT 1 FROM \`proj.data.other_table\` WHERE ${conj}`, scope, table),
+    false,
+    "an unconfigured table can never certify the scope",
+  );
+});
+
+test("scan predicates must belong to the scan, and FROM tails are closed (#2-r11)", () => {
+  const scope = { startIso: "2026-08-06T00:00:00Z", endIso: "2026-08-07T00:00:00Z", agent: "billing" };
+  const conj = `timestamp BETWEEN '${scope.startIso}' AND '${scope.endIso}' AND agent = 'billing'`;
+  // predicates qualified by something other than the scan's alias are structs
+  const struct = `SELECT 1 FROM t WHERE s.timestamp BETWEEN '${scope.startIso}' AND '${scope.endIso}' AND s.agent = 'billing'`;
+  assert.equal(verifyScope(struct, scope), false, "a foreign qualifier cannot constrain this scan");
+  const aliased = `SELECT 1 FROM t AS ev WHERE ev.timestamp BETWEEN '${scope.startIso}' AND '${scope.endIso}' AND ev.agent = 'billing'`;
+  assert.equal(verifyScope(aliased, scope), true, "the scan's own alias binds");
+  // TABLESAMPLE (and anything else between the table and WHERE) is unprovable
+  assert.equal(verifyScope(`SELECT 1 FROM t TABLESAMPLE SYSTEM (10 PERCENT) WHERE ${conj}`, scope), false);
+  assert.equal(verifyScope(`SELECT 1 FROM t x, u WHERE ${conj}`, scope), false, "aliased comma join");
+});
+
+test("gid-less retries make later pairings permanently ambiguous (#1-r11)", () => {
+  const scope = { startIso: "2026-08-06T00:00:00Z", endIso: "2026-08-07T00:00:00Z" };
+  const scoped = `SELECT 2 FROM t WHERE timestamp BETWEEN '${scope.startIso}' AND '${scope.endIso}'`;
+  // unscoped SQL, then a scoped retry, THEN rows: the rows could belong to
+  // either statement, so nothing may certify
+  const stream = [
+    { systemMessage: { data: { generatedSql: "SELECT 1 FROM t" } } },
+    { systemMessage: { data: { generatedSql: scoped } } },
+    { systemMessage: { data: { result: { schema: { fields: [{ name: "x" }] }, data: [{ x: 1 }] } } } },
+    { systemMessage: { text: { parts: ["ans"], textType: "FINAL_RESPONSE" } } },
+  ];
+  const r = withScope(parseMessages("q", stream), scope);
+  assert.equal(r.scope?.verified, false, "ambiguous ownership can never verify");
+  assert.equal(r.sql, null, "no SQL may be presented beside rows it may not own");
+});

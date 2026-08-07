@@ -1,7 +1,7 @@
 // Mock-data truthfulness — filters honored, one row set drives everything (r9).
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mockWidget, mockAsk, mockErrorTraces, mockTrace } from "../src/mock.js";
+import { mockWidget, mockAsk, mockErrorTraces, mockTrace, mockDashboard } from "../src/mock.js";
 
 const start = new Date("2026-07-01T00:00:00Z");
 const end = new Date("2026-07-02T00:00:00Z");
@@ -60,4 +60,26 @@ test("every listed error trace round-trips to its listed error count (#13-r10)",
   // and a trace NOT on the list must be error-free, so the list is complete
   const other = mockTrace("traceffffffff9");
   assert.equal(other.filter(isError).length, 0, "unlisted traces cannot contradict the error list");
+});
+
+test("mock error-trace list honors the requested window (#6-r11)", () => {
+  // fixture rows are 1.5h apart: a 1h window keeps only the newest
+  assert.equal(mockErrorTraces(1).length, 1);
+  assert.equal(mockErrorTraces(4).length, 3, "rows at 0h/1.5h/3h fit a 4h window");
+  assert.equal(mockErrorTraces(720).length, 6, "a wide window keeps the whole fixture");
+});
+
+test("an unknown dashboard agent returns the empty window BigQuery would (#8-r11)", () => {
+  const d = mockDashboard(start, end, "hour", "no-such-agent");
+  assert.equal(d.overview.total_events, 0);
+  assert.deepEqual(d.timeseries, []);
+  assert.deepEqual(d.topSessions, []);
+  assert.equal(d.meta.agent, "no-such-agent");
+});
+
+test("impossible cross-filters return zero widget rows for every dimension (#8-r11)", () => {
+  const time = mockWidget({ measure: "events", dimension: "time", granularity: "hour", filters: { tool: "no_such_tool" } }, start, end);
+  assert.deepEqual(time.rows, [], "a time widget must not chart activity for a nonexistent tool");
+  const cat = mockWidget({ measure: "events", dimension: "agent", granularity: "auto", filters: { model: "no-such-model" } }, start, end);
+  assert.deepEqual(cat.rows, [], "a categorical widget must not rank agents for a nonexistent model");
 });

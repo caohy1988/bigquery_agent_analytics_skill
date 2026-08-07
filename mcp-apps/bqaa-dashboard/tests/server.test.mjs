@@ -487,6 +487,28 @@ test("deadline covers job CREATION, not just polling (#1)", async () => {
   }
 });
 
+test("permanently hung creations hold their slots — the cap never lies (#5-r11)", async () => {
+  const port = PORT + 111;
+  const srv = startServer({ ...FAKE_ENV, BQAA_FAKE_BQ: "stall_create_all", BQAA_QUERY_TIMEOUT_MS: "600" }, port);
+  try {
+    await waitFor(`http://localhost:${port}/healthz`);
+    // two DISTINCT dashboard loads (the cache coalesces identical ones) =
+    // 20 stalled creations = the whole cap
+    await fetch(`http://localhost:${port}/api/dashboard?time_range_hours=24`);
+    await fetch(`http://localhost:${port}/api/dashboard?time_range_hours=48`);
+    const probe = await fetch(`http://localhost:${port}/api/widget?measure=events&dimension=agent`);
+    const body = await probe.json();
+    assert.match(body.error ?? "", /busy/i, "request 21 must be refused");
+    // and it STAYS refused — no timer may hand out slots the transport still holds
+    await new Promise((r) => setTimeout(r, 1600));
+    const again = await fetch(`http://localhost:${port}/api/widget?measure=events&dimension=agent`);
+    const againBody = await again.json();
+    assert.match(againBody.error ?? "", /busy/i, "a timer valve must not defeat the cap");
+  } finally {
+    srv.child.kill();
+  }
+});
+
 test("malformed JSON keeps the API error contract (#19)", async () => {
   const res = await fetch(`${BASE}/api/ask`, {
     method: "POST",

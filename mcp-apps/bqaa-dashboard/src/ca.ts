@@ -133,7 +133,8 @@ export async function askConversational(
   } catch {
     throw new Error("Conversational Analytics returned a non-JSON stream");
   }
-  return withScope(parseMessages(question, parsed), cfg.scope);
+  // #2(r11): certification is bound to the configured telemetry table
+  return withScope(parseMessages(question, parsed), cfg.scope, `${cfg.project}.${cfg.dataset}.${cfg.table}`);
 }
 
 export function parseMessages(question: string, parsed: any[]): AskResult {
@@ -159,6 +160,8 @@ export function parseMessages(question: string, parsed: any[]): AskResult {
   // #4(r10): once a group has shown two SQL statements, ownership inside it
   // is permanently unprovable - later SQL must NOT restore trust
   const ambiguousGroups = new Set<string>();
+  // #1(r11): the gid-less fallback has the same sticky rule as groups
+  let gidlessAmbiguous = false;
 
   for (const m of parsed) {
     const sm = m?.systemMessage;
@@ -189,7 +192,14 @@ export function parseMessages(question: string, parsed: any[]): AskResult {
           p.sql = sm.data.generatedSql;
         }
       } else {
-        current = { sql: sm.data.generatedSql, schema: [], rows: [], hasResult: false };
+        // #1(r11): a second gid-less SQL while one is still OPEN makes every
+        // later gid-less pairing permanently unprovable — rows that arrive
+        // after a retry could belong to either statement
+        if (current && !current.hasResult) {
+          gidlessAmbiguous = true;
+          current.sql = null;
+        }
+        current = { sql: gidlessAmbiguous ? null : sm.data.generatedSql, schema: [], rows: [], hasResult: false };
         pairs.push(current);
       }
     }
@@ -236,21 +246,82 @@ export function parseMessages(question: string, parsed: any[]): AskResult {
 // #3(r7): the scope instruction is prompt-level, so the label must be earned:
 // the generated SQL is checked for the scope's predicates, and the result
 // reports verified: true only when every check passes.
-// #1(r10): verification is a CLOSED grammar that must prove the scope
+// #1(r10)/#2(r11): verification is a CLOSED grammar that must prove the scope
 // DOMINATES EVERY telemetry scan, not merely that predicate text exists:
-//   1. string literals are tokenized FIRST (#5-r10: agent names may contain
-//      comment delimiters), then comments are stripped from code only
+//   1. ONE character-level lexer handles comments and string literals in a
+//      single pass (#3-r11: two regex passes let quotes inside comments hide
+//      active SQL); prefixed (r'', b''), triple-quoted, or unterminated
+//      strings are unprovable
 //   2. constructs that can widen, negate, or hide a scan are rejected
 //      outright: OR, NOT, IS TRUE/FALSE, UNION/INTERSECT/EXCEPT, EXISTS,
-//      JOIN, CASE, comma-joins, multiple statements, triple quotes
+//      JOIN, CASE, TABLESAMPLE, multiple statements
 //   3. every base-table FROM (recursively, through CTE bodies and derived
-//      tables) must have a WHERE whose top-level conjuncts include
-//      `timestamp BETWEEN <start> AND <end>` with the scope's exact
-//      literals — and the agent equality when the scope has an agent.
-//      Function-wrapped or nested predicates do not count.
+//      tables) must reference the CONFIGURED table when one is given, be
+//      followed only by an optional alias and then a known clause keyword
+//      (so comma-joins and unmodeled clauses cannot hide a second scan), and
+//      carry a WHERE whose top-level conjuncts include
+//      `timestamp BETWEEN <start> AND <end>` and the agent equality —
+//      qualified only by that scan's own alias or table name (#2-r11:
+//      struct fields named timestamp/agent must not count)
 // Anything the grammar cannot prove is reported as NOT verified.
 const SUBEXPR = "";
-const LIT_RE = " (\\d+) ";
+const LIT_RE = "\\u0000(\\d+)\\u0000";
+const CLAUSE_KEYWORDS = /^(WHERE|GROUP|HAVING|ORDER|LIMIT|WINDOW|QUALIFY)$/i;
+
+// One pass over the raw SQL: comments become spaces, string literals become
+// numbered placeholders. Returns null when the text cannot be lexed the way
+// BigQuery would read it — which must always FAIL verification.
+function lexSql(sql: string): { code: string; literals: string[] } | null {
+  const literals: string[] = [];
+  let out = "";
+  let i = 0;
+  const n = sql.length;
+  while (i < n) {
+    const two = sql.slice(i, i + 2);
+    const c = sql[i];
+    if (two === "--") {
+      while (i < n && sql[i] !== "\n") i++;
+      out += " ";
+    } else if (two === "/*") {
+      const end = sql.indexOf("*/", i + 2);
+      if (end < 0) return null; // unterminated comment
+      out += " ";
+      i = end + 2;
+    } else if (c === "'" || c === '"') {
+      if (/[A-Za-z0-9_]$/.test(out)) return null; // r'..'/b'..' prefixes change escape rules
+      if (sql.slice(i, i + 3) === c + c + c) return null; // triple-quoted: unprovable
+      let j = i + 1;
+      let lit = "";
+      let closed = false;
+      while (j < n) {
+        if (sql[j] === "\\") {
+          lit += sql[j + 1] ?? "";
+          j += 2;
+        } else if (sql[j] === c) {
+          closed = true;
+          j++;
+          break;
+        } else {
+          lit += sql[j];
+          j++;
+        }
+      }
+      if (!closed) return null; // unterminated string
+      literals.push(lit);
+      out += ` ${literals.length - 1} `;
+      i = j;
+    } else if (c === "`") {
+      const end = sql.indexOf("`", i + 1);
+      if (end < 0) return null;
+      out += sql.slice(i, end + 1);
+      i = end + 1;
+    } else {
+      out += c;
+      i++;
+    }
+  }
+  return { code: out, literals };
+}
 
 function flattenTopLevel(text: string): { flat: string; groups: string[] } {
   // Replace each top-level (...) group with a marker, EXCEPT TIMESTAMP(...)
@@ -285,12 +356,22 @@ function flattenTopLevel(text: string): { flat: string; groups: string[] } {
   return { flat, groups };
 }
 
+// Does this base-table reference match the configured table? Accepts the
+// full `project.dataset.table`, `dataset.table`, or bare `table` spellings.
+function matchesTable(name: string, expected: string): boolean {
+  const parts = expected.toLowerCase().split(".");
+  const got = name.toLowerCase().split(".");
+  if (got.length > parts.length) return false;
+  return parts.slice(parts.length - got.length).join(".") === got.join(".");
+}
+
 function checkBlock(
   text: string,
   scope: { startIso: string; endIso: string; agent?: string },
   literals: string[],
   cteNames: Set<string>,
   seen: { scans: number },
+  expectedTable?: string,
 ): boolean {
   const { flat, groups } = flattenTopLevel(text);
   // collect CTE names declared at this level so their references are not
@@ -299,10 +380,6 @@ function checkBlock(
   for (const m of flat.matchAll(new RegExp(`(?:\\bWITH\\b|,)\\s*([A-Za-z_]\\w*)\\s+AS\\s+${SUBEXPR}\\d+`, "gi"))) {
     names.add(m[1].toLowerCase());
   }
-  const timeRe = new RegExp(
-    `\\btimestamp\\b\\s+BETWEEN\\s+(?:TIMESTAMP\\s*\\(\\s*)?${LIT_RE}\\s*\\)?\\s+AND\\s+(?:TIMESTAMP\\s*\\(\\s*)?${LIT_RE}\\s*\\)?`,
-    "i",
-  );
   const fromRe = new RegExp(`\\bFROM\\s+(${SUBEXPR}\\d+|\`[^\`]+\`|[A-Za-z_][\\w.]*)`, "gi");
   let fm: RegExpExecArray | null;
   while ((fm = fromRe.exec(flat))) {
@@ -312,49 +389,63 @@ function checkBlock(
     if (/^UNNEST$/i.test(name)) continue; // array scan, not the table
     if (names.has(name.toLowerCase()) && !name.includes(".")) continue; // CTE reference
     seen.scans++;
-    // base-table scan — a comma here is an implicit join: unprovable
-    const after = flat.slice(fm.index + fm[0].length);
-    const rest = after.replace(/^\s+(?:AS\s+)?[A-Za-z_]\w*/i, ""); // optional alias
-    if (/^\s*,/.test(rest)) return false;
+    // #2(r11): only the configured telemetry table may be scanned at all
+    if (expectedTable && !matchesTable(name, expectedTable)) return false;
+    // parse the FROM tail as a CLOSED grammar: an optional alias, then a
+    // known clause keyword or end of block — anything else (a comma join,
+    // TABLESAMPLE, a second source) is unprovable
+    let after = flat.slice(fm.index + fm[0].length);
+    let alias: string | null = null;
+    const aliasM = /^\s+(?:AS\s+)?([A-Za-z_]\w*)/i.exec(after);
+    if (aliasM && !CLAUSE_KEYWORDS.test(aliasM[1])) {
+      alias = aliasM[1].toLowerCase();
+      after = after.slice(aliasM[0].length);
+    }
+    const nextTok = /^\s*(\S+)/.exec(after)?.[1];
+    if (nextTok && !CLAUSE_KEYWORDS.test(nextTok)) return false; // unmodeled FROM tail
     // its clause region runs to the next top-level clause keyword
     const region = after.split(/\b(?:GROUP|HAVING|ORDER|LIMIT|WINDOW|QUALIFY)\b/i)[0];
     const whereAt = region.search(/\bWHERE\b/i);
     if (whereAt < 0) return false; // unconstrained scan
     const where = region.slice(whereAt);
+    // #2(r11): a qualified column must belong to THIS scan — its alias or its
+    // table name — so constant structs named timestamp/agent never count
+    const ownQualifiers = new Set([alias, name.toLowerCase().split(".").pop() ?? null].filter(Boolean) as string[]);
+    const qualifierOk = (q: string | undefined): boolean => q == null || ownQualifiers.has(q.toLowerCase());
+    const timeRe = new RegExp(
+      `(?:\\b([A-Za-z_]\\w*)\\.)?\\btimestamp\\b\\s+BETWEEN\\s+(?:TIMESTAMP\\s*\\(\\s*)?${LIT_RE}\\s*\\)?\\s+AND\\s+(?:TIMESTAMP\\s*\\(\\s*)?${LIT_RE}\\s*\\)?`,
+      "i",
+    );
     const tm = timeRe.exec(where);
-    if (!tm || literals[Number(tm[1])] !== scope.startIso || literals[Number(tm[2])] !== scope.endIso) return false;
+    if (!tm || !qualifierOk(tm[1]) || literals[Number(tm[2])] !== scope.startIso || literals[Number(tm[3])] !== scope.endIso) {
+      return false;
+    }
     if (scope.agent) {
-      const am = new RegExp(`\\bagent\\b\\s*=\\s*${LIT_RE}`, "i").exec(where);
-      if (!am || literals[Number(am[1])] !== scope.agent) return false;
+      const am = new RegExp(`(?:\\b([A-Za-z_]\\w*)\\.)?\\bagent\\b\\s*=\\s*${LIT_RE}`, "i").exec(where);
+      if (!am || !qualifierOk(am[1]) || literals[Number(am[2])] !== scope.agent) return false;
     }
   }
-  return groups.every((g) => checkBlock(g, scope, literals, names, seen));
+  return groups.every((g) => checkBlock(g, scope, literals, names, seen, expectedTable));
 }
 
 export function verifyScope(
   sql: string | null,
   scope?: { startIso: string; endIso: string; agent?: string },
+  expectedTable?: string,
 ): boolean {
   if (!scope) return true;
   if (!sql) return false; // nothing to verify against
-  if (sql.includes("'''") || sql.includes('"""')) return false; // triple-quoted: unprovable
-  // #5(r10): tokenize string literals BEFORE stripping comments, so agent
-  // names containing -- or /* stay intact inside their literals
-  const literals: string[] = [];
-  let code = sql.replace(/'((?:[^'\\]|\\.)*)'|"((?:[^"\\]|\\.)*)"/g, (_all, sq: string, dq: string) => {
-    const inner = sq ?? dq;
-    literals.push(inner.replaceAll("\\'", "'").replaceAll('\\"', '"').replaceAll("\\\\", "\\"));
-    return ` ${literals.length - 1} `;
-  });
+  const lexed = lexSql(sql);
+  if (!lexed) return false; // not provably lexable the way BigQuery reads it
+  const { literals } = lexed;
+  let code = lexed.code;
   if (code.includes("'") || code.includes('"')) return false; // unbalanced quoting: unprovable
-  code = code.replace(/--[^\n]*/g, " ").replace(/\/\*[\s\S]*?\*\//g, " ");
-  if (code.includes("/*")) return false; // unterminated comment
   if (/;\s*\S/.test(code)) return false; // multiple statements
   // IS NOT NULL is a benign narrowing predicate; strip it so the global NOT
   // rejection below doesn't have to reason about it
   code = code.replace(/\bIS\s+NOT\s+NULL\b/gi, " __ISNOTNULL__ ");
   // constructs that can widen, negate, split, or hide a scan → unprovable
-  if (/\b(OR|NOT|UNION|INTERSECT|EXCEPT|EXISTS|JOIN|CASE)\b/i.test(code)) return false;
+  if (/\b(OR|NOT|UNION|INTERSECT|EXCEPT|EXISTS|JOIN|CASE|TABLESAMPLE)\b/i.test(code)) return false;
   if (/\bIS\s+(TRUE|FALSE)\b/i.test(code)) return false; // (pred) IS FALSE inverts it
   if (/\bagent\b\s*(?:!=|<>|\bIN\b|\bLIKE\b)/i.test(code)) return false; // only equality is provable
   // a predicate on a DIFFERENT agent anywhere poisons the statement
@@ -368,18 +459,22 @@ export function verifyScope(
   // an answer must come from at least one PROVABLY scoped telemetry scan -
   // a query with no table scan at all cannot certify the scope
   const seen = { scans: 0 };
-  return checkBlock(code, scope, literals, new Set(), seen) && seen.scans > 0;
+  return checkBlock(code, scope, literals, new Set(), seen, expectedTable) && seen.scans > 0;
 }
 
-export function withScope(result: AskResult, scope?: { startIso: string; endIso: string; agent?: string }): AskResult {
+export function withScope(
+  result: AskResult,
+  scope?: { startIso: string; endIso: string; agent?: string },
+  expectedTable?: string,
+): AskResult {
   if (!scope) return result;
   // #1(r8): EVERY data-bearing query must pass — one unscoped result row set
   // poisons the whole answer. Streams with results but no owning SQL fail
   // closed; a purely textual answer verifies against the final SQL if any.
   const dataPairs = (result.queries ?? []).filter((q) => q.data_bearing);
   const verified = dataPairs.length
-    ? dataPairs.every((q) => q.sql != null && verifyScope(q.sql, scope))
-    : verifyScope(result.sql, scope);
+    ? dataPairs.every((q) => q.sql != null && verifyScope(q.sql, scope, expectedTable))
+    : verifyScope(result.sql, scope, expectedTable);
   return {
     ...result,
     scope: { ...scope, verified },

@@ -50,6 +50,24 @@ export function mockDashboard(
   const rand = mulberry32(1234567);
   const stepMs = granularity === "hour" ? 3_600_000 : 86_400_000;
   const t0 = Math.floor(start.getTime() / stepMs) * stepMs;
+  // #8(r11): filtering to an agent that does not exist in the synthetic
+  // domain returns the empty window BigQuery would — never invented activity
+  if (agentFilter && !AGENTS.includes(agentFilter)) {
+    return {
+      overview: {
+        total_events: 0, errors: 0, error_rate_pct: 0, sessions: 0,
+        agents: 0, users: 0, p95_latency_ms: null, last_event_ts: null,
+      },
+      prevOverview: null,
+      timeseries: [], latencyByAgent: [], toolStats: [],
+      modelComparison: [], topSessions: [], hitl: [], delegation: [],
+      agentsList: AGENTS,
+      meta: {
+        start: start.toISOString(), end: end.toISOString(), granularity,
+        agent: agentFilter, source: "mock", bytes_processed: null, cache_hit: false,
+      },
+    };
+  }
   // Filtering to one agent scales volume down but keeps shapes recognizable.
   const scale = agentFilter ? 0.35 : 1;
 
@@ -234,6 +252,22 @@ export function mockWidget(spec: WidgetSpec, start: Date, end: Date): WidgetResu
   );
   const scale =
     spec.measure.includes("tokens") ? 250_000 : spec.measure.includes("ms") ? 4000 : spec.measure.includes("pct") ? 5 : 900;
+  // #8(r11): every supplied filter — not just the grouped dimension — must
+  // name an entity that exists in the synthetic domain. An impossible
+  // cross-filter returns zero rows for time AND categorical widgets.
+  const FILTER_DOMAINS: Record<string, string[]> = {
+    agent: AGENTS,
+    model: MODELS,
+    tool: TOOLS.map(([t]) => t),
+    status: ["OK", "ERROR"],
+  };
+  const filters = (spec.filters ?? {}) as Record<string, string | undefined>;
+  const impossible = Object.entries(filters).some(
+    ([k, v]) => v != null && FILTER_DOMAINS[k] != null && !FILTER_DOMAINS[k].includes(v),
+  );
+  if (impossible) {
+    return { spec: { v: 1, ...spec }, window: { start: start.toISOString(), end: end.toISOString() }, rows: [] };
+  }
   let rows;
   if (spec.dimension === "time") {
     const stepMs = spec.granularity === "hour" ? 3_600_000 : 86_400_000;
@@ -286,14 +320,17 @@ const ERROR_TRACE_FIXTURE: Array<{ trace_id: string; error_events: number; sampl
   }));
 })();
 
-export function mockErrorTraces(): ErrorTraceRow[] {
+export function mockErrorTraces(timeRangeHours = 720): ErrorTraceRow[] {
+  // #6(r11): the fixture rows are spaced 1.5h apart going back in time — the
+  // requested window filters them exactly as the production query would
+  const cutoffMs = timeRangeHours * 3_600_000;
   return ERROR_TRACE_FIXTURE.map((f, i) => ({
     trace_id: f.trace_id,
     last_ts: new Date(Date.now() - i * 5_400_000).toISOString(),
     agents: f.agent,
     error_events: f.error_events,
     sample_errors: f.sample_error,
-  }));
+  })).filter((r) => Date.now() - Date.parse(r.last_ts) <= cutoffMs);
 }
 
 export function mockTrace(traceId: string): TraceEvent[] {

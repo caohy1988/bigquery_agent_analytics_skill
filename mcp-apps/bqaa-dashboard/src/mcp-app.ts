@@ -1370,6 +1370,7 @@ let exploreOpSeq = 0;
 function exploreSpecChanged(): void {
   exploreOpSeq++; // cancels any in-flight op's right to publish
   widgetAbort?.abort(); // and stops its HTTP request outright (#15)
+  embeddedWidgetQueued = null; // #4(r11): queued actions belong to the old intent
   explore.estimate = null;
   explore.result = null;
   explore.note = ""; // #6(r10): a superseded op must not leave "Running..." behind
@@ -1390,11 +1391,14 @@ let widgetAbort: AbortController | null = null;
 // failing; it dispatches when the dispatcher frees, so Estimate→Run publishes
 // the Run, not an error.
 let embeddedWidgetBusy = false;
-let embeddedWidgetQueued: (() => void) | null = null;
+// #4(r10/r11): the queued action remembers the intent epoch it was created
+// under; any scope/spec change advances exploreOpSeq AND clears the queue, and
+// the dequeue re-checks the epoch so captured work can never outlive intent.
+let embeddedWidgetQueued: { action: () => Promise<void>; epoch: number } | null = null;
 
 function dispatchWidgetAction(action: () => Promise<void>): void {
   if (embedded && embeddedWidgetBusy) {
-    embeddedWidgetQueued = action; // latest wins
+    embeddedWidgetQueued = { action, epoch: exploreOpSeq }; // latest wins
     explore.note = "Waiting for the previous request to settle…";
     renderView();
     return;
@@ -1435,7 +1439,8 @@ async function runWidget(dryRun: boolean): Promise<WidgetResult> {
           embeddedWidgetBusy = false;
           const latest = embeddedWidgetQueued ?? next;
           embeddedWidgetQueued = null;
-          void latest();
+          if (latest.epoch !== exploreOpSeq) return; // #4(r11): intent moved on
+          void latest.action();
         }, 0);
       } else {
         embeddedWidgetBusy = false;
@@ -1684,11 +1689,13 @@ let askAbort: AbortController | null = null;
 // single-flight — one in-flight question, and only the LATEST replacement
 // queues. The server's 3 Ask slots can never be filled by one abandoned UI.
 let embeddedAskBusy = false;
-let embeddedAskQueued: string | null = null;
+// #4(r11): queued questions carry the scope generation they were asked under
+let embeddedAskQueued: { q: string; gen: number } | null = null;
 
 function invalidateAskScope(): void {
   askGen++;
   askAbort?.abort(); // stop the obsolete HTTP request outright
+  embeddedAskQueued = null; // #4(r11): a queued question belongs to the old scope
   if (askState.pending) {
     askState.pending = null; // unblock the input immediately
     askState.note = "Analysis cancelled — the filters changed.";
@@ -1725,7 +1732,7 @@ async function submitQuestion(question: string): Promise<void> {
   const q = question.trim();
   if (!q) return;
   if (embedded && embeddedAskBusy) {
-    embeddedAskQueued = q; // latest replacement only
+    embeddedAskQueued = { q, gen: askGen }; // latest replacement only
     askState.note = "Queued — will run when the current analysis settles (host calls cannot be cancelled).";
     renderView();
     return;
@@ -1762,7 +1769,8 @@ async function submitQuestion(question: string): Promise<void> {
             embeddedAskBusy = false;
             const latest = embeddedAskQueued ?? next;
             embeddedAskQueued = null;
-            void submitQuestion(latest);
+            if (latest.gen !== askGen) return; // #4(r11): scope moved on
+            void submitQuestion(latest.q);
           }, 0);
         } else {
           embeddedAskBusy = false;
@@ -2045,8 +2053,27 @@ function renderTabs(): void {
   (active as HTMLElement | null)?.scrollIntoView?.({ inline: "nearest", block: "nearest" });
 }
 
+// #10(r10)/#7(r11): curated panels only follow time + the GLOBAL agent. When
+// Explore carries model/tool/status filters — or an agent differing from the
+// global selector — say so persistently, and re-derive it on every render so
+// typed filter changes update the notice without waiting for a refresh.
+function updateScopeNotice(): void {
+  document.getElementById("scope-warn")?.remove();
+  const f = explore.spec.filters as Record<string, string | undefined> | undefined;
+  const parts: string[] = (["model", "tool", "status"] as const).filter((k) => f?.[k]);
+  const globalAgent = pendingAgent !== undefined ? pendingAgent : agentEl.value;
+  if (f?.agent && f.agent !== globalAgent) parts.unshift("agent");
+  if (!parts.length) return;
+  const warn = el("span", "pill warn", `${parts.join(" + ")} filter: Explore only`);
+  warn.id = "scope-warn";
+  warn.title =
+    "Overview/Latency/Tokens/Tools/Cost/Agents panels apply only the time window and the global agent filter.";
+  scopeEl.appendChild(warn);
+}
+
 function renderView(): void {
   hideTooltip();
+  updateScopeNotice();
   mainEl.replaceChildren();
   if (authRequired) {
     renderLoginPrompt(); // #17: survives resize-triggered re-renders
@@ -2074,15 +2101,7 @@ function setData(d: DashboardData): void {
   }
   scopeEl.replaceChildren();
   scopeEl.appendChild(el("span", "pill", d.meta.source === "mock" ? "sample data" : d.meta.source));
-  // #10(r10): curated panels only follow time + agent. When Explore carries
-  // model/tool/status filters (typed or pushed via render_widget), say so —
-  // otherwise the tabs imply a synchronized scope they do not have.
-  const unsynced = (["model", "tool", "status"] as const).filter((k) => (explore.spec.filters as any)?.[k]);
-  if (unsynced.length) {
-    const warn = el("span", "pill warn", `${unsynced.join(" + ")} filter: Explore only`);
-    warn.title = "Overview/Latency/Tokens/Tools/Cost/Agents panels apply only the time window and agent filter.";
-    scopeEl.appendChild(warn);
-  }
+  updateScopeNotice(); // #7(r11): recomputed here AND on every Explore change
   scopeEl.appendChild(
     document.createTextNode(
       `last ${hours % 24 === 0 && hours >= 48 ? `${hours / 24} days` : `${hours} h`} · by ${d.meta.granularity}`,
@@ -2465,6 +2484,11 @@ function renderTraceCard(main: HTMLElement): void {
   head.appendChild(h2);
   const close = el("button", "trace-close", "Close");
   close.addEventListener("click", () => {
+    // #4(r11): Close is an intent — in-flight AND queued trace loads die with it
+    traceGen++;
+    traceAbort?.abort();
+    traceIntentEpoch++;
+    embeddedTraceQueued = null;
     traceCard = null;
     card.remove();
   });
@@ -2561,6 +2585,8 @@ async function showTrace(traceId: string): Promise<void> {
 function invalidateTrace(): void {
   traceGen++;
   traceAbort?.abort();
+  traceIntentEpoch++; // #4(r11): queued trace dispatches lose their intent too
+  embeddedTraceQueued = null;
   traceCard = null; // an open trace belongs to the previous window
   invalidateAskScope(); // #5(r5): pending Ask answers belong to the old scope too
 }
@@ -2697,6 +2723,7 @@ if (embedded) {
     if (d) {
       refreshSeq++;
       inflightAbort?.abort();
+      embeddedRefreshQueued = false; // #4(r11): the host result IS the rerun
       invalidateTrace();
       setData(d);
     }

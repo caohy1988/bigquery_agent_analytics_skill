@@ -13,6 +13,8 @@
 //                  the late job must be cancelled and never polled
 //   slow_create_all — EVERY job's creation is slow; used to prove abandoned
 //                  creations keep counting against the admission cap
+//   stall_create_all — EVERY job's creation hangs forever; proves permanently
+//                  hung creations hold their slots (the cap never lies)
 //   slow_dry     — dry-run job creation is slow; proves dry runs share the
 //                  same admission ownership as real queries
 
@@ -87,6 +89,9 @@ export function makeFakeBigQuery(scenario: string): { createQueryJob: (opts: Fak
     async createQueryJob(opts: FakeJobOpts) {
       if (scenario === "stall_create" && opts.query.includes("AS total_events")) {
         await new Promise(() => {}); // job creation hangs forever
+      }
+      if (scenario === "stall_create_all") {
+        await new Promise(() => {}); // EVERY creation hangs — cap-integrity tests
       }
       const lateCreate =
         (scenario === "slow_create" && opts.query.includes("AS total_events")) || scenario === "slow_create_all";
