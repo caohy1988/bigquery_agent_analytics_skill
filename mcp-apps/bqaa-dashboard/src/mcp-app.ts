@@ -1276,13 +1276,23 @@ function renderAgents(d: DashboardData, main: HTMLElement): void {
     ),
   );
 
-  const bars = chartCard("Delegation map", "parent → child span relationships", [], "full", {
-    filename: "delegation.csv",
-    get: () => ({
-      head: ["Parent", "Child", "Delegations", "Unique traces"],
-      rows: deleg.map((r) => [r.parent_agent, r.child_agent, String(r.delegation_count), String(r.unique_traces)]),
-    }),
-  });
+  // #8(r7): a header-only CSV from a failed query looks like a real no-data
+  // result — the export exists only when the section succeeded
+  const bars = chartCard(
+    "Delegation map",
+    "parent → child span relationships",
+    [],
+    "full",
+    delegErr
+      ? undefined
+      : {
+          filename: "delegation.csv",
+          get: () => ({
+            head: ["Parent", "Child", "Delegations", "Unique traces"],
+            rows: deleg.map((r) => [r.parent_agent, r.child_agent, String(r.delegation_count), String(r.unique_traces)]),
+          }),
+        },
+  );
   hBars(
     bars.body,
     deleg.slice(0, 12).map((r) => ({
@@ -1307,13 +1317,21 @@ function renderAgents(d: DashboardData, main: HTMLElement): void {
   }
   main.appendChild(bars.card);
 
-  const tbl = chartCard("Human-in-the-loop", "requests vs completions by type", [], "full", {
-    filename: "hitl.csv",
-    get: () => ({
-      head: ["Agent", "Type", "Requests", "Completed", "Avg wait s", "Max wait s"],
-      rows: hitl.map((r) => [r.agent ?? "?", r.request_type ?? "?", String(r.total_requests), String(r.completed), String(r.avg_wait_sec ?? ""), String(r.max_wait_sec ?? "")]),
-    }),
-  });
+  const tbl = chartCard(
+    "Human-in-the-loop",
+    "requests vs completions by type",
+    [],
+    "full",
+    hitlErr
+      ? undefined
+      : {
+          filename: "hitl.csv",
+          get: () => ({
+            head: ["Agent", "Type", "Requests", "Completed", "Avg wait s", "Max wait s"],
+            rows: hitl.map((r) => [r.agent ?? "?", r.request_type ?? "?", String(r.total_requests), String(r.completed), String(r.avg_wait_sec ?? ""), String(r.max_wait_sec ?? "")]),
+          }),
+        },
+  );
   table(tbl.body, [
     { label: "Agent", get: (r) => r.agent ?? "?" },
     { label: "Type", get: (r) => r.request_type ?? "?" },
@@ -1625,6 +1643,11 @@ const askState: { exchanges: AskResult[]; pending: string | null; note: string; 
 let askGen = 0;
 let askOp = 0;
 let askAbort: AbortController | null = null;
+// #4(r7): host tool calls cannot be cancelled, so embedded Ask is
+// single-flight — one in-flight question, and only the LATEST replacement
+// queues. The server's 3 Ask slots can never be filled by one abandoned UI.
+let embeddedAskBusy = false;
+let embeddedAskQueued: string | null = null;
 
 function invalidateAskScope(): void {
   askGen++;
@@ -1663,7 +1686,14 @@ function renderAnswer(text: string): HTMLElement {
 
 async function submitQuestion(question: string): Promise<void> {
   const q = question.trim();
-  if (!q || askState.pending) return;
+  if (!q) return;
+  if (embedded && embeddedAskBusy) {
+    embeddedAskQueued = q; // latest replacement only
+    askState.note = "Queued — will run when the current analysis settles (host calls cannot be cancelled).";
+    renderView();
+    return;
+  }
+  if (askState.pending) return;
   askState.pending = q;
   askState.note = "";
   renderView();
@@ -1678,10 +1708,20 @@ async function submitQuestion(question: string): Promise<void> {
     let result: AskResult;
     const history = askState.exchanges.slice(-3).map((e) => ({ question: e.question, answer: e.answer }));
     if (embedded && appBridge) {
-      const r: any = await appBridge.callServerTool({ name: "ask_data", arguments: { question: q, history, ...scope } });
-      const d = r?.structuredContent?.data;
-      if (!d?.answer) throw new Error("no answer in tool result");
-      result = d as AskResult;
+      embeddedAskBusy = true;
+      try {
+        const r: any = await appBridge.callServerTool({ name: "ask_data", arguments: { question: q, history, ...scope } });
+        const d = r?.structuredContent?.data;
+        if (!d?.answer) throw new Error("no answer in tool result");
+        result = d as AskResult;
+      } finally {
+        embeddedAskBusy = false;
+        if (embeddedAskQueued) {
+          const next = embeddedAskQueued;
+          embeddedAskQueued = null;
+          setTimeout(() => void submitQuestion(next), 0);
+        }
+      }
     } else if (location.protocol.startsWith("http")) {
       const res = await fetch("api/ask", {
         method: "POST",
@@ -1776,6 +1816,9 @@ function renderAsk(d: DashboardData | null, main: HTMLElement): void {
     const card = el("div", "card span-full ask-exchange");
     card.appendChild(el("div", "ask-q", ex.question));
     if (ex.steps.length) card.appendChild(el("div", "sub", `${ex.steps.length} analysis steps · ${ex.steps.slice(0, 3).join(" · ")}`));
+    if (ex.scope && ex.scope.verified === false) {
+      card.appendChild(el("div", "empty error", "Scope not verified — the generated SQL may cover a different slice than the label."));
+    }
     card.appendChild(renderAnswer(ex.answer));
     if (ex.sql) {
       const det = statefulDetails("data-table", "Generated SQL", `ask-sql:${ex.question}`);
@@ -2153,6 +2196,7 @@ let embeddedRefreshQueued = false;
 async function refresh(): Promise<void> {
   if (embedded && embeddedRefreshBusy) {
     embeddedRefreshQueued = true; // controls/pendingAgent stay untouched for the rerun
+    refreshSeq++; // #5(r7): the in-flight refresh must not publish or reset controls
     return;
   }
   const seq = ++refreshSeq;
@@ -2329,9 +2373,14 @@ function invalidateTrace(): void {
 }
 
 // #16: rapid filter changes coalesce into one refresh instead of racing
-// several 10-query loads against the job-slot cap.
+// several 10-query loads against the job-slot cap. #5(r7): the generation is
+// invalidated IMMEDIATELY — not at debounce expiry — so an in-flight refresh
+// (embedded included) loses publication rights the moment the scope changes
+// and can never reset the controls before the queued rerun reads them.
 let refreshDebounce: ReturnType<typeof setTimeout> | undefined;
 function scheduleRefresh(): void {
+  refreshSeq++; // stale publication is dead from this instant
+  inflightAbort?.abort(); // standalone work stops before the debounce, too
   clearTimeout(refreshDebounce);
   refreshDebounce = setTimeout(() => void refresh(), 250);
 }

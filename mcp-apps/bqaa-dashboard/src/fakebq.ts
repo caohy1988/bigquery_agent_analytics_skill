@@ -13,6 +13,8 @@
 //                  the late job must be cancelled and never polled
 //   slow_create_all — EVERY job's creation is slow; used to prove abandoned
 //                  creations keep counting against the admission cap
+//   slow_dry     — dry-run job creation is slow; proves dry runs share the
+//                  same admission ownership as real queries
 
 import { BQ_MIN_BYTES_PER_QUERY } from "./queries.js";
 
@@ -92,6 +94,9 @@ export function makeFakeBigQuery(scenario: string): { createQueryJob: (opts: Fak
         await new Promise((r) => setTimeout(r, 1500)); // resolves after the test deadline
       }
       if (opts.dryRun) {
+        if (scenario === "slow_dry") {
+          await new Promise((r) => setTimeout(r, 1500)); // resolves after the deadline
+        }
         return [{ metadata: { statistics: { totalBytesProcessed: "1234567" } } }];
       }
       // real BigQuery rejects sub-minimum byte caps at job creation

@@ -670,3 +670,40 @@ test("an aborted dashboard pipeline is never reused by a retry (#3-r6)", async (
     srv.child.kill();
   }
 });
+
+// ---- seventh-review merge items
+
+test("timed-out dry runs stay inside admission accounting (#2-r7)", async () => {
+  const port = PORT + 120;
+  const srv = startServer({ ...FAKE_ENV, BQAA_FAKE_BQ: "slow_dry", BQAA_QUERY_TIMEOUT_MS: "500" }, port);
+  try {
+    await waitFor(`http://localhost:${port}/healthz`);
+    // 20 slow dry runs: all time out at 500ms while creation stays pending
+    const dryRuns = Array.from({ length: 20 }, () =>
+      fetch(`http://localhost:${port}/api/widget?measure=events&dimension=agent&dry_run=true`).then((r) => r.json()),
+    );
+    await new Promise((r) => setTimeout(r, 700)); // deadlines fired, creations pending
+    const probe = await (await fetch(`http://localhost:${port}/api/widget?measure=events&dimension=agent`)).json();
+    assert.match(probe.error ?? "", /busy/i, "request 21 must be refused while abandoned dry runs count");
+    await Promise.all(dryRuns);
+    await new Promise((r) => setTimeout(r, 1200)); // abandoned creations settle
+    const after = await fetch(`http://localhost:${port}/api/widget?measure=events&dimension=agent`);
+    assert.equal(after.status, 200, "admission must recover after dry-run creations settle");
+  } finally {
+    srv.child.kill();
+  }
+});
+
+test("mock Ask is scope-consistent with explicit provenance (#7-r7)", async () => {
+  const res = await fetch(`${BASE}/api/ask`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ question: "Which tool fails most?", time_range_hours: 24, agent: "coder" }),
+  });
+  const { data } = await res.json();
+  assert.match(data.sql, /timestamp BETWEEN '/, "sample SQL must carry the actual window");
+  assert.match(data.sql, /agent = 'coder'/, "sample SQL must carry the agent scope");
+  assert.ok(!/INTERVAL 30 DAY/.test(data.sql), "fixed 30-day sample SQL must be gone when scoped");
+  assert.equal(data.scope?.verified, true);
+  assert.match(data.answer, /mock data/i, "sample provenance must be explicit");
+});

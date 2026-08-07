@@ -273,17 +273,33 @@ function withDeadline<T>(p: Promise<T>, ms: number): Promise<T> {
 }
 
 // Estimate a query's scan size without running it (BigQuery dry run).
-async function dryRunQuery(sql: string, params: Record<string, unknown>): Promise<number> {
-  return withJobSlot(() =>
-    withDeadline(
-      (async () => {
-        const client = await bigQueryClient();
-        const [job] = await client.createQueryJob({ query: sql, params, dryRun: true });
-        return Number(job.metadata?.statistics?.totalBytesProcessed ?? 0);
-      })(),
-      CONFIG.queryTimeoutMs,
-    ),
-  );
+// #2(r7): dry runs share the SAME lifecycle ownership as real queries — a
+// timed-out or aborted dry-run creation stays inside admission accounting
+// until it settles, instead of silently escaping the cap.
+async function dryRunQuery(sql: string, params: Record<string, unknown>, signal?: AbortSignal): Promise<number> {
+  if (signal?.aborted) throw new Error("request aborted");
+  return withJobSlot(async () => {
+    const work = (async () => {
+      const client = await bigQueryClient();
+      const [job] = await client.createQueryJob({ query: sql, params, dryRun: true });
+      return Number(job.metadata?.statistics?.totalBytesProcessed ?? 0);
+    })();
+    const abortPromise: Promise<never> | null = signal
+      ? new Promise((_, reject) => {
+          const fail = (): void => reject(new Error("request aborted"));
+          if (signal.aborted) fail();
+          else signal.addEventListener("abort", fail, { once: true });
+        })
+      : null;
+    try {
+      const raced = abortPromise ? Promise.race([work, abortPromise]) : work;
+      return await withDeadline<number>(raced, CONFIG.queryTimeoutMs);
+    } catch (e) {
+      trackAbandonedCreation(work); // dry-run creation still pending — keep it counted
+      work.catch(() => {});
+      throw e;
+    }
+  });
 }
 
 const EMPTY_OVERVIEW: OverviewStats = {
@@ -399,7 +415,7 @@ async function loadWidget(
   const params = { start: start.toISOString(), end: end.toISOString(), ...built.filterParams };
   const window = { start: start.toISOString(), end: end.toISOString() };
   if (dryRun) {
-    const estimated = await dryRunQuery(built.sql, params);
+    const estimated = await dryRunQuery(built.sql, params, signal);
     return { spec: fullSpec as WidgetResult["spec"], window, rows: [], dry_run: true, estimated_bytes: estimated, source: sourceLabel() };
   }
   const { rows, bytes } = await runQuery(built.sql, params, WIDGET_QUERY_BYTES, signal);
@@ -422,17 +438,23 @@ async function ask(question: string, history: AskExchange[], scope: AskScope, si
   if (CONFIG.caDisabled) {
     throw new Error("Conversational analytics is disabled on this deployment (BQAA_CA_DISABLED=1)");
   }
-  if (CONFIG.mock) return mockAsk(question);
+  // #7(r7): normalize the scope BEFORE the mock/live branch so sample answers
+  // are scope-consistent instead of fixed-30-day data under the user's label
+  const hoursNorm = Math.min(MAX_HOURS, Math.max(1, scope.time_range_hours ?? CONFIG.defaultHours));
+  const endNorm = new Date();
+  const startNorm = new Date(endNorm.getTime() - hoursNorm * 3_600_000);
+  const normScope = {
+    startIso: startNorm.toISOString(),
+    endIso: endNorm.toISOString(),
+    agent: scope.agent?.slice(0, 200),
+  };
+  if (CONFIG.mock) return mockAsk(question, normScope);
   if (signal?.aborted) throw new Error("Ask aborted before start"); // #8: never consume a slot for dead work
   if (inflightAsk >= MAX_CONCURRENT_ASK) {
     throw new Error("Server busy: too many concurrent Ask requests — retry shortly");
   }
   inflightAsk++;
   try {
-    // #5: the answer must match the filters the user is looking at
-    const hours = Math.min(MAX_HOURS, Math.max(1, scope.time_range_hours ?? CONFIG.defaultHours));
-    const end = new Date();
-    const start = new Date(end.getTime() - hours * 3_600_000);
     return await askConversational(
       {
         project: CONFIG.project,
@@ -442,11 +464,7 @@ async function ask(question: string, history: AskExchange[], scope: AskScope, si
         // per-QUERY cap on CA-generated SQL (CA may run several queries per
         // question); aggregate spend control belongs to project/user quotas
         maxBilledBytes: CONFIG.refreshBytesBudget,
-        scope: {
-          startIso: start.toISOString(),
-          endIso: end.toISOString(),
-          agent: scope.agent?.slice(0, 200),
-        },
+        scope: normScope,
       },
       question,
       history,

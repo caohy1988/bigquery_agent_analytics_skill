@@ -178,6 +178,29 @@ export function parseMessages(question: string, parsed: any[]): AskResult {
   };
 }
 
+// #3(r7): the scope instruction is prompt-level, so the label must be earned:
+// the generated SQL is checked for the scope's predicates, and the result
+// reports verified: true only when every check passes. Unverifiable or
+// missing-predicate SQL is reported truthfully as NOT verified.
+export function verifyScope(
+  sql: string | null,
+  scope?: { startIso: string; endIso: string; agent?: string },
+): boolean {
+  if (!scope) return true;
+  if (!sql) return false; // nothing to verify against
+  const hasWindow = sql.includes(scope.startIso) && sql.includes(scope.endIso) && /timestamp/i.test(sql);
+  const hasAgent = !scope.agent || sql.includes(scope.agent);
+  return hasWindow && hasAgent;
+}
+
 export function withScope(result: AskResult, scope?: { startIso: string; endIso: string; agent?: string }): AskResult {
-  return scope ? { ...result, scope } : result;
+  if (!scope) return result;
+  const verified = verifyScope(result.sql, scope);
+  return {
+    ...result,
+    scope: { ...scope, verified },
+    answer: verified
+      ? result.answer
+      : `${result.answer}\n\n⚠ Scope not verified: the generated SQL could not be confirmed to contain the selected time window${scope.agent ? " and agent filter" : ""}. Treat this answer as potentially covering a different slice.`,
+  };
 }

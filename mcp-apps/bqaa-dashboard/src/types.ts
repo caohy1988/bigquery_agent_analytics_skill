@@ -164,7 +164,9 @@ export interface AskResult {
   schema: string[]; // result column names
   rows: Array<Record<string, unknown>>; // last query result (capped)
   followups: string[];
-  scope?: { startIso: string; endIso: string; agent?: string }; // the ENFORCED scope
+  // The REQUESTED scope, with verified=true only when the generated SQL was
+  // confirmed to contain its predicates — never assumed.
+  scope?: { startIso: string; endIso: string; agent?: string; verified?: boolean };
 }
 
 export interface ErrorTraceRow {

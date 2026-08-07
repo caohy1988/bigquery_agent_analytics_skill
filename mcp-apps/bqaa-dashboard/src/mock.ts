@@ -315,13 +315,18 @@ export function mockTrace(traceId: string): TraceEvent[] {
   return events;
 }
 
-export function mockAsk(question: string): AskResult {
+export function mockAsk(question: string, scope?: { startIso: string; endIso: string; agent?: string }): AskResult {
+  // #7(r7): the sample answer is scope-consistent — its SQL carries the
+  // caller's actual window/agent, and provenance is explicit.
+  const windowPredicate = scope
+    ? `timestamp BETWEEN '${scope.startIso}' AND '${scope.endIso}'${scope.agent ? ` AND agent = '${scope.agent}'` : ""}`
+    : "timestamp > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)";
   return {
     question,
     answer:
-      "**fetch_invoice** has the highest failure rate at **7.1%** of started executions (196 errors out of 2,759 starts), followed by check_inventory at 6.9%.\n\n(Sample answer — connect a BigQuery project to ask real questions.)",
+      "**fetch_invoice** has the highest failure rate at **7.1%** of started executions (196 errors out of 2,759 starts), followed by check_inventory at 6.9%.\n\n(Sample answer from mock data — connect a BigQuery project to ask real questions.)",
     steps: ["Analyzing context", "Running a query", "Tool failure analysis"],
-    sql: "WITH tool_stats AS (\n  SELECT LAX_STRING(content.tool) AS tool_name,\n    COUNTIF(event_type = 'TOOL_STARTING') AS starting_count,\n    COUNTIF(event_type = 'TOOL_ERROR') AS error_count\n  FROM `project.dataset.agent_events`\n  WHERE timestamp > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)\n  GROUP BY tool_name\n)\nSELECT tool_name, error_count / starting_count AS failure_rate\nFROM tool_stats ORDER BY failure_rate DESC",
+    sql: `WITH tool_stats AS (\n  SELECT LAX_STRING(content.tool) AS tool_name,\n    COUNTIF(event_type = 'TOOL_STARTING') AS starting_count,\n    COUNTIF(event_type = 'TOOL_ERROR') AS error_count\n  FROM \`project.dataset.agent_events\`\n  WHERE ${windowPredicate}\n  GROUP BY tool_name\n)\nSELECT tool_name, error_count / starting_count AS failure_rate\nFROM tool_stats ORDER BY failure_rate DESC`,
     schema: ["tool_name", "starting_count", "error_count", "failure_rate"],
     rows: [
       { tool_name: "fetch_invoice", starting_count: 2759, error_count: 196, failure_rate: 0.071 },
@@ -333,5 +338,6 @@ export function mockAsk(question: string): AskResult {
       "What is the failure rate broken down by agent?",
       "Show me the daily trend of failures.",
     ],
+    ...(scope ? { scope: { ...scope, verified: true } } : {}),
   };
 }
