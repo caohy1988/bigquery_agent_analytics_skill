@@ -24,11 +24,20 @@ test("every query carries the mandatory partition predicate", () => {
 
 test("agent filter is parameterized, never interpolated", () => {
   const filtered = buildDashboardSql({ table: "`p.d.t`", granularity: "hour", agentFilter: true });
-  // "agents" (the filter's own option list) and "delegation" (parent→child
-  // pairs span two agents) intentionally ignore the agent filter.
-  for (const s of SECTIONS.filter((s) => s !== "agents" && s !== "delegation")) {
+  // "agents" (the filter's own option list) intentionally ignores the filter
+  for (const s of SECTIONS.filter((s) => s !== "agents")) {
     assert.match(filtered[s], /agent = @agent/, `${s} lacks agent param`);
   }
+});
+
+test("delegation filters edges by the requested agent after resolution (#8-r5)", () => {
+  const filtered = buildDashboardSql({ table: "`p.d.t`", granularity: "day", agentFilter: true });
+  assert.match(filtered.delegation, /WHERE parent_agent = @agent OR child_agent = @agent/);
+  assert.ok(!sql.delegation.includes("@agent"), "unfiltered delegation must not reference @agent");
+});
+
+test("sessions exclude null session ids (#7-r5)", () => {
+  assert.match(sql.sessions, /session_id IS NOT NULL/);
 });
 
 test("schema aliases cover both producers (canonical ADK + tracing plugin)", () => {

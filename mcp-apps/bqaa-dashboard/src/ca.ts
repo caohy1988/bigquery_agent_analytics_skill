@@ -10,6 +10,17 @@ import type { AskExchange, AskResult } from "./types.js";
 
 const MAX_ROWS = 100;
 
+// Exact BigQuery string literal for a user-supplied value: quotes, backslashes,
+// and newlines are escaped rather than stripped, so an agent named with an
+// apostrophe scopes to precisely that agent instead of a silently different one.
+export function sqlStringLiteral(value: string): string {
+  return `'${value
+    .replaceAll("\\", "\\\\")
+    .replaceAll("'", "\\'")
+    .replaceAll("\n", "\\n")
+    .replaceAll("\r", "\\r")}'`;
+}
+
 let auth: GoogleAuth | null = null;
 
 async function accessToken(): Promise<string> {
@@ -68,7 +79,7 @@ export async function askConversational(
   // #5: pin the analysis to the filters the user is looking at
   const scopeInstruction = cfg.scope
     ? ` SCOPE: unless the user explicitly asks otherwise, restrict every query to timestamp BETWEEN '${cfg.scope.startIso}' AND '${cfg.scope.endIso}'` +
-      (cfg.scope.agent ? ` AND agent = '${cfg.scope.agent.replaceAll("'", "")}'` : "") +
+      (cfg.scope.agent ? ` AND agent = ${sqlStringLiteral(cfg.scope.agent)}` : "") +
       "."
     : "";
 

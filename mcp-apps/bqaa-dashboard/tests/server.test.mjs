@@ -505,3 +505,101 @@ test("ask_data accepts scope arguments (#5)", async () => {
   });
   assert.ok(call.body.result.structuredContent?.data?.answer);
 });
+
+// ---- fifth-review merge gate
+
+test("a job created after the deadline is cancelled and never polled (#1-r5)", async () => {
+  const port = PORT + 111;
+  const srv = startServer({ ...FAKE_ENV, BQAA_FAKE_BQ: "slow_create", BQAA_QUERY_TIMEOUT_MS: "600" }, port);
+  try {
+    await waitFor(`http://localhost:${port}/healthz`);
+    const res = await fetch(`http://localhost:${port}/api/dashboard?time_range_hours=24`);
+    const { data } = await res.json();
+    assert.match(data.meta.section_errors?.overview ?? "", /timed out/);
+    await new Promise((r) => setTimeout(r, 1600)); // let the late creation land
+    assert.match(srv.logs(), /FAKE_BQ_JOB_CANCELLED/, "late job must be cancelled");
+    assert.ok(!srv.logs().includes("FAKE_BQ_LATE_POLL"), "late job must never be polled");
+  } finally {
+    srv.child.kill();
+  }
+});
+
+test("widget and trace results carry provenance; production without a project fails fast (#2-r5)", async () => {
+  const port = PORT + 112;
+  const srv = startServer(FAKE_ENV, port);
+  try {
+    await waitFor(`http://localhost:${port}/healthz`);
+    const widget = await (await fetch(`http://localhost:${port}/api/widget?measure=events&dimension=agent`)).json();
+    assert.match(widget.data.source ?? "", /FAKE_BQ/);
+    const trace = await (await fetch(`http://localhost:${port}/api/trace?trace_id=abcd1234abcd1234`)).json();
+    assert.match(trace.source ?? "", /FAKE_BQ/);
+  } finally {
+    srv.child.kill();
+  }
+  const bad = startServer({ BQAA_MOCK: "", BQAA_PROJECT: "", NODE_ENV: "production" }, PORT + 113);
+  const code = await new Promise((resolve) => bad.child.on("exit", resolve));
+  assert.notEqual(code, 0);
+  assert.match(bad.logs(), /BQAA_PROJECT is required in production/);
+});
+
+test("normal non-mock Ask POSTs are not falsely aborted after body parsing (#3-r5)", async () => {
+  const port = PORT + 114;
+  const srv = startServer(FAKE_ENV, port);
+  try {
+    await waitFor(`http://localhost:${port}/healthz`);
+    const res = await fetch(`http://localhost:${port}/api/ask`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question: "Which tool fails most?" }),
+    });
+    // the CA call itself may fail (fake project / missing credentials), but it
+    // must never fail with the false-abort signature from req 'close'
+    const body = await res.json().catch(() => ({}));
+    assert.ok(!/aborted while acquiring credentials/i.test(body.error ?? ""), `false abort: ${body.error}`);
+  } finally {
+    srv.child.kill();
+  }
+});
+
+test("MCP client disconnect cancels stalled backend work (#11-r5)", async () => {
+  const port = PORT + 115;
+  const srv = startServer({ ...FAKE_ENV, BQAA_FAKE_BQ: "stall", BQAA_QUERY_TIMEOUT_MS: "60000" }, port);
+  try {
+    await waitFor(`http://localhost:${port}/healthz`);
+    const ac = new AbortController();
+    const call = fetch(`http://localhost:${port}/mcp`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+      body: JSON.stringify({
+        jsonrpc: "2.0", id: 1, method: "tools/call",
+        params: { name: "query_agent_metrics", arguments: { time_range_hours: 24 } },
+      }),
+      signal: ac.signal,
+    }).catch(() => null);
+    await new Promise((r) => setTimeout(r, 500)); // let the stalled job start
+    ac.abort();
+    await call;
+    await new Promise((r) => setTimeout(r, 700));
+    assert.match(srv.logs(), /FAKE_BQ_JOB_CANCELLED/, "disconnect must cancel the stalled job");
+  } finally {
+    srv.child.kill();
+  }
+});
+
+test("the Ask disable flag outranks mock mode (#12-r5)", async () => {
+  const port = PORT + 116;
+  const srv = startServer({ BQAA_CA_DISABLED: "1" }, port); // mock mode
+  try {
+    await waitFor(`http://localhost:${port}/healthz`);
+    const res = await fetch(`http://localhost:${port}/api/ask`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question: "Which tool fails most?" }),
+    });
+    assert.equal(res.status, 500);
+    const body = await res.json();
+    assert.match(body.error, /disabled/);
+  } finally {
+    srv.child.kill();
+  }
+});

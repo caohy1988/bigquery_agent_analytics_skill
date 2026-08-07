@@ -343,7 +343,9 @@ function lineChart(
   };
   overlay.addEventListener("pointermove", (e) => {
     const rect = svg.getBoundingClientRect();
-    const px = e.clientX - rect.left - m.left;
+    // #21(r5): the SVG may render scaled (max-width guard) — map client
+    // coordinates into viewBox space before picking a bucket
+    const px = (e.clientX - rect.left) * (W / rect.width) - m.left;
     const i = Math.max(0, Math.min(n - 1, Math.round((px / pw) * (n - 1))));
     focusIdx = i;
     present(i, e.clientX, e.clientY);
@@ -354,7 +356,8 @@ function lineChart(
   });
   const presentFocus = () => {
     const rect = svg.getBoundingClientRect();
-    present(focusIdx, rect.left + x(focusIdx), rect.top + m.top + ph / 2);
+    const scale = rect.width / W;
+    present(focusIdx, rect.left + x(focusIdx) * scale, rect.top + (m.top + ph / 2) * scale);
   };
   overlay.addEventListener("focus", presentFocus);
   overlay.addEventListener("blur", () => {
@@ -713,8 +716,8 @@ function statefulDetails(cls: string, summaryText: string, key: string): HTMLEle
   return details;
 }
 
-function dataTable(dt: ChartData): HTMLElement {
-  const details = statefulDetails("data-table", "Show data", `${currentView}:${dt.head.join("|")}`);
+function dataTable(dt: ChartData, stateKey?: string): HTMLElement {
+  const details = statefulDetails("data-table", "Show data", stateKey ?? `${currentView}:${dt.head.join("|")}`);
   const scroll = el("div", "table-scroll");
   const t = el("table");
   const thead = el("thead");
@@ -1109,7 +1112,6 @@ function renderCost(d: DashboardData, main: HTMLElement): void {
   const totalIn = rows.reduce((a, r) => a + r.costIn, 0);
   const totalOut = rows.reduce((a, r) => a + r.costOut, 0);
   const total = totalIn + totalOut;
-  const unpriced = rows.filter((r) => r.price.in === 0 && r.price.out === 0 && (r.promptTot > 0 || r.completionTot > 0));
 
   main.appendChild(
     modelsErr
@@ -1138,6 +1140,11 @@ function renderCost(d: DashboardData, main: HTMLElement): void {
     }),
   });
   main.appendChild(trend.card);
+  if (modelsErr) {
+    // #4: without model pricing data the trend would be a plausible $0 chart
+    emptyNote(trend.body, modelsErr);
+    return renderCostRest(d, main, rows, modelsErr);
+  }
   lineChart(
     trend.body,
     d.timeseries,
@@ -1159,6 +1166,16 @@ function renderCost(d: DashboardData, main: HTMLElement): void {
     );
   }
 
+  renderCostRest(d, main, rows, modelsErr);
+}
+
+function renderCostRest(
+  d: DashboardData,
+  main: HTMLElement,
+  rows: Array<{ model: string; calls: number; promptTot: number; completionTot: number; price: { in: number; out: number }; costIn: number; costOut: number; cost: number }>,
+  modelsErr: string | null,
+): void {
+  const unpriced = rows.filter((r) => r.price.in === 0 && r.price.out === 0 && (r.promptTot > 0 || r.completionTot > 0));
   const byModel = chartCard("Cost by model", "estimates — tokens × your price book", [], "half", {
     filename: "cost-by-model.csv",
     get: () => ({
@@ -1584,6 +1601,14 @@ const askState: { exchanges: AskResult[]; pending: string | null; note: string; 
   draft: "", // survives re-renders so a background refresh never eats typing
 };
 
+// #5(r5): an Ask answer computed under old filters must not publish under new
+// ones — scope changes bump the generation and stale completions are dropped.
+let askGen = 0;
+
+function invalidateAskScope(): void {
+  askGen++;
+}
+
 // Minimal, injection-safe renderer for the API's markdown-ish answers:
 // headings, bullets, **bold**, `code` — everything else is plain text.
 function renderAnswer(text: string): HTMLElement {
@@ -1616,11 +1641,13 @@ async function submitQuestion(question: string): Promise<void> {
   askState.pending = q;
   askState.note = "";
   renderView();
+  // #5: the answer must match the filters on screen; stale completions are dropped
+  const gen = askGen;
+  const scope = { time_range_hours: currentHours(), ...(agentEl.value ? { agent: agentEl.value } : {}) };
+  const scopeLabel = `last ${scope.time_range_hours}h${scope.agent ? ` · agent ${scope.agent}` : ""}`;
   try {
     let result: AskResult;
     const history = askState.exchanges.slice(-3).map((e) => ({ question: e.question, answer: e.answer }));
-    // #5: the answer must match the filters on screen
-    const scope = { time_range_hours: currentHours(), ...(agentEl.value ? { agent: agentEl.value } : {}) };
     if (embedded && appBridge) {
       const r: any = await appBridge.callServerTool({ name: "ask_data", arguments: { question: q, history, ...scope } });
       const d = r?.structuredContent?.data;
@@ -1639,9 +1666,13 @@ async function submitQuestion(question: string): Promise<void> {
       await new Promise((r) => setTimeout(r, 600));
       result = mockAsk(q);
     }
-    askState.exchanges.push(result);
+    if (gen !== askGen) {
+      askState.note = "Answer discarded — the filters changed while it was being computed.";
+    } else {
+      askState.exchanges.push({ ...result, question: `${result.question}  (${scopeLabel})` });
+    }
   } catch (e) {
-    askState.note = `Ask failed: ${e instanceof Error ? e.message : String(e)}`;
+    if (gen === askGen) askState.note = `Ask failed: ${e instanceof Error ? e.message : String(e)}`;
   } finally {
     askState.pending = null;
     renderView();
@@ -1723,10 +1754,13 @@ function renderAsk(d: DashboardData | null, main: HTMLElement): void {
     if (ex.rows.length) {
       const cols = ex.schema.length ? ex.schema : Object.keys(ex.rows[0]);
       card.appendChild(
-        dataTable({
-          head: cols,
-          rows: ex.rows.slice(0, 30).map((r) => cols.map((c) => fmtCell((r as Record<string, unknown>)[c]))),
-        }),
+        dataTable(
+          {
+            head: cols,
+            rows: ex.rows.slice(0, 30).map((r) => cols.map((c) => fmtCell((r as Record<string, unknown>)[c]))),
+          },
+          `ask-data:${ex.question}`, // #22(r5): per-exchange, not per-column-shape
+        ),
       );
     }
     if (ex.followups.length) {
@@ -1811,7 +1845,7 @@ function renderPulse(d: DashboardData): void {
   const overlay = svgEl("rect", { x: 0, y: 0, width: W, height: H, fill: "transparent" });
   overlay.addEventListener("pointermove", (e) => {
     const rect = svg.getBoundingClientRect();
-    const i = Math.max(0, Math.min(n - 1, Math.round(((e.clientX - rect.left) / W) * (n - 1))));
+    const i = Math.max(0, Math.min(n - 1, Math.round(((e.clientX - rect.left) / rect.width) * (n - 1))));
     showTooltip(
       bucketLabel(ts[i].ts, d.meta.granularity),
       [
@@ -2085,8 +2119,11 @@ async function refresh(): Promise<void> {
   inflightAbort = abort;
 
   const hours = currentHours(); // #18: honor a non-preset effective window
-  const agent = agentEl.value || pendingAgent || undefined;
+  // #6(r5): a pushed scope is authoritative — "" is the explicit all-agents
+  // sentinel and must CLEAR a previously selected agent, not defer to it
+  const pushed = pendingAgent;
   pendingAgent = undefined;
+  const agent = pushed !== undefined ? pushed || undefined : agentEl.value || undefined;
   mainEl.classList.add("loading");
   statusEl.textContent = "Refreshing…";
   statusEl.classList.remove("error");
@@ -2237,6 +2274,7 @@ function invalidateTrace(): void {
   traceGen++;
   traceAbort?.abort();
   traceCard = null; // an open trace belongs to the previous window
+  invalidateAskScope(); // #5(r5): pending Ask answers belong to the old scope too
 }
 
 // #16: rapid filter changes coalesce into one refresh instead of racing
@@ -2264,6 +2302,7 @@ function scheduleRerender(): void {
   resizeTimer = setTimeout(() => {
     renderView();
     if (data) renderPulse(data);
+    renderTabs(); // #20(r5): keep the active tab scrolled into view after resize
   }, 150);
 }
 window.addEventListener("resize", scheduleRerender);
@@ -2306,8 +2345,9 @@ if (embedded) {
           effectiveHours = h;
         }
       }
-      // promote the pushed agent filter so curated tabs match the widget
-      if (payload.spec.filters?.agent) pendingAgent = payload.spec.filters.agent;
+      // promote the pushed scope so curated tabs match the widget; an absent
+      // agent filter means ALL agents and must clear any previous selection
+      pendingAgent = payload.spec.filters?.agent ?? "";
       currentView = "explore";
       renderTabs();
       renderView();

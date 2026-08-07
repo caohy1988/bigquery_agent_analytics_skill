@@ -320,7 +320,7 @@ export function buildDashboardSql(opts: DashboardSqlOptions): Record<Section, st
         COALESCE(CAST(${PROMPT_TOK_EXPR} AS INT64), 0) AS prompt_tokens,
         COALESCE(CAST(${COMPLETION_TOK_EXPR} AS INT64), 0) AS completion_tokens
       FROM ${T}
-      WHERE event_type = 'LLM_RESPONSE' AND ${W}
+      WHERE event_type = 'LLM_RESPONSE' AND session_id IS NOT NULL AND ${W}
     )
     SELECT
       session_id,
@@ -403,6 +403,7 @@ export function buildDashboardSql(opts: DashboardSqlOptions): Record<Section, st
       COUNT(*) AS delegation_count,
       COUNT(DISTINCT trace_id) AS unique_traces
     FROM agent_tree
+    ${opts.agentFilter ? "WHERE parent_agent = @agent OR child_agent = @agent" : ""}
     GROUP BY parent_agent, child_agent
     ORDER BY delegation_count DESC
     LIMIT 30`,

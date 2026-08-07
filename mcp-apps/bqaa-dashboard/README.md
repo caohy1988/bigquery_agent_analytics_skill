@@ -74,6 +74,7 @@ The MCP endpoint is `http://localhost:3001/mcp` (override with `PORT`).
 | `BQAA_CANONICAL_ORIGIN` | — | The service's own public origin (e.g. `https://app.run.app`) — granted the same-origin exemption; loopback origins are always allowed for local dev |
 | `BQAA_CA_DISABLED` | — | `1` disables the Ask path for strict BigQuery-only deployments (Conversational Analytics processes questions/results inside Google Cloud but beyond BigQuery) |
 | `PORT` | `3001` | HTTP port |
+| `BQAA_HOST` | `127.0.0.1` (dev) / `0.0.0.0` (production builds) | Bind address — local live mode is loopback-only by default |
 
 Guardrails: read-only parameterized `SELECT`s only, a mandatory `timestamp`
 predicate so the partitioned table is never full-scanned, a per-refresh
@@ -110,6 +111,14 @@ Grant the runtime service account `roles/bigquery.jobUser` and
 `roles/bigquery.dataViewer` (or dataset-scoped read access). Reach a private
 service through an identity-aware proxy / `gcloud run services proxy`, or grant
 `roles/run.invoker` to specific members.
+
+**After the first deploy**, set the canonical origin so browser POSTs from the
+deployed page itself are trusted (Origin checks never trust the Host header):
+
+```bash
+gcloud run services update bqaa-dashboard --region us-central1 \
+  --set-env-vars "BQAA_CANONICAL_ORIGIN=https://<your-service>.run.app"
+```
 
 For a **demo on a test dataset only**, you can expose it publicly — combine
 `--allow-unauthenticated` with the app-level guards:

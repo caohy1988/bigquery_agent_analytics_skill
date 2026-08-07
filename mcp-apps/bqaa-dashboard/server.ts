@@ -74,7 +74,10 @@ const CONFIG = {
   project: process.env.BQAA_PROJECT ?? "",
   dataset: process.env.BQAA_DATASET ?? "agent_analytics",
   table: process.env.BQAA_TABLE ?? "agent_events",
-  mock: process.env.BQAA_MOCK === "1" || !process.env.BQAA_PROJECT,
+  // Mock only when EXPLICITLY requested, or (dev convenience) when no project
+  // is set outside production. In production the absence of a project is a
+  // configuration error, not a silent switch to synthetic data.
+  mock: process.env.BQAA_MOCK === "1" || (!process.env.BQAA_PROJECT && process.env.NODE_ENV !== "production"),
   // Budget for ONE dashboard refresh (split across its queries), in bytes.
   // Minimum = SECTIONS x BigQuery's 10 MiB floor for maximumBytesBilled —
   // anything smaller would make every panel query invalid.
@@ -87,6 +90,8 @@ const CONFIG = {
   // Application deadline for a single BigQuery query (job is cancelled on expiry).
   queryTimeoutMs: intEnv("BQAA_QUERY_TIMEOUT_MS", 90_000, 500, 600_000),
   port: intEnv("PORT", 3001, 0, 65535),
+  // #10: local live mode binds loopback; containers set BQAA_HOST=0.0.0.0
+  host: process.env.BQAA_HOST ?? (process.env.NODE_ENV === "production" ? "0.0.0.0" : "127.0.0.1"),
   defaultHours: intEnv("BQAA_DEFAULT_HOURS", 168, 1, MAX_HOURS),
   authToken: process.env.BQAA_AUTH_TOKEN ?? "",
   // The service's own public origin (e.g. https://app.example.run.app) —
@@ -103,6 +108,15 @@ const CONFIG = {
     .filter(Boolean),
 };
 
+// Test seam: BQAA_FAKE_BQ swaps in a controllable fake client. It is refused
+// outright in production builds, and every payload it produces is labeled —
+// synthetic rows must be impossible to mistake for live telemetry.
+const FAKE_BQ = process.env.NODE_ENV !== "production" ? (process.env.BQAA_FAKE_BQ ?? "") : "";
+if (process.env.BQAA_FAKE_BQ && process.env.NODE_ENV === "production") {
+  console.error("BQAA_FAKE_BQ is test-only and cannot be enabled in production builds");
+  process.exit(1);
+}
+
 const PROJECT_RE = /^[A-Za-z0-9_.:-]+$/;
 const ID_RE = /^[A-Za-z0-9_]+$/;
 const TRACE_ID_RE = /^[A-Za-z0-9_-]{4,64}$/;
@@ -113,7 +127,18 @@ function tableRef(): string {
   if (!ID_RE.test(CONFIG.table)) throw new Error(`Invalid BQAA_TABLE: ${CONFIG.table}`);
   return "`" + `${CONFIG.project}.${CONFIG.dataset}.${CONFIG.table}` + "`";
 }
+if (process.env.NODE_ENV === "production" && !process.env.BQAA_PROJECT && process.env.BQAA_MOCK !== "1") {
+  console.error("BQAA_PROJECT is required in production (or set BQAA_MOCK=1 explicitly for a demo)");
+  process.exit(1);
+}
 if (!CONFIG.mock) tableRef(); // fail fast on invalid identifiers
+
+// Every payload names its true source; synthetic backends are always labeled.
+function sourceLabel(): string {
+  if (CONFIG.mock) return "mock";
+  return `${CONFIG.project}.${CONFIG.dataset}.${CONFIG.table}${FAKE_BQ ? ` [FAKE_BQ:${FAKE_BQ} — synthetic test data]` : ""}`;
+}
+const SYNTHETIC = (): boolean => CONFIG.mock || !!FAKE_BQ;
 
 function uiBundlePath(): string {
   // src layout: <root>/dist/mcp-app.html — container layout: <dist>/mcp-app.html
@@ -163,6 +188,7 @@ async function runQuery(
     // the slot is retained until that bounded cancellation settles.
     let jobRef: any = null;
     let onAbort: (() => void) | null = null;
+    let expired = false; // #1: a job that surfaces after expiry must self-cancel
     const work = (async () => {
       const client = await bigQueryClient();
       const [job] = await client.createQueryJob({
@@ -171,6 +197,12 @@ async function runQuery(
         maximumBytesBilled: String(maxBytes),
       });
       jobRef = job;
+      if (expired) {
+        // the deadline already fired while creation was in flight: cancel the
+        // late job and never poll it
+        await withDeadline(Promise.resolve(job.cancel?.()), 5_000).catch(() => {});
+        throw new Error(`BigQuery query timed out after ${CONFIG.queryTimeoutMs} ms (job created after expiry)`);
+      }
       if (signal) {
         onAbort = () => void job.cancel?.().catch(() => {});
         if (signal.aborted) onAbort();
@@ -183,6 +215,7 @@ async function runQuery(
     try {
       return await withDeadline<QueryResult>(work, CONFIG.queryTimeoutMs);
     } catch (e) {
+      expired = true;
       work.catch(() => {}); // the abandoned lifecycle must not become unhandled
       if (e instanceof Error && e.message.includes("timed out") && jobRef) {
         // hold the admission slot until cancellation is confirmed (bounded)
@@ -193,15 +226,6 @@ async function runQuery(
       if (signal && onAbort) signal.removeEventListener("abort", onAbort);
     }
   });
-}
-
-// Test seam: BQAA_FAKE_BQ swaps in a controllable fake client. It is refused
-// outright in production builds, and every payload it produces is labeled —
-// synthetic rows must be impossible to mistake for live telemetry.
-const FAKE_BQ = process.env.NODE_ENV !== "production" ? (process.env.BQAA_FAKE_BQ ?? "") : "";
-if (process.env.BQAA_FAKE_BQ && process.env.NODE_ENV === "production") {
-  console.error("BQAA_FAKE_BQ is test-only and cannot be enabled in production builds");
-  process.exit(1);
 }
 
 async function bigQueryClient(): Promise<any> {
@@ -256,6 +280,7 @@ async function bigQueryDashboard(
   end: Date,
   granularity: Granularity,
   agent?: string | null,
+  signal?: AbortSignal,
 ): Promise<DashboardData> {
   const sql = buildDashboardSql({ table: tableRef(), granularity, agentFilter: !!agent });
   const params: Record<string, unknown> = { start: start.toISOString(), end: end.toISOString() };
@@ -266,14 +291,17 @@ async function bigQueryDashboard(
     end: start.toISOString(),
     ...(agent ? { agent } : {}),
   };
+  // delegation resolves parent-child edges over ALL spans first, then filters
+  // edges by the requested agent — so it needs the @agent param but not the
+  // per-row agent predicate; the agents option list never filters.
   const paramsFor = (s: (typeof SECTIONS)[number]): Record<string, unknown> =>
-    s === "prev_overview" ? prevParams : s === "agents" || s === "delegation" ? { start: params.start, end: params.end } : params;
+    s === "prev_overview" ? prevParams : s === "agents" ? { start: params.start, end: params.end } : params;
 
   // The refresh budget is split exactly across the panel queries so one
   // dashboard load can never authorize more than BQAA_MAX_BYTES_BILLED total.
   const perQueryBytes = splitBudget(CONFIG.refreshBytesBudget, SECTIONS.length);
 
-  const settled = await Promise.allSettled(SECTIONS.map((s) => runQuery(sql[s], paramsFor(s), perQueryBytes)));
+  const settled = await Promise.allSettled(SECTIONS.map((s) => runQuery(sql[s], paramsFor(s), perQueryBytes, signal)));
 
   // One failed panel must not blank the dashboard: keep healthy sections,
   // report the failed ones (truthfully) in meta.section_errors.
@@ -307,7 +335,7 @@ async function bigQueryDashboard(
 
   return {
     meta: {
-      source: `${CONFIG.project}.${CONFIG.dataset}.${CONFIG.table}${FAKE_BQ ? ` [FAKE_BQ:${FAKE_BQ} — synthetic test data]` : ""}`,
+      source: sourceLabel(),
       start: start.toISOString(),
       end: end.toISOString(),
       granularity,
@@ -343,7 +371,7 @@ async function loadWidget(
   const granularity: Granularity = spec.granularity ?? (timeRangeHours <= 72 ? "hour" : "day");
   const fullSpec: WidgetSpec = { v: 1, ...spec, granularity };
   if (CONFIG.mock) {
-    const result = mockWidget(fullSpec, start, end);
+    const result = { ...mockWidget(fullSpec, start, end), source: "mock" };
     return dryRun ? { ...result, rows: [], dry_run: true, estimated_bytes: 12_345_678 } : result;
   }
   const built = buildWidgetSql(tableRef(), fullSpec);
@@ -351,10 +379,10 @@ async function loadWidget(
   const window = { start: start.toISOString(), end: end.toISOString() };
   if (dryRun) {
     const estimated = await dryRunQuery(built.sql, params);
-    return { spec: fullSpec as WidgetResult["spec"], window, rows: [], dry_run: true, estimated_bytes: estimated };
+    return { spec: fullSpec as WidgetResult["spec"], window, rows: [], dry_run: true, estimated_bytes: estimated, source: sourceLabel() };
   }
   const { rows, bytes } = await runQuery(built.sql, params, WIDGET_QUERY_BYTES, signal);
-  return { spec: fullSpec as WidgetResult["spec"], window, rows, bytes_processed: bytes };
+  return { spec: fullSpec as WidgetResult["spec"], window, rows, bytes_processed: bytes, source: sourceLabel() };
 }
 
 // ------------------------------------------------ conversational layer (BQCA)
@@ -370,10 +398,10 @@ interface AskScope {
 }
 
 async function ask(question: string, history: AskExchange[], scope: AskScope, signal?: AbortSignal): Promise<AskResult> {
-  if (CONFIG.mock) return mockAsk(question);
   if (CONFIG.caDisabled) {
     throw new Error("Conversational analytics is disabled on this deployment (BQAA_CA_DISABLED=1)");
   }
+  if (CONFIG.mock) return mockAsk(question);
   if (inflightAsk >= MAX_CONCURRENT_ASK) {
     throw new Error("Server busy: too many concurrent Ask requests — retry shortly");
   }
@@ -407,7 +435,7 @@ async function ask(question: string, history: AskExchange[], scope: AskScope, si
   }
 }
 
-async function loadErrorTraces(timeRangeHours: number, limit: number): Promise<ErrorTraceRow[]> {
+async function loadErrorTraces(timeRangeHours: number, limit: number, signal?: AbortSignal): Promise<ErrorTraceRow[]> {
   if (CONFIG.mock) return mockErrorTraces().slice(0, limit);
   const end = new Date();
   const start = new Date(end.getTime() - timeRangeHours * 3_600_000);
@@ -415,6 +443,7 @@ async function loadErrorTraces(timeRangeHours: number, limit: number): Promise<E
     buildErrorTracesSql(tableRef()),
     { start: start.toISOString(), end: end.toISOString(), limit },
     WIDGET_QUERY_BYTES,
+    signal,
   );
   return rows;
 }
@@ -425,12 +454,21 @@ async function loadErrorTraces(timeRangeHours: number, limit: number): Promise<E
 // entries are evicted on access.
 const CACHE_TTL_MS = 60_000;
 const CACHE_MAX_ENTRIES = 50;
-const dashboardCache = new Map<string, { promise: Promise<DashboardData>; expires: number }>();
 
-function cacheGet(key: string): { promise: Promise<DashboardData>; expires: number } | null {
+interface CacheEntry {
+  promise: Promise<DashboardData>;
+  expires: number; // Infinity while pending — in-flight work is never evicted
+  settled: boolean;
+  subscribers: number; // callers currently awaiting this pipeline
+  abort: AbortController; // fires only when the LAST subscriber disconnects
+}
+
+const dashboardCache = new Map<string, CacheEntry>();
+
+function cacheGet(key: string): CacheEntry | null {
   const entry = dashboardCache.get(key);
   if (!entry) return null;
-  if (entry.expires <= Date.now()) {
+  if (entry.settled && entry.expires <= Date.now()) {
     dashboardCache.delete(key);
     return null;
   }
@@ -439,18 +477,42 @@ function cacheGet(key: string): { promise: Promise<DashboardData>; expires: numb
   return entry;
 }
 
-function cacheSet(key: string, entry: { promise: Promise<DashboardData>; expires: number }): void {
+function cacheSet(key: string, entry: CacheEntry): void {
   const now = Date.now();
-  for (const [k, e] of dashboardCache) if (e.expires <= now) dashboardCache.delete(k);
+  for (const [k, e] of dashboardCache) if (e.settled && e.expires <= now) dashboardCache.delete(k);
   while (dashboardCache.size >= CACHE_MAX_ENTRIES) {
-    const oldest = dashboardCache.keys().next().value;
-    if (oldest == null) break;
-    dashboardCache.delete(oldest);
+    // evict the oldest SETTLED entry; pending pipelines have awaiting callers
+    let evicted = false;
+    for (const [k, e] of dashboardCache) {
+      if (e.settled) {
+        dashboardCache.delete(k);
+        evicted = true;
+        break;
+      }
+    }
+    if (!evicted) break;
   }
   dashboardCache.set(key, entry);
 }
 
-async function loadDashboard(timeRangeHours: number, agent?: string | null): Promise<DashboardData> {
+// #14/#11: callers subscribe to the shared pipeline; a caller abort only
+// cancels the underlying BigQuery work when NO other subscriber remains.
+function subscribe(entry: CacheEntry, signal?: AbortSignal): void {
+  if (!signal || entry.settled) return;
+  entry.subscribers++;
+  const release = (): void => {
+    entry.subscribers--;
+    if (entry.subscribers <= 0 && !entry.settled) entry.abort.abort();
+  };
+  if (signal.aborted) release();
+  else signal.addEventListener("abort", release, { once: true });
+}
+
+async function loadDashboard(
+  timeRangeHours: number,
+  agent?: string | null,
+  signal?: AbortSignal,
+): Promise<DashboardData> {
   const end = new Date();
   const start = new Date(end.getTime() - timeRangeHours * 3_600_000);
   const granularity: Granularity = timeRangeHours <= 72 ? "hour" : "day";
@@ -459,31 +521,42 @@ async function loadDashboard(timeRangeHours: number, agent?: string | null): Pro
   const key = `${timeRangeHours}|${agent ?? ""}`;
   const cached = cacheGet(key);
   if (cached) {
+    subscribe(cached, signal);
     const data = await cached.promise;
     return { ...data, meta: { ...data.meta, cache_hit: true } };
   }
-  const promise = bigQueryDashboard(start, end, granularity, agent);
-  const entry = { promise, expires: Date.now() + CACHE_TTL_MS };
+  const abort = new AbortController();
+  const entry: CacheEntry = {
+    promise: undefined as any,
+    expires: Infinity, // #26: pending work is never evicted mid-flight
+    settled: false,
+    subscribers: 0,
+    abort,
+  };
+  entry.promise = bigQueryDashboard(start, end, granularity, agent, abort.signal);
   cacheSet(key, entry);
-  promise
+  subscribe(entry, signal);
+  entry.promise
     .then((d) => {
-      // #2: a degraded (partial-failure) result must not be served from cache
-      // for the full TTL — evict it so the next refresh retries immediately.
+      entry.settled = true;
+      entry.expires = Date.now() + CACHE_TTL_MS; // #26: TTL starts at success
+      // a degraded (partial-failure) result must not be served from cache
       if (Object.keys(d.meta.section_errors ?? {}).length && dashboardCache.get(key) === entry) {
         dashboardCache.delete(key);
       }
     })
     .catch(() => {
+      entry.settled = true;
       if (dashboardCache.get(key) === entry) dashboardCache.delete(key); // failures are not cacheable
     });
-  return promise;
+  return entry.promise;
 }
 
 const TRACE_EVENT_CAP = 500;
 
 async function loadTrace(traceId: string, timeRangeHours: number, signal?: AbortSignal): Promise<TraceResult> {
   if (!TRACE_ID_RE.test(traceId)) throw new Error("Invalid trace_id");
-  if (CONFIG.mock) return { events: mockTrace(traceId), truncated: false };
+  if (CONFIG.mock) return { events: mockTrace(traceId), truncated: false, source: "mock" };
   const end = new Date();
   const start = new Date(end.getTime() - timeRangeHours * 3_600_000);
   // fetch cap+1 so truncation is reported instead of silently dropping events
@@ -493,7 +566,7 @@ async function loadTrace(traceId: string, timeRangeHours: number, signal?: Abort
     WIDGET_QUERY_BYTES,
     signal,
   );
-  return { events: rows.slice(0, TRACE_EVENT_CAP), truncated: rows.length > TRACE_EVENT_CAP };
+  return { events: rows.slice(0, TRACE_EVENT_CAP), truncated: rows.length > TRACE_EVENT_CAP, source: sourceLabel() };
 }
 
 // ---------------------------------------------------------------- summaries
@@ -533,8 +606,8 @@ const metricArgs = {
   agent: z.string().max(200).optional().describe("Optional: restrict to a single agent name"),
 };
 
-async function metricsHandler(args: { time_range_hours?: number; agent?: string }) {
-  const data = await loadDashboard(args.time_range_hours ?? CONFIG.defaultHours, args.agent ?? null);
+async function metricsHandler(args: { time_range_hours?: number; agent?: string }, extra?: { signal?: AbortSignal }) {
+  const data = await loadDashboard(args.time_range_hours ?? CONFIG.defaultHours, args.agent ?? null, extra?.signal);
   return {
     content: [{ type: "text" as const, text: summarize(data) }],
     structuredContent: { data } as any,
@@ -583,7 +656,8 @@ function widgetSpecOf(args: WidgetArgs): WidgetSpec {
 }
 
 function summarizeWidget(r: WidgetResult): string {
-  const label = `${WIDGET_MEASURES[r.spec.measure]?.label ?? r.spec.measure} by ${r.spec.dimension}`;
+  const marker = SYNTHETIC() ? "(synthetic sample data) " : "";
+  const label = `${marker}${WIDGET_MEASURES[r.spec.measure]?.label ?? r.spec.measure} by ${r.spec.dimension}`;
   if (r.dry_run) {
     return `Dry run for "${label}": would scan ~${((r.estimated_bytes ?? 0) / 1e6).toFixed(1)} MB.`;
   }
@@ -594,8 +668,8 @@ function summarizeWidget(r: WidgetResult): string {
   return `${label} (${r.rows.length} rows): ${top}${r.rows.length > 5 ? "; …" : ""}`;
 }
 
-async function widgetHandler(args: WidgetArgs) {
-  const result = await loadWidget(widgetSpecOf(args), args.time_range_hours ?? CONFIG.defaultHours, !!args.dry_run);
+async function widgetHandler(args: WidgetArgs, extra?: { signal?: AbortSignal }) {
+  const result = await loadWidget(widgetSpecOf(args), args.time_range_hours ?? CONFIG.defaultHours, !!args.dry_run, extra?.signal);
   return {
     content: [{ type: "text" as const, text: summarizeWidget(result) }],
     structuredContent: { data: result } as any,
@@ -645,8 +719,8 @@ server.registerTool(
     },
     outputSchema: { data: z.unknown() },
   },
-  async (args) => {
-    const trace = await loadTrace(args.trace_id, args.time_range_hours ?? CONFIG.defaultHours);
+  async (args, extra) => {
+    const trace = await loadTrace(args.trace_id, args.time_range_hours ?? CONFIG.defaultHours, extra?.signal);
     const errorCount = trace.events.filter(
       (e) => e.status === "ERROR" || e.event_type.endsWith("_ERROR") || e.error_message != null,
     ).length;
@@ -655,7 +729,7 @@ server.registerTool(
         {
           type: "text" as const,
           text:
-            `Trace ${args.trace_id}: ${trace.events.length} events, ${errorCount} errors.` +
+            `${SYNTHETIC() ? "(synthetic sample data) " : ""}Trace ${args.trace_id}: ${trace.events.length} events, ${errorCount} errors.` +
             (trace.truncated ? ` TRUNCATED at ${trace.events.length} events — narrow the window for the full trace.` : ""),
         },
       ],
@@ -708,11 +782,13 @@ server.registerTool(
     },
     outputSchema: { data: z.unknown() },
   },
-  async (args) => {
-    const result = await ask(args.question, args.history ?? [], {
-      time_range_hours: args.time_range_hours,
-      agent: args.agent,
-    });
+  async (args, extra) => {
+    const result = await ask(
+      args.question,
+      args.history ?? [],
+      { time_range_hours: args.time_range_hours, agent: args.agent },
+      extra?.signal,
+    );
     return {
       content: [{ type: "text" as const, text: result.answer + (result.sql ? `\n\nGenerated SQL:\n${result.sql}` : "") }],
       structuredContent: { data: result } as any,
@@ -732,10 +808,10 @@ server.registerTool(
     },
     outputSchema: { data: z.unknown() },
   },
-  async (args) => {
-    const rows = await loadErrorTraces(args.time_range_hours ?? CONFIG.defaultHours, args.limit ?? 10);
+  async (args, extra) => {
+    const rows = await loadErrorTraces(args.time_range_hours ?? CONFIG.defaultHours, args.limit ?? 10, extra?.signal);
     const text = rows.length
-      ? `${rows.length} recent trace(s) with errors:\n` +
+      ? `${SYNTHETIC() ? "(synthetic sample data) " : ""}${rows.length} recent trace(s) with errors:\n` +
         rows.map((r) => `- ${r.trace_id} (${r.last_ts}, agents: ${r.agents ?? "?"}) — ${r.sample_errors ?? ""}`).join("\n")
       : "No traces with errors in this window.";
     return { content: [{ type: "text" as const, text }], structuredContent: { data: rows } as any };
@@ -836,10 +912,19 @@ app.use((req, res, next) => {
 // lives at /api/health and actually proves BigQuery access with a cached,
 // zero-cost dry run — green must mean "can serve data".
 let bqProbe: { ok: boolean; detail: string; checked: number } = { ok: true, detail: "unchecked", checked: 0 };
+let bqProbeInflight: Promise<{ ok: boolean; detail: string }> | null = null;
 
 async function probeBigQuery(): Promise<{ ok: boolean; detail: string }> {
   if (CONFIG.mock) return { ok: true, detail: "mock" };
   if (Date.now() - bqProbe.checked < 60_000) return bqProbe;
+  if (bqProbeInflight) return bqProbeInflight; // #27: cold probes coalesce
+  bqProbeInflight = runProbe().finally(() => {
+    bqProbeInflight = null;
+  });
+  return bqProbeInflight;
+}
+
+async function runProbe(): Promise<{ ok: boolean; detail: string }> {
   try {
     const end = new Date();
     const start = new Date(end.getTime() - 3_600_000);
@@ -904,9 +989,12 @@ app.post("/auth/login", checkOrigin, (req, res) => {
 // (cached/coalesced) dashboard pipeline, which other callers may be awaiting.
 function requestAbort(req: express.Request, res: express.Response): AbortSignal {
   const ac = new AbortController();
-  req.on("close", () => {
+  // #3: req 'close' fires once the request BODY is consumed (normal POSTs!),
+  // so disconnect detection must watch the response/socket instead.
+  res.on("close", () => {
     if (!res.writableEnded) ac.abort();
   });
+  void req; // request stream events are deliberately not used for aborts
   return ac.signal;
 }
 
@@ -914,7 +1002,7 @@ app.get("/api/dashboard", checkOrigin, requireAuth, async (req, res) => {
   try {
     const hours = Math.min(MAX_HOURS, Math.max(1, Math.trunc(Number(req.query.time_range_hours)) || CONFIG.defaultHours));
     const agentRaw = typeof req.query.agent === "string" ? req.query.agent.slice(0, 200) : "";
-    const data = await loadDashboard(hours, agentRaw || null);
+    const data = await loadDashboard(hours, agentRaw || null, requestAbort(req, res));
     res.json({ data });
   } catch (e) {
     res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
@@ -930,7 +1018,7 @@ app.get("/api/trace", checkOrigin, requireAuth, async (req, res) => {
     }
     const hours = Math.min(MAX_HOURS, Math.max(1, Math.trunc(Number(req.query.time_range_hours)) || CONFIG.defaultHours));
     const trace = await loadTrace(traceId, hours, requestAbort(req, res));
-    res.json({ data: trace.events, truncated: trace.truncated });
+    res.json({ data: trace.events, truncated: trace.truncated, source: trace.source });
   } catch (e) {
     res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
   }
@@ -1038,13 +1126,13 @@ app.use((err: any, _req: express.Request, res: express.Response, next: express.N
   res.status(500).json({ error: "Internal server error" });
 });
 
-app.listen(CONFIG.port, () => {
+app.listen(CONFIG.port, CONFIG.host, () => {
   const authNote = CONFIG.authToken ? "auth: bearer token" : "auth: NONE (set BQAA_AUTH_TOKEN)";
   const originNote = CONFIG.allowedOrigins.length
     ? `origins: ${CONFIG.allowedOrigins.join(",")}`
     : "origins: same-origin only";
   console.log(
-    `BQAA dashboard MCP server on http://localhost:${CONFIG.port}/mcp ` +
+    `BQAA dashboard MCP server on http://${CONFIG.host}:${CONFIG.port}/mcp ` +
       (CONFIG.mock
         ? "(mock data — set BQAA_PROJECT/BQAA_DATASET/BQAA_TABLE for BigQuery)"
         : `(BigQuery: ${CONFIG.project}.${CONFIG.dataset}.${CONFIG.table})`) +

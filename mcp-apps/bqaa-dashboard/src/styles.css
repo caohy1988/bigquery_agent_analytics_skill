@@ -403,6 +403,9 @@ details.data-table[open] summary { color: var(--ink-2); }
 
 /* trace drill-down timeline */
 .trace-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+/* the unbroken 32-char trace id must shrink, not push the Close button out */
+.trace-head h2 { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.trace-head .trace-close { flex: none; }
 .trace-close {
   font: 500 12px var(--font-body);
   color: var(--ink-2);
@@ -416,8 +419,10 @@ details.data-table[open] summary { color: var(--ink-2); }
 .trace-timeline { display: flex; flex-direction: column; margin-top: 8px; }
 .trace-row {
   display: grid;
-  grid-template-columns: 64px minmax(140px, max-content) 1fr max-content;
-  gap: 10px;
+  /* every column can shrink: the row must fit a 320px host without widening
+     the document; long event types ellipsize instead of growing the track */
+  grid-template-columns: 48px minmax(88px, auto) minmax(0, 1fr) max-content;
+  gap: 8px;
   align-items: baseline;
   padding: 6px 10px;
   border-left: 2px solid var(--grid);
@@ -425,7 +430,7 @@ details.data-table[open] summary { color: var(--ink-2); }
 }
 .trace-row.error { border-left-color: var(--s8); }
 .trace-t { color: var(--muted); font-variant-numeric: tabular-nums; }
-.trace-type { color: var(--ink); font-weight: 500; white-space: nowrap; }
+.trace-type { color: var(--ink); font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .trace-detail { color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 .trace-lat { color: var(--muted); font-variant-numeric: tabular-nums; }
 .trace-row.error .trace-detail { color: #d03b3b; }

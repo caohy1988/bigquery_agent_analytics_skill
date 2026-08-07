@@ -9,6 +9,8 @@
 //   stall        — the overview query's results never resolve (deadline test)
 //   stall_create — the overview query's job CREATION never resolves, proving
 //                  the deadline covers the whole lifecycle, not just polling
+//   slow_create  — the overview job's creation resolves AFTER the deadline;
+//                  the late job must be cancelled and never polled
 
 import { BQ_MIN_BYTES_PER_QUERY } from "./queries.js";
 
@@ -82,6 +84,10 @@ export function makeFakeBigQuery(scenario: string): { createQueryJob: (opts: Fak
       if (scenario === "stall_create" && opts.query.includes("AS total_events")) {
         await new Promise(() => {}); // job creation hangs forever
       }
+      const lateCreate = scenario === "slow_create" && opts.query.includes("AS total_events");
+      if (lateCreate) {
+        await new Promise((r) => setTimeout(r, 1500)); // resolves after the test deadline
+      }
       if (opts.dryRun) {
         return [{ metadata: { statistics: { totalBytesProcessed: "1234567" } } }];
       }
@@ -94,6 +100,7 @@ export function makeFakeBigQuery(scenario: string): { createQueryJob: (opts: Fak
       const stallThis = scenario === "stall" && opts.query.includes("AS total_events");
       const job = {
         async getQueryResults() {
+          if (lateCreate) console.log("FAKE_BQ_LATE_POLL"); // must never appear (#1)
           if (failThis) throw new Error("synthetic models-section failure");
           if (stallThis) await new Promise(() => {}); // never resolves
           return [rowsFor(opts.query)];

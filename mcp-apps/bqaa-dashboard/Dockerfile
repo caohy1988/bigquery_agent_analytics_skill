@@ -12,6 +12,7 @@ RUN npm run build \
 FROM node:22-slim
 WORKDIR /app
 ENV NODE_ENV=production
+ENV BQAA_HOST=0.0.0.0
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 COPY --from=build /app/dist ./dist

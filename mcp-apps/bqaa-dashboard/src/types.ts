@@ -146,6 +146,7 @@ export interface WidgetResult {
   bytes_processed?: number | null;
   estimated_bytes?: number | null; // dry-run only
   dry_run?: boolean;
+  source?: string; // provenance — "mock", table id, or labeled synthetic
 }
 
 // ---------------------------------------------- conversational layer (BQCA)
@@ -176,6 +177,7 @@ export interface ErrorTraceRow {
 export interface TraceResult {
   events: TraceEvent[];
   truncated: boolean; // true when the trace has more events than the cap
+  source?: string; // provenance — "mock", table id, or labeled synthetic
 }
 
 export interface TraceEvent {
