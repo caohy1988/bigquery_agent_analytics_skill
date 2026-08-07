@@ -7,6 +7,7 @@ import "./styles.css";
 import { App } from "@modelcontextprotocol/ext-apps";
 import { mockAsk, mockDashboard, mockTrace, mockWidget } from "./mock.js";
 import { WIDGET_DIMENSIONS, WIDGET_MEASURES } from "./queries.js";
+import { buildSpans } from "./spans.js";
 import type {
   AskResult,
   DashboardData,
@@ -2311,6 +2312,89 @@ function isErrorEvent(e: TraceEvent): boolean {
   return e.status === "ERROR" || e.event_type.endsWith("_ERROR") || e.error_message != null;
 }
 
+// Waterfall: spans as duration bars on a shared time axis, indented by
+// parent-child depth — the classic tracing view (LLM=blue, tool=orange,
+// other=aqua; errors outlined and labeled, never color-alone).
+function renderWaterfall(container: HTMLElement, events: TraceEvent[]): void {
+  const { spans, totalMs } = buildSpans(events);
+  if (!spans.length) return;
+
+  const legend = el("div", "legend");
+  for (const item of [
+    { name: "LLM", cssVar: "--s1" },
+    { name: "Tool", cssVar: "--s2" },
+    { name: "Other", cssVar: "--s3" },
+  ]) {
+    const it = el("span", "item");
+    const key = el("span", "key-rect");
+    key.style.background = `var(${item.cssVar})`;
+    it.appendChild(key);
+    it.appendChild(document.createTextNode(item.name));
+    legend.appendChild(it);
+  }
+  const errKey = el("span", "item");
+  errKey.appendChild(el("span", "wf-err-key"));
+  errKey.appendChild(document.createTextNode("Error"));
+  legend.appendChild(errKey);
+  container.appendChild(legend);
+
+  const wf = el("div", "waterfall");
+  // time axis with ~4 clean ticks
+  const axis = el("div", "wf-axis");
+  axis.appendChild(el("span", "wf-axis-label", ""));
+  const ticksWrap = el("div", "wf-ticks");
+  for (let t = 0; t <= 4; t++) {
+    const tick = el("span", "wf-tick", fmtMs((totalMs / 4) * t));
+    tick.style.left = `${t * 25}%`;
+    ticksWrap.appendChild(tick);
+  }
+  axis.appendChild(ticksWrap);
+  wf.appendChild(axis);
+
+  const kindVar: Record<string, string> = { llm: "--s1", tool: "--s2", other: "--s3" };
+  for (const span of spans) {
+    const row = el("div", "wf-row");
+    row.tabIndex = 0;
+    const label = el("span", "wf-label", `${span.error ? "! " : ""}${span.name}`);
+    label.style.paddingLeft = `${span.depth * 12}px`;
+    if (span.error) label.classList.add("error");
+    row.appendChild(label);
+    const track = el("span", "wf-track");
+    const left = Math.min(99, (span.startMs / totalMs) * 100);
+    if (span.instant) {
+      const dot = el("span", "wf-dot");
+      dot.style.left = `${left}%`;
+      dot.style.background = `var(${kindVar[span.kind]})`;
+      track.appendChild(dot);
+    } else {
+      const bar = el("span", `wf-bar${span.error ? " error" : ""}`);
+      bar.style.left = `${left}%`;
+      bar.style.width = `${Math.max(0.8, ((span.endMs - span.startMs) / totalMs) * 100)}%`;
+      bar.style.background = `var(${kindVar[span.kind]})`;
+      track.appendChild(bar);
+    }
+    row.appendChild(track);
+    row.appendChild(el("span", "wf-dur", span.instant ? "·" : fmtMs(span.endMs - span.startMs)));
+    const present = (x: number, y: number): void =>
+      showTooltip(span.name, [
+        { name: "start", value: `+${(span.startMs / 1000).toFixed(2)}s` },
+        { name: "duration", value: span.instant ? "instant" : fmtMs(span.endMs - span.startMs), cssVar: kindVar[span.kind] },
+        ...(span.agent ? [{ name: "agent", value: span.agent }] : []),
+        ...(span.error ? [{ name: "status", value: span.detail || "ERROR", cssVar: "--s8" }] : []),
+        ...(!span.error && span.detail ? [{ name: "detail", value: span.detail }] : []),
+      ], x, y);
+    row.addEventListener("pointermove", (e) => present(e.clientX, e.clientY));
+    row.addEventListener("pointerleave", hideTooltip);
+    row.addEventListener("focus", () => {
+      const r = row.getBoundingClientRect();
+      present(r.left + r.width / 2, r.bottom);
+    });
+    row.addEventListener("blur", hideTooltip);
+    wf.appendChild(row);
+  }
+  container.appendChild(wf);
+}
+
 function renderTraceCard(main: HTMLElement): void {
   const t = traceCard;
   if (!t || t.view !== currentView) return;
@@ -2334,6 +2418,8 @@ function renderTraceCard(main: HTMLElement): void {
   } else if (!t.events.length) {
     body.appendChild(el("div", "empty", "No events found for this trace in the selected window"));
   } else {
+    renderWaterfall(body, t.events);
+    const log = statefulDetails("data-table", "Event log", `trace-log:${t.traceId}`);
     const t0 = Date.parse(t.events[0].timestamp);
     const list = el("div", "trace-timeline");
     for (const e of t.events) {
@@ -2351,7 +2437,8 @@ function renderTraceCard(main: HTMLElement): void {
       row.appendChild(el("span", "trace-lat", e.latency_ms != null ? fmtMs(e.latency_ms) : ""));
       list.appendChild(row);
     }
-    body.appendChild(list);
+    log.appendChild(list);
+    body.appendChild(log);
     if (t.truncated) {
       body.appendChild(
         el("div", "sub", `Showing the first ${t.events.length} events — the trace is longer; narrow the time window for the rest.`),

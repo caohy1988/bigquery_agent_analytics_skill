@@ -25,8 +25,10 @@ and get eight views:
 
 Global filters (time-range presets + agent) re-query BigQuery through the
 iframe → host `tools/call` bridge. Every chart has hover/keyboard tooltips and
-an accessible "Show data" table; top sessions drill down to a full trace
-timeline (`get_trace`). Light and dark themes are both first-class.
+an accessible "Show data" table; top sessions drill down to a trace
+**waterfall** (spans as duration bars, nested by parent/child, errors
+highlighted) with the flat event log behind a disclosure (`get_trace`).
+Light and dark themes are both first-class.
 
 ## Tools exposed
 

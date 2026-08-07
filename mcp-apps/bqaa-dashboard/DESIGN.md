@@ -208,7 +208,10 @@ single CSP-safe file and the chart set is small and bespoke.
   CVD-validated palette; series identity is never color-alone.
 - **Views** (8): Overview, Ask, Latency, Tokens, Tools, Cost (client-side
   price book in `localStorage` × exact token sums), Agents (HITL +
-  delegation), Explore (widget builder with dry-run estimate).
+  delegation), Explore (widget builder with dry-run estimate). Trace
+  drill-down renders a **waterfall** (`src/spans.ts` reconstructs spans from
+  start/complete event pairs with completion-only latency fallback and
+  parent-chain depth; unit-tested) plus the flat event log.
 - **State discipline** (hardened across three review rounds):
   - every async path publishes through a guard — refresh generation +
     `AbortController` (dashboard), operation sequence + abort (Explore), trace
