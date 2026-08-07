@@ -2558,6 +2558,22 @@ if (embedded) {
       void refresh(); // always re-sync the dashboard to the pushed scope
       return;
     }
+    // render_trace pushes a trace: open the waterfall card on the current view
+    if (payload?.trace_id && Array.isArray(payload.events)) {
+      traceGen++; // supersede any in-flight local trace fetch
+      traceAbort?.abort();
+      traceCard = {
+        traceId: payload.trace_id,
+        view: currentView,
+        events: payload.events as TraceEvent[],
+        truncated: !!payload.truncated,
+        error: null,
+      };
+      renderView();
+      document.getElementById("trace-card")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      if (!data) void refresh(); // populate the rest of the dashboard behind it
+      return;
+    }
     // a host push is the newest truth — invalidate in-flight refreshes and
     // any trace whose scope no longer matches (#7)
     const d = extractData(result);

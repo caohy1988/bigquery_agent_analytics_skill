@@ -743,3 +743,20 @@ test("a disconnected coalesced caller releases while the survivor completes (#4-
     srv.child.kill();
   }
 });
+
+// ---- render_trace: the waterfall is model-invokable
+
+test("render_trace carries UI metadata and a renderable trace payload", async () => {
+  const tools = await rpc(BASE, "tools/list", {});
+  const rt = tools.body.result.tools.find((t) => t.name === "render_trace");
+  assert.equal(rt?._meta?.ui?.resourceUri, "ui://bqaa/dashboard.html", "render_trace must declare the app UI");
+  const call = await rpc(BASE, "tools/call", {
+    name: "render_trace",
+    arguments: { trace_id: "abcd1234abcd1234" },
+  });
+  const d = call.body.result.structuredContent?.data;
+  assert.equal(d?.trace_id, "abcd1234abcd1234", "payload must identify the trace for the UI");
+  assert.ok(Array.isArray(d?.events) && d.events.length > 0);
+  assert.equal(typeof d?.truncated, "boolean");
+  assert.match(call.body.result.content[0].text, /waterfall has been rendered/);
+});

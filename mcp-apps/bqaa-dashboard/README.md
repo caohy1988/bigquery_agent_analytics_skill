@@ -44,6 +44,8 @@ Light and dark themes are both first-class.
   Analytics (plans, writes and runs SQL; ~30–60 s).
 - `get_trace(trace_id, time_range_hours)` — ordered trace reconstruction for
   drill-down; reports truncation when a trace exceeds 500 events.
+- `render_trace(trace_id, time_range_hours)` — the same trace rendered
+  interactively: the waterfall opens in the dashboard UI inside the host.
 - `list_error_traces(time_range_hours, limit)` — recent trace ids with errors,
   for evidence-cited root-cause analysis.
 

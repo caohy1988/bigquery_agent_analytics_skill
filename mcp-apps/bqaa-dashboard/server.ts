@@ -860,6 +860,40 @@ server.registerTool(
   },
 );
 
+registerAppTool(
+  server,
+  "render_trace",
+  {
+    title: "Render a trace waterfall",
+    description:
+      "Render one trace interactively in the dashboard UI: a waterfall of spans (LLM calls, tool calls, instants) on a shared time axis with errors highlighted, plus the ordered event log. Use when the user wants to SEE a trace — e.g. after list_error_traces surfaces a suspicious trace id. get_trace returns the same data without UI.",
+    inputSchema: {
+      trace_id: z.string().regex(TRACE_ID_RE).describe("OpenTelemetry trace id"),
+      time_range_hours: z.number().int().min(1).max(MAX_HOURS).default(CONFIG.defaultHours),
+    },
+    outputSchema: { data: z.unknown() },
+    _meta: { ui: { resourceUri } },
+  },
+  async (args, extra) => {
+    const trace = await loadTrace(args.trace_id, args.time_range_hours ?? CONFIG.defaultHours, extra?.signal);
+    const errorCount = trace.events.filter(
+      (e) => e.status === "ERROR" || e.event_type.endsWith("_ERROR") || e.error_message != null,
+    ).length;
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text:
+            `${SYNTHETIC() ? "(synthetic sample data) " : ""}Trace ${args.trace_id}: ${trace.events.length} events, ${errorCount} errors.` +
+            (trace.truncated ? " TRUNCATED — narrow the window for the full trace." : "") +
+            " The waterfall has been rendered for the user.",
+        },
+      ],
+      structuredContent: { data: { trace_id: args.trace_id, ...trace } } as any,
+    };
+  },
+);
+
 server.registerTool(
   "list_error_traces",
   {
