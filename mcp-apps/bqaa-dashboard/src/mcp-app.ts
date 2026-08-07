@@ -1372,6 +1372,7 @@ function exploreSpecChanged(): void {
   widgetAbort?.abort(); // and stops its HTTP request outright (#15)
   explore.estimate = null;
   explore.result = null;
+  explore.note = ""; // #6(r10): a superseded op must not leave "Running..." behind
 }
 
 // #9/#21: the effective window can differ from the preset control (e.g. a
@@ -1384,8 +1385,22 @@ function currentHours(): number {
 
 // #15: superseded standalone widget requests are aborted, not just ignored
 let widgetAbort: AbortController | null = null;
-// #13(r9): embedded widget calls are uncancellable — allow only one in flight
+// #13(r9): embedded widget calls are uncancellable — allow only one in flight.
+// #7(r10): while one is in flight, the LATEST user action queues instead of
+// failing; it dispatches when the dispatcher frees, so Estimate→Run publishes
+// the Run, not an error.
 let embeddedWidgetBusy = false;
+let embeddedWidgetQueued: (() => void) | null = null;
+
+function dispatchWidgetAction(action: () => Promise<void>): void {
+  if (embedded && embeddedWidgetBusy) {
+    embeddedWidgetQueued = action; // latest wins
+    explore.note = "Waiting for the previous request to settle…";
+    renderView();
+    return;
+  }
+  void action();
+}
 
 async function runWidget(dryRun: boolean): Promise<WidgetResult> {
   const hours = currentHours();
@@ -1412,7 +1427,19 @@ async function runWidget(dryRun: boolean): Promise<WidgetResult> {
       if (!data?.spec) throw new Error("no widget data in tool result");
       return data as WidgetResult;
     } finally {
-      embeddedWidgetBusy = false;
+      // #7(r10): hold the dispatcher until the queued LATEST action fires
+      if (embeddedWidgetQueued) {
+        const next = embeddedWidgetQueued;
+        embeddedWidgetQueued = null;
+        setTimeout(() => {
+          embeddedWidgetBusy = false;
+          const latest = embeddedWidgetQueued ?? next;
+          embeddedWidgetQueued = null;
+          void latest();
+        }, 0);
+      } else {
+        embeddedWidgetBusy = false;
+      }
     }
   }
   if (location.protocol.startsWith("http")) {
@@ -1534,7 +1561,7 @@ function renderExplore(d: DashboardData | null, main: HTMLElement): void {
 
   const actions = el("div", "explore-actions");
   const estimateBtn = el("button", "trace-close", "Estimate scan");
-  estimateBtn.addEventListener("click", async () => {
+  estimateBtn.addEventListener("click", () => dispatchWidgetAction(async () => {
     const op = ++exploreOpSeq;
     explore.note = "Estimating…";
     renderView();
@@ -1548,9 +1575,9 @@ function renderExplore(d: DashboardData | null, main: HTMLElement): void {
       explore.note = `Estimate failed: ${e instanceof Error ? e.message : String(e)}`;
     }
     renderView();
-  });
+  }));
   const runBtn = el("button", "run-btn", "Run query");
-  runBtn.addEventListener("click", async () => {
+  runBtn.addEventListener("click", () => dispatchWidgetAction(async () => {
     const op = ++exploreOpSeq;
     explore.note = "Running…";
     renderView();
@@ -1564,7 +1591,7 @@ function renderExplore(d: DashboardData | null, main: HTMLElement): void {
       explore.note = `Query failed: ${e instanceof Error ? e.message : String(e)}`;
     }
     renderView();
-  });
+  }));
   const copyBtn = el("button", "link-btn", "Copy widget JSON");
   copyBtn.addEventListener("click", () => {
     // the copied shape IS the query_widget / render_widget tool-argument shape,
@@ -2047,6 +2074,15 @@ function setData(d: DashboardData): void {
   }
   scopeEl.replaceChildren();
   scopeEl.appendChild(el("span", "pill", d.meta.source === "mock" ? "sample data" : d.meta.source));
+  // #10(r10): curated panels only follow time + agent. When Explore carries
+  // model/tool/status filters (typed or pushed via render_widget), say so —
+  // otherwise the tabs imply a synchronized scope they do not have.
+  const unsynced = (["model", "tool", "status"] as const).filter((k) => (explore.spec.filters as any)?.[k]);
+  if (unsynced.length) {
+    const warn = el("span", "pill warn", `${unsynced.join(" + ")} filter: Explore only`);
+    warn.title = "Overview/Latency/Tokens/Tools/Cost/Agents panels apply only the time window and agent filter.";
+    scopeEl.appendChild(warn);
+  }
   scopeEl.appendChild(
     document.createTextNode(
       `last ${hours % 24 === 0 && hours >= 48 ? `${hours / 24} days` : `${hours} h`} · by ${d.meta.granularity}`,
@@ -2353,15 +2389,24 @@ function renderWaterfall(container: HTMLElement, events: TraceEvent[]): void {
   const axis = el("div", "wf-axis");
   axis.appendChild(el("span", "wf-axis-label", ""));
   const ticksWrap = el("div", "wf-ticks");
-  // #7(r9): tick density follows the available width so labels never overlap
-  const width = mainEl.clientWidth || 800;
-  const divisions = width < 420 ? 2 : width < 700 ? 3 : 4;
-  for (let t = 0; t <= divisions; t++) {
-    const tick = el("span", "wf-tick", fmtMs((totalMs / divisions) * t));
-    tick.style.left = `${(t / divisions) * 100}%`;
-    if (t === divisions) tick.classList.add("last"); // anchored inside the track
-    ticksWrap.appendChild(tick);
-  }
+  // #8(r10): density must follow the TRACK the labels actually live in — the
+  // panel is wider than the track by the row-label column, so panel-based
+  // counts overlap at 320px. Build from the panel as a first guess, then
+  // remeasure the mounted track and rebuild if the answer differs.
+  const buildTicks = (width: number): void => {
+    ticksWrap.replaceChildren();
+    const divisions = width < 200 ? 1 : width < 340 ? 2 : width < 560 ? 3 : 4;
+    for (let t = 0; t <= divisions; t++) {
+      const tick = el("span", "wf-tick", fmtMs((totalMs / divisions) * t));
+      tick.style.left = `${(t / divisions) * 100}%`;
+      if (t === divisions) tick.classList.add("last"); // anchored inside the track
+      ticksWrap.appendChild(tick);
+    }
+  };
+  buildTicks(Math.max(0, (mainEl.clientWidth || 800) - 120));
+  requestAnimationFrame(() => {
+    if (ticksWrap.isConnected && ticksWrap.clientWidth > 0) buildTicks(ticksWrap.clientWidth);
+  });
   axis.appendChild(ticksWrap);
   wf.appendChild(axis);
 
@@ -2467,6 +2512,9 @@ function renderTraceCard(main: HTMLElement): void {
 // stacking concurrent get_trace jobs against the shared admission cap.
 let embeddedTraceBusy = false;
 let embeddedTraceQueued: string | null = null;
+// #2(r10): a host-pushed trace is the newest intent — it advances this epoch
+// and clears the queue, and a captured dequeue must recheck before starting
+let traceIntentEpoch = 0;
 
 async function showTrace(traceId: string): Promise<void> {
   if (embedded && embeddedTraceBusy) {
@@ -2494,8 +2542,10 @@ async function showTrace(traceId: string): Promise<void> {
       if (embeddedTraceQueued) {
         const next = embeddedTraceQueued;
         embeddedTraceQueued = null;
+        const epoch = traceIntentEpoch; // #2(r10)
         setTimeout(() => {
           embeddedTraceBusy = false;
+          if (epoch !== traceIntentEpoch) return; // a host trace arrived meanwhile
           const latest = embeddedTraceQueued ?? next;
           embeddedTraceQueued = null;
           void showTrace(latest);
@@ -2579,7 +2629,15 @@ if (embedded) {
       exploreOpSeq++; // supersede any in-flight Explore op
       invalidateTrace(); // #7: an open trace belongs to the previous scope
       explore.spec = { v: 1, filters: {}, ...payload.spec };
-      explore.result = payload as WidgetResult;
+      if (payload.dry_run) {
+        // #9(r10): a cost estimate is NOT a data result — rendering it as one
+        // would claim the scoped query returned no rows
+        explore.estimate = payload.estimated_bytes ?? null;
+        explore.result = null;
+      } else {
+        explore.result = payload as WidgetResult;
+        explore.estimate = null;
+      }
       // keep the pushed widget's window as the effective one
       if (payload.window?.start && payload.window?.end) {
         const h = Math.round((Date.parse(payload.window.end) - Date.parse(payload.window.start)) / 3_600_000);
@@ -2603,6 +2661,9 @@ if (embedded) {
     if (payload?.trace_id && Array.isArray(payload.events)) {
       traceGen++; // supersede any in-flight local trace fetch
       traceAbort?.abort();
+      // #2(r10): revoke any QUEUED local trace too — latest-host-wins
+      traceIntentEpoch++;
+      embeddedTraceQueued = null;
       // #1(r9): adopt the pushed trace's window so the surrounding dashboard
       // is labeled and refreshed with the SAME scope the trace was fetched in
       const h = Math.trunc(Number(payload.time_range_hours));
@@ -2623,7 +2684,11 @@ if (embedded) {
       };
       renderView();
       document.getElementById("trace-card")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
-      if (!data) void refresh(); // populate the rest of the dashboard behind it
+      // #3(r10): the pushed window is a GLOBAL scope change — already-loaded
+      // panels, pending Ask answers, and Explore results all belong to the
+      // old window. Invalidate them and re-query; the pushed trace stays.
+      invalidateAskScope();
+      scheduleRefresh();
       return;
     }
     // a host push is the newest truth — invalidate in-flight refreshes and

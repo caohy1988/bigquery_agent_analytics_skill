@@ -57,8 +57,10 @@ export function buildSpans(events: TraceEvent[]): { spans: TraceSpan[]; totalMs:
   for (const [id, g] of groups) {
     parentOf.set(id, g.find((e) => e.parent_span_id)?.parent_span_id ?? null);
   }
-  // #11(r9): cyclic parent links are malformed hierarchy — every member of a
-  // cycle gets depth 0, and callers never add to a cycle-poisoned value.
+  // #11(r9): cyclic parent links are malformed hierarchy — members of a cycle
+  // get depth 0. #15(r10): ONLY the members actually on the cycle are zeroed;
+  // a chain that merely leads INTO a cycle resolves off it (parent depth + 1),
+  // so permuting event order can never change any span's depth.
   const depthCache = new Map<string, number>();
   const depthOf = (id: string): number => {
     if (depthCache.has(id)) return depthCache.get(id)!;
@@ -67,7 +69,7 @@ export function buildSpans(events: TraceEvent[]): { spans: TraceSpan[]; totalMs:
     let cur: string | null = id;
     while (cur && groups.has(cur) && !depthCache.has(cur)) {
       if (seen.has(cur)) {
-        for (const c of chain) depthCache.set(c, 0); // whole cycle → 0
+        for (const c of chain.slice(chain.indexOf(cur))) depthCache.set(c, 0); // the cycle itself
         break;
       }
       seen.add(cur);
@@ -96,7 +98,9 @@ export function buildSpans(events: TraceEvent[]): { spans: TraceSpan[]; totalMs:
   for (const [id, g] of groups) {
     const times = g.map((e) => Date.parse(e.timestamp));
     const starts = g.filter((e) => START_TYPES.test(e.event_type));
-    const latency = g.map((e) => e.latency_ms).find((l) => l != null) ?? null;
+    // residual #14(r10): malformed latency (NaN/Infinity from bad JSON) must
+    // never reach coordinate math — treat it as absent
+    const latency = g.map((e) => e.latency_ms).find((l) => l != null && Number.isFinite(l)) ?? null;
     if (starts.length) {
       boundsOf.set(id, {
         startAbs: Math.min(...starts.map((e) => Date.parse(e.timestamp))),
@@ -112,8 +116,10 @@ export function buildSpans(events: TraceEvent[]): { spans: TraceSpan[]; totalMs:
   }
   const orphanBounds = orphans.map((e) => {
     const at = Date.parse(e.timestamp);
-    // spanless completion events get the same latency fallback
-    return e.latency_ms != null ? { startAbs: at - e.latency_ms, endAbs: at } : { startAbs: at, endAbs: at };
+    // spanless completion events get the same latency fallback (finite only)
+    return e.latency_ms != null && Number.isFinite(e.latency_ms)
+      ? { startAbs: at - e.latency_ms, endAbs: at }
+      : { startAbs: at, endAbs: at };
   });
   const t0 = Math.min(
     ...events.map((e) => Date.parse(e.timestamp)),

@@ -1,16 +1,29 @@
 // Mock-data truthfulness — filters honored, one row set drives everything (r9).
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mockWidget, mockAsk } from "../src/mock.js";
+import { mockWidget, mockAsk, mockErrorTraces, mockTrace } from "../src/mock.js";
 
 const start = new Date("2026-07-01T00:00:00Z");
 const end = new Date("2026-07-02T00:00:00Z");
 
 test("mockWidget honors a filter on the grouped dimension (#8-r9)", () => {
-  const spec = { measure: "events", dimension: "agent", granularity: "auto", filters: { agent: "billing-agent" } };
+  const spec = { measure: "events", dimension: "agent", granularity: "auto", filters: { agent: "coder" } };
   const r = mockWidget(spec, start, end);
   assert.equal(r.rows.length, 1, "a matching dimension filter narrows to that value");
-  assert.equal(r.rows[0].dim, "billing-agent");
+  assert.equal(r.rows[0].dim, "coder");
+});
+
+test("filtering to an entity that does not exist returns zero rows (#11-r10)", () => {
+  const spec = { measure: "events", dimension: "agent", granularity: "auto", filters: { agent: "no-such-agent" } };
+  const r = mockWidget(spec, start, end);
+  assert.deepEqual(r.rows, [], "the mock must not invent the requested value");
+});
+
+test("mockWidget applies the production categorical limit contract (#12-r10)", () => {
+  const base = { measure: "events", dimension: "agent", granularity: "auto" };
+  assert.equal(mockWidget({ ...base, limit: 1 }, start, end).rows.length, 1, "limit: 1 keeps only the top row");
+  assert.equal(mockWidget(base, start, end).rows.length, 4, "default keeps the whole 4-agent domain (under 20)");
+  assert.equal(mockWidget({ ...base, limit: 100 }, start, end).rows.length, 4, "upper bound never pads rows");
 });
 
 test("mockWidget seed covers filters — different filters, different data (#8-r9)", () => {
@@ -34,4 +47,17 @@ test("mockAsk escapes a hostile agent value in the sample SQL (#9-r9)", () => {
   const r = mockAsk("q", { startIso: "2026-07-01T00:00:00Z", endIso: "2026-07-02T00:00:00Z", agent: "x' OR '1'='1" });
   assert.ok(!r.sql.includes("agent = 'x' OR '1'='1'"), "raw interpolation would break out of the literal");
   assert.ok(r.sql.includes("agent = 'x\\' OR \\'1\\'=\\'1'"), "value is escaped as one literal");
+});
+
+test("every listed error trace round-trips to its listed error count (#13-r10)", () => {
+  const isError = (e) => e.status === "ERROR" || e.event_type.endsWith("_ERROR") || e.error_message != null;
+  for (const row of mockErrorTraces()) {
+    const events = mockTrace(row.trace_id);
+    const errors = events.filter(isError);
+    assert.equal(errors.length, row.error_events, `${row.trace_id} must show exactly its listed count`);
+    assert.ok(errors.every((e) => e.error_message === row.sample_errors), "drill-down shows the listed message");
+  }
+  // and a trace NOT on the list must be error-free, so the list is complete
+  const other = mockTrace("traceffffffff9");
+  assert.equal(other.filter(isError).length, 0, "unlisted traces cannot contradict the error list");
 });

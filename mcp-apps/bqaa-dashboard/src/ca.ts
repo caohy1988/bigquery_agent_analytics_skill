@@ -156,6 +156,9 @@ export function parseMessages(question: string, parsed: any[]): AskResult {
   // arrival order. Arrival pairing remains only for streams with no groupIds,
   // and anything ambiguous pairs as sql:null so verification fails closed.
   const byGroup = new Map<string, QueryPair>();
+  // #4(r10): once a group has shown two SQL statements, ownership inside it
+  // is permanently unprovable - later SQL must NOT restore trust
+  const ambiguousGroups = new Set<string>();
 
   for (const m of parsed) {
     const sm = m?.systemMessage;
@@ -176,9 +179,15 @@ export function parseMessages(question: string, parsed: any[]): AskResult {
           p = { sql: null, schema: [], rows: [], hasResult: false };
           byGroup.set(gid, p);
           pairs.push(p);
+        } else if (p.sql != null) {
+          // a second SQL in an open group makes ownership ambiguous -
+          // permanently, for the whole group (#4-r10)
+          ambiguousGroups.add(gid);
+          p.sql = null;
         }
-        // a second SQL in the same open group makes ownership ambiguous
-        p.sql = p.sql == null ? sm.data.generatedSql : null;
+        if (!ambiguousGroups.has(gid) && p.sql == null && !p.hasResult) {
+          p.sql = sm.data.generatedSql;
+        }
       } else {
         current = { sql: sm.data.generatedSql, schema: [], rows: [], hasResult: false };
         pairs.push(current);
@@ -226,55 +235,140 @@ export function parseMessages(question: string, parsed: any[]): AskResult {
 
 // #3(r7): the scope instruction is prompt-level, so the label must be earned:
 // the generated SQL is checked for the scope's predicates, and the result
-// reports verified: true only when every check passes. Unverifiable or
-// missing-predicate SQL is reported truthfully as NOT verified.
-// #2(r9): verification is a deliberately SMALL grammar that must PROVE the
-// scope dominates the query, and rejects anything unprovable:
-//   1. comments are stripped; triple-quoted strings are unprovable → fail
-//   2. string literals are tokenized out, so literal CONTENT can never fake a
-//      predicate — predicates must appear in code with literal tokens
-//   3. constructs that can widen or split the scan are unprovable → fail:
-//      OR, UNION, multiple statements, or non-equality agent operators
-//   4. the time bound must be `timestamp BETWEEN <start> AND <end>` with the
-//      scope's exact literals; every `agent = <literal>` must equal the
-//      scope's agent, and at least one must exist
+// reports verified: true only when every check passes.
+// #1(r10): verification is a CLOSED grammar that must prove the scope
+// DOMINATES EVERY telemetry scan, not merely that predicate text exists:
+//   1. string literals are tokenized FIRST (#5-r10: agent names may contain
+//      comment delimiters), then comments are stripped from code only
+//   2. constructs that can widen, negate, or hide a scan are rejected
+//      outright: OR, NOT, IS TRUE/FALSE, UNION/INTERSECT/EXCEPT, EXISTS,
+//      JOIN, CASE, comma-joins, multiple statements, triple quotes
+//   3. every base-table FROM (recursively, through CTE bodies and derived
+//      tables) must have a WHERE whose top-level conjuncts include
+//      `timestamp BETWEEN <start> AND <end>` with the scope's exact
+//      literals — and the agent equality when the scope has an agent.
+//      Function-wrapped or nested predicates do not count.
+// Anything the grammar cannot prove is reported as NOT verified.
+const SUBEXPR = "";
+const LIT_RE = " (\\d+) ";
+
+function flattenTopLevel(text: string): { flat: string; groups: string[] } {
+  // Replace each top-level (...) group with a marker, EXCEPT TIMESTAMP(...)
+  // wrappers, which stay inline so literal conjuncts keep their shape.
+  const groups: string[] = [];
+  let flat = "";
+  let i = 0;
+  while (i < text.length) {
+    const ch = text[i];
+    if (ch === "(") {
+      let depth = 1;
+      let j = i + 1;
+      while (j < text.length && depth > 0) {
+        if (text[j] === "(") depth++;
+        else if (text[j] === ")") depth--;
+        j++;
+      }
+      const inner = text.slice(i + 1, j - 1);
+      const before = flat.replace(/\s+$/, "");
+      if (/\btimestamp$/i.test(before) && !inner.includes("(")) {
+        flat += `(${inner})`; // TIMESTAMP('...') wrapper stays inline
+      } else {
+        groups.push(inner);
+        flat += ` ${SUBEXPR}${groups.length - 1} `;
+      }
+      i = j;
+    } else {
+      flat += ch;
+      i++;
+    }
+  }
+  return { flat, groups };
+}
+
+function checkBlock(
+  text: string,
+  scope: { startIso: string; endIso: string; agent?: string },
+  literals: string[],
+  cteNames: Set<string>,
+  seen: { scans: number },
+): boolean {
+  const { flat, groups } = flattenTopLevel(text);
+  // collect CTE names declared at this level so their references are not
+  // mistaken for base-table scans (their bodies are verified recursively)
+  const names = new Set(cteNames);
+  for (const m of flat.matchAll(new RegExp(`(?:\\bWITH\\b|,)\\s*([A-Za-z_]\\w*)\\s+AS\\s+${SUBEXPR}\\d+`, "gi"))) {
+    names.add(m[1].toLowerCase());
+  }
+  const timeRe = new RegExp(
+    `\\btimestamp\\b\\s+BETWEEN\\s+(?:TIMESTAMP\\s*\\(\\s*)?${LIT_RE}\\s*\\)?\\s+AND\\s+(?:TIMESTAMP\\s*\\(\\s*)?${LIT_RE}\\s*\\)?`,
+    "i",
+  );
+  const fromRe = new RegExp(`\\bFROM\\s+(${SUBEXPR}\\d+|\`[^\`]+\`|[A-Za-z_][\\w.]*)`, "gi");
+  let fm: RegExpExecArray | null;
+  while ((fm = fromRe.exec(flat))) {
+    const src = fm[1];
+    if (src.startsWith(SUBEXPR)) continue; // derived table — verified recursively
+    const name = src.replace(/`/g, "");
+    if (/^UNNEST$/i.test(name)) continue; // array scan, not the table
+    if (names.has(name.toLowerCase()) && !name.includes(".")) continue; // CTE reference
+    seen.scans++;
+    // base-table scan — a comma here is an implicit join: unprovable
+    const after = flat.slice(fm.index + fm[0].length);
+    const rest = after.replace(/^\s+(?:AS\s+)?[A-Za-z_]\w*/i, ""); // optional alias
+    if (/^\s*,/.test(rest)) return false;
+    // its clause region runs to the next top-level clause keyword
+    const region = after.split(/\b(?:GROUP|HAVING|ORDER|LIMIT|WINDOW|QUALIFY)\b/i)[0];
+    const whereAt = region.search(/\bWHERE\b/i);
+    if (whereAt < 0) return false; // unconstrained scan
+    const where = region.slice(whereAt);
+    const tm = timeRe.exec(where);
+    if (!tm || literals[Number(tm[1])] !== scope.startIso || literals[Number(tm[2])] !== scope.endIso) return false;
+    if (scope.agent) {
+      const am = new RegExp(`\\bagent\\b\\s*=\\s*${LIT_RE}`, "i").exec(where);
+      if (!am || literals[Number(am[1])] !== scope.agent) return false;
+    }
+  }
+  return groups.every((g) => checkBlock(g, scope, literals, names, seen));
+}
+
 export function verifyScope(
   sql: string | null,
   scope?: { startIso: string; endIso: string; agent?: string },
 ): boolean {
   if (!scope) return true;
   if (!sql) return false; // nothing to verify against
-  const stripped = sql.replace(/--[^\n]*/g, " ").replace(/\/\*[\s\S]*?\*\//g, " ");
-  if (stripped.includes("'''") || stripped.includes('"""')) return false; // triple-quoted: unprovable
-  // tokenize single-quoted string literals out of the code
+  if (sql.includes("'''") || sql.includes('"""')) return false; // triple-quoted: unprovable
+  // #5(r10): tokenize string literals BEFORE stripping comments, so agent
+  // names containing -- or /* stay intact inside their literals
   const literals: string[] = [];
-  const code = stripped.replace(/'((?:[^'\\]|\\.)*)'/g, (_all, inner: string) => {
-    literals.push(inner.replaceAll("\\'", "'").replaceAll("\\\\", "\\"));
-    return `\u0000${literals.length - 1}\u0000`;
+  let code = sql.replace(/'((?:[^'\\]|\\.)*)'|"((?:[^"\\]|\\.)*)"/g, (_all, sq: string, dq: string) => {
+    const inner = sq ?? dq;
+    literals.push(inner.replaceAll("\\'", "'").replaceAll('\\"', '"').replaceAll("\\\\", "\\"));
+    return ` ${literals.length - 1} `;
   });
-  if (code.includes("'")) return false; // unbalanced/odd quoting: unprovable
-  if (/\bOR\b/i.test(code)) return false; // OR can widen the scan
-  if (/\bUNION\b/i.test(code)) return false; // UNION can add unscoped branches
+  if (code.includes("'") || code.includes('"')) return false; // unbalanced quoting: unprovable
+  code = code.replace(/--[^\n]*/g, " ").replace(/\/\*[\s\S]*?\*\//g, " ");
+  if (code.includes("/*")) return false; // unterminated comment
   if (/;\s*\S/.test(code)) return false; // multiple statements
-  if (/\bagent\b\s*(?:!=|<>|\bNOT\b|\bIN\b|\bLIKE\b)/i.test(code)) return false; // only equality is provable
-  const lit = "\u0000(\\d+)\u0000";
-  const timeRe = new RegExp(
-    `\\btimestamp\\b\\s+BETWEEN\\s+(?:TIMESTAMP\\s*\\(\\s*)?${lit}\\s*\\)?\\s+AND\\s+(?:TIMESTAMP\\s*\\(\\s*)?${lit}\\s*\\)?`,
-    "i",
-  );
-  const tm = timeRe.exec(code);
-  if (!tm || literals[Number(tm[1])] !== scope.startIso || literals[Number(tm[2])] !== scope.endIso) return false;
+  // IS NOT NULL is a benign narrowing predicate; strip it so the global NOT
+  // rejection below doesn't have to reason about it
+  code = code.replace(/\bIS\s+NOT\s+NULL\b/gi, " __ISNOTNULL__ ");
+  // constructs that can widen, negate, split, or hide a scan → unprovable
+  if (/\b(OR|NOT|UNION|INTERSECT|EXCEPT|EXISTS|JOIN|CASE)\b/i.test(code)) return false;
+  if (/\bIS\s+(TRUE|FALSE)\b/i.test(code)) return false; // (pred) IS FALSE inverts it
+  if (/\bagent\b\s*(?:!=|<>|\bIN\b|\bLIKE\b)/i.test(code)) return false; // only equality is provable
+  // a predicate on a DIFFERENT agent anywhere poisons the statement
   if (scope.agent) {
-    const agentRe = new RegExp(`\\bagent\\b\\s*=\\s*${lit}`, "gi");
-    let matchedScope = false;
-    let m: RegExpExecArray | null;
-    while ((m = agentRe.exec(code))) {
-      if (literals[Number(m[1])] === scope.agent) matchedScope = true;
-      else return false; // a predicate on a DIFFERENT agent can never verify
+    const agentRe = new RegExp(`\\bagent\\b\\s*=\\s*${LIT_RE}`, "gi");
+    let am: RegExpExecArray | null;
+    while ((am = agentRe.exec(code))) {
+      if (literals[Number(am[1])] !== scope.agent) return false;
     }
-    if (!matchedScope) return false;
   }
-  return true;
+  // an answer must come from at least one PROVABLY scoped telemetry scan -
+  // a query with no table scan at all cannot certify the scope
+  const seen = { scans: 0 };
+  return checkBlock(code, scope, literals, new Set(), seen) && seen.scans > 0;
 }
 
 export function withScope(result: AskResult, scope?: { startIso: string; endIso: string; agent?: string }): AskResult {

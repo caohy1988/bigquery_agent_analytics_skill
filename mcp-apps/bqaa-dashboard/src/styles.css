@@ -436,6 +436,7 @@ details.data-table[open] summary { color: var(--ink-2); }
 }
 .wf-tick:first-child { transform: none; }
 .wf-tick.last { transform: translateX(-100%); }
+.pill.warn { color: var(--s2); border-color: color-mix(in srgb, var(--s2) 40%, transparent); }
 .wf-row { border-radius: 5px; padding: 1px 0; }
 .wf-row:hover, .wf-row:focus-visible { background: color-mix(in srgb, var(--ink) 4%, transparent); outline: none; }
 .wf-label {

@@ -104,3 +104,34 @@ test("spanless events with latency render as bars, not instants (#12-r9)", () =>
   assert.equal(orphan.endMs - orphan.startMs, 3000);
   assert.equal(orphan.startMs, 1000, "start back-computed from ts - latency");
 });
+
+test("cycle depth is identical under every event permutation (#15-r10)", () => {
+  const mk = () => [
+    ev({ span_id: "A", parent_span_id: "B", event_type: "TOOL_STARTING", tool_name: "a" }),
+    ev({ span_id: "B", parent_span_id: "A", event_type: "TOOL_STARTING", tool_name: "b", timestamp: "2026-08-07T00:00:01Z" }),
+    ev({ span_id: "C", parent_span_id: "A", event_type: "TOOL_STARTING", tool_name: "c", timestamp: "2026-08-07T00:00:02Z" }),
+  ];
+  const perms = [
+    [0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0],
+  ];
+  const results = perms.map((order) => {
+    const base = mk();
+    const { spans } = buildSpans(order.map((i) => base[i]));
+    return Object.fromEntries(spans.map((sp) => [sp.id, sp.depth]));
+  });
+  for (const r of results) {
+    assert.equal(r.A, 0, "cycle member A");
+    assert.equal(r.B, 0, "cycle member B");
+    assert.equal(r.C, 1, "C hangs off the zeroed cycle, deterministically");
+  }
+});
+
+test("non-finite latency is treated as absent, never NaN coordinates (#14-r10)", () => {
+  const { spans } = buildSpans([
+    ev({ span_id: "L", event_type: "LLM_RESPONSE", timestamp: "2026-08-07T00:00:05Z", latency_ms: NaN }),
+    ev({ event_type: "USER_MESSAGE_RECEIVED", timestamp: "2026-08-07T00:00:01Z", latency_ms: Infinity }),
+  ]);
+  for (const sp of spans) {
+    assert.ok(Number.isFinite(sp.startMs) && Number.isFinite(sp.endMs), `${sp.name} has finite coordinates`);
+  }
+});

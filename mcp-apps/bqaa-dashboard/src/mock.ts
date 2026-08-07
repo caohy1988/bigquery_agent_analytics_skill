@@ -250,13 +250,20 @@ export function mockWidget(spec: WidgetSpec, start: Date, end: Date): WidgetResu
       status: ["OK", "ERROR"],
       event_type: ["LLM_RESPONSE", "LLM_REQUEST", "TOOL_COMPLETED", "TOOL_STARTING"],
     };
+    const domain = values[spec.dimension] ?? ["a", "b"];
     const filterValue = (spec.filters as Record<string, string | undefined> | undefined)?.[spec.dimension];
-    const candidates = filterValue ? [filterValue] : (values[spec.dimension] ?? ["a", "b"]);
+    // #11(r10): a filter SELECTS from the synthetic domain — it never invents
+    // the requested value. Filtering to an absent entity returns zero rows,
+    // exactly like BigQuery would.
+    const candidates = filterValue ? domain.filter((v) => v === filterValue) : domain;
     rows = candidates.map((dim) => ({
       dim,
       value: Math.round(scale * (0.2 + rand())),
     }));
     rows.sort((a, b) => (b.value ?? 0) - (a.value ?? 0));
+    // #12(r10): same categorical limit contract as production (default 20, 1..100)
+    const requested = Number.isInteger(spec.limit) ? (spec.limit as number) : 20;
+    rows = rows.slice(0, Math.min(100, Math.max(1, requested)));
   }
   return {
     spec: { v: 1, ...spec },
@@ -265,14 +272,27 @@ export function mockWidget(spec: WidgetSpec, start: Date, end: Date): WidgetResu
   };
 }
 
-export function mockErrorTraces(): ErrorTraceRow[] {
+// #13(r10): ONE deterministic fixture is the source of truth for which mock
+// traces contain errors and how many — the error list and every per-trace
+// drill-down must agree, so a listed trace always round-trips to the same
+// positive error count.
+const ERROR_TRACE_FIXTURE: Array<{ trace_id: string; error_events: number; sample_error: string; agent: string }> = (() => {
   const rand = mulberry32(77);
   return Array.from({ length: 6 }, (_, i) => ({
     trace_id: `trace${(0x20000000 + Math.floor(rand() * 0xdfffffff)).toString(16)}${i}`,
-    last_ts: new Date(Date.now() - i * 5_400_000).toISOString(),
-    agents: AGENTS[i % AGENTS.length],
     error_events: 1 + Math.floor(rand() * 3),
-    sample_errors: ["TimeoutError: tool call exceeded 30s", "PermissionDenied: missing scope", "RateLimitError"][i % 3],
+    sample_error: ["TimeoutError: tool call exceeded 30s", "PermissionDenied: missing scope", "RateLimitError"][i % 3],
+    agent: AGENTS[i % AGENTS.length],
+  }));
+})();
+
+export function mockErrorTraces(): ErrorTraceRow[] {
+  return ERROR_TRACE_FIXTURE.map((f, i) => ({
+    trace_id: f.trace_id,
+    last_ts: new Date(Date.now() - i * 5_400_000).toISOString(),
+    agents: f.agent,
+    error_events: f.error_events,
+    sample_errors: f.sample_error,
   }));
 }
 
@@ -298,23 +318,30 @@ export function mockTrace(traceId: string): TraceEvent[] {
       ...e,
     });
   };
+  // #13(r10): a trace listed in the error fixture shows EXACTLY its listed
+  // error count with its listed message; unlisted traces are error-free, so
+  // the mock error list is complete as well as consistent.
+  const fx = ERROR_TRACE_FIXTURE.find((f) => f.trace_id === traceId);
   push({ event_type: "LLM_REQUEST", span_id: "s1" });
   t += 1200;
   push({ event_type: "LLM_RESPONSE", span_id: "s1", llm_response: "Plan: search then summarize.", latency_ms: 1200 });
-  for (let i = 0; i < 2 + Math.floor(rand() * 3); i++) {
+  const toolCount = Math.max(2 + Math.floor(rand() * 3), fx?.error_events ?? 0);
+  for (let i = 0; i < toolCount; i++) {
     t += 300;
     const [tool, origin] = TOOLS[Math.floor(rand() * TOOLS.length)];
-    push({ event_type: "TOOL_STARTING", agent: "researcher", span_id: `t${i}`, parent_span_id: "s1", tool_name: tool, tool_origin: origin });
+    push({ event_type: "TOOL_STARTING", agent: fx?.agent ?? "researcher", span_id: `t${i}`, parent_span_id: "s1", tool_name: tool, tool_origin: origin });
     t += Math.round(200 + rand() * 1500);
+    const isError = fx != null && i < fx.error_events;
     push({
-      event_type: "TOOL_COMPLETED",
-      agent: "researcher",
+      event_type: isError ? "TOOL_ERROR" : "TOOL_COMPLETED",
+      agent: fx?.agent ?? "researcher",
       span_id: `t${i}`,
       parent_span_id: "s1",
       tool_name: tool,
       tool_origin: origin,
       latency_ms: Math.round(200 + rand() * 1500),
-      status: rand() < 0.12 ? "ERROR" : "OK",
+      status: isError ? "ERROR" : "OK",
+      error_message: isError ? fx.sample_error : null,
     });
   }
   t += 900;

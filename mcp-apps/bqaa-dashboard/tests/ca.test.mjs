@@ -210,3 +210,79 @@ test("a result without any owning group fails closed as sql:null (#5-r9)", () =>
   const scoped = withScope(r, { startIso: "2026-08-06T00:00:00Z", endIso: "2026-08-07T00:00:00Z" });
   assert.equal(scoped.scope.verified, false, "unowned data can never verify");
 });
+
+// ---- tenth-review: dominating-predicate grammar, sticky ambiguity
+
+test("grammar rejects every reproduced round-10 bypass (#1-r10)", () => {
+  const scope = { startIso: "2026-08-06T00:00:00Z", endIso: "2026-08-07T00:00:00Z", agent: "billing" };
+  const conj = `timestamp BETWEEN '${scope.startIso}' AND '${scope.endIso}' AND agent = 'billing'`;
+  assert.equal(verifyScope(`SELECT 1 FROM t WHERE ${conj}`, scope), true, "baseline still verifies");
+  // negated predicates
+  assert.equal(verifyScope(`SELECT 1 FROM t WHERE NOT (${conj})`, scope), false, "NOT-wrapped scope");
+  assert.equal(verifyScope(`SELECT 1 FROM t WHERE (${conj}) IS FALSE`, scope), false, "(pred) IS FALSE");
+  // predicate only in the SELECT list
+  assert.equal(verifyScope(`SELECT ${conj} AS in_scope FROM t`, scope), false, "projection-only predicate");
+  // scoped scan hidden in an unused CTE while the real scan is unscoped
+  assert.equal(
+    verifyScope(`WITH unused AS (SELECT 1 FROM t WHERE ${conj}) SELECT COUNT(*) FROM t`, scope),
+    false,
+    "unused scoped CTE beside an unscoped scan",
+  );
+  // predicate only inside an EXISTS subquery
+  assert.equal(
+    verifyScope(`SELECT 1 FROM t WHERE EXISTS (SELECT 1 FROM t WHERE ${conj})`, scope),
+    false,
+    "EXISTS is not provably constraining",
+  );
+  // joins and comma-joins are unprovable
+  assert.equal(verifyScope(`SELECT 1 FROM t JOIN u ON t.id = u.id WHERE ${conj}`, scope), false, "JOIN");
+  assert.equal(verifyScope(`SELECT 1 FROM t, u WHERE ${conj}`, scope), false, "comma join");
+  // set operations beyond UNION
+  assert.equal(verifyScope(`SELECT 1 FROM t WHERE ${conj} INTERSECT DISTINCT SELECT 1 FROM t`, scope), false);
+  // an unscoped second scan in a derived table
+  assert.equal(
+    verifyScope(`SELECT 1 FROM (SELECT * FROM t) WHERE ${conj}`, scope),
+    false,
+    "derived-table scan has no WHERE of its own",
+  );
+  // no table scan at all cannot certify a scope
+  assert.equal(verifyScope("SELECT 1", scope), false, "scanless query");
+});
+
+test("grammar accepts scoped scans inside CTE bodies (#1-r10)", () => {
+  const scope = { startIso: "2026-08-06T00:00:00Z", endIso: "2026-08-07T00:00:00Z", agent: "billing" };
+  const conj = `timestamp BETWEEN '${scope.startIso}' AND '${scope.endIso}' AND agent = 'billing'`;
+  const cte = `WITH stats AS (SELECT agent, COUNT(*) AS n FROM \`p.d.agent_events\` WHERE ${conj} GROUP BY agent) SELECT * FROM stats ORDER BY n DESC`;
+  assert.equal(verifyScope(cte, scope), true, "the real CA shape: scoped scan in a CTE, outer query over the CTE");
+  assert.equal(verifyScope("SELECT error_message FROM t WHERE " + conj + " AND error_message IS NOT NULL", scope), true, "IS NOT NULL stays legal");
+});
+
+test("agent names containing comment delimiters verify correctly (#5-r10)", () => {
+  const mk = (agent) => ({ startIso: "2026-08-06T00:00:00Z", endIso: "2026-08-07T00:00:00Z", agent });
+  for (const agent of ["billing--prod", "billing/*prod*/"]) {
+    const scope = mk(agent);
+    const sql = `SELECT 1 FROM t WHERE timestamp BETWEEN '${scope.startIso}' AND '${scope.endIso}' AND agent = '${agent}'`;
+    assert.equal(verifyScope(sql, scope), true, `${agent} must survive comment stripping`);
+  }
+});
+
+test("group ambiguity is sticky - a third SQL cannot restore trust (#4-r10)", () => {
+  const scope = { startIso: "2026-08-06T00:00:00Z", endIso: "2026-08-07T00:00:00Z" };
+  const scoped = `SELECT 1 FROM t WHERE timestamp BETWEEN '${scope.startIso}' AND '${scope.endIso}'`;
+  const stream = [
+    { systemMessage: { groupId: "g", data: { generatedSql: scoped } } },
+    { systemMessage: { groupId: "g", data: { generatedSql: scoped } } }, // ambiguity
+    { systemMessage: { groupId: "g", data: { generatedSql: scoped } } }, // must NOT restore trust
+    { systemMessage: { groupId: "g", data: { result: { schema: { fields: [{ name: "x" }] }, data: [{ x: 1 }] } } } },
+  ];
+  const r = withScope(parseMessages("q", stream), scope);
+  assert.equal(r.scope?.verified, false, "a multi-SQL group stays unprovable forever");
+  // and a LATER cycle in the same poisoned group is also untrusted
+  const later = [
+    ...stream,
+    { systemMessage: { groupId: "g", data: { generatedSql: scoped } } },
+    { systemMessage: { groupId: "g", data: { result: { schema: { fields: [{ name: "y" }] }, data: [{ y: 2 }] } } } },
+  ];
+  const r2 = withScope(parseMessages("q", later), scope);
+  assert.equal(r2.scope?.verified, false, "poisoning survives result boundaries");
+});
