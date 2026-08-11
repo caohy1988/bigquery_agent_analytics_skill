@@ -28,11 +28,12 @@ import {
   RESOURCE_MIME_TYPE,
 } from "@modelcontextprotocol/ext-apps/server";
 import { askConversational } from "./src/ca.js";
-import { mockAsk, mockDashboard, mockErrorTraces, mockTrace, mockWidget } from "./src/mock.js";
+import { mockAsk, mockDashboard, mockErrorTraces, mockTrace, mockTracesList, mockWidget } from "./src/mock.js";
 import {
   BQ_MIN_BYTES_PER_QUERY,
   buildDashboardSql,
   buildErrorTracesSql,
+  buildTracesListSql,
   buildTraceSql,
   buildWidgetSql,
   SECTIONS,
@@ -51,7 +52,7 @@ import type {
   TraceResult,
   WidgetResult,
   WidgetSpec,
-} from "./src/types.js";
+ TraceListRow,} from "./src/types.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -492,6 +493,27 @@ async function loadErrorTraces(timeRangeHours: number, limit: number, signal?: A
   return rows;
 }
 
+// Trace explorer: summary rows for recent traces, optionally errors-only,
+// optionally narrowed to one agent — same budget class as widgets.
+async function loadTraces(
+  timeRangeHours: number,
+  limit: number,
+  errorsOnly: boolean,
+  agent?: string,
+  signal?: AbortSignal,
+): Promise<TraceListRow[]> {
+  if (CONFIG.mock) return mockTracesList(timeRangeHours, errorsOnly, agent).slice(0, limit);
+  const end = new Date();
+  const start = new Date(end.getTime() - timeRangeHours * 3_600_000);
+  const { rows } = await runQuery(
+    buildTracesListSql(tableRef(), { errorsOnly, agentFilter: !!agent }),
+    { start: start.toISOString(), end: end.toISOString(), limit, ...(agent ? { agent } : {}) },
+    WIDGET_QUERY_BYTES,
+    signal,
+  );
+  return rows;
+}
+
 // Cache + coalescing: identical (window, agent) refreshes within the TTL share
 // one BigQuery round-trip, including concurrent ones. The cache is a bounded
 // LRU — arbitrary agent filters cannot grow it without limit, and expired
@@ -920,6 +942,39 @@ registerAppTool(
 );
 
 server.registerTool(
+  "list_traces",
+  {
+    title: "List recent traces",
+    description:
+      "Return summary rows for recent traces in the window (start, duration, event and error counts, agents), newest first — the trace explorer's data source. Set errors_only=true to keep only traces containing errors; pass agent to narrow to one agent. Use get_trace or render_trace on a returned trace_id to dive deeper.",
+    inputSchema: {
+      time_range_hours: z.number().int().min(1).max(MAX_HOURS).default(CONFIG.defaultHours),
+      limit: z.number().int().min(1).max(50).default(25),
+      errors_only: z.boolean().default(false),
+      agent: z.string().max(200).optional().describe("Only traces this agent participated in"),
+    },
+    outputSchema: { data: z.unknown() },
+    annotations: READ_ONLY_ANNOTATIONS,
+  },
+  async (args, extra) => {
+    const rows = await loadTraces(
+      args.time_range_hours ?? CONFIG.defaultHours,
+      args.limit ?? 25,
+      args.errors_only ?? false,
+      args.agent,
+      extra?.signal,
+    );
+    const text = rows.length
+      ? `${SYNTHETIC() ? "(synthetic sample data) " : ""}${rows.length} recent trace(s):\n` +
+        rows
+          .map((r) => `- ${r.trace_id} (${r.last_ts}, ${r.events} events, ${r.error_events} errors, agents: ${r.agents ?? "?"})`)
+          .join("\n")
+      : "No traces in this window.";
+    return { content: [{ type: "text" as const, text }], structuredContent: { data: rows } as any };
+  },
+);
+
+server.registerTool(
   "list_error_traces",
   {
     title: "List recent error traces",
@@ -1143,6 +1198,19 @@ app.get("/api/trace", checkOrigin, requireAuth, async (req, res) => {
     const hours = Math.min(MAX_HOURS, Math.max(1, Math.trunc(Number(req.query.time_range_hours)) || CONFIG.defaultHours));
     const trace = await loadTrace(traceId, hours, requestAbort(req, res));
     res.json({ data: trace.events, truncated: trace.truncated, source: trace.source });
+  } catch (e) {
+    res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
+app.get("/api/traces", checkOrigin, requireAuth, async (req, res) => {
+  try {
+    const hours = Math.min(MAX_HOURS, Math.max(1, Math.trunc(Number(req.query.time_range_hours)) || CONFIG.defaultHours));
+    const limit = Math.min(50, Math.max(1, Math.trunc(Number(req.query.limit)) || 25));
+    const errorsOnly = req.query.errors_only === "1" || req.query.errors_only === "true";
+    const agent = typeof req.query.agent === "string" && req.query.agent ? req.query.agent.slice(0, 200) : undefined;
+    const rows = await loadTraces(hours, limit, errorsOnly, agent, requestAbort(req, res));
+    res.json({ data: rows, source: sourceLabel() });
   } catch (e) {
     res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
   }

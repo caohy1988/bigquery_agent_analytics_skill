@@ -1,7 +1,7 @@
 // Mock-data truthfulness — filters honored, one row set drives everything (r9).
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mockWidget, mockAsk, mockErrorTraces, mockTrace, mockDashboard } from "../src/mock.js";
+import { mockWidget, mockAsk, mockErrorTraces, mockTrace, mockDashboard, mockTracesList } from "../src/mock.js";
 
 const start = new Date("2026-07-01T00:00:00Z");
 const end = new Date("2026-07-02T00:00:00Z");
@@ -82,4 +82,19 @@ test("impossible cross-filters return zero widget rows for every dimension (#8-r
   assert.deepEqual(time.rows, [], "a time widget must not chart activity for a nonexistent tool");
   const cat = mockWidget({ measure: "events", dimension: "agent", granularity: "auto", filters: { model: "no-such-model" } }, start, end);
   assert.deepEqual(cat.rows, [], "a categorical widget must not rank agents for a nonexistent model");
+});
+
+test("mockTracesList round-trips exactly to mockTrace (explorer truth)", () => {
+  for (const row of mockTracesList(720)) {
+    const events = mockTrace(row.trace_id);
+    const errors = events.filter(
+      (e) => e.status === "ERROR" || e.event_type.endsWith("_ERROR") || e.error_message != null,
+    ).length;
+    assert.equal(row.events, events.length, `${row.trace_id} event count`);
+    assert.equal(row.error_events, errors, `${row.trace_id} error count`);
+  }
+  const errsOnly = mockTracesList(720, true);
+  assert.ok(errsOnly.length > 0 && errsOnly.every((r) => r.error_events > 0));
+  const scoped = mockTracesList(720, false, "no-such-agent");
+  assert.deepEqual(scoped, [], "an unknown agent filter returns no traces");
 });

@@ -46,6 +46,9 @@ Light and dark themes are both first-class.
   drill-down; reports truncation when a trace exceeds 500 events.
 - `render_trace(trace_id, time_range_hours)` — the same trace rendered
   interactively: the waterfall opens in the dashboard UI inside the host.
+- `list_traces(time_range_hours, limit, errors_only, agent)` — recent trace
+  summaries (duration, events, errors, agents) for the Traces explorer; click
+  through with `render_trace`
 - `list_error_traces(time_range_hours, limit)` — recent trace ids with errors,
   for evidence-cited root-cause analysis.
 

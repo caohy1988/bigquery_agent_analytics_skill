@@ -5,7 +5,7 @@
 
 import "./styles.css";
 import { App } from "@modelcontextprotocol/ext-apps";
-import { mockAsk, mockDashboard, mockTrace, mockWidget } from "./mock.js";
+import { mockAsk, mockDashboard, mockTrace, mockTracesList, mockWidget } from "./mock.js";
 import { WIDGET_DIMENSIONS, WIDGET_MEASURES } from "./queries.js";
 import { buildSpans } from "./spans.js";
 import type {
@@ -16,7 +16,7 @@ import type {
   TraceEvent,
   WidgetResult,
   WidgetSpec,
-} from "./types.js";
+ TraceListRow,} from "./types.js";
 
 // Shareable page state lives in the hash: #view=tokens&range=720&agent=coder
 // (legacy #tokens-style hashes still work).
@@ -1915,6 +1915,140 @@ function renderAsk(d: DashboardData | null, main: HTMLElement): void {
 
 // ---------------------------------------------------------------- app state
 
+// ------------------------------------------------------------ trace explorer
+// Recent traces in the current scope, newest first — click a row to dive into
+// its waterfall. Same publication rules as everything else: a scope change
+// revokes in-flight results, and embedded host calls are single-flight.
+const tracesState: { rows: TraceListRow[] | null; loading: boolean; error: string | null; key: string; errorsOnly: boolean } = {
+  rows: null,
+  loading: false,
+  error: null,
+  key: "",
+  errorsOnly: false,
+};
+let tracesGen = 0;
+let tracesAbort: AbortController | null = null;
+let embeddedTracesBusy = false;
+
+function tracesKey(): string {
+  return `${currentHours()}|${agentEl.value}|${tracesState.errorsOnly}`;
+}
+
+async function fetchTracesList(): Promise<void> {
+  const key = tracesKey();
+  if (tracesState.loading || (tracesState.rows && tracesState.key === key)) return;
+  if (embedded && embeddedTracesBusy) return; // the settle path re-checks the key
+  const gen = ++tracesGen;
+  tracesState.loading = true;
+  tracesState.error = null;
+  renderView();
+  try {
+    let rows: TraceListRow[];
+    const agent = agentEl.value || undefined;
+    if (embedded && appBridge) {
+      embeddedTracesBusy = true;
+      try {
+        const r: any = await appBridge.callServerTool({
+          name: "list_traces",
+          arguments: {
+            time_range_hours: currentHours(),
+            errors_only: tracesState.errorsOnly,
+            ...(agent ? { agent } : {}),
+          },
+        });
+        rows = (r?.structuredContent?.data as TraceListRow[]) ?? [];
+      } finally {
+        embeddedTracesBusy = false;
+      }
+    } else if (location.protocol.startsWith("http")) {
+      tracesAbort?.abort();
+      const abort = new AbortController();
+      tracesAbort = abort;
+      const q = new URLSearchParams({
+        time_range_hours: String(currentHours()),
+        ...(tracesState.errorsOnly ? { errors_only: "1" } : {}),
+        ...(agent ? { agent } : {}),
+      });
+      const res = await fetch(`api/traces?${q}`, { headers: authHeaders(), signal: abort.signal });
+      const body: any = await res.json().catch(() => null);
+      if (!res.ok) throw new Error(body?.error ?? `HTTP ${res.status}`);
+      rows = body.data as TraceListRow[];
+    } else {
+      rows = mockTracesList(currentHours(), tracesState.errorsOnly, agent);
+    }
+    if (gen !== tracesGen) return; // superseded by a newer scope
+    tracesState.rows = rows;
+    tracesState.key = key;
+  } catch (e) {
+    if (gen !== tracesGen || (e instanceof DOMException && e.name === "AbortError")) return;
+    tracesState.error = e instanceof Error ? e.message : String(e);
+  } finally {
+    if (gen === tracesGen) {
+      tracesState.loading = false;
+      renderView();
+      // an embedded fetch cannot be cancelled — if the scope moved while it
+      // ran, fetch again for the current key
+      if (tracesKey() !== tracesState.key && currentView === "traces") void fetchTracesList();
+    }
+  }
+}
+
+function renderTraces(_d: DashboardData | null, main: HTMLElement): void {
+  const { card, body } = chartCard(
+    "Trace explorer",
+    "recent traces in this scope, newest first — click one to open its waterfall, then click spans to expand",
+    [],
+  );
+  card.classList.add("span-full");
+
+  const controls = el("div", "explore-actions");
+  const toggle = el("label", "wf-errors-toggle");
+  const cb = el("input") as HTMLInputElement;
+  cb.type = "checkbox";
+  cb.checked = tracesState.errorsOnly;
+  cb.addEventListener("change", () => {
+    tracesState.errorsOnly = cb.checked;
+    tracesState.rows = null; // different question — refetch
+    void fetchTracesList();
+  });
+  toggle.appendChild(cb);
+  toggle.appendChild(document.createTextNode(" errors only"));
+  controls.appendChild(toggle);
+  body.appendChild(controls);
+
+  if (tracesState.error) {
+    body.appendChild(el("div", "empty error", `Trace list failed: ${tracesState.error}`));
+  } else if (!tracesState.rows || tracesState.key !== tracesKey()) {
+    body.appendChild(el("div", "empty", "Loading traces…"));
+    void fetchTracesList();
+  } else if (!tracesState.rows.length) {
+    body.appendChild(el("div", "empty", tracesState.errorsOnly ? "No traces with errors in this window." : "No traces in this window."));
+  } else {
+    table(body, [
+      {
+        label: "Trace",
+        get: (r: TraceListRow) => r.trace_id,
+        cell: (r: TraceListRow) => {
+          const b = el("button", "link-btn", r.trace_id.slice(0, 12) + (r.trace_id.length > 12 ? "…" : ""));
+          b.title = r.trace_id;
+          b.addEventListener("click", () => void showTrace(r.trace_id));
+          return b;
+        },
+      },
+      { label: "Started", get: (r: TraceListRow) => r.start_ts.replace("T", " ").replace(/\.\d+Z$|Z$/, "") },
+      { label: "Duration", get: (r: TraceListRow) => fmtMs(r.duration_ms) },
+      { label: "Events", get: (r: TraceListRow) => fmtInt(r.events) },
+      {
+        label: "Errors",
+        get: (r: TraceListRow) => fmtInt(r.error_events),
+        cell: (r: TraceListRow) => el("span", r.error_events > 0 ? "err-count" : undefined, fmtInt(r.error_events)),
+      },
+      { label: "Agents", get: (r: TraceListRow) => r.agents ?? "—" },
+    ], tracesState.rows);
+  }
+  main.appendChild(card);
+}
+
 const VIEWS = [
   { id: "overview", label: "Overview", render: renderOverview },
   { id: "ask", label: "Ask", render: renderAsk as (d: DashboardData, main: HTMLElement) => void },
@@ -1923,6 +2057,7 @@ const VIEWS = [
   { id: "tools", label: "Tools", render: renderTools },
   { id: "cost", label: "Cost", render: renderCost },
   { id: "agents", label: "Agents", render: renderAgents },
+  { id: "traces", label: "Traces", render: renderTraces as (d: DashboardData, main: HTMLElement) => void },
   { id: "explore", label: "Explore", render: renderExplore as (d: DashboardData, main: HTMLElement) => void },
 ] as const;
 
@@ -2041,6 +2176,7 @@ function renderTabs(): void {
     b.setAttribute("role", "tab");
     b.setAttribute("aria-selected", String(v.id === currentView));
     b.addEventListener("click", () => {
+      traceFocus = false; // a tab is an explicit exit from the focused span view
       currentView = v.id;
       renderTabs();
       renderView();
@@ -2071,6 +2207,10 @@ function updateScopeNotice(): void {
   scopeEl.appendChild(warn);
 }
 
+// render_trace asked for the SPAN VIEW, not the dashboard: while focused,
+// only the waterfall card renders. Tabs and Close exit focus.
+let traceFocus = false;
+
 function renderView(): void {
   hideTooltip();
   updateScopeNotice();
@@ -2079,7 +2219,18 @@ function renderView(): void {
     renderLoginPrompt(); // #17: survives resize-triggered re-renders
     return;
   }
-  if (!data && !(currentView === "explore" && explore.result) && currentView !== "ask") {
+  if (traceFocus && traceCard) {
+    const back = el("button", "trace-close wf-back", "◂ Full dashboard");
+    back.addEventListener("click", () => {
+      traceFocus = false;
+      renderView();
+    });
+    mainEl.appendChild(back);
+    renderTraceCard(mainEl);
+    return;
+  }
+  if (traceFocus) traceFocus = false; // the focused trace is gone — fall through
+  if (!data && !(currentView === "explore" && explore.result) && currentView !== "ask" && currentView !== "traces") {
     mainEl.appendChild(el("div", "empty", "Waiting for data…"));
     renderTraceCard(mainEl); // #4(r9): a pushed waterfall must not be hidden by a failed refresh
     return;
@@ -2380,6 +2531,20 @@ function isErrorEvent(e: TraceEvent): boolean {
 // Waterfall: spans as duration bars on a shared time axis, indented by
 // parent-child depth — the classic tracing view (LLM=blue, tool=orange,
 // other=aqua; errors outlined and labeled, never color-alone).
+// Expansion state for the CURRENT trace: collapsed parents hide their whole
+// subtree; expanded leaves show an inline detail row. Reset per trace.
+let wfStateTraceId: string | null = null;
+const wfCollapsed = new Set<string>();
+const wfExpandedDetails = new Set<string>();
+
+function resetWaterfallState(traceId: string): void {
+  if (wfStateTraceId !== traceId) {
+    wfStateTraceId = traceId;
+    wfCollapsed.clear();
+    wfExpandedDetails.clear();
+  }
+}
+
 function renderWaterfall(container: HTMLElement, events: TraceEvent[]): void {
   const { spans, totalMs } = buildSpans(events);
   if (!spans.length) return;
@@ -2430,12 +2595,29 @@ function renderWaterfall(container: HTMLElement, events: TraceEvent[]): void {
   wf.appendChild(axis);
 
   const kindVar: Record<string, string> = { llm: "--s1", tool: "--s2", other: "--s3" };
-  for (const span of spans) {
+  const hasChildren = new Set<string>();
+  for (const sp of spans) if (sp.parentId) hasChildren.add(sp.parentId);
+  const hiddenByCollapse = (sp: (typeof spans)[number]): boolean => {
+    let p = sp.parentId;
+    for (let i = 0; p && i <= 8; i++) {
+      if (wfCollapsed.has(p)) return true;
+      p = spans.find((x) => x.id === p)?.parentId ?? null;
+    }
+    return false;
+  };
+  spans.forEach((span, spanIdx) => {
+    if (hiddenByCollapse(span)) return;
+    const key = span.id ?? `orphan:${spanIdx}`;
+    const parent = span.id != null && hasChildren.has(span.id);
     const row = el("div", "wf-row");
     row.tabIndex = 0;
-    const label = el("span", "wf-label", `${span.error ? "! " : ""}${span.name}`);
+    row.setAttribute("role", "button");
+    if (parent) row.setAttribute("aria-expanded", String(!wfCollapsed.has(span.id!)));
+    const chevron = parent ? (wfCollapsed.has(span.id!) ? "▸ " : "▾ ") : "";
+    const label = el("span", "wf-label", `${chevron}${span.error ? "! " : ""}${span.name}`);
     label.style.paddingLeft = `${span.depth * 12}px`;
     if (span.error) label.classList.add("error");
+    if (parent) label.classList.add("wf-parent");
     row.appendChild(label);
     const track = el("span", "wf-track");
     const left = Math.min(99, (span.startMs / totalMs) * 100);
@@ -2468,14 +2650,52 @@ function renderWaterfall(container: HTMLElement, events: TraceEvent[]): void {
       present(r.left + r.width / 2, r.bottom);
     });
     row.addEventListener("blur", hideTooltip);
+    // click to dive deeper: parents toggle their subtree, leaves toggle an
+    // inline detail row (agent, timing, tool origin / error / response)
+    const toggle = (): void => {
+      hideTooltip();
+      if (parent) {
+        if (wfCollapsed.has(span.id!)) wfCollapsed.delete(span.id!);
+        else wfCollapsed.add(span.id!);
+      } else if (wfExpandedDetails.has(key)) {
+        wfExpandedDetails.delete(key);
+      } else {
+        wfExpandedDetails.add(key);
+      }
+      renderView();
+    };
+    row.addEventListener("click", toggle);
+    row.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        toggle();
+      }
+    });
     wf.appendChild(row);
-  }
+    if (!parent && wfExpandedDetails.has(key)) {
+      const detail = el("div", "wf-detail");
+      detail.style.paddingLeft = `${span.depth * 12 + 14}px`;
+      const line = (name: string, value: string): void => {
+        const d = el("div", "wf-detail-line");
+        d.appendChild(el("span", "wf-detail-k", name));
+        d.appendChild(el("span", undefined, value));
+        detail.appendChild(d);
+      };
+      line("start", `+${(span.startMs / 1000).toFixed(2)}s`);
+      line("duration", span.instant ? "instant" : fmtMs(span.endMs - span.startMs));
+      if (span.agent) line("agent", span.agent);
+      if (span.error) line("status", span.detail || "ERROR");
+      else if (span.detail) line("detail", span.detail);
+      wf.appendChild(detail);
+    }
+  });
   container.appendChild(wf);
 }
 
 function renderTraceCard(main: HTMLElement): void {
   const t = traceCard;
-  if (!t || t.view !== currentView) return;
+  if (!t || (!traceFocus && t.view !== currentView)) return;
+  resetWaterfallState(t.traceId);
   const { card, body } = chartCard(`Trace ${t.traceId}`, "ordered agent_events for this trace", []);
   card.id = "trace-card";
   const h2 = card.querySelector("h2")!;
@@ -2490,6 +2710,11 @@ function renderTraceCard(main: HTMLElement): void {
     traceIntentEpoch++;
     embeddedTraceQueued = null;
     traceCard = null;
+    if (traceFocus) {
+      traceFocus = false; // leaving the focused span view returns to the dashboard
+      renderView();
+      return;
+    }
     card.remove();
   });
   head.appendChild(close);
@@ -2602,6 +2827,11 @@ function scheduleRefresh(): void {
   inflightAbort?.abort(); // standalone work stops before the debounce, too
   pendingAgent = undefined; // #3(r8): a LOCAL choice outranks any queued host push
   exploreSpecChanged(); // #15(r9): Explore results computed under the old scope are stale
+  tracesGen++; // the trace-explorer list belongs to the old scope too
+  tracesAbort?.abort();
+  tracesState.rows = null;
+  tracesState.loading = false;
+  tracesState.key = "";
   clearTimeout(refreshDebounce);
   refreshDebounce = setTimeout(() => void refresh(), 250);
 }
@@ -2708,6 +2938,7 @@ if (embedded) {
         truncated: !!payload.truncated,
         error: null,
       };
+      traceFocus = true; // render_trace asked for the span view, not the dashboard
       renderView();
       document.getElementById("trace-card")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
       // #3(r10): the pushed window is a GLOBAL scope change — already-loaded

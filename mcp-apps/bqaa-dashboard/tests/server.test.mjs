@@ -766,12 +766,45 @@ test("a disconnected coalesced caller releases while the survivor completes (#4-
   }
 });
 
+// ---- trace explorer: list_traces is the tab's data source
+
+test("list_traces returns summary rows consistent with trace drill-downs", async () => {
+  const call = await rpc(BASE, "tools/call", { name: "list_traces", arguments: { time_range_hours: 720 } });
+  const rows = call.body.result.structuredContent?.data;
+  assert.ok(Array.isArray(rows) && rows.length > 0);
+  for (const r of rows) {
+    assert.equal(typeof r.trace_id, "string");
+    assert.equal(typeof r.events, "number");
+    assert.equal(typeof r.error_events, "number");
+    assert.equal(typeof r.duration_ms, "number");
+  }
+  // errors_only keeps exactly the traces with errors
+  const errs = await rpc(BASE, "tools/call", { name: "list_traces", arguments: { time_range_hours: 720, errors_only: true } });
+  const errRows = errs.body.result.structuredContent?.data;
+  assert.ok(errRows.length > 0 && errRows.length < rows.length, "errors_only must narrow the list");
+  assert.ok(errRows.every((r) => r.error_events > 0));
+  // each listed trace round-trips: get_trace shows the SAME error count
+  const first = errRows[0];
+  const trace = await rpc(BASE, "tools/call", { name: "get_trace", arguments: { trace_id: first.trace_id, time_range_hours: 720 } });
+  const events = trace.body.result.structuredContent?.data?.events;
+  const errCount = events.filter((e) => e.status === "ERROR" || e.event_type.endsWith("_ERROR") || e.error_message != null).length;
+  assert.equal(errCount, first.error_events, "list and drill-down must agree");
+});
+
+test("GET /api/traces mirrors the tool", async () => {
+  const res = await fetch(`${BASE}/api/traces?time_range_hours=720&errors_only=1`);
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.ok(Array.isArray(body.data) && body.data.every((r) => r.error_events > 0));
+  assert.ok(body.source, "payload carries provenance");
+});
+
 // ---- render_trace: the waterfall is model-invokable
 
 test("every tool declares read-only annotations so hosts can skip confirmation", async () => {
   const tools = await rpc(BASE, "tools/list", {});
   const list = tools.body.result.tools;
-  assert.equal(list.length, 8);
+  assert.equal(list.length, 9);
   for (const t of list) {
     assert.equal(t.annotations?.readOnlyHint, true, `${t.name} must be marked read-only`);
     assert.equal(t.annotations?.destructiveHint, false, `${t.name} must be marked non-destructive`);

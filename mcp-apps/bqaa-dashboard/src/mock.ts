@@ -18,6 +18,7 @@ import type {
   TraceEvent,
   WidgetResult,
   WidgetSpec,
+  TraceListRow,
 } from "./types.js";
 
 function mulberry32(seed: number): () => number {
@@ -367,6 +368,28 @@ export function mockTrace(traceId: string): TraceEvent[] {
     t += 300;
     const [tool, origin] = TOOLS[Math.floor(rand() * TOOLS.length)];
     push({ event_type: "TOOL_STARTING", agent: fx?.agent ?? "researcher", span_id: `t${i}`, parent_span_id: "s1", tool_name: tool, tool_origin: origin });
+    if (i === 0) {
+      // nested-span example: the first tool DELEGATES to a sub-agent, which
+      // makes its own LLM call and tool call — a 4-deep chain
+      // (s1 → t0 → d-llm → d-tool) that exercises waterfall nesting
+      t += 250;
+      push({ event_type: "LLM_REQUEST", agent: "sub-researcher", span_id: "d-llm", parent_span_id: "t0" });
+      t += 700;
+      push({
+        event_type: "LLM_RESPONSE", agent: "sub-researcher", span_id: "d-llm", parent_span_id: "t0",
+        llm_response: "Delegated plan: query the vector index.", latency_ms: 700,
+      });
+      t += 150;
+      push({
+        event_type: "TOOL_STARTING", agent: "sub-researcher", span_id: "d-tool", parent_span_id: "d-llm",
+        tool_name: "vector_search", tool_origin: "sub-researcher",
+      });
+      t += 450;
+      push({
+        event_type: "TOOL_COMPLETED", agent: "sub-researcher", span_id: "d-tool", parent_span_id: "d-llm",
+        tool_name: "vector_search", tool_origin: "sub-researcher", latency_ms: 450,
+      });
+    }
     t += Math.round(200 + rand() * 1500);
     const isError = fx != null && i < fx.error_events;
     push({
@@ -384,6 +407,39 @@ export function mockTrace(traceId: string): TraceEvent[] {
   t += 900;
   push({ event_type: "LLM_RESPONSE", span_id: "s2", parent_span_id: "s1", llm_response: "Final answer.", latency_ms: 900 });
   return events;
+}
+
+// Trace-explorer list — derived by ROUND-TRIPPING mockTrace, so the summary a
+// row shows (events, errors, duration, agents) is exactly what opening that
+// trace renders. Error traces come from the shared fixture; the rest are
+// deterministic healthy traces.
+const HEALTHY_TRACE_IDS = ["trace4ea11f3a10", "trace4ea11f3a11", "trace4ea11f3a12", "trace4ea11f3a13"];
+
+export function mockTracesList(timeRangeHours = 720, errorsOnly = false, agentFilter?: string): TraceListRow[] {
+  const ids = [...ERROR_TRACE_FIXTURE.map((f) => f.trace_id), ...(errorsOnly ? [] : HEALTHY_TRACE_IDS)];
+  const cutoffMs = timeRangeHours * 3_600_000;
+  const rows: TraceListRow[] = [];
+  for (const [i, id] of ids.entries()) {
+    const lastTs = Date.now() - i * 5_400_000; // 1.5h apart, matching mockErrorTraces
+    if (Date.now() - lastTs > cutoffMs) continue;
+    const events = mockTrace(id);
+    if (agentFilter && !events.some((e) => e.agent === agentFilter)) continue;
+    const errors = events.filter(
+      (e) => e.status === "ERROR" || e.event_type.endsWith("_ERROR") || e.error_message != null,
+    ).length;
+    const times = events.map((e) => Date.parse(e.timestamp));
+    const durationMs = Math.max(...times) - Math.min(...times);
+    rows.push({
+      trace_id: id,
+      start_ts: new Date(lastTs - durationMs).toISOString(),
+      last_ts: new Date(lastTs).toISOString(),
+      duration_ms: durationMs,
+      events: events.length,
+      error_events: errors,
+      agents: [...new Set(events.map((e) => e.agent).filter(Boolean))].slice(0, 5).join(","),
+    });
+  }
+  return rows.sort((a, b) => Date.parse(b.last_ts) - Date.parse(a.last_ts));
 }
 
 function stringSeed(s: string): number {

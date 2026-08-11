@@ -18,6 +18,10 @@ export interface TraceSpan {
   startMs: number; // relative to trace start
   endMs: number;
   depth: number; // parent-chain nesting, capped
+  // TRUE nesting parent only: set when the parent span exists in this trace
+  // and sits exactly one level up — collapse/expand walks this chain, so
+  // cycle members (depth 0) never parent each other
+  parentId: string | null;
   error: boolean;
   instant: boolean; // no measurable duration — render as a point marker
   detail: string; // tooltip line: origin / error message / response snippet
@@ -136,6 +140,8 @@ export function buildSpans(events: TraceEvent[]): { spans: TraceSpan[]; totalMs:
     const kind = kindOf(types);
     const tool = g.map((e) => e.tool_name).find(Boolean) ?? null;
     const err = g.find(isErrorEvent);
+    const depth = depthOf(id);
+    const parent = parentOf.get(id);
     spans.push({
       id,
       name: tool ?? (kind === "llm" ? "LLM call" : types[0]),
@@ -143,7 +149,8 @@ export function buildSpans(events: TraceEvent[]): { spans: TraceSpan[]; totalMs:
       agent: g.map((e) => e.agent).find(Boolean) ?? null,
       startMs,
       endMs: Math.max(endMs, startMs),
-      depth: depthOf(id),
+      depth,
+      parentId: parent && groups.has(parent) && depthOf(parent) === depth - 1 ? parent : null,
       error: !!err,
       instant: endMs <= startMs,
       detail:
@@ -163,6 +170,7 @@ export function buildSpans(events: TraceEvent[]): { spans: TraceSpan[]; totalMs:
       startMs: startAbs - t0,
       endMs: endAbs - t0,
       depth: 0,
+      parentId: null,
       error: isErrorEvent(e),
       instant: endAbs <= startAbs,
       detail: e.error_message ?? "",

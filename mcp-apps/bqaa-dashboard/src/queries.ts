@@ -438,6 +438,28 @@ export function buildErrorTracesSql(table: string): string {
     LIMIT @limit`;
 }
 
+// Trace explorer: one summary row per trace in the window, newest first.
+// errors_only narrows to traces containing at least one canonical error.
+export function buildTracesListSql(table: string, opts: { errorsOnly?: boolean; agentFilter?: boolean } = {}): string {
+  return `
+    SELECT
+      trace_id,
+      FORMAT_TIMESTAMP('%FT%TZ', MIN(timestamp)) AS start_ts,
+      FORMAT_TIMESTAMP('%FT%TZ', MAX(timestamp)) AS last_ts,
+      TIMESTAMP_DIFF(MAX(timestamp), MIN(timestamp), MILLISECOND) AS duration_ms,
+      COUNT(*) AS events,
+      COUNTIF(${ERROR_EXPR}) AS error_events,
+      STRING_AGG(DISTINCT agent LIMIT 5) AS agents
+    FROM ${table}
+    WHERE timestamp BETWEEN @start AND @end
+      AND trace_id IS NOT NULL
+      ${opts.agentFilter ? "AND agent = @agent" : ""}
+    GROUP BY trace_id
+    ${opts.errorsOnly ? `HAVING COUNTIF(${ERROR_EXPR}) > 0` : ""}
+    ORDER BY last_ts DESC
+    LIMIT @limit`;
+}
+
 export function buildTraceSql(table: string): string {
   return `
     SELECT

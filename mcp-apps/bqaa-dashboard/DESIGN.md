@@ -29,7 +29,7 @@ MCP client. Upstream design discussion:
  Browser ── GET / ──►  static UI bundle (dist/mcp-app.html)         │
  Browser ── /api/* ─►  dashboard / widget / trace / ask JSON        │
  MCP host ─ /mcp ───►  buildMcpServer() per request                 │
-                    │   ├─ 8 tools (zod schemas)                    │
+                    │   ├─ 9 tools (zod schemas)                    │
                     │   └─ ui://bqaa/dashboard.html resource        │
                     │                                               │
                     │  src/queries.ts   SQL contract (pure)         │
@@ -83,7 +83,14 @@ Built on `@modelcontextprotocol/sdk` + `@modelcontextprotocol/ext-apps`.
   - `get_trace(trace_id, time_range_hours)` — ordered trace reconstruction,
     with explicit truncation reporting past 500 events.
   - `render_trace(trace_id, time_range_hours)` — the same trace rendered as an
-    interactive waterfall in MCP-App hosts, carrying its requested window.
+    interactive waterfall in MCP-App hosts, carrying its requested window. The
+    app renders the FOCUSED span view (waterfall only, not the dashboard);
+    tabs or Close return to the full dashboard. Spans with children collapse
+    and expand on click; leaf tool calls expand an inline detail row.
+  - `list_traces(time_range_hours, limit, errors_only, agent)` — summary rows
+    for recent traces (start, duration, event/error counts, agents), newest
+    first: the Traces explorer tab's data source. Click a row to dive into
+    that trace's waterfall.
   - `list_error_traces(time_range_hours, limit)` — recent trace ids containing
     errors with sample messages; pairs with `get_trace` for evidence-cited
     root-cause ("the timeout is real: trace `ac99…`, TOOL_ERROR, 'upstream

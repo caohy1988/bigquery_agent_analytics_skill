@@ -135,3 +135,27 @@ test("non-finite latency is treated as absent, never NaN coordinates (#14-r10)",
     assert.ok(Number.isFinite(sp.startMs) && Number.isFinite(sp.endMs), `${sp.name} has finite coordinates`);
   }
 });
+
+import { mockTrace } from "../src/mock.js";
+
+test("the mock trace demonstrates 4-deep nesting with true parent links", () => {
+  const { spans } = buildSpans(mockTrace("trace4ea11f3a10"));
+  const byId = Object.fromEntries(spans.filter((s) => s.id).map((s) => [s.id, s]));
+  assert.equal(byId["s1"].depth, 0);
+  assert.equal(byId["t0"].depth, 1);
+  assert.equal(byId["d-llm"].depth, 2);
+  assert.equal(byId["d-tool"].depth, 3);
+  // parentId is the collapse chain: child → parent, one level at a time
+  assert.equal(byId["d-tool"].parentId, "d-llm");
+  assert.equal(byId["d-llm"].parentId, "t0");
+  assert.equal(byId["t0"].parentId, "s1");
+  assert.equal(byId["s1"].parentId, null);
+});
+
+test("cycle members never become collapse parents", () => {
+  const { spans } = buildSpans([
+    ev({ span_id: "A", parent_span_id: "B", event_type: "TOOL_STARTING", tool_name: "a" }),
+    ev({ span_id: "B", parent_span_id: "A", event_type: "TOOL_STARTING", tool_name: "b", timestamp: "2026-08-07T00:00:01Z" }),
+  ]);
+  for (const sp of spans) assert.equal(sp.parentId, null, `${sp.id} must not nest under a cycle`);
+});

@@ -171,6 +171,17 @@ export interface AskResult {
   queries?: Array<{ sql: string | null; row_count: number; data_bearing: boolean }>;
 }
 
+// Trace explorer summary row — one per trace, newest first.
+export interface TraceListRow {
+  trace_id: string;
+  start_ts: string;
+  last_ts: string;
+  duration_ms: number;
+  events: number;
+  error_events: number;
+  agents: string | null;
+}
+
 export interface ErrorTraceRow {
   trace_id: string;
   last_ts: string;
