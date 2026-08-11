@@ -10,7 +10,7 @@ Design/discussion: [GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK#396](https:
 · Detailed design & implementation: [DESIGN.md](./DESIGN.md)
 
 Ask the host *"show me my agent dashboard"* — or open the URL in a browser —
-and get eight views:
+and get nine views:
 
 | View | Contents |
 |---|---|

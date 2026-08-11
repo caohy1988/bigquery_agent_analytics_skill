@@ -1963,6 +1963,18 @@ async function fetchTracesList(force = false): Promise<void> {
         rows = (r?.structuredContent?.data as TraceListRow[]) ?? [];
       } finally {
         embeddedTracesBusy = false;
+        // #2(r14): this settle is the ONLY wake-up there is — if the scope
+        // moved while this uncancellable call was in flight, its generation
+        // went stale and the outer refetch guard will never run, so dispatch
+        // the CURRENT key from here. `loading` is true only when this
+        // generation is still current (the outer finally owns that case),
+        // and same-scope failures stay terminal because an error stamps its
+        // own key into tracesState.key.
+        if (!tracesState.loading || gen !== tracesGen) {
+          if (currentView === "traces" && tracesKey() !== tracesState.key) {
+            setTimeout(() => void fetchTracesList(), 0);
+          }
+        }
       }
     } else if (location.protocol.startsWith("http")) {
       tracesAbort?.abort();

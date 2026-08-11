@@ -368,3 +368,23 @@ test("parenthesized STRUCT field access never certifies (#2-r12)", () => {
     `  AND (STRUCT('billing' AS agent)).agent = 'billing'`;
   assert.equal(verifyScope(struct, scope, "proj.data.agent_events"), false);
 });
+
+// ---- fourteenth-review: conjuncts must be complete expressions
+
+test("widening expression suffixes never verify (#1-r14)", () => {
+  const scope = { startIso: "2026-08-06T00:00:00Z", endIso: "2026-08-07T00:00:00Z", agent: "billing" };
+  const good = `SELECT 1 FROM t WHERE timestamp BETWEEN TIMESTAMP('${scope.startIso}') AND TIMESTAMP('${scope.endIso}') AND agent = 'billing'`;
+  assert.equal(verifyScope(good, scope), true, "the anchored form still verifies");
+  // the exact published repros: BigQuery-valid SQL whose conjuncts CONTAIN
+  // the required literals but evaluate wider
+  const widerTime = good.replace(
+    `TIMESTAMP('${scope.endIso}') AND agent`,
+    `TIMESTAMP('${scope.endIso}') + INTERVAL 1 DAY AND agent`,
+  );
+  assert.equal(verifyScope(widerTime, scope), false, "+ INTERVAL widens the window");
+  const widerAgent = `${good} || SUBSTR(agent, 8)`;
+  assert.equal(verifyScope(widerAgent, scope), false, "|| concatenation widens the agent");
+  // arithmetic BEFORE the column is not this conjunct either
+  const prefixed = `SELECT 1 FROM t WHERE 1 + timestamp BETWEEN '${scope.startIso}' AND '${scope.endIso}' AND agent = 'billing'`;
+  assert.equal(verifyScope(prefixed, scope), false, "left-side arithmetic is not the raw column");
+});

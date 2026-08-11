@@ -148,3 +148,12 @@ test("boundary-clipped traces list exactly what drill-down shows (#4-r13)", () =
     assert.ok(errors > 0, "an errorless windowed slice must not be listed");
   }
 });
+
+test("mock error-trace rows list every participating agent (#3-r14)", () => {
+  for (const row of mockErrorTraces(720)) {
+    const events = mockTrace(row.trace_id, 720);
+    const expected = [...new Set(events.map((e) => e.agent).filter(Boolean))].slice(0, 5).join(",");
+    assert.equal(row.agents, expected, `${row.trace_id} agents must match its drill-down`);
+    assert.ok(row.agents.includes("sub-researcher"), "the delegated sub-agent is a participant");
+  }
+});

@@ -416,9 +416,16 @@ function checkBlock(
     // #2(r12): the column is either qualified by an IDENTIFIER (checked
     // against this scan's alias below) or NOT preceded by a dot at all —
     // `(STRUCT(...)).timestamp` is a constant field access, not this scan's
-    // column, and must never count
+    // column, and must never count.
+    // #1(r14): each conjunct must be COMPLETE — anchored between WHERE/AND
+    // and the next AND or the end of the clause. A prefix match is not a
+    // proof: `TIMESTAMP(<end>) + INTERVAL 1 DAY` widens the window and
+    // `'billing' || SUBSTR(agent, 8)` widens the agent, and both contain the
+    // required literals as prefixes.
+    const CONJ_START = `(?:\\bWHERE\\b|\\bAND\\b)\\s+`;
+    const CONJ_END = `(?=\\s+AND\\b|\\s*$)`;
     const timeRe = new RegExp(
-      `(?:\\b([A-Za-z_]\\w*)\\.|(?<![.\\w]))\\btimestamp\\b\\s+BETWEEN\\s+(?:TIMESTAMP\\s*\\(\\s*)?${LIT_RE}\\s*\\)?\\s+AND\\s+(?:TIMESTAMP\\s*\\(\\s*)?${LIT_RE}\\s*\\)?`,
+      `${CONJ_START}(?:\\b([A-Za-z_]\\w*)\\.|(?<![.\\w]))\\btimestamp\\b\\s+BETWEEN\\s+(?:TIMESTAMP\\s*\\(\\s*)?${LIT_RE}\\s*\\)?\\s+AND\\s+(?:TIMESTAMP\\s*\\(\\s*)?${LIT_RE}\\s*\\)?${CONJ_END}`,
       "i",
     );
     const tm = timeRe.exec(where);
@@ -426,7 +433,10 @@ function checkBlock(
       return false;
     }
     if (scope.agent) {
-      const am = new RegExp(`(?:\\b([A-Za-z_]\\w*)\\.|(?<![.\\w]))\\bagent\\b\\s*=\\s*${LIT_RE}`, "i").exec(where);
+      const am = new RegExp(
+        `${CONJ_START}(?:\\b([A-Za-z_]\\w*)\\.|(?<![.\\w]))\\bagent\\b\\s*=\\s*${LIT_RE}${CONJ_END}`,
+        "i",
+      ).exec(where);
       if (!am || !qualifierOk(am[1]) || literals[Number(am[2])] !== scope.agent) return false;
     }
   }

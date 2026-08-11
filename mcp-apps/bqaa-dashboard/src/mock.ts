@@ -335,7 +335,9 @@ export function mockErrorTraces(timeRangeHours = 720): ErrorTraceRow[] {
     return [{
       trace_id: f.trace_id,
       last_ts: new Date(Math.max(...events.map((e) => Date.parse(e.timestamp)))).toISOString(),
-      agents: f.agent,
+      // #3(r14): production is STRING_AGG(DISTINCT agent LIMIT 5) — the row
+      // must list every participant the drill-down shows, not just the owner
+      agents: [...new Set(events.map((e) => e.agent).filter(Boolean))].slice(0, 5).join(","),
       error_events: errors,
       sample_errors: f.sample_error,
     }];
