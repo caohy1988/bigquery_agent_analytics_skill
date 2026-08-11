@@ -46,7 +46,8 @@ export interface TimeBucket {
   ts: string; // ISO bucket start
   events: number;
   errors: number;
-  llm_calls: number;
+  llm_calls: number; // ATTEMPTS: responses + errors (#3-r15)
+  llm_responses: number; // successful responses only — token/latency denominator (#2-r16)
   prompt_tokens: number;
   completion_tokens: number;
   p50_latency_ms: number | null;

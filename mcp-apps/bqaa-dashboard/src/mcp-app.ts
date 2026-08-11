@@ -882,13 +882,15 @@ function renderLatency(d: DashboardData, main: HTMLElement): void {
   main.appendChild(
     latErr
       ? tileRow(
-          unavailableTile("LLM calls"),
+          unavailableTile("Successful responses"),
           unavailableTile("Avg latency"),
           unavailableTile("Avg TTFT"),
           unavailableTile("Slowest p95"),
         )
       : tileRow(
-          tile("LLM calls", fmtCompact(calls)),
+          // #1(r16): this counts the latency section's population — responses
+          // with measured latency — not attempts; the label must not claim more
+          tile("Successful responses", fmtCompact(calls)),
           tile("Avg latency", fmtMs(wavg((r) => r.avg_total_ms))),
           tile("Avg TTFT", fmtMs(wavg((r) => r.avg_ttft_ms))),
           tile(
@@ -936,6 +938,9 @@ function renderTokens(d: DashboardData, main: HTMLElement): void {
   const prompt = d.timeseries.reduce((a, b) => a + b.prompt_tokens, 0);
   const completion = d.timeseries.reduce((a, b) => a + b.completion_tokens, 0);
   const llmCalls = d.timeseries.reduce((a, b) => a + b.llm_calls, 0);
+  // #2(r16): tokens exist only on successful responses — dividing response
+  // tokens by ATTEMPTS understates the average
+  const llmResponses = d.timeseries.reduce((a, b) => a + (b.llm_responses ?? b.llm_calls), 0);
   const tsErr = sectionsFailed(d, "timeseries");
   main.appendChild(
     tsErr
@@ -943,13 +948,17 @@ function renderTokens(d: DashboardData, main: HTMLElement): void {
           unavailableTile("Total tokens"),
           unavailableTile("Prompt tokens"),
           unavailableTile("Completion tokens"),
-          unavailableTile("Avg tokens / call"),
+          unavailableTile("Avg tokens / response"),
         )
       : tileRow(
           tile("Total tokens", fmtCompact(prompt + completion), undefined, d.timeseries.map((b) => b.prompt_tokens + b.completion_tokens)),
           tile("Prompt tokens", fmtCompact(prompt), undefined, d.timeseries.map((b) => b.prompt_tokens)),
           tile("Completion tokens", fmtCompact(completion), undefined, d.timeseries.map((b) => b.completion_tokens)),
-          tile("Avg tokens / call", llmCalls ? fmtCompact((prompt + completion) / llmCalls) : "—", `${fmtCompact(llmCalls)} LLM calls`),
+          tile(
+            "Avg tokens / response",
+            llmResponses ? fmtCompact((prompt + completion) / llmResponses) : "—",
+            `${fmtCompact(llmResponses)} responses · ${fmtCompact(llmCalls)} attempts`,
+          ),
         ),
   );
 

@@ -210,3 +210,16 @@ test("LLM calls means attempts on every surface (#3-r15)", () => {
   // averages keep response-only denominators — an errored call has no tokens
   assert.match(WIDGET_MEASURES.total_tokens.sql, /event_type = 'LLM_RESPONSE'/);
 });
+
+test("token denominators use responses, never attempts (#2-r16)", () => {
+  const sections = buildAllSections({ table: "`p.d.t`", granularity: "day", agentFilter: false });
+  assert.match(
+    sections.timeseries,
+    /COUNTIF\(event_type = 'LLM_RESPONSE'\) AS llm_responses/,
+    "the timeseries carries a distinct response count for token math",
+  );
+  // with the reviewer's 10-attempt/2-response fixture: 2000 tokens over 2
+  // responses is 1000/response — the UI divides by llm_responses, and the
+  // SQL proves the two populations are distinct columns
+  assert.match(sections.timeseries, /IN \('LLM_RESPONSE', 'LLM_ERROR'\)\) AS llm_calls/);
+});

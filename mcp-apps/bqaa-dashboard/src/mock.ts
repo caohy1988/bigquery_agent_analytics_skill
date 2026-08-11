@@ -100,7 +100,10 @@ export function mockDashboard(
       ts: new Date(t).toISOString(),
       events,
       errors,
-      llm_calls: llmCalls,
+      // #2(r16): attempts vs successful responses are DIFFERENT populations —
+      // a share of the bucket's errors are model errors, so attempts > responses
+      llm_calls: llmCalls + Math.round(errors * 0.3),
+      llm_responses: llmCalls,
       prompt_tokens: prompt,
       completion_tokens: completion,
       p50_latency_ms: Math.round(p50),

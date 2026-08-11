@@ -220,6 +220,7 @@ export function buildDashboardSql(opts: DashboardSqlOptions): Record<Section, st
       COUNT(*) AS events,
       COUNTIF(${ERROR_EXPR}) AS errors,
       COUNTIF(event_type IN ('LLM_RESPONSE', 'LLM_ERROR')) AS llm_calls, -- attempts (#3-r15)
+      COUNTIF(event_type = 'LLM_RESPONSE') AS llm_responses, -- token/latency denominator (#2-r16)
       COALESCE(SUM(IF(event_type = 'LLM_RESPONSE',
         COALESCE(CAST(${PROMPT_TOK_EXPR} AS INT64), 0), 0)), 0) AS prompt_tokens,
       COALESCE(SUM(IF(event_type = 'LLM_RESPONSE',
