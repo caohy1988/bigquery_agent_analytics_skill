@@ -157,3 +157,12 @@ test("mock error-trace rows list every participating agent (#3-r14)", () => {
     assert.ok(row.agents.includes("sub-researcher"), "the delegated sub-agent is a participant");
   }
 });
+
+test("mock model calls equal timeseries attempts (#4-r17)", () => {
+  const d = mockDashboard(start, end, "hour");
+  const attempts = d.timeseries.reduce((a, b) => a + b.llm_calls, 0);
+  const responses = d.timeseries.reduce((a, b) => a + b.llm_responses, 0);
+  const modelCalls = d.modelComparison.reduce((a, m) => a + m.calls, 0);
+  assert.ok(attempts > responses, "the preview models failed attempts");
+  assert.equal(modelCalls, attempts, "model breakdown sums exactly to the attempt total");
+});

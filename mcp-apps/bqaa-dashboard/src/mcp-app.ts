@@ -910,7 +910,7 @@ function renderLatency(d: DashboardData, main: HTMLElement): void {
       display: fmtMs(r.p95_total_ms),
       tooltipTitle: `${r.agent} · ${r.model_id ?? "?"}`,
       tooltipRows: [
-        { name: "calls", value: fmtInt(r.calls) },
+        { name: "responses", value: fmtInt(r.calls) },
         { name: "p50", value: fmtMs(r.p50_total_ms), cssVar: "--s1" },
         { name: "p95", value: fmtMs(r.p95_total_ms), cssVar: "--s1" },
         { name: "p99", value: fmtMs(r.p99_total_ms), cssVar: "--s1" },
@@ -924,7 +924,7 @@ function renderLatency(d: DashboardData, main: HTMLElement): void {
   const tbl = chartCard("All agents", null, []);
   table(tbl.body, [
     { label: "Agent", get: (r) => `${r.agent} · ${r.model_id ?? "?"}` },
-    { label: "Calls", get: (r) => fmtInt(r.calls) },
+    { label: "Responses", get: (r) => fmtInt(r.calls) },
     { label: "Avg", get: (r) => fmtMs(r.avg_total_ms) },
     { label: "Avg TTFT", get: (r) => fmtMs(r.avg_ttft_ms) },
     { label: "p50", get: (r) => fmtMs(r.p50_total_ms) },

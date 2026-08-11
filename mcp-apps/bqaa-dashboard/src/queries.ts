@@ -34,7 +34,14 @@ export const SECTIONS = [
 export type Section = (typeof SECTIONS)[number];
 
 const LATENCY_EXPR = "CAST(JSON_VALUE(latency_ms, '$.total_ms') AS FLOAT64)";
-const LLM_LATENCY_EXPR = `IF(event_type = 'LLM_RESPONSE', ${LATENCY_EXPR}, NULL)`;
+// #1(r17): the producer can emit LLM_RESPONSE rows with status='ERROR' or an
+// error_message — those are FAILED attempts, not successful responses.
+// Success metrics (response counts, latency populations) use this null-safe
+// predicate; token SUMS deliberately stay over ALL response rows because
+// billed tokens are billed whether or not the response succeeded.
+export const SUCCESSFUL_LLM_RESPONSE_EXPR =
+  "(event_type = 'LLM_RESPONSE' AND COALESCE(status, 'OK') != 'ERROR' AND error_message IS NULL)";
+const LLM_LATENCY_EXPR = `IF(${SUCCESSFUL_LLM_RESPONSE_EXPR}, ${LATENCY_EXPR}, NULL)`;
 
 // Canonical error predicate (SDK contract): an event is an error if its type
 // is *_ERROR, its status says so, or it carries an error message. Every
@@ -92,7 +99,7 @@ export const WIDGET_MEASURES: Record<string, { label: string; sql: string; unit:
   },
   avg_ttft_ms: {
     label: "Avg time to first token",
-    sql: "ROUND(AVG(IF(event_type = 'LLM_RESPONSE', CAST(JSON_VALUE(latency_ms, '$.time_to_first_token_ms') AS FLOAT64), NULL)), 0)",
+    sql: `ROUND(AVG(IF(${SUCCESSFUL_LLM_RESPONSE_EXPR}, CAST(JSON_VALUE(latency_ms, '$.time_to_first_token_ms') AS FLOAT64), NULL)), 0)`,
     unit: "ms",
   },
   prompt_tokens: {
@@ -220,14 +227,14 @@ export function buildDashboardSql(opts: DashboardSqlOptions): Record<Section, st
       COUNT(*) AS events,
       COUNTIF(${ERROR_EXPR}) AS errors,
       COUNTIF(event_type IN ('LLM_RESPONSE', 'LLM_ERROR')) AS llm_calls, -- attempts (#3-r15)
-      COUNTIF(event_type = 'LLM_RESPONSE') AS llm_responses, -- token/latency denominator (#2-r16)
+      COUNTIF(${SUCCESSFUL_LLM_RESPONSE_EXPR}) AS llm_responses, -- successful only (#1-r17)
       COALESCE(SUM(IF(event_type = 'LLM_RESPONSE',
         COALESCE(CAST(${PROMPT_TOK_EXPR} AS INT64), 0), 0)), 0) AS prompt_tokens,
       COALESCE(SUM(IF(event_type = 'LLM_RESPONSE',
         COALESCE(CAST(${COMPLETION_TOK_EXPR} AS INT64), 0), 0)), 0) AS completion_tokens,
-      APPROX_QUANTILES(IF(event_type = 'LLM_RESPONSE',
+      APPROX_QUANTILES(IF(${SUCCESSFUL_LLM_RESPONSE_EXPR},
         CAST(JSON_VALUE(latency_ms, '$.total_ms') AS FLOAT64), NULL), 100)[OFFSET(50)] AS p50_latency_ms,
-      APPROX_QUANTILES(IF(event_type = 'LLM_RESPONSE',
+      APPROX_QUANTILES(IF(${SUCCESSFUL_LLM_RESPONSE_EXPR},
         CAST(JSON_VALUE(latency_ms, '$.total_ms') AS FLOAT64), NULL), 100)[OFFSET(95)] AS p95_latency_ms
     FROM ${T} WHERE ${W}
     GROUP BY ts ORDER BY ts ASC`,
@@ -240,7 +247,7 @@ export function buildDashboardSql(opts: DashboardSqlOptions): Record<Section, st
         CAST(JSON_VALUE(latency_ms, '$.total_ms') AS FLOAT64) AS total_latency_ms,
         CAST(JSON_VALUE(latency_ms, '$.time_to_first_token_ms') AS FLOAT64) AS ttft_ms
       FROM ${T}
-      WHERE event_type = 'LLM_RESPONSE' AND ${W}
+      WHERE ${SUCCESSFUL_LLM_RESPONSE_EXPR} AND ${W}
     )
     SELECT
       agent, model_id,
@@ -289,9 +296,9 @@ export function buildDashboardSql(opts: DashboardSqlOptions): Record<Section, st
         IF(event_type = 'LLM_RESPONSE', CAST(${PROMPT_TOK_EXPR} AS INT64), NULL) AS prompt_tokens,
         IF(event_type = 'LLM_RESPONSE', CAST(${COMPLETION_TOK_EXPR} AS INT64), NULL) AS completion_tokens,
         IF(event_type = 'LLM_RESPONSE', CAST(${TOTAL_TOK_EXPR} AS INT64), NULL) AS total_tokens,
-        IF(event_type = 'LLM_RESPONSE',
+        IF(${SUCCESSFUL_LLM_RESPONSE_EXPR},
           CAST(JSON_VALUE(latency_ms, '$.total_ms') AS FLOAT64), NULL) AS total_latency_ms,
-        IF(event_type = 'LLM_RESPONSE',
+        IF(${SUCCESSFUL_LLM_RESPONSE_EXPR},
           CAST(JSON_VALUE(latency_ms, '$.time_to_first_token_ms') AS FLOAT64), NULL) AS ttft_ms
       FROM ${T}
       WHERE event_type IN ('LLM_RESPONSE', 'LLM_ERROR') AND ${W}
@@ -324,7 +331,9 @@ export function buildDashboardSql(opts: DashboardSqlOptions): Record<Section, st
         COALESCE(CAST(${PROMPT_TOK_EXPR} AS INT64), 0) AS prompt_tokens,
         COALESCE(CAST(${COMPLETION_TOK_EXPR} AS INT64), 0) AS completion_tokens
       FROM ${T}
-      WHERE event_type = 'LLM_RESPONSE' AND session_id IS NOT NULL AND ${W}
+      -- attempts, so the sessions Calls column matches the global contract;
+      -- LLM_ERROR rows carry no tokens, so the token sums are unchanged
+      WHERE event_type IN ('LLM_RESPONSE', 'LLM_ERROR') AND session_id IS NOT NULL AND ${W}
     )
     SELECT
       session_id,
@@ -428,7 +437,8 @@ export function buildErrorTracesSql(table: string): string {
       FORMAT_TIMESTAMP('%FT%TZ', MAX(timestamp)) AS last_ts,
       STRING_AGG(DISTINCT agent LIMIT 5) AS agents,
       COUNTIF(${ERROR_EXPR}) AS error_events,
-      STRING_AGG(DISTINCT SUBSTR(COALESCE(error_message, event_type), 1, 160) LIMIT 3) AS sample_errors
+      STRING_AGG(DISTINCT IF(${ERROR_EXPR},
+        SUBSTR(COALESCE(error_message, event_type), 1, 160), NULL) LIMIT 3) AS sample_errors -- error rows only (#2-r17)
     FROM ${table}
     WHERE timestamp BETWEEN @start AND @end
       AND trace_id IS NOT NULL

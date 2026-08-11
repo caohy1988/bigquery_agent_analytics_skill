@@ -146,8 +146,13 @@ export function mockDashboard(
     };
   }).sort((a, b) => b.total_calls - a.total_calls);
 
+  // #4(r17): model calls are ATTEMPTS and must sum exactly to the timeseries
+  // attempt total — the preview cannot report per-model error rates while its
+  // call totals exclude the very attempts that failed
+  const attemptsTotal = timeseries.reduce((a, b) => a + b.llm_calls, 0);
+  const flashCalls = Math.round(attemptsTotal * 0.64);
   const modelComparison: ModelComparisonRow[] = MODELS.map((model) => {
-    const calls = Math.round(llmCallsTotal * (model.endsWith("flash") ? 0.64 : 0.36));
+    const calls = model.endsWith("flash") ? flashCalls : attemptsTotal - flashCalls;
     const base = model.endsWith("pro") ? 2100 : 950;
     const share = model.endsWith("flash") ? 0.64 : 0.36;
     return {

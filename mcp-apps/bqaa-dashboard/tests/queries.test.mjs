@@ -215,11 +215,36 @@ test("token denominators use responses, never attempts (#2-r16)", () => {
   const sections = buildAllSections({ table: "`p.d.t`", granularity: "day", agentFilter: false });
   assert.match(
     sections.timeseries,
-    /COUNTIF\(event_type = 'LLM_RESPONSE'\) AS llm_responses/,
+    /AS llm_responses/,
     "the timeseries carries a distinct response count for token math",
   );
   // with the reviewer's 10-attempt/2-response fixture: 2000 tokens over 2
   // responses is 1000/response — the UI divides by llm_responses, and the
   // SQL proves the two populations are distinct columns
   assert.match(sections.timeseries, /IN \('LLM_RESPONSE', 'LLM_ERROR'\)\) AS llm_calls/);
+});
+
+import { SUCCESSFUL_LLM_RESPONSE_EXPR } from "../src/queries.js";
+
+test("success metrics exclude errored LLM_RESPONSE rows (#1-r17)", () => {
+  // null-safe: OK, NULL-status-without-error pass; ERROR status or an
+  // error_message fail — the predicate is the single source of truth
+  assert.match(SUCCESSFUL_LLM_RESPONSE_EXPR, /COALESCE\(status, 'OK'\) != 'ERROR'/);
+  assert.match(SUCCESSFUL_LLM_RESPONSE_EXPR, /error_message IS NULL/);
+  const sections = buildAllSections({ table: "`p.d.t`", granularity: "day", agentFilter: false });
+  // the response count, latency quantiles, and latency population all use it
+  assert.match(sections.timeseries, /COUNTIF\(\(event_type = 'LLM_RESPONSE' AND COALESCE\(status, 'OK'\) != 'ERROR' AND error_message IS NULL\)\) AS llm_responses/);
+  assert.ok(!/WHERE event_type = 'LLM_RESPONSE' AND/.test(sections.latency), "latency population is successful-only");
+  assert.match(sections.latency, /COALESCE\(status, 'OK'\) != 'ERROR'/);
+  // token SUMS deliberately remain billed (all response rows) — cost truth
+  assert.match(sections.timeseries, /IF\(event_type = 'LLM_RESPONSE',\n\s+COALESCE\(CAST/);
+});
+
+test("error samples aggregate only error rows (#2-r17)", () => {
+  const sql = buildErrorTracesSql("`p.d.t`");
+  const sampleAgg = sql.slice(sql.indexOf("sample_errors") - 400, sql.indexOf("sample_errors"));
+  assert.match(sampleAgg, /STRING_AGG\(DISTINCT IF\(/, "the aggregate is gated per-row");
+  assert.match(sampleAgg, /status = 'ERROR'/, "gated on the canonical error predicate");
+  // agents/counts still aggregate over the WHOLE trace (membership subquery intact)
+  assert.match(sql, /STRING_AGG\(DISTINCT agent LIMIT 5\)/);
 });
