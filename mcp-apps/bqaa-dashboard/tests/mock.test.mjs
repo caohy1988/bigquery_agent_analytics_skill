@@ -166,3 +166,19 @@ test("mock model calls equal timeseries attempts (#4-r17)", () => {
   assert.ok(attempts > responses, "the preview models failed attempts");
   assert.equal(modelCalls, attempts, "model breakdown sums exactly to the attempt total");
 });
+
+test("mock enforces the same widget compatibility contract (#1-r19)", () => {
+  assert.throws(
+    () => mockWidget({ measure: "p95_latency_ms", dimension: "tool", granularity: "auto", filters: { status: "ERROR" } }, start, end),
+    /cannot be grouped/,
+    "the preview must not fabricate data production would answer with nulls",
+  );
+});
+
+test("mock cost buckets sum to the timeseries billed tokens (#3-r19)", () => {
+  const d = mockDashboard(start, end, "hour");
+  const billed = d.timeseries.reduce((a, b) => a + b.prompt_tokens + b.completion_tokens, 0);
+  const bucketed = (d.costBuckets ?? []).reduce((a, c) => a + c.prompt_tokens + c.completion_tokens, 0);
+  assert.equal(bucketed, billed, "the exact-cost series covers every billed token");
+  assert.ok((d.costBuckets ?? []).some((c) => c.model_id === "gemini-2.5-pro"));
+});

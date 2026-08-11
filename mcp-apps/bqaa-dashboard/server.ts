@@ -40,6 +40,7 @@ import {
   splitBudget,
   WIDGET_DIMENSIONS,
   WIDGET_MEASURES,
+  widgetSpecError,
 } from "./src/queries.js";
 import type {
   AskExchange,
@@ -369,6 +370,7 @@ async function bigQueryDashboard(
     hitl,
     delegation,
     agentRows,
+    costBuckets,
   ] = SECTIONS.map((_, i) => rowsOf(i));
 
   if (Object.keys(sectionErrors).length === SECTIONS.length) {
@@ -395,12 +397,17 @@ async function bigQueryDashboard(
     hitl: hitl ?? [],
     delegation: delegation ?? [],
     agentsList: (agentRows ?? []).map((r: any) => r.agent),
+    costBuckets: costBuckets ?? [],
   };
 }
 
 // ------------------------------------------------------------ custom widgets
 
 const WIDGET_QUERY_BYTES = Math.min(200_000_000, CONFIG.refreshBytesBudget); // single-query ops
+
+// A spec the measure's population cannot answer — an INPUT error (400), not
+// a server failure
+class WidgetSpecError extends Error {}
 
 async function loadWidget(
   spec: WidgetSpec,
@@ -412,6 +419,10 @@ async function loadWidget(
   const start = new Date(end.getTime() - timeRangeHours * 3_600_000);
   const granularity: Granularity = spec.granularity ?? (timeRangeHours <= 72 ? "hour" : "day");
   const fullSpec: WidgetSpec = { v: 1, ...spec, granularity };
+  // #1(r19): the compatibility contract gates EVERY surface — HTTP, MCP, and
+  // mock — before any dry run, execution, or plausible-looking sample data
+  const compat = widgetSpecError(fullSpec);
+  if (compat) throw new WidgetSpecError(compat);
   if (CONFIG.mock) {
     const result = { ...mockWidget(fullSpec, start, end), source: "mock" };
     return dryRun ? { ...result, rows: [], dry_run: true, estimated_bytes: 12_345_678 } : result;
@@ -1265,6 +1276,10 @@ app.get("/api/widget", checkOrigin, requireAuth, async (req, res) => {
     const data = await loadWidget(widgetSpecOf(a), a.time_range_hours ?? CONFIG.defaultHours, !!a.dry_run, requestAbort(req, res));
     res.json({ data });
   } catch (e) {
+    if (e instanceof WidgetSpecError) {
+      res.status(400).json({ error: e.message });
+      return;
+    }
     res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
   }
 });

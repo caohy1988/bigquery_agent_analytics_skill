@@ -3,6 +3,7 @@
 // Browser-safe: no Node APIs.
 
 import { sqlStringLiteral } from "./sqltext.js";
+import { widgetSpecError } from "./queries.js";
 import type {
   AgentLatencyRow,
   AskResult,
@@ -19,7 +20,7 @@ import type {
   WidgetResult,
   WidgetSpec,
   TraceListRow,
-} from "./types.js";
+ CostBucketRow,} from "./types.js";
 
 function mulberry32(seed: number): () => number {
   let a = seed >>> 0;
@@ -108,6 +109,7 @@ export function mockDashboard(
       completion_tokens: completion,
       ok_prompt_tokens: prompt, // mock failed responses bill nothing
       ok_completion_tokens: completion,
+      token_samples: llmCalls, // every mock response reports usage
       p50_latency_ms: Math.round(p50),
       p95_latency_ms: Math.round(p95),
     });
@@ -123,6 +125,8 @@ export function mockDashboard(
         agent,
         model_id: model,
         calls,
+        latency_samples: calls,
+        ttft_samples: Math.round(calls * 0.9), // some rows omit TTFT
         avg_total_ms: Math.round(base * 1.4),
         avg_ttft_ms: Math.round(base * 0.45),
         p50_total_ms: Math.round(base * 1.2),
@@ -171,6 +175,17 @@ export function mockDashboard(
       p95_latency_ms: Math.round(base * 2.9),
       avg_ttft_ms: Math.round(base * 0.4),
     };
+  });
+
+  // #3(r19): exact cost buckets — the same billed bucket tokens split by the
+  // model shares used everywhere else in the mock
+  const costBuckets: CostBucketRow[] = timeseries.flatMap((b) => {
+    const flashP = Math.round(b.prompt_tokens * 0.64);
+    const flashC = Math.round(b.completion_tokens * 0.64);
+    return [
+      { ts: b.ts, model_id: "gemini-2.5-flash", prompt_tokens: flashP, completion_tokens: flashC },
+      { ts: b.ts, model_id: "gemini-2.5-pro", prompt_tokens: b.prompt_tokens - flashP, completion_tokens: b.completion_tokens - flashC },
+    ];
   });
 
   const topSessions: SessionTokenRow[] = [];
@@ -252,10 +267,15 @@ export function mockDashboard(
     hitl,
     delegation,
     agentsList: AGENTS,
+    costBuckets,
   };
 }
 
 export function mockWidget(spec: WidgetSpec, start: Date, end: Date): WidgetResult {
+  // #1(r19): the preview obeys the SAME compatibility contract as production —
+  // it must never render plausible data for a spec BigQuery would answer with nulls
+  const compat = widgetSpecError(spec);
+  if (compat) throw new Error(compat);
   // #8(r9): the seed covers the FULL normalized spec — filters included — and
   // categorical rows honor a matching dimension filter instead of ignoring it
   const rand = mulberry32(

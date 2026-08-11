@@ -52,14 +52,25 @@ export interface TimeBucket {
   completion_tokens: number; // BILLED: all response rows, cost truth
   ok_prompt_tokens?: number; // successful responses only — average numerator (#1-r18)
   ok_completion_tokens?: number;
+  token_samples?: number; // successful responses that reported token usage (#2-r19)
   p50_latency_ms: number | null;
   p95_latency_ms: number | null;
+}
+
+// Billed tokens for one (time bucket, model) pair — the exact-cost series.
+export interface CostBucketRow {
+  ts: string;
+  model_id: string;
+  prompt_tokens: number;
+  completion_tokens: number;
 }
 
 export interface AgentLatencyRow {
   agent: string;
   model_id: string | null;
   calls: number;
+  latency_samples?: number; // rows with a measured total latency (#2-r19)
+  ttft_samples?: number; // rows with a measured TTFT (#2-r19)
   avg_total_ms: number | null;
   avg_ttft_ms: number | null;
   p50_total_ms: number | null;
@@ -108,6 +119,7 @@ export interface DashboardData {
   prevOverview?: OverviewStats | null; // same stats for the preceding window
   timeseries: TimeBucket[];
   latencyByAgent: AgentLatencyRow[];
+  costBuckets?: CostBucketRow[]; // billed tokens per (bucket, model) (#3-r19)
   toolStats: ToolStatRow[];
   modelComparison: ModelComparisonRow[];
   topSessions: SessionTokenRow[];

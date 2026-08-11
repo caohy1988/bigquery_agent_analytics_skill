@@ -82,7 +82,7 @@ test("trace query is parameterized and time-bounded", () => {
 
 // ---- widget contract (parity: measure × dimension × filters)
 
-import { buildWidgetSql, buildErrorTracesSql, WIDGET_MEASURES, WIDGET_DIMENSIONS } from "../src/queries.js";
+import { buildWidgetSql, buildErrorTracesSql, WIDGET_MEASURES, WIDGET_DIMENSIONS, widgetSpecError } from "../src/queries.js";
 
 test("widget: unknown measure/dimension/filter is rejected", () => {
   assert.throws(() => buildWidgetSql("`p.d.t`", { measure: "nope", dimension: "time" }));
@@ -94,8 +94,10 @@ test("widget: unknown measure/dimension/filter is rejected", () => {
 
 test("widget: filter values bind as parameters, never interpolated", () => {
   const evil = "x'; DROP TABLE users; --";
+  // (r19: p95_latency_ms no longer accepts a status filter — use a measure
+  // whose population supports both filters; the binding contract is the same)
   const w = buildWidgetSql("`p.d.t`", {
-    measure: "p95_latency_ms",
+    measure: "events",
     dimension: "model",
     filters: { agent: evil, status: "ERROR" },
   });
@@ -264,4 +266,45 @@ test("token averages use successful numerators; sums stay billed (#1-r18)", () =
   assert.match(sections.models, /AVG\(ok_prompt_tokens\)/);
   assert.match(sections.models, /SUM\(prompt_tokens\)/, "cost totals keep billed truth");
   assert.ok(!/AVG\(total_tokens\)/.test(sections.models), "no average over the billed population remains");
+});
+
+// ---- nineteenth-review
+
+test("incompatible widget specs are rejected before execution (#1-r19)", () => {
+  // the EXACT live repro: p95 LLM latency grouped by tool, filtered to errors —
+  // 3.9MB scanned for six all-null rows
+  assert.throws(
+    () => buildWidgetSql("`p.d.t`", { measure: "p95_latency_ms", dimension: "tool", filters: { status: "ERROR" } }),
+    /cannot be grouped by "tool"/,
+  );
+  assert.throws(
+    () => buildWidgetSql("`p.d.t`", { measure: "p95_latency_ms", dimension: "time", filters: { status: "ERROR" } }),
+    /cannot be filtered by "status"/,
+  );
+  assert.throws(
+    () => buildWidgetSql("`p.d.t`", { measure: "tool_calls", dimension: "model" }),
+    /cannot be grouped by "model"/,
+  );
+  // the ADVERTISED question is answerable by the tool-latency population
+  const w = buildWidgetSql("`p.d.t`", { measure: "tool_p95_latency_ms", dimension: "tool", filters: { status: "ERROR" } });
+  assert.match(w.sql, /TOOL_COMPLETED', 'TOOL_ERROR'/);
+  assert.match(w.sql, /status = @f_status/);
+  // validator is exported for every surface
+  assert.equal(widgetSpecError({ measure: "events", dimension: "tool", filters: {} }), null);
+  assert.match(widgetSpecError({ measure: "avg_ttft_ms", dimension: "status", filters: {} }) ?? "", /supports/);
+});
+
+test("latency and token metrics carry their own denominators (#2-r19)", () => {
+  const sections = buildAllSections({ table: "`p.d.t`", granularity: "day", agentFilter: false });
+  assert.match(sections.latency, /COUNT\(total_latency_ms\) AS latency_samples/);
+  assert.match(sections.latency, /COUNT\(ttft_ms\) AS ttft_samples/);
+  assert.match(sections.timeseries, /AS token_samples/);
+});
+
+test("cost buckets carry billed tokens per bucket AND model (#3-r19)", () => {
+  const sections = buildAllSections({ table: "`p.d.t`", granularity: "day", agentFilter: true });
+  assert.ok(sections.cost_buckets, "the section exists");
+  assert.match(sections.cost_buckets, /GROUP BY ts, model_id/);
+  assert.match(sections.cost_buckets, /timestamp BETWEEN @start AND @end/);
+  assert.match(sections.cost_buckets, /agent = @agent/, "scope-aware like every section");
 });

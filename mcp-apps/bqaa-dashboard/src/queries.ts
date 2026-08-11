@@ -30,6 +30,7 @@ export const SECTIONS = [
   "hitl",
   "delegation",
   "agents",
+  "cost_buckets",
 ] as const;
 export type Section = (typeof SECTIONS)[number];
 
@@ -72,56 +73,127 @@ export function splitBudget(totalBytes: number, parts: number): number {
 // is a whitelisted SQL fragment — specs select by KEY, so user/model input is
 // never interpolated into SQL (filters bind as query parameters).
 
-export const WIDGET_MEASURES: Record<string, { label: string; sql: string; unit: "count" | "pct" | "ms" | "tokens" }> = {
-  events: { label: "Events", sql: "COUNT(*)", unit: "count" },
-  errors: { label: "Errors", sql: `COUNTIF(${ERROR_EXPR})`, unit: "count" },
+// #1(r19): every measure declares the dimensions and filters its event
+// POPULATION can answer — the Cartesian product was advertising combinations
+// (p95 LLM latency × tool × status=ERROR) that scan real bytes and return
+// only nulls, because LLM latency lives on successful LLM_RESPONSE rows that
+// carry no tool and no error status. The shared validator rejects
+// incompatible specs BEFORE any dry run or execution, on every surface.
+const ALL_DIMS = ["time", "agent", "model", "tool", "user", "status", "event_type"];
+const ALL_FILTERS = ["agent", "model", "tool", "status"];
+const LLM_DIMS = ["time", "agent", "model", "user", "status", "event_type"];
+const LLM_FILTERS = ["agent", "model", "status"];
+const OK_LLM_DIMS = ["time", "agent", "model", "user"]; // successful responses: one status, one event type
+const OK_LLM_FILTERS = ["agent", "model"];
+const TOOL_DIMS = ["time", "agent", "tool", "user", "status", "event_type"];
+const TOOL_FILTERS = ["agent", "tool", "status"];
+
+export interface WidgetMeasure {
+  label: string;
+  sql: string;
+  unit: "count" | "pct" | "ms" | "tokens";
+  dimensions: string[];
+  filters: string[];
+}
+
+export function widgetSpecError(spec: { measure: string; dimension: string; filters?: object }): string | null {
+  const m = WIDGET_MEASURES[spec.measure];
+  if (!m) return `Unknown measure: ${spec.measure}`;
+  if (!m.dimensions.includes(spec.dimension)) {
+    return `Measure "${spec.measure}" cannot be grouped by "${spec.dimension}" — its event population supports: ${m.dimensions.join(", ")}`;
+  }
+  for (const [key, value] of Object.entries(spec.filters ?? {})) {
+    if (value == null || value === "") continue;
+    if (!m.filters.includes(key)) {
+      return `Measure "${spec.measure}" cannot be filtered by "${key}" — its event population supports: ${m.filters.join(", ") || "(no filters)"}`;
+    }
+  }
+  return null;
+}
+
+export const WIDGET_MEASURES: Record<string, WidgetMeasure> = {
+  events: { label: "Events", sql: "COUNT(*)", unit: "count", dimensions: ALL_DIMS, filters: ALL_FILTERS },
+  errors: { label: "Errors", sql: `COUNTIF(${ERROR_EXPR})`, unit: "count", dimensions: ALL_DIMS, filters: ALL_FILTERS },
   error_rate_pct: {
     label: "Error rate %",
     sql: `ROUND(SAFE_DIVIDE(COUNTIF(${ERROR_EXPR}), COUNT(*)) * 100, 2)`,
     unit: "pct",
+    dimensions: ALL_DIMS,
+    filters: ALL_FILTERS,
   },
-  sessions: { label: "Sessions", sql: "COUNT(DISTINCT session_id)", unit: "count" },
-  users: { label: "Users", sql: "COUNT(DISTINCT user_id)", unit: "count" },
+  sessions: { label: "Sessions", sql: "COUNT(DISTINCT session_id)", unit: "count", dimensions: ALL_DIMS, filters: ALL_FILTERS },
+  users: { label: "Users", sql: "COUNT(DISTINCT user_id)", unit: "count", dimensions: ALL_DIMS, filters: ALL_FILTERS },
   // #3(r15): "LLM calls" means ATTEMPTS everywhere — responses + errors —
   // matching the model-comparison view. Token/latency averages keep their
   // response-only denominators (an errored call has neither).
-  llm_calls: { label: "LLM calls", sql: "COUNTIF(event_type IN ('LLM_RESPONSE', 'LLM_ERROR'))", unit: "count" },
-  avg_latency_ms: { label: "Avg LLM latency", sql: `ROUND(AVG(${LLM_LATENCY_EXPR}), 0)`, unit: "ms" },
+  llm_calls: { label: "LLM calls", sql: "COUNTIF(event_type IN ('LLM_RESPONSE', 'LLM_ERROR'))", unit: "count", dimensions: LLM_DIMS, filters: LLM_FILTERS },
+  avg_latency_ms: { label: "Avg LLM latency", sql: `ROUND(AVG(${LLM_LATENCY_EXPR}), 0)`, unit: "ms", dimensions: OK_LLM_DIMS, filters: OK_LLM_FILTERS },
   p50_latency_ms: {
     label: "p50 LLM latency",
     sql: `APPROX_QUANTILES(${LLM_LATENCY_EXPR}, 100)[OFFSET(50)]`,
     unit: "ms",
+    dimensions: OK_LLM_DIMS,
+    filters: OK_LLM_FILTERS,
   },
   p95_latency_ms: {
     label: "p95 LLM latency",
     sql: `APPROX_QUANTILES(${LLM_LATENCY_EXPR}, 100)[OFFSET(95)]`,
     unit: "ms",
+    dimensions: OK_LLM_DIMS,
+    filters: OK_LLM_FILTERS,
   },
   avg_ttft_ms: {
     label: "Avg time to first token",
     sql: `ROUND(AVG(IF(${SUCCESSFUL_LLM_RESPONSE_EXPR}, CAST(JSON_VALUE(latency_ms, '$.time_to_first_token_ms') AS FLOAT64), NULL)), 0)`,
     unit: "ms",
+    dimensions: OK_LLM_DIMS,
+    filters: OK_LLM_FILTERS,
   },
   prompt_tokens: {
     label: "Prompt tokens",
     sql: `SUM(IF(event_type = 'LLM_RESPONSE', COALESCE(CAST(${PROMPT_TOK_EXPR} AS INT64), 0), 0))`,
     unit: "tokens",
+    dimensions: LLM_DIMS,
+    filters: LLM_FILTERS,
   },
   completion_tokens: {
     label: "Completion tokens",
     sql: `SUM(IF(event_type = 'LLM_RESPONSE', COALESCE(CAST(${COMPLETION_TOK_EXPR} AS INT64), 0), 0))`,
     unit: "tokens",
+    dimensions: LLM_DIMS,
+    filters: LLM_FILTERS,
   },
   total_tokens: {
     label: "Total tokens",
     sql: `SUM(IF(event_type = 'LLM_RESPONSE', COALESCE(CAST(${PROMPT_TOK_EXPR} AS INT64), 0) + COALESCE(CAST(${COMPLETION_TOK_EXPR} AS INT64), 0), 0))`,
     unit: "tokens",
+    dimensions: LLM_DIMS,
+    filters: LLM_FILTERS,
   },
-  tool_calls: { label: "Tool calls", sql: "COUNTIF(event_type IN ('TOOL_COMPLETED', 'TOOL_ERROR'))", unit: "count" },
+  tool_calls: { label: "Tool calls", sql: "COUNTIF(event_type IN ('TOOL_COMPLETED', 'TOOL_ERROR'))", unit: "count", dimensions: TOOL_DIMS, filters: TOOL_FILTERS },
   tool_failures: {
     label: "Tool failures",
     sql: `COUNTIF(event_type IN ('TOOL_COMPLETED', 'TOOL_ERROR') AND ${ERROR_EXPR})`,
     unit: "count",
+    dimensions: TOOL_DIMS,
+    filters: TOOL_FILTERS,
+  },
+  // #1(r19): REAL tool-latency measures — the advertised "p95 latency by tool
+  // for errors" is answerable by the TOOL event population, which carries
+  // latency on completions and errors alike
+  tool_avg_latency_ms: {
+    label: "Avg tool latency",
+    sql: `ROUND(AVG(IF(event_type IN ('TOOL_COMPLETED', 'TOOL_ERROR'), ${LATENCY_EXPR}, NULL)), 0)`,
+    unit: "ms",
+    dimensions: TOOL_DIMS,
+    filters: TOOL_FILTERS,
+  },
+  tool_p95_latency_ms: {
+    label: "p95 tool latency",
+    sql: `APPROX_QUANTILES(IF(event_type IN ('TOOL_COMPLETED', 'TOOL_ERROR'), ${LATENCY_EXPR}, NULL), 100)[OFFSET(95)]`,
+    unit: "ms",
+    dimensions: TOOL_DIMS,
+    filters: TOOL_FILTERS,
   },
 };
 
@@ -148,6 +220,8 @@ export interface BuiltWidget {
 }
 
 export function buildWidgetSql(table: string, spec: WidgetSpec): BuiltWidget {
+  const compat = widgetSpecError(spec); // #1(r19): reject before ANY execution
+  if (compat) throw new Error(compat);
   const measure = WIDGET_MEASURES[spec.measure];
   if (!measure) throw new Error(`Unknown measure: ${spec.measure}`);
   const dimension = WIDGET_DIMENSIONS[spec.dimension];
@@ -239,6 +313,11 @@ export function buildDashboardSql(opts: DashboardSqlOptions): Record<Section, st
         COALESCE(CAST(${PROMPT_TOK_EXPR} AS INT64), 0), 0)), 0) AS ok_prompt_tokens,
       COALESCE(SUM(IF(${SUCCESSFUL_LLM_RESPONSE_EXPR},
         COALESCE(CAST(${COMPLETION_TOK_EXPR} AS INT64), 0), 0)), 0) AS ok_completion_tokens,
+      -- #2(r19): the average's denominator counts responses that actually
+      -- REPORTED token usage — a producer omitting usage metadata must not
+      -- deflate the average
+      COUNTIF(${SUCCESSFUL_LLM_RESPONSE_EXPR}
+        AND COALESCE(CAST(${PROMPT_TOK_EXPR} AS INT64), CAST(${COMPLETION_TOK_EXPR} AS INT64)) IS NOT NULL) AS token_samples,
       APPROX_QUANTILES(IF(${SUCCESSFUL_LLM_RESPONSE_EXPR},
         CAST(JSON_VALUE(latency_ms, '$.total_ms') AS FLOAT64), NULL), 100)[OFFSET(50)] AS p50_latency_ms,
       APPROX_QUANTILES(IF(${SUCCESSFUL_LLM_RESPONSE_EXPR},
@@ -259,6 +338,10 @@ export function buildDashboardSql(opts: DashboardSqlOptions): Record<Section, st
     SELECT
       agent, model_id,
       COUNT(*) AS calls,
+      -- #2(r19): AVG ignores NULLs, so aggregate weighting must use the
+      -- populations the averages actually describe, not the row count
+      COUNT(total_latency_ms) AS latency_samples,
+      COUNT(ttft_ms) AS ttft_samples,
       ROUND(AVG(total_latency_ms), 0) AS avg_total_ms,
       ROUND(AVG(ttft_ms), 0) AS avg_ttft_ms,
       APPROX_QUANTILES(total_latency_ms, 100)[OFFSET(50)] AS p50_total_ms,
@@ -329,6 +412,22 @@ export function buildDashboardSql(opts: DashboardSqlOptions): Record<Section, st
     FROM llm_events
     GROUP BY model_id
     ORDER BY calls DESC`,
+
+    // #3(r19): EXACT cost buckets — billed tokens per (bucket, model), so the
+    // client prices each bucket with its own model mix instead of smearing
+    // the window total by token volume (which reversed day-to-day
+    // comparisons when the mix shifted).
+    cost_buckets: `
+    SELECT
+      FORMAT_TIMESTAMP('%FT%TZ', TIMESTAMP_TRUNC(timestamp, ${G})) AS ts,
+      COALESCE(${MODEL_EXPR}, '(unknown)') AS model_id,
+      COALESCE(SUM(COALESCE(CAST(${PROMPT_TOK_EXPR} AS INT64), 0)), 0) AS prompt_tokens,
+      COALESCE(SUM(COALESCE(CAST(${COMPLETION_TOK_EXPR} AS INT64), 0)), 0) AS completion_tokens
+    FROM ${T}
+    WHERE event_type = 'LLM_RESPONSE' AND ${W}
+    GROUP BY ts, model_id
+    ORDER BY ts ASC
+    LIMIT 4400`,
 
     // Sessions rank as whole sessions; models are a breakdown label, so a
     // multi-model session is one row, not several competing partial rows.
