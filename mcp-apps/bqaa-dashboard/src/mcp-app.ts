@@ -6,7 +6,7 @@
 import "./styles.css";
 import { App } from "@modelcontextprotocol/ext-apps";
 import { mockAsk, mockDashboard, mockTrace, mockTracesList, mockWidget } from "./mock.js";
-import { WIDGET_DIMENSIONS, WIDGET_MEASURES } from "./queries.js";
+import { COST_BUCKETS_ROW_LIMIT, WIDGET_DIMENSIONS, WIDGET_MEASURES } from "./queries.js";
 import { buildSpans } from "./spans.js";
 import type {
   AskResult,
@@ -462,7 +462,7 @@ function renderCost(d: DashboardData, main: HTMLElement): void {
     "apportioned by token volume",
     [],
     "full",
-    modelsErr || costTsErr
+    modelsErr || costTsErr || (d.costBuckets?.length ?? 0) >= COST_BUCKETS_ROW_LIMIT
       ? undefined
       : {
           filename: "cost-over-time.csv",
@@ -482,6 +482,12 @@ function renderCost(d: DashboardData, main: HTMLElement): void {
     // #2(r20): missing buckets are UNKNOWN cost, not zero cost — suppress the
     // chart and table entirely, exactly like the CSV
     emptyNote(trend.body, costTsErr);
+    return renderCostRest(d, main, rows, null);
+  }
+  if ((d.costBuckets?.length ?? 0) >= COST_BUCKETS_ROW_LIMIT) {
+    // #3(r21): a hit row bound means the series is incomplete — unavailable
+    // beats inexact
+    emptyNote(trend.body, "cost series exceeds the transport bound for this window — narrow the time range");
     return renderCostRest(d, main, rows, null);
   }
   lineChart(

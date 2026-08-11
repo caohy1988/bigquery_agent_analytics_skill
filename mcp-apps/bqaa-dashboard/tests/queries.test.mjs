@@ -82,7 +82,7 @@ test("trace query is parameterized and time-bounded", () => {
 
 // ---- widget contract (parity: measure × dimension × filters)
 
-import { buildWidgetSql, buildErrorTracesSql, WIDGET_MEASURES, WIDGET_DIMENSIONS, widgetSpecError } from "../src/queries.js";
+import { buildWidgetSql, buildErrorTracesSql, WIDGET_MEASURES, WIDGET_DIMENSIONS, widgetSpecError, COST_BUCKETS_ROW_LIMIT } from "../src/queries.js";
 
 test("widget: unknown measure/dimension/filter is rejected", () => {
   assert.throws(() => buildWidgetSql("`p.d.t`", { measure: "nope", dimension: "time" }));
@@ -321,18 +321,26 @@ test("status=ERROR matches canonical errors; status=OK excludes them (#3-r20)", 
   assert.match(err.sql, /ENDS_WITH\(event_type, '_ERROR'\)/);
   assert.match(err.sql, /error_message IS NOT NULL/);
   const ok = buildWidgetSql("`p.d.t`", { measure: "tool_calls", dimension: "tool", filters: { status: "OK" } });
-  assert.match(ok.sql, /NOT \(/);
+  // #2(r21): NOT(NULL) is NULL in GoogleSQL — OK must be the NULL-SAFE
+  // complement so OK + ERROR covers the whole population
+  assert.match(ok.sql, /NOT COALESCE\(/);
+  assert.match(ok.sql, /, FALSE\)/);
   assert.throws(
     () => buildWidgetSql("`p.d.t`", { measure: "events", dimension: "time", filters: { status: "WEIRD" } }),
     /accepts OK or ERROR/,
   );
 });
 
-test("cost buckets are bounded AND lossless (#6-r20)", () => {
+test("cost buckets keep real model identity with a detectable bound (#3-r21)", () => {
   const sections = buildAllSections({ table: "`p.d.t`", granularity: "day", agentFilter: false });
-  assert.match(sections.cost_buckets, /'\(other models\)'/, "overflow models fold into an explicit labeled row");
-  assert.match(sections.cost_buckets, /LIMIT 12/, "top models keep their identity");
-  assert.match(sections.cost_buckets, /LIMIT 30000/, "row bound exceeds max buckets x 13 ids");
+  // #3(r21): folding tail models discarded their configured price-book rates —
+  // every model row survives to the client, and a hit row bound is DETECTED
+  // (exactly COST_BUCKETS_ROW_LIMIT rows) so the trend goes unavailable
+  // instead of publishing a partial series
+  assert.ok(!sections.cost_buckets.includes("(other models)"), "no folding — identity survives to pricing");
+  assert.match(sections.cost_buckets, /GROUP BY ts, model_id/);
+  assert.match(sections.cost_buckets, new RegExp(`LIMIT ${COST_BUCKETS_ROW_LIMIT}`));
+  assert.equal(typeof COST_BUCKETS_ROW_LIMIT, "number");
 });
 
 test("the refresh budget floor derives from the section count (#4-r20)", () => {

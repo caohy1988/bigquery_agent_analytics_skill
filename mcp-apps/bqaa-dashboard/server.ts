@@ -176,51 +176,91 @@ function trackAbandonedCreation(work: Promise<unknown>): void {
     if (!released) {
       released = true;
       abandonedCreations--;
+      pumpAdmission();
     }
   };
   work.then(release, release);
 }
 
-// #1(r20): one dashboard refresh fans out SECTIONS.length jobs. Two
-// concurrent refreshes (22 jobs) exceed the 20-job cap and previously turned
-// admission pressure into ARBITRARY per-panel "Server busy" failures. A
-// refresh now passes a whole-refresh turnstile first: one full fan-out at a
-// time; later refreshes WAIT (bounded, abort-aware, FIFO) instead of
-// starting a doomed partial fan-out. Single-query ops keep per-op admission.
-let refreshInFlight = false;
-const refreshWaiters: Array<{ resolve: () => void; reject: (e: Error) => void }> = [];
+// #1(r21): ONE weighted admission controller over the shared job pool.
+// Single-query work (widgets, traces, dry runs, probes) admits with weight 1
+// and fails fast when the pool is exhausted — unchanged contract. A dashboard
+// refresh atomically RESERVES SECTIONS.length permits first, waiting FIFO
+// behind mixed traffic (bounded queue depth #4(r21), bounded wait, abort-
+// aware with timer/listener cleanup on every terminal path). Reserved permits
+// convert one-by-one into live jobs, so widgets can never starve a refresh
+// into arbitrary failed panels and a refresh can never oversubscribe BigQuery.
+interface Reservation {
+  remaining: number;
+}
+let reservedPermits = 0;
+const MAX_ADMISSION_WAITERS = 4;
+interface AdmissionWaiter {
+  weight: number;
+  resolve: () => void;
+  cleanup: () => void;
+}
+const admissionWaiters: AdmissionWaiter[] = [];
 
-function releaseRefreshTurnstile(): void {
-  const next = refreshWaiters.shift();
-  if (next) next.resolve(); // hand the turnstile to the next waiter directly
-  else refreshInFlight = false;
+function capacityUsed(): number {
+  return inflightJobs + abandonedCreations + reservedPermits;
 }
 
-async function acquireRefreshTurnstile(signal?: AbortSignal): Promise<void> {
-  if (!refreshInFlight) {
-    refreshInFlight = true;
-    return;
+function pumpAdmission(): void {
+  while (admissionWaiters.length && capacityUsed() + admissionWaiters[0].weight <= MAX_CONCURRENT_JOBS) {
+    const w = admissionWaiters.shift()!;
+    w.cleanup();
+    reservedPermits += w.weight;
+    w.resolve();
+  }
+}
+
+async function reservePermits(weight: number, signal?: AbortSignal): Promise<Reservation> {
+  if (capacityUsed() + weight <= MAX_CONCURRENT_JOBS) {
+    reservedPermits += weight;
+    return { remaining: weight };
+  }
+  if (admissionWaiters.length >= MAX_ADMISSION_WAITERS) {
+    throw new Error("Server busy: the refresh queue is full — retry shortly");
   }
   await new Promise<void>((resolve, reject) => {
-    const waiter = { resolve, reject };
-    refreshWaiters.push(waiter);
+    const waiter: AdmissionWaiter = { weight, resolve, cleanup: () => {} };
     const drop = (err: Error): void => {
-      const i = refreshWaiters.indexOf(waiter);
+      const i = admissionWaiters.indexOf(waiter);
       if (i >= 0) {
-        refreshWaiters.splice(i, 1);
+        admissionWaiters.splice(i, 1);
+        waiter.cleanup();
         reject(err);
       }
-      // if not found, the turnstile was already handed to us — the caller's
-      // finally releases it
+      // not found → already admitted; the caller's release path owns the permits
     };
-    const timer = setTimeout(() => drop(new Error("Server busy: a dashboard refresh is already running — retry shortly")), CONFIG.queryTimeoutMs * 2);
+    const timer = setTimeout(
+      () => drop(new Error("Server busy: timed out waiting for refresh capacity — retry shortly")),
+      CONFIG.queryTimeoutMs * 2,
+    );
     (timer as any).unref?.();
-    signal?.addEventListener("abort", () => drop(new Error("Refresh aborted while queued")), { once: true });
+    const onAbort = (): void => drop(new Error("Refresh aborted while queued for capacity"));
+    signal?.addEventListener("abort", onAbort, { once: true });
+    waiter.cleanup = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+    };
+    admissionWaiters.push(waiter);
   });
+  return { remaining: weight };
 }
 
-async function withJobSlot<T>(fn: () => Promise<T>): Promise<T> {
-  if (inflightJobs + abandonedCreations >= MAX_CONCURRENT_JOBS) {
+function releaseReservation(r: Reservation): void {
+  reservedPermits -= r.remaining;
+  r.remaining = 0;
+  pumpAdmission();
+}
+
+async function withJobSlot<T>(fn: () => Promise<T>, reservation?: Reservation): Promise<T> {
+  if (reservation && reservation.remaining > 0) {
+    reservation.remaining--;
+    reservedPermits--; // the reserved permit converts into a live job
+  } else if (capacityUsed() >= MAX_CONCURRENT_JOBS) {
     throw new Error("Server busy: too many concurrent BigQuery jobs — retry shortly");
   }
   inflightJobs++;
@@ -228,6 +268,7 @@ async function withJobSlot<T>(fn: () => Promise<T>): Promise<T> {
     return await fn();
   } finally {
     inflightJobs--;
+    pumpAdmission();
   }
 }
 
@@ -241,6 +282,7 @@ async function runQuery(
   params: Record<string, unknown>,
   maxBytes: number,
   signal?: AbortSignal, // caller abort (per-request ops only, never shared/cached work)
+  reservation?: Reservation, // #1(r21): dashboard sections consume pre-reserved permits
 ): Promise<QueryResult> {
   if (signal?.aborted) throw new Error("request aborted");
   return withJobSlot(async () => {
@@ -290,7 +332,7 @@ async function runQuery(
       }
       throw e;
     }
-  });
+  }, reservation);
 }
 
 async function bigQueryClient(): Promise<any> {
@@ -382,12 +424,15 @@ async function bigQueryDashboard(
   // dashboard load can never authorize more than BQAA_MAX_BYTES_BILLED total.
   const perQueryBytes = splitBudget(CONFIG.refreshBytesBudget, SECTIONS.length);
 
-  await acquireRefreshTurnstile(signal); // #1(r20): whole-refresh admission
+  // #1(r21): reserve the WHOLE fan-out atomically; sections consume permits
+  const reservation = await reservePermits(SECTIONS.length, signal);
   let settled: PromiseSettledResult<Awaited<ReturnType<typeof runQuery>>>[];
   try {
-    settled = await Promise.allSettled(SECTIONS.map((s) => runQuery(sql[s], paramsFor(s), perQueryBytes, signal)));
+    settled = await Promise.allSettled(
+      SECTIONS.map((s) => runQuery(sql[s], paramsFor(s), perQueryBytes, signal, reservation)),
+    );
   } finally {
-    releaseRefreshTurnstile();
+    releaseReservation(reservation); // returns any unconsumed permits
   }
 
   // One failed panel must not blank the dashboard: keep healthy sections,

@@ -49,7 +49,9 @@ function rowsFor(query: string): any[] {
         ok_completion_tokens: 2500,
         token_samples: 9,
         llm_calls: 150, prompt_tokens: 300000, completion_tokens: 50000, p50_latency_ms: 400, p95_latency_ms: 900 },
-      { ts: "2026-08-06T00:00:00Z", events: 500, errors: 15, llm_calls: 160, prompt_tokens: 320000, completion_tokens: 52000, p50_latency_ms: 410, p95_latency_ms: 950 },
+      { ts: "2026-08-06T00:00:00Z", events: 500, errors: 15, llm_calls: 160, llm_responses: 150,
+        prompt_tokens: 320000, completion_tokens: 52000, ok_prompt_tokens: 315000, ok_completion_tokens: 51000,
+        token_samples: 148, p50_latency_ms: 410, p95_latency_ms: 950 },
     ];
   }
   if (query.includes("llm_events")) {

@@ -492,10 +492,13 @@ test("permanently hung creations hold their slots — the cap never lies (#5-r11
   const srv = startServer({ ...FAKE_ENV, BQAA_FAKE_BQ: "stall_create_all", BQAA_QUERY_TIMEOUT_MS: "600" }, port);
   try {
     await waitFor(`http://localhost:${port}/healthz`);
-    // two DISTINCT dashboard loads (the cache coalesces identical ones) =
-    // 20 stalled creations = the whole cap
-    await fetch(`http://localhost:${port}/api/dashboard?time_range_hours=24`);
-    await fetch(`http://localhost:${port}/api/dashboard?time_range_hours=48`);
+    // r21: refreshes RESERVE atomically and queue, so saturate the pool with
+    // twenty weight-1 widgets whose creations hang forever
+    await Promise.all(
+      Array.from({ length: 20 }, () =>
+        fetch(`http://localhost:${port}/api/widget?measure=events&dimension=agent`).then((r) => r.json()),
+      ),
+    );
     const probe = await fetch(`http://localhost:${port}/api/widget?measure=events&dimension=agent`);
     const body = await probe.json();
     assert.match(body.error ?? "", /busy/i, "request 21 must be refused");
@@ -543,6 +546,30 @@ test("two concurrent refreshes never trade panels for admission (#1-r20)", async
         `${name} refresh must queue, not fail panels: ${errs.join("; ")}`,
       );
     }
+  } finally {
+    srv.child.kill();
+  }
+});
+
+test("a refresh queues behind mixed widget traffic — no failed panels (#1-r21)", async () => {
+  const port = PORT + 114;
+  const srv = startServer({ ...FAKE_ENV, BQAA_FAKE_BQ: "slow_create_all", BQAA_QUERY_TIMEOUT_MS: "8000" }, port);
+  try {
+    await waitFor(`http://localhost:${port}/healthz`);
+    // the exact round-21 repro: ten slow weight-1 widgets occupy half the
+    // pool, then a dashboard needs 11 permits — it must WAIT and succeed,
+    // never start a partial fan-out that fails arbitrary sections
+    const widgets = Promise.all(
+      Array.from({ length: 10 }, () =>
+        fetch(`http://localhost:${port}/api/widget?measure=events&dimension=agent`).then((r) => r.json()),
+      ),
+    );
+    await new Promise((r) => setTimeout(r, 150)); // widgets hold their slots
+    const dash = await fetch(`http://localhost:${port}/api/dashboard?time_range_hours=24`).then((r) => r.json());
+    const errs = Object.values(dash.data?.meta?.section_errors ?? {});
+    assert.ok(!errs.some((e) => /busy/i.test(e)), `refresh must queue, not fail panels: ${errs.join("; ")}`);
+    const widgetBodies = await widgets;
+    assert.ok(widgetBodies.every((w) => w.data), "every widget completes too");
   } finally {
     srv.child.kill();
   }
@@ -690,16 +717,18 @@ test("abandoned creations keep counting against admission (#2-r6)", async () => 
   const srv = startServer({ ...FAKE_ENV, BQAA_FAKE_BQ: "slow_create_all", BQAA_QUERY_TIMEOUT_MS: "500" }, port);
   try {
     await waitFor(`http://localhost:${port}/healthz`);
-    // 3 distinct refreshes = 30 lifecycles; ~20 admitted then time out into
-    // abandoned-creation accounting, the rest fail admission immediately
-    const refreshes = [24, 48, 72].map((h) =>
-      fetch(`http://localhost:${port}/api/dashboard?time_range_hours=${h}`).then((r) => r.json()),
+    // r21: saturate with twenty weight-1 widgets — each times out at 500ms
+    // leaving its slow creation pending in abandoned-creation accounting
+    const saturating = Promise.all(
+      Array.from({ length: 20 }, () =>
+        fetch(`http://localhost:${port}/api/widget?measure=events&dimension=agent`).then((r) => r.json()),
+      ),
     );
     await new Promise((r) => setTimeout(r, 700)); // deadlines fired, creations still pending
-    const widget = await fetch(`http://localhost:${port}/api/widget?measure=events&dimension=agent`);
+    const widget = await fetch(`http://localhost:${port}/api/widget?measure=tool_calls&dimension=tool`);
     const widgetBody = await widget.json();
     assert.match(widgetBody?.data ? "" : (widgetBody.error ?? ""), /busy/i, "abandoned creations must occupy the cap");
-    await Promise.all(refreshes);
+    await saturating;
     await new Promise((r) => setTimeout(r, 1600)); // abandoned creations settle
     // in this scenario every creation is slow, so the recovery probe itself
     // times out — recovery means it is ADMITTED (timeout), no longer refused (busy)

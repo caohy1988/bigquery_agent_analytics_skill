@@ -219,7 +219,10 @@ const WIDGET_FILTER_SQL: Record<string, string> = {
 
 const STATUS_FILTER_SQL: Record<string, string> = {
   ERROR: `(${ERROR_EXPR})`,
-  OK: `NOT (${ERROR_EXPR})`,
+  // #2(r21): GoogleSQL three-valued logic — NOT(NULL) is NULL, so a normal
+  // event with a NULL status column matched NEITHER filter. COALESCE makes
+  // OK the exact complement: OK + ERROR = the whole population.
+  OK: `NOT COALESCE((${ERROR_EXPR}), FALSE)`,
 };
 
 export interface BuiltWidget {
@@ -286,6 +289,12 @@ function whereClause(agentFilter: boolean): string {
   // The time predicate is mandatory: the table is partitioned on `timestamp`.
   return `timestamp BETWEEN @start AND @end${agentFilter ? " AND agent = @agent" : ""}`;
 }
+
+// #3(r21): when cost_buckets returns exactly this many rows, the window's
+// (bucket, model) cardinality exceeded the transport bound and the series is
+// INCOMPLETE — consumers must mark the cost trend unavailable, never publish
+// a partial series as exact.
+export const COST_BUCKETS_ROW_LIMIT = 30000;
 
 export function buildDashboardSql(opts: DashboardSqlOptions): Record<Section, string> {
   const T = opts.table;
@@ -431,34 +440,22 @@ export function buildDashboardSql(opts: DashboardSqlOptions): Record<Section, st
     // client prices each bucket with its own model mix instead of smearing
     // the window total by token volume (which reversed day-to-day
     // comparisons when the mix shifted).
-    // #6(r20): bounded AND lossless — the top 12 models by billed volume keep
-    // their identity; everything else folds into an explicit '(other models)'
-    // row per bucket. Max rows = 2200 buckets x 13 ids = 28,600 < LIMIT, so
-    // the tail of the window can never silently vanish. ('(other models)'
-    // prices at 0 unless the price book names it — identical to any unpriced
-    // model, and visibly labeled.)
+    // #3(r21): REAL model identity survives to the client, where the local
+    // price book prices each (bucket, model) pair exactly — folding tail
+    // models discarded their configured rates. The row bound stays; the
+    // client detects a hit bound (COST_BUCKETS_ROW_LIMIT rows returned) and
+    // marks the trend unavailable rather than publish an inexact series.
     cost_buckets: `
-    WITH billed AS (
-      SELECT
-        FORMAT_TIMESTAMP('%FT%TZ', TIMESTAMP_TRUNC(timestamp, ${G})) AS ts,
-        COALESCE(${MODEL_EXPR}, '(unknown)') AS model_id,
-        COALESCE(CAST(${PROMPT_TOK_EXPR} AS INT64), 0) AS p,
-        COALESCE(CAST(${COMPLETION_TOK_EXPR} AS INT64), 0) AS c
-      FROM ${T}
-      WHERE event_type = 'LLM_RESPONSE' AND ${W}
-    ),
-    top_models AS (
-      SELECT model_id FROM billed GROUP BY model_id ORDER BY SUM(p + c) DESC LIMIT 12
-    )
     SELECT
-      ts,
-      IF(model_id IN (SELECT model_id FROM top_models), model_id, '(other models)') AS model_id,
-      SUM(p) AS prompt_tokens,
-      SUM(c) AS completion_tokens
-    FROM billed
+      FORMAT_TIMESTAMP('%FT%TZ', TIMESTAMP_TRUNC(timestamp, ${G})) AS ts,
+      COALESCE(${MODEL_EXPR}, '(unknown)') AS model_id,
+      COALESCE(SUM(COALESCE(CAST(${PROMPT_TOK_EXPR} AS INT64), 0)), 0) AS prompt_tokens,
+      COALESCE(SUM(COALESCE(CAST(${COMPLETION_TOK_EXPR} AS INT64), 0)), 0) AS completion_tokens
+    FROM ${T}
+    WHERE event_type = 'LLM_RESPONSE' AND ${W}
     GROUP BY ts, model_id
     ORDER BY ts ASC
-    LIMIT 30000`,
+    LIMIT ${COST_BUCKETS_ROW_LIMIT}`,
 
     // Sessions rank as whole sessions; models are a breakdown label, so a
     // multi-model session is one row, not several competing partial rows.
