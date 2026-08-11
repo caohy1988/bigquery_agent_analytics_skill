@@ -177,3 +177,24 @@ test("top sessions aggregate whole sessions, models as a label (#28)", () => {
 test("trace query limit is parameterized for truncation detection (#23)", () => {
   assert.match(buildTraceSql("`p.d.t`"), /LIMIT @limit/);
 });
+
+import { buildTracesListSql } from "../src/queries.js";
+
+test("agent filter selects traces by membership, never truncates them (#2-r13)", () => {
+  const sql = buildTracesListSql("`p.d.t`", { agentFilter: true });
+  assert.match(sql, /trace_id IN \(/, "membership is a subquery over whole traces");
+  assert.match(sql, /SELECT DISTINCT trace_id FROM `p\.d\.t`/);
+  // the OUTER aggregation must see every event of a qualifying trace
+  const outerWhere = sql.slice(0, sql.indexOf("GROUP BY"));
+  const outerTop = outerWhere.replace(/AND trace_id IN \([\s\S]*?\)/, "");
+  assert.ok(!/AND agent = @agent/.test(outerTop), "no event-level agent filter outside the membership subquery");
+  // errors_only evaluates over the whole scoped trace
+  const errSql = buildTracesListSql("`p.d.t`", { agentFilter: true, errorsOnly: true });
+  assert.match(errSql, /HAVING COUNTIF/);
+  // both queries keep the partition predicate in every scan
+  for (const q of [sql, errSql]) {
+    const scans = q.split("FROM `p.d.t`").length - 1;
+    const bounds = q.split("timestamp BETWEEN @start AND @end").length - 1;
+    assert.equal(bounds, scans, "every table scan is partition-bounded");
+  }
+});

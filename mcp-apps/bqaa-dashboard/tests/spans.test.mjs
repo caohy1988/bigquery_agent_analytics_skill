@@ -159,3 +159,35 @@ test("cycle members never become collapse parents", () => {
   ]);
   for (const sp of spans) assert.equal(sp.parentId, null, `${sp.id} must not nest under a cycle`);
 });
+
+test("deep chains keep full collapse ancestry past the display cap (#5-r13)", () => {
+  const events = Array.from({ length: 9 }, (_, i) =>
+    ev({
+      span_id: `s${i}`,
+      parent_span_id: i ? `s${i - 1}` : null,
+      event_type: "TOOL_STARTING",
+      tool_name: `t${i}`,
+      timestamp: `2026-08-07T00:00:0${i}Z`,
+    }),
+  );
+  const { spans } = buildSpans(events);
+  const byId = Object.fromEntries(spans.map((s) => [s.id, s]));
+  // display depth caps at 6...
+  assert.equal(byId.s6.depth, 6);
+  assert.equal(byId.s8.depth, 6);
+  // ...but LOGICAL ancestry is intact all the way down
+  for (let i = 1; i < 9; i++) assert.equal(byId[`s${i}`].parentId, `s${i - 1}`, `s${i} keeps its parent`);
+  // so collapsing the root must be able to hide every descendant by walking parentId
+  const reachable = new Set(["s0"]);
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (const sp of spans) {
+      if (sp.parentId && reachable.has(sp.parentId) && !reachable.has(sp.id)) {
+        reachable.add(sp.id);
+        grew = true;
+      }
+    }
+  }
+  assert.equal(reachable.size, 9, "the whole chain is reachable from the root");
+});

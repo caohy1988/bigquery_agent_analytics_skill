@@ -66,6 +66,10 @@ export function buildSpans(events: TraceEvent[]): { spans: TraceSpan[]; totalMs:
   // a chain that merely leads INTO a cycle resolves off it (parent depth + 1),
   // so permuting event order can never change any span's depth.
   const depthCache = new Map<string, number>();
+  // #5(r13): cycle membership is tracked separately so LOGICAL ancestry
+  // (parentId, used for collapse) survives the display-depth cap — only
+  // cycle-tainted links are severed, never merely-deep ones
+  const cycleMembers = new Set<string>();
   const depthOf = (id: string): number => {
     if (depthCache.has(id)) return depthCache.get(id)!;
     const chain: string[] = [];
@@ -73,7 +77,10 @@ export function buildSpans(events: TraceEvent[]): { spans: TraceSpan[]; totalMs:
     let cur: string | null = id;
     while (cur && groups.has(cur) && !depthCache.has(cur)) {
       if (seen.has(cur)) {
-        for (const c of chain.slice(chain.indexOf(cur))) depthCache.set(c, 0); // the cycle itself
+        for (const c of chain.slice(chain.indexOf(cur))) {
+          depthCache.set(c, 0); // the cycle itself
+          cycleMembers.add(c);
+        }
         break;
       }
       seen.add(cur);
@@ -150,7 +157,10 @@ export function buildSpans(events: TraceEvent[]): { spans: TraceSpan[]; totalMs:
       startMs,
       endMs: Math.max(endMs, startMs),
       depth,
-      parentId: parent && groups.has(parent) && depthOf(parent) === depth - 1 ? parent : null,
+      // #5(r13): logical parent whenever the parent exists and neither end is
+      // cycle-tainted — deep chains past the DISPLAY cap keep full ancestry,
+      // so collapsing a root hides every descendant
+      parentId: parent && groups.has(parent) && !cycleMembers.has(parent) && !cycleMembers.has(id) ? parent : null,
       error: !!err,
       instant: endMs <= startMs,
       detail:

@@ -325,17 +325,21 @@ export function mockErrorTraces(timeRangeHours = 720): ErrorTraceRow[] {
   // #6(r11): the requested window filters exactly as production would.
   // #4(r12): last_ts is the trace's ACTUAL newest event — list and
   // drill-down can never disagree about when a trace happened.
-  const cutoffMs = timeRangeHours * 3_600_000;
-  return ERROR_TRACE_FIXTURE.map((f) => {
-    const events = mockTrace(f.trace_id);
-    return {
+  // #4(r13): summarize the WINDOWED events, exactly what a drill-down returns
+  return ERROR_TRACE_FIXTURE.flatMap((f) => {
+    const events = mockTrace(f.trace_id, timeRangeHours);
+    const errors = events.filter(
+      (e) => e.status === "ERROR" || e.event_type.endsWith("_ERROR") || e.error_message != null,
+    ).length;
+    if (!errors) return []; // the windowed slice has no errors — not an error trace
+    return [{
       trace_id: f.trace_id,
       last_ts: new Date(Math.max(...events.map((e) => Date.parse(e.timestamp)))).toISOString(),
       agents: f.agent,
-      error_events: f.error_events,
+      error_events: errors,
       sample_errors: f.sample_error,
-    };
-  }).filter((r) => MOCK_EPOCH - Date.parse(r.last_ts) <= cutoffMs);
+    }];
+  });
 }
 
 // #4(r12): ONE timestamp rule for every mock trace surface — the trace's
@@ -448,8 +452,11 @@ export function mockTracesList(timeRangeHours = 720, errorsOnly = false, agentFi
   const cutoffMs = timeRangeHours * 3_600_000;
   const rows: TraceListRow[] = [];
   for (const id of ids) {
-    // #4(r12): every field comes from the drill-down events themselves
-    const events = mockTrace(id);
+    // #4(r12)/#4(r13): every field comes from the drill-down events — the
+    // WINDOWED ones, so a boundary-clipped trace lists exactly what opening
+    // it will show, and fully-outside traces are dropped
+    const events = mockTrace(id, timeRangeHours);
+    if (!events.length) continue;
     const times = events.map((e) => Date.parse(e.timestamp));
     const lastTs = Math.max(...times);
     if (MOCK_EPOCH - lastTs > cutoffMs) continue;

@@ -126,3 +126,25 @@ test("mockTrace honors the requested window (#4-r12)", () => {
   const cutoff = Date.now() - 720 * 3_600_000 - 60_000; // tolerance for the mock clock epoch
   assert.ok(wide.every((e) => Date.parse(e.timestamp) >= cutoff));
 });
+
+test("boundary-clipped traces list exactly what drill-down shows (#4-r13)", () => {
+  // 3h window: the trace anchored exactly 3h ago is clipped mid-trace
+  for (const hours of [3, 4.5 / 1.5, 2]) {
+    for (const row of mockTracesList(hours)) {
+      const events = mockTrace(row.trace_id, hours);
+      assert.equal(row.events, events.length, `${row.trace_id} @${hours}h`);
+      const times = events.map((e) => Date.parse(e.timestamp));
+      assert.equal(row.last_ts, new Date(Math.max(...times)).toISOString());
+      assert.equal(row.duration_ms, Math.max(...times) - Math.min(...times));
+    }
+  }
+  // error list too: windowed error counts, no empty-window rows
+  for (const row of mockErrorTraces(3)) {
+    const events = mockTrace(row.trace_id, 3);
+    const errors = events.filter(
+      (e) => e.status === "ERROR" || e.event_type.endsWith("_ERROR") || e.error_message != null,
+    ).length;
+    assert.equal(row.error_events, errors, `${row.trace_id} windowed error count`);
+    assert.ok(errors > 0, "an errorless windowed slice must not be listed");
+  }
+});

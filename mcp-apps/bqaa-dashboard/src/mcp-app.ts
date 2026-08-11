@@ -1934,9 +1934,13 @@ function tracesKey(): string {
   return `${currentHours()}|${agentEl.value}|${tracesState.errorsOnly}`;
 }
 
-async function fetchTracesList(): Promise<void> {
+async function fetchTracesList(force = false): Promise<void> {
   const key = tracesKey();
   if (tracesState.loading || (tracesState.rows && tracesState.key === key)) return;
+  // #1(r13): a failure for the CURRENT scope is terminal — no automatic
+  // same-scope retry. Only an explicit Retry, a scope change, or a queued
+  // key mismatch may issue another request.
+  if (!force && tracesState.error && tracesState.key === key) return;
   if (embedded && embeddedTracesBusy) return; // the settle path re-checks the key
   const gen = ++tracesGen;
   tracesState.loading = true;
@@ -1982,13 +1986,15 @@ async function fetchTracesList(): Promise<void> {
   } catch (e) {
     if (gen !== tracesGen || (e instanceof DOMException && e.name === "AbortError")) return;
     tracesState.error = e instanceof Error ? e.message : String(e);
+    tracesState.rows = null;
+    tracesState.key = key; // #1(r13): the error ANSWERS this key — it must not refetch itself
   } finally {
     if (gen === tracesGen) {
       tracesState.loading = false;
       renderView();
-      // an embedded fetch cannot be cancelled — if the scope moved while it
-      // ran, fetch again for the current key
-      if (tracesKey() !== tracesState.key && currentView === "traces") void fetchTracesList();
+      // an embedded fetch cannot be cancelled — refetch ONLY when the scope
+      // moved while this request ran (#1-r13: never on a same-scope failure)
+      if (tracesKey() !== key && currentView === "traces") void fetchTracesList();
     }
   }
 }
@@ -2016,8 +2022,15 @@ function renderTraces(_d: DashboardData | null, main: HTMLElement): void {
   controls.appendChild(toggle);
   body.appendChild(controls);
 
-  if (tracesState.error) {
-    body.appendChild(el("div", "empty error", `Trace list failed: ${tracesState.error}`));
+  if (tracesState.error && tracesState.key === tracesKey()) {
+    const errBox = el("div", "empty error", `Trace list failed: ${tracesState.error} `);
+    const retry = el("button", "trace-close", "Retry");
+    retry.addEventListener("click", () => {
+      tracesState.error = null;
+      void fetchTracesList(true); // #1(r13): retry is EXPLICIT
+    });
+    errBox.appendChild(retry);
+    body.appendChild(errBox);
   } else if (!tracesState.rows || tracesState.key !== tracesKey()) {
     body.appendChild(el("div", "empty", "Loading traces…"));
     void fetchTracesList();
@@ -2536,6 +2549,9 @@ function isErrorEvent(e: TraceEvent): boolean {
 let wfStateTraceId: string | null = null;
 const wfCollapsed = new Set<string>();
 const wfExpandedDetails = new Set<string>();
+// #3(r13): Enter/Space toggles rebuild the DOM — the toggled row's key is
+// remembered so the recreated row receives focus instead of BODY
+let wfPendingFocusKey: string | null = null;
 
 function resetWaterfallState(traceId: string): void {
   if (wfStateTraceId !== traceId) {
@@ -2597,10 +2613,14 @@ function renderWaterfall(container: HTMLElement, events: TraceEvent[]): void {
   const kindVar: Record<string, string> = { llm: "--s1", tool: "--s2", other: "--s3" };
   const hasChildren = new Set<string>();
   for (const sp of spans) if (sp.parentId) hasChildren.add(sp.parentId);
+  // #5(r13): visited-set walk — ancestry is unbounded now that parentId
+  // survives the display-depth cap, and a malformed link can never loop
   const hiddenByCollapse = (sp: (typeof spans)[number]): boolean => {
+    const visited = new Set<string>();
     let p = sp.parentId;
-    for (let i = 0; p && i <= 8; i++) {
+    while (p && !visited.has(p)) {
       if (wfCollapsed.has(p)) return true;
+      visited.add(p);
       p = spans.find((x) => x.id === p)?.parentId ?? null;
     }
     return false;
@@ -2612,7 +2632,9 @@ function renderWaterfall(container: HTMLElement, events: TraceEvent[]): void {
     const row = el("div", "wf-row");
     row.tabIndex = 0;
     row.setAttribute("role", "button");
-    if (parent) row.setAttribute("aria-expanded", String(!wfCollapsed.has(span.id!)));
+    row.dataset.wfKey = key; // #3(r13): stable identity for focus restoration
+    // parents expose subtree state; leaves expose detail-row state
+    row.setAttribute("aria-expanded", String(parent ? !wfCollapsed.has(span.id!) : wfExpandedDetails.has(key)));
     const chevron = parent ? (wfCollapsed.has(span.id!) ? "▸ " : "▾ ") : "";
     const label = el("span", "wf-label", `${chevron}${span.error ? "! " : ""}${span.name}`);
     label.style.paddingLeft = `${span.depth * 12}px`;
@@ -2662,6 +2684,7 @@ function renderWaterfall(container: HTMLElement, events: TraceEvent[]): void {
       } else {
         wfExpandedDetails.add(key);
       }
+      wfPendingFocusKey = key; // #3(r13): the rerender must give focus back
       renderView();
     };
     row.addEventListener("click", toggle);
@@ -2690,6 +2713,14 @@ function renderWaterfall(container: HTMLElement, events: TraceEvent[]): void {
     }
   });
   container.appendChild(wf);
+  if (wfPendingFocusKey != null) {
+    const focusKey = wfPendingFocusKey;
+    wfPendingFocusKey = null;
+    requestAnimationFrame(() => {
+      const target = wf.querySelector<HTMLElement>(`[data-wf-key="${CSS.escape(focusKey)}"]`);
+      target?.focus();
+    });
+  }
 }
 
 function renderTraceCard(main: HTMLElement): void {
@@ -2831,6 +2862,7 @@ function scheduleRefresh(): void {
   tracesAbort?.abort();
   tracesState.rows = null;
   tracesState.loading = false;
+  tracesState.error = null; // #1(r13): a stale error must not block the new scope
   tracesState.key = "";
   clearTimeout(refreshDebounce);
   refreshDebounce = setTimeout(() => void refresh(), 250);

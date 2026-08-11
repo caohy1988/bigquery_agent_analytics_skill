@@ -453,7 +453,19 @@ export function buildTracesListSql(table: string, opts: { errorsOnly?: boolean; 
     FROM ${table}
     WHERE timestamp BETWEEN @start AND @end
       AND trace_id IS NOT NULL
-      ${opts.agentFilter ? "AND agent = @agent" : ""}
+      ${
+        // #2(r13): the agent filter selects WHICH traces qualify (the agent
+        // participated), but the summary aggregates the WHOLE trace — filtering
+        // events first would misreport duration, counts, agents, and errors,
+        // and errors_only would miss traces where another agent owns the error
+        opts.agentFilter
+          ? `AND trace_id IN (
+        SELECT DISTINCT trace_id FROM ${table}
+        WHERE timestamp BETWEEN @start AND @end
+          AND trace_id IS NOT NULL AND agent = @agent
+      )`
+          : ""
+      }
     GROUP BY trace_id
     ${opts.errorsOnly ? `HAVING COUNTIF(${ERROR_EXPR}) > 0` : ""}
     ORDER BY last_ts DESC
