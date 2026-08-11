@@ -75,7 +75,10 @@ export const WIDGET_MEASURES: Record<string, { label: string; sql: string; unit:
   },
   sessions: { label: "Sessions", sql: "COUNT(DISTINCT session_id)", unit: "count" },
   users: { label: "Users", sql: "COUNT(DISTINCT user_id)", unit: "count" },
-  llm_calls: { label: "LLM calls", sql: "COUNTIF(event_type = 'LLM_RESPONSE')", unit: "count" },
+  // #3(r15): "LLM calls" means ATTEMPTS everywhere — responses + errors —
+  // matching the model-comparison view. Token/latency averages keep their
+  // response-only denominators (an errored call has neither).
+  llm_calls: { label: "LLM calls", sql: "COUNTIF(event_type IN ('LLM_RESPONSE', 'LLM_ERROR'))", unit: "count" },
   avg_latency_ms: { label: "Avg LLM latency", sql: `ROUND(AVG(${LLM_LATENCY_EXPR}), 0)`, unit: "ms" },
   p50_latency_ms: {
     label: "p50 LLM latency",
@@ -216,7 +219,7 @@ export function buildDashboardSql(opts: DashboardSqlOptions): Record<Section, st
       FORMAT_TIMESTAMP('%FT%TZ', TIMESTAMP_TRUNC(timestamp, ${G})) AS ts,
       COUNT(*) AS events,
       COUNTIF(${ERROR_EXPR}) AS errors,
-      COUNTIF(event_type = 'LLM_RESPONSE') AS llm_calls,
+      COUNTIF(event_type IN ('LLM_RESPONSE', 'LLM_ERROR')) AS llm_calls, -- attempts (#3-r15)
       COALESCE(SUM(IF(event_type = 'LLM_RESPONSE',
         COALESCE(CAST(${PROMPT_TOK_EXPR} AS INT64), 0), 0)), 0) AS prompt_tokens,
       COALESCE(SUM(IF(event_type = 'LLM_RESPONSE',

@@ -1101,6 +1101,9 @@ function loadPrices(): PriceBook {
 function renderCost(d: DashboardData, main: HTMLElement): void {
   const prices = loadPrices();
   const modelsErr = sectionsFailed(d, "models");
+  // #2(r15): the cost-over-time CSV depends on the TIMESERIES section too —
+  // a failed timeseries must suppress the export, not offer a header-only file
+  const costTsErr = sectionsFailed(d, "timeseries");
   // exact token sums from the models section — never average × attempts
   const rows = d.modelComparison.map((m) => {
     const price = prices[m.model_id ?? ""] ?? { in: 0, out: 0 };
@@ -1140,7 +1143,7 @@ function renderCost(d: DashboardData, main: HTMLElement): void {
     "apportioned by token volume",
     [],
     "full",
-    modelsErr
+    modelsErr || costTsErr
       ? undefined
       : {
           filename: "cost-over-time.csv",
@@ -2531,7 +2534,7 @@ async function fetchTrace(traceId: string, signal?: AbortSignal): Promise<{ even
     if (!res.ok) throw new Error(body?.error ?? `HTTP ${res.status}`);
     return { events: body?.data ?? [], truncated: !!body?.truncated };
   }
-  return { events: mockTrace(traceId), truncated: false };
+  return { events: mockTrace(traceId, currentHours()), truncated: false }; // r15 residual: preview honors the active window
 }
 
 // #22: the open trace lives in state and is re-rendered after any full

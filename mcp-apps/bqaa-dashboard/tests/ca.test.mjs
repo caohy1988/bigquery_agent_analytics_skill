@@ -388,3 +388,36 @@ test("widening expression suffixes never verify (#1-r14)", () => {
   const prefixed = `SELECT 1 FROM t WHERE 1 + timestamp BETWEEN '${scope.startIso}' AND '${scope.endIso}' AND agent = 'billing'`;
   assert.equal(verifyScope(prefixed, scope), false, "left-side arithmetic is not the raw column");
 });
+
+// ---- fifteenth-review: declaration-ordered CTE visibility
+
+test("a self-shadowing CTE cannot hide an unscoped base scan (#1-r15)", () => {
+  const scope = { startIso: "2026-08-06T00:00:00Z", endIso: "2026-08-07T00:00:00Z" };
+  const conj = `timestamp BETWEEN '${scope.startIso}' AND '${scope.endIso}'`;
+  const table = "proj.data.agent_events";
+  // the exact reviewed bypass: the CTE named after the table scans the RAW
+  // table (its own name is not visible to its body in non-recursive
+  // GoogleSQL), unscoped, while a scoped decoy scan certifies the text
+  const shadow =
+    `WITH agent_events AS (SELECT * FROM agent_events), ` +
+    `decoy AS (SELECT 1 AS n FROM agent_events WHERE ${conj}) ` +
+    `SELECT COUNT(*) AS leaked_n FROM agent_events`;
+  assert.equal(verifyScope(shadow, scope, table), false, "the shadowed body's scan is unscoped");
+  // declaration order is respected: a later CTE referencing an EARLIER one
+  // is a CTE reference, and the single base scan carries the scope
+  const ordered =
+    `WITH base AS (SELECT * FROM agent_events WHERE ${conj}), ` +
+    `agg AS (SELECT COUNT(*) AS n FROM base) SELECT * FROM agg`;
+  assert.equal(verifyScope(ordered, scope, table), true);
+  // an EARLIER CTE referencing a LATER name is a raw base-table scan — with
+  // a bound table config, an unknown name fails outright
+  const forward =
+    `WITH agg AS (SELECT COUNT(*) AS n FROM base), ` +
+    `base AS (SELECT * FROM agent_events WHERE ${conj}) SELECT * FROM agg`;
+  assert.equal(verifyScope(forward, scope, table), false, "forward references are not CTE references");
+  // recursive CTEs have visibility this grammar does not model — fail closed
+  assert.equal(
+    verifyScope(`WITH RECURSIVE r AS (SELECT 1 FROM t WHERE ${conj}) SELECT * FROM r`, scope),
+    false,
+  );
+});

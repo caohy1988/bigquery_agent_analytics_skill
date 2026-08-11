@@ -375,12 +375,18 @@ function checkBlock(
   expectedTable?: string,
 ): boolean {
   const { flat, groups } = flattenTopLevel(text);
-  // collect CTE names declared at this level so their references are not
-  // mistaken for base-table scans (their bodies are verified recursively)
-  const names = new Set(cteNames);
-  for (const m of flat.matchAll(new RegExp(`(?:\\bWITH\\b|,)\\s*([A-Za-z_]\\w*)\\s+AS\\s+${SUBEXPR}\\d+`, "gi"))) {
-    names.add(m[1].toLowerCase());
+  // #1(r15): CTE visibility is DECLARATION-ORDERED, exactly like
+  // non-recursive GoogleSQL — a CTE body sees only the outer names and the
+  // CTEs declared BEFORE it, never itself or later ones. Collecting every
+  // name up front let `WITH agent_events AS (SELECT * FROM agent_events)`
+  // hide an unscoped base scan behind its own shadow.
+  const cteDecls: Array<{ name: string; groupIdx: number }> = [];
+  for (const m of flat.matchAll(new RegExp(`(?:\\bWITH\\b|,)\\s*([A-Za-z_]\\w*)\\s+AS\\s+${SUBEXPR}(\\d+)`, "gi"))) {
+    cteDecls.push({ name: m[1].toLowerCase(), groupIdx: Number(m[2]) });
   }
+  // the MAIN query (and any non-CTE subexpression at this level) sees them all
+  const names = new Set(cteNames);
+  for (const d of cteDecls) names.add(d.name);
   const fromRe = new RegExp(`\\bFROM\\s+(${SUBEXPR}\\d+|\`[^\`]+\`|[A-Za-z_][\\w.]*)`, "gi");
   let fm: RegExpExecArray | null;
   while ((fm = fromRe.exec(flat))) {
@@ -440,7 +446,16 @@ function checkBlock(
       if (!am || !qualifierOk(am[1]) || literals[Number(am[2])] !== scope.agent) return false;
     }
   }
-  return groups.every((g) => checkBlock(g, scope, literals, names, seen, expectedTable));
+  return groups.every((g, gi) => {
+    const declPos = cteDecls.findIndex((d) => d.groupIdx === gi);
+    if (declPos >= 0) {
+      // this group IS a CTE body: outer names + strictly earlier CTEs only
+      const visible = new Set(cteNames);
+      for (let j = 0; j < declPos; j++) visible.add(cteDecls[j].name);
+      return checkBlock(g, scope, literals, visible, seen, expectedTable);
+    }
+    return checkBlock(g, scope, literals, names, seen, expectedTable);
+  });
 }
 
 export function verifyScope(
@@ -460,7 +475,7 @@ export function verifyScope(
   // rejection below doesn't have to reason about it
   code = code.replace(/\bIS\s+NOT\s+NULL\b/gi, " __ISNOTNULL__ ");
   // constructs that can widen, negate, split, or hide a scan → unprovable
-  if (/\b(OR|NOT|UNION|INTERSECT|EXCEPT|EXISTS|JOIN|CASE|TABLESAMPLE)\b/i.test(code)) return false;
+  if (/\b(OR|NOT|UNION|INTERSECT|EXCEPT|EXISTS|JOIN|CASE|TABLESAMPLE|RECURSIVE)\b/i.test(code)) return false; // RECURSIVE: unmodeled CTE visibility (#1-r15)
   if (/\bIS\s+(TRUE|FALSE)\b/i.test(code)) return false; // (pred) IS FALSE inverts it
   if (/\bagent\b\s*(?:!=|<>|\bIN\b|\bLIKE\b)/i.test(code)) return false; // only equality is provable
   // a predicate on a DIFFERENT agent anywhere poisons the statement

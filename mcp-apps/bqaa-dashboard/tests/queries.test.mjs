@@ -198,3 +198,15 @@ test("agent filter selects traces by membership, never truncates them (#2-r13)",
     assert.equal(bounds, scans, "every table scan is partition-bounded");
   }
 });
+
+
+import { buildDashboardSql as buildAllSections } from "../src/queries.js";
+
+test("LLM calls means attempts on every surface (#3-r15)", () => {
+  assert.match(WIDGET_MEASURES.llm_calls.sql, /IN \('LLM_RESPONSE', 'LLM_ERROR'\)/, "Explore counts attempts");
+  const sections = buildAllSections({ table: "`p.d.t`", granularity: "day", agentFilter: false });
+  assert.match(sections.timeseries, /COUNTIF\(event_type IN \('LLM_RESPONSE', 'LLM_ERROR'\)\) AS llm_calls/, "overview timeseries counts attempts");
+  assert.match(sections.models, /IN \('LLM_RESPONSE', 'LLM_ERROR'\)/, "model comparison already counts attempts");
+  // averages keep response-only denominators — an errored call has no tokens
+  assert.match(WIDGET_MEASURES.total_tokens.sql, /event_type = 'LLM_RESPONSE'/);
+});

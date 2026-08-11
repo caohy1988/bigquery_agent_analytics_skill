@@ -21,6 +21,7 @@ and get nine views:
 | **Tools** | succeeded/failed calls per tool; failure-rate and latency table |
 | **Cost** | editable per-model price book × exact token sums; cost over time and by model |
 | **Agents** | HITL requests/completions/wait times; agent delegation map |
+| **Traces** | trace explorer: recent traces (errors-only toggle) with click-through to an expandable span waterfall |
 | **Explore** | custom widget builder (measure × dimension × filters) with dry-run scan estimates |
 
 Global filters (time-range presets + agent) re-query BigQuery through the
