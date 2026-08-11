@@ -232,6 +232,13 @@ export function buildDashboardSql(opts: DashboardSqlOptions): Record<Section, st
         COALESCE(CAST(${PROMPT_TOK_EXPR} AS INT64), 0), 0)), 0) AS prompt_tokens,
       COALESCE(SUM(IF(event_type = 'LLM_RESPONSE',
         COALESCE(CAST(${COMPLETION_TOK_EXPR} AS INT64), 0), 0)), 0) AS completion_tokens,
+      -- #1(r18): SUCCESSFUL-response token sums — the per-response average's
+      -- numerator. The billed sums above keep cost truth; a failed response
+      -- may bill tokens but contributes to no success average.
+      COALESCE(SUM(IF(${SUCCESSFUL_LLM_RESPONSE_EXPR},
+        COALESCE(CAST(${PROMPT_TOK_EXPR} AS INT64), 0), 0)), 0) AS ok_prompt_tokens,
+      COALESCE(SUM(IF(${SUCCESSFUL_LLM_RESPONSE_EXPR},
+        COALESCE(CAST(${COMPLETION_TOK_EXPR} AS INT64), 0), 0)), 0) AS ok_completion_tokens,
       APPROX_QUANTILES(IF(${SUCCESSFUL_LLM_RESPONSE_EXPR},
         CAST(JSON_VALUE(latency_ms, '$.total_ms') AS FLOAT64), NULL), 100)[OFFSET(50)] AS p50_latency_ms,
       APPROX_QUANTILES(IF(${SUCCESSFUL_LLM_RESPONSE_EXPR},
@@ -295,7 +302,10 @@ export function buildDashboardSql(opts: DashboardSqlOptions): Record<Section, st
         ${ERROR_EXPR} AS failed,
         IF(event_type = 'LLM_RESPONSE', CAST(${PROMPT_TOK_EXPR} AS INT64), NULL) AS prompt_tokens,
         IF(event_type = 'LLM_RESPONSE', CAST(${COMPLETION_TOK_EXPR} AS INT64), NULL) AS completion_tokens,
-        IF(event_type = 'LLM_RESPONSE', CAST(${TOTAL_TOK_EXPR} AS INT64), NULL) AS total_tokens,
+        -- #1(r18): averages describe SUCCESSFUL responses; sums stay billed
+        IF(${SUCCESSFUL_LLM_RESPONSE_EXPR}, CAST(${PROMPT_TOK_EXPR} AS INT64), NULL) AS ok_prompt_tokens,
+        IF(${SUCCESSFUL_LLM_RESPONSE_EXPR}, CAST(${COMPLETION_TOK_EXPR} AS INT64), NULL) AS ok_completion_tokens,
+        IF(${SUCCESSFUL_LLM_RESPONSE_EXPR}, CAST(${TOTAL_TOK_EXPR} AS INT64), NULL) AS ok_total_tokens,
         IF(${SUCCESSFUL_LLM_RESPONSE_EXPR},
           CAST(JSON_VALUE(latency_ms, '$.total_ms') AS FLOAT64), NULL) AS total_latency_ms,
         IF(${SUCCESSFUL_LLM_RESPONSE_EXPR},
@@ -309,9 +319,9 @@ export function buildDashboardSql(opts: DashboardSqlOptions): Record<Section, st
       ROUND(SAFE_DIVIDE(COUNTIF(failed), COUNT(*)) * 100, 2) AS error_rate_pct,
       COALESCE(SUM(prompt_tokens), 0) AS total_prompt_tokens,
       COALESCE(SUM(completion_tokens), 0) AS total_completion_tokens,
-      ROUND(AVG(total_tokens), 0) AS avg_total_tokens,
-      ROUND(AVG(prompt_tokens), 0) AS avg_prompt_tokens,
-      ROUND(AVG(completion_tokens), 0) AS avg_completion_tokens,
+      ROUND(AVG(ok_total_tokens), 0) AS avg_total_tokens,
+      ROUND(AVG(ok_prompt_tokens), 0) AS avg_prompt_tokens,
+      ROUND(AVG(ok_completion_tokens), 0) AS avg_completion_tokens,
       ROUND(AVG(total_latency_ms), 0) AS avg_latency_ms,
       APPROX_QUANTILES(total_latency_ms, 100)[OFFSET(50)] AS p50_latency_ms,
       APPROX_QUANTILES(total_latency_ms, 100)[OFFSET(95)] AS p95_latency_ms,

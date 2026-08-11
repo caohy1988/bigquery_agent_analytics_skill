@@ -248,3 +248,20 @@ test("error samples aggregate only error rows (#2-r17)", () => {
   // agents/counts still aggregate over the WHOLE trace (membership subquery intact)
   assert.match(sql, /STRING_AGG\(DISTINCT agent LIMIT 5\)/);
 });
+
+test("token averages use successful numerators; sums stay billed (#1-r18)", () => {
+  const sections = buildAllSections({ table: "`p.d.t`", granularity: "day", agentFilter: false });
+  // the timeseries carries BOTH populations: billed sums for cost, ok sums
+  // for the per-response average — on the review fixture (one OK response
+  // with 1,100 tokens, one errored response with 950), the tile divides
+  // 1,100 by 1 response, not 2,050 by 1
+  assert.match(sections.timeseries, /AS ok_prompt_tokens/);
+  assert.match(sections.timeseries, /AS ok_completion_tokens/);
+  const okAgg = sections.timeseries.slice(sections.timeseries.indexOf("ok_prompt_tokens") - 300, sections.timeseries.indexOf("ok_prompt_tokens"));
+  assert.match(okAgg, /COALESCE\(status, 'OK'\) != 'ERROR'/, "ok sums are gated on the success predicate");
+  // model token AVERAGES read the ok columns; the billed SUMS remain
+  assert.match(sections.models, /AVG\(ok_total_tokens\)/);
+  assert.match(sections.models, /AVG\(ok_prompt_tokens\)/);
+  assert.match(sections.models, /SUM\(prompt_tokens\)/, "cost totals keep billed truth");
+  assert.ok(!/AVG\(total_tokens\)/.test(sections.models), "no average over the billed population remains");
+});

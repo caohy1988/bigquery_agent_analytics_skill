@@ -48,8 +48,10 @@ export interface TimeBucket {
   errors: number;
   llm_calls: number; // ATTEMPTS: responses + errors (#3-r15)
   llm_responses: number; // successful responses only — token/latency denominator (#2-r16)
-  prompt_tokens: number;
-  completion_tokens: number;
+  prompt_tokens: number; // BILLED: all response rows, cost truth
+  completion_tokens: number; // BILLED: all response rows, cost truth
+  ok_prompt_tokens?: number; // successful responses only — average numerator (#1-r18)
+  ok_completion_tokens?: number;
   p50_latency_ms: number | null;
   p95_latency_ms: number | null;
 }

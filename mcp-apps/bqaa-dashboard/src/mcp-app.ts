@@ -941,6 +941,13 @@ function renderTokens(d: DashboardData, main: HTMLElement): void {
   // #2(r16): tokens exist only on successful responses — dividing response
   // tokens by ATTEMPTS understates the average
   const llmResponses = d.timeseries.reduce((a, b) => a + (b.llm_responses ?? b.llm_calls), 0);
+  // #1(r18): the average's NUMERATOR is successful-response tokens too — a
+  // failed response can bill tokens, and mixing billed tokens over a
+  // successful-only denominator overstates the average
+  const okTokens = d.timeseries.reduce(
+    (a, b) => a + (b.ok_prompt_tokens ?? b.prompt_tokens) + (b.ok_completion_tokens ?? b.completion_tokens),
+    0,
+  );
   const tsErr = sectionsFailed(d, "timeseries");
   main.appendChild(
     tsErr
@@ -956,7 +963,7 @@ function renderTokens(d: DashboardData, main: HTMLElement): void {
           tile("Completion tokens", fmtCompact(completion), undefined, d.timeseries.map((b) => b.completion_tokens)),
           tile(
             "Avg tokens / response",
-            llmResponses ? fmtCompact((prompt + completion) / llmResponses) : "—",
+            llmResponses ? fmtCompact(okTokens / llmResponses) : "—",
             `${fmtCompact(llmResponses)} responses · ${fmtCompact(llmCalls)} attempts`,
           ),
         ),

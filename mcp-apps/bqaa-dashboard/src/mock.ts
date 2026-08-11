@@ -106,6 +106,8 @@ export function mockDashboard(
       llm_responses: llmCalls,
       prompt_tokens: prompt,
       completion_tokens: completion,
+      ok_prompt_tokens: prompt, // mock failed responses bill nothing
+      ok_completion_tokens: completion,
       p50_latency_ms: Math.round(p50),
       p95_latency_ms: Math.round(p95),
     });
