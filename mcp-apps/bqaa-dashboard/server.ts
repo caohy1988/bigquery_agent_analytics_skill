@@ -181,6 +181,44 @@ function trackAbandonedCreation(work: Promise<unknown>): void {
   work.then(release, release);
 }
 
+// #1(r20): one dashboard refresh fans out SECTIONS.length jobs. Two
+// concurrent refreshes (22 jobs) exceed the 20-job cap and previously turned
+// admission pressure into ARBITRARY per-panel "Server busy" failures. A
+// refresh now passes a whole-refresh turnstile first: one full fan-out at a
+// time; later refreshes WAIT (bounded, abort-aware, FIFO) instead of
+// starting a doomed partial fan-out. Single-query ops keep per-op admission.
+let refreshInFlight = false;
+const refreshWaiters: Array<{ resolve: () => void; reject: (e: Error) => void }> = [];
+
+function releaseRefreshTurnstile(): void {
+  const next = refreshWaiters.shift();
+  if (next) next.resolve(); // hand the turnstile to the next waiter directly
+  else refreshInFlight = false;
+}
+
+async function acquireRefreshTurnstile(signal?: AbortSignal): Promise<void> {
+  if (!refreshInFlight) {
+    refreshInFlight = true;
+    return;
+  }
+  await new Promise<void>((resolve, reject) => {
+    const waiter = { resolve, reject };
+    refreshWaiters.push(waiter);
+    const drop = (err: Error): void => {
+      const i = refreshWaiters.indexOf(waiter);
+      if (i >= 0) {
+        refreshWaiters.splice(i, 1);
+        reject(err);
+      }
+      // if not found, the turnstile was already handed to us — the caller's
+      // finally releases it
+    };
+    const timer = setTimeout(() => drop(new Error("Server busy: a dashboard refresh is already running — retry shortly")), CONFIG.queryTimeoutMs * 2);
+    (timer as any).unref?.();
+    signal?.addEventListener("abort", () => drop(new Error("Refresh aborted while queued")), { once: true });
+  });
+}
+
 async function withJobSlot<T>(fn: () => Promise<T>): Promise<T> {
   if (inflightJobs + abandonedCreations >= MAX_CONCURRENT_JOBS) {
     throw new Error("Server busy: too many concurrent BigQuery jobs — retry shortly");
@@ -344,7 +382,13 @@ async function bigQueryDashboard(
   // dashboard load can never authorize more than BQAA_MAX_BYTES_BILLED total.
   const perQueryBytes = splitBudget(CONFIG.refreshBytesBudget, SECTIONS.length);
 
-  const settled = await Promise.allSettled(SECTIONS.map((s) => runQuery(sql[s], paramsFor(s), perQueryBytes, signal)));
+  await acquireRefreshTurnstile(signal); // #1(r20): whole-refresh admission
+  let settled: PromiseSettledResult<Awaited<ReturnType<typeof runQuery>>>[];
+  try {
+    settled = await Promise.allSettled(SECTIONS.map((s) => runQuery(sql[s], paramsFor(s), perQueryBytes, signal)));
+  } finally {
+    releaseRefreshTurnstile();
+  }
 
   // One failed panel must not blank the dashboard: keep healthy sections,
   // report the failed ones (truthfully) in meta.section_errors.
@@ -799,7 +843,7 @@ registerAppTool(
   {
     title: "Agent Analytics Dashboard",
     description:
-      "Render an interactive dashboard (overview, latency, tokens, tools) over the BigQuery Agent Analytics agent_events table. Use when the user wants to see, explore, or monitor agent metrics visually.",
+      "Render an interactive dashboard over the BigQuery Agent Analytics agent_events table with nine views: Overview, Ask (conversational analytics), Latency, Tokens, Tools, Cost, Agents (HITL + delegation), Traces (explorer + waterfalls), and Explore (custom widgets). Use when the user wants to see, explore, or monitor agent metrics visually.",
     inputSchema: metricArgs,
     outputSchema: { data: z.unknown() },
     annotations: READ_ONLY_ANNOTATIONS,
@@ -813,7 +857,7 @@ server.registerTool(
   {
     title: "Query agent metrics",
     description:
-      "Return the aggregated agent-analytics payload (overview, timeseries, latency by agent, token usage, tool stats) as structured data without rendering UI. Used by the dashboard for refresh/filtering; also useful for text answers.",
+      "Return the aggregated agent-analytics payload (overview, timeseries, latency by agent, token usage, tool stats, model comparison, sessions, HITL, delegation, per-model cost buckets) as structured data without rendering UI. Used by the dashboard for refresh/filtering; also useful for text answers.",
     inputSchema: metricArgs,
     outputSchema: { data: z.unknown() },
     annotations: READ_ONLY_ANNOTATIONS,
@@ -852,12 +896,20 @@ server.registerTool(
   },
 );
 
+// #5(r20): the compatibility matrix is PUBLISHED in the tool contract — an
+// MCP model can plan a valid spec from tools/list instead of submitting and
+// recovering from rejections.
+const WIDGET_MATRIX = Object.entries(WIDGET_MEASURES)
+  .map(([k, m]) => `${k} (dims: ${m.dimensions.join("|")}; filters: ${m.filters.join("|") || "none"})`)
+  .join("; ");
+
 server.registerTool(
   "query_widget",
   {
     title: "Query a custom widget",
     description:
-      "Run one custom analytics widget over agent_events: a measure (count/latency/tokens/error-rate/…) grouped by a dimension (time, agent, model, tool, user, status, event_type) with optional filters. Set dry_run=true to estimate bytes scanned first. Used by the dashboard's Explore tab and for ad-hoc questions.",
+      "Run one custom analytics widget over agent_events: a measure grouped by a compatible dimension with optional filters. Set dry_run=true to estimate bytes scanned first. Used by the dashboard's Explore tab and for ad-hoc questions. " +
+      `Measure compatibility: ${WIDGET_MATRIX}. The status filter uses the canonical error contract (ERROR matches *_ERROR events, status='ERROR', or an error_message).`,
     inputSchema: widgetArgs,
     outputSchema: { data: z.unknown() },
     annotations: READ_ONLY_ANNOTATIONS,
@@ -871,7 +923,8 @@ registerAppTool(
   {
     title: "Render a custom widget",
     description:
-      "Build a custom chart from natural language and render it interactively in the dashboard UI: pick a measure, a dimension, and filters. Use when the user asks to visualize a specific slice (e.g. 'show p95 latency by tool for errors').",
+      "Build a custom chart from natural language and render it interactively in the dashboard UI: pick a measure, a compatible dimension, and filters. Use when the user asks to visualize a specific slice (e.g. tool_p95_latency_ms by tool with status=ERROR for 'show p95 tool latency for errors'). " +
+      `Measure compatibility: ${WIDGET_MATRIX}.`,
     inputSchema: widgetArgs,
     outputSchema: { data: z.unknown() },
     annotations: READ_ONLY_ANNOTATIONS,

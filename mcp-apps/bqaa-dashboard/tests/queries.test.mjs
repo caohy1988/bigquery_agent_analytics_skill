@@ -103,8 +103,11 @@ test("widget: filter values bind as parameters, never interpolated", () => {
   });
   assert.ok(!w.sql.includes(evil), "filter value leaked into SQL");
   assert.match(w.sql, /agent = @f_agent/);
-  assert.match(w.sql, /status = @f_status/);
+  // #3(r20): the status filter resolves to the canonical error predicate —
+  // no parameter, no raw-column equality
+  assert.match(w.sql, /ENDS_WITH\(event_type, '_ERROR'\)/);
   assert.equal(w.filterParams.f_agent, evil);
+  assert.equal(w.filterParams.f_status, undefined, "status never becomes a raw parameter");
 });
 
 test("widget: time dimension buckets and orders by time; categorical clamps limit", () => {
@@ -288,7 +291,7 @@ test("incompatible widget specs are rejected before execution (#1-r19)", () => {
   // the ADVERTISED question is answerable by the tool-latency population
   const w = buildWidgetSql("`p.d.t`", { measure: "tool_p95_latency_ms", dimension: "tool", filters: { status: "ERROR" } });
   assert.match(w.sql, /TOOL_COMPLETED', 'TOOL_ERROR'/);
-  assert.match(w.sql, /status = @f_status/);
+  assert.match(w.sql, /ENDS_WITH\(event_type, '_ERROR'\)/, "errors filter by the CANONICAL predicate (#3-r20)");
   // validator is exported for every surface
   assert.equal(widgetSpecError({ measure: "events", dimension: "tool", filters: {} }), null);
   assert.match(widgetSpecError({ measure: "avg_ttft_ms", dimension: "status", filters: {} }) ?? "", /supports/);
@@ -307,4 +310,34 @@ test("cost buckets carry billed tokens per bucket AND model (#3-r19)", () => {
   assert.match(sections.cost_buckets, /GROUP BY ts, model_id/);
   assert.match(sections.cost_buckets, /timestamp BETWEEN @start AND @end/);
   assert.match(sections.cost_buckets, /agent = @agent/, "scope-aware like every section");
+});
+
+// ---- twentieth-review
+
+test("status=ERROR matches canonical errors; status=OK excludes them (#3-r20)", () => {
+  const err = buildWidgetSql("`p.d.t`", { measure: "tool_calls", dimension: "tool", filters: { status: "ERROR" } });
+  // a TOOL_ERROR row with a NULL status column MUST match: the predicate
+  // covers event type, status, and error_message — not the raw column
+  assert.match(err.sql, /ENDS_WITH\(event_type, '_ERROR'\)/);
+  assert.match(err.sql, /error_message IS NOT NULL/);
+  const ok = buildWidgetSql("`p.d.t`", { measure: "tool_calls", dimension: "tool", filters: { status: "OK" } });
+  assert.match(ok.sql, /NOT \(/);
+  assert.throws(
+    () => buildWidgetSql("`p.d.t`", { measure: "events", dimension: "time", filters: { status: "WEIRD" } }),
+    /accepts OK or ERROR/,
+  );
+});
+
+test("cost buckets are bounded AND lossless (#6-r20)", () => {
+  const sections = buildAllSections({ table: "`p.d.t`", granularity: "day", agentFilter: false });
+  assert.match(sections.cost_buckets, /'\(other models\)'/, "overflow models fold into an explicit labeled row");
+  assert.match(sections.cost_buckets, /LIMIT 12/, "top models keep their identity");
+  assert.match(sections.cost_buckets, /LIMIT 30000/, "row bound exceeds max buckets x 13 ids");
+});
+
+test("the refresh budget floor derives from the section count (#4-r20)", () => {
+  // the boundary is SECTIONS.length x 10 MiB — never a hard-coded byte count
+  assert.equal(SECTIONS.length, 11);
+  assert.equal(splitBudget(SECTIONS.length * 10_485_760, SECTIONS.length), 10_485_760);
+  assert.throws(() => splitBudget(SECTIONS.length * 10_485_760 - 1, SECTIONS.length), /minimum/);
 });

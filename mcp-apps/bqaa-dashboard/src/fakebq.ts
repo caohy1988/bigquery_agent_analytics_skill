@@ -44,7 +44,11 @@ function rowsFor(query: string): any[] {
   }
   if (query.includes("AS llm_calls") && query.includes("TIMESTAMP_TRUNC")) {
     return [
-      { ts: "2026-08-05T00:00:00Z", events: 500, errors: 10, llm_calls: 150, prompt_tokens: 300000, completion_tokens: 50000, p50_latency_ms: 400, p95_latency_ms: 900 },
+      { ts: "2026-08-05T00:00:00Z", events: 500, errors: 10, llm_responses: 9,
+        ok_prompt_tokens: 18000,
+        ok_completion_tokens: 2500,
+        token_samples: 9,
+        llm_calls: 150, prompt_tokens: 300000, completion_tokens: 50000, p50_latency_ms: 400, p95_latency_ms: 900 },
       { ts: "2026-08-06T00:00:00Z", events: 500, errors: 15, llm_calls: 160, prompt_tokens: 320000, completion_tokens: 52000, p50_latency_ms: 410, p95_latency_ms: 950 },
     ];
   }
@@ -77,6 +81,12 @@ function rowsFor(query: string): any[] {
         total_tokens: 28000,
         trace_ids: ["fakefakefakefake"],
       },
+    ];
+  }
+  if (query.includes("GROUP BY ts, model_id")) {
+    return [
+      { ts: "2026-08-06T00:00:00Z", model_id: "fake-model", prompt_tokens: 1000, completion_tokens: 200 },
+      { ts: "2026-08-06T01:00:00Z", model_id: "fake-model", prompt_tokens: 900, completion_tokens: 180 },
     ];
   }
   if (query.includes("SELECT DISTINCT agent")) return [{ agent: "fake-agent" }];

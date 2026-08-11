@@ -74,7 +74,7 @@ The MCP endpoint is `http://localhost:3001/mcp` (override with `PORT`).
 | `BQAA_DATASET` | `agent_analytics` | Dataset containing agent_events |
 | `BQAA_TABLE` | `agent_events` | Event table |
 | `BQAA_MOCK` | — | `1` forces deterministic sample data |
-| `BQAA_MAX_BYTES_BILLED` | `2000000000` | Bytes-billed budget for **one dashboard refresh** (split across its queries; also caps Conversational Analytics queries). Minimum ≈105 MB — BigQuery requires ≥10 MiB per query |
+| `BQAA_MAX_BYTES_BILLED` | `2000000000` | Bytes-billed budget for **one dashboard refresh** (split across its queries; also caps Conversational Analytics queries). Minimum = sections × 10 MiB (currently 11 × 10 MiB = 115,343,360 bytes) — BigQuery requires ≥10 MiB per query |
 | `BQAA_DEFAULT_HOURS` | `168` | Default lookback window in hours (1–2160); validated at startup |
 | `BQAA_QUERY_TIMEOUT_MS` | `90000` | Application deadline per BigQuery query; the job is cancelled and its slot released on expiry |
 | `BQAA_AUTH_TOKEN` | — | If set, `/mcp` and `/api/*` require `Authorization: Bearer <token>`; browsers sign in via `POST /auth/login`, which sets an HttpOnly cookie (tokens are never accepted in URLs) |

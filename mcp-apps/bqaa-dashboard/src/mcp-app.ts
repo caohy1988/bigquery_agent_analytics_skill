@@ -478,6 +478,12 @@ function renderCost(d: DashboardData, main: HTMLElement): void {
     emptyNote(trend.body, modelsErr);
     return renderCostRest(d, main, rows, modelsErr);
   }
+  if (costTsErr) {
+    // #2(r20): missing buckets are UNKNOWN cost, not zero cost — suppress the
+    // chart and table entirely, exactly like the CSV
+    emptyNote(trend.body, costTsErr);
+    return renderCostRest(d, main, rows, null);
+  }
   lineChart(
     trend.body,
     d.timeseries,
@@ -864,6 +870,9 @@ function renderExplore(d: DashboardData | null, main: HTMLElement): void {
     { value: "", label: "Any" },
     ...[...new Set(vals.filter((v): v is string => !!v))].map((v) => ({ value: v, label: v })),
   ];
+  // #5(r20): only the filters this measure's population supports are shown
+  const filterAllowed = (k: string): boolean => !measureCompat || measureCompat.filters.includes(k);
+  if (filterAllowed("agent"))
   controls.appendChild(
     exploreSelect("Agent", opt(d?.agentsList ?? []), s.filters?.agent ?? "", (v) => {
       s.filters = { ...s.filters, agent: v || undefined };
@@ -871,6 +880,7 @@ function renderExplore(d: DashboardData | null, main: HTMLElement): void {
       renderView();
     }),
   );
+  if (filterAllowed("model"))
   controls.appendChild(
     exploreSelect("Model", opt((d?.modelComparison ?? []).map((m) => m.model_id)), s.filters?.model ?? "", (v) => {
       s.filters = { ...s.filters, model: v || undefined };
@@ -878,6 +888,7 @@ function renderExplore(d: DashboardData | null, main: HTMLElement): void {
       renderView();
     }),
   );
+  if (filterAllowed("tool"))
   controls.appendChild(
     exploreSelect("Tool", opt((d?.toolStats ?? []).map((t) => t.tool_name)), s.filters?.tool ?? "", (v) => {
       s.filters = { ...s.filters, tool: v || undefined };
@@ -885,6 +896,7 @@ function renderExplore(d: DashboardData | null, main: HTMLElement): void {
       renderView();
     }),
   );
+  if (filterAllowed("status"))
   controls.appendChild(
     exploreSelect(
       "Status",

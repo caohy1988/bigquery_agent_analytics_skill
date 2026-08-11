@@ -211,7 +211,15 @@ const WIDGET_FILTER_SQL: Record<string, string> = {
   agent: "agent = @f_agent",
   model: `${MODEL_EXPR} = @f_model`,
   tool: "JSON_VALUE(content, '$.tool') = @f_tool",
-  status: "status = @f_status",
+  // #3(r20): "status" filtering means the CANONICAL error contract — a
+  // TOOL_ERROR row with a NULL status column is an error and must match
+  // status=ERROR. Raw column equality missed every such row.
+  status: "__CANONICAL_STATUS__", // resolved in buildWidgetSql, no parameter
+};
+
+const STATUS_FILTER_SQL: Record<string, string> = {
+  ERROR: `(${ERROR_EXPR})`,
+  OK: `NOT (${ERROR_EXPR})`,
 };
 
 export interface BuiltWidget {
@@ -233,6 +241,12 @@ export function buildWidgetSql(table: string, spec: WidgetSpec): BuiltWidget {
     if (value == null || value === "") continue;
     const clause = WIDGET_FILTER_SQL[key];
     if (!clause) throw new Error(`Unknown filter: ${key}`);
+    if (key === "status") {
+      const canonical = STATUS_FILTER_SQL[String(value)];
+      if (!canonical) throw new Error(`Status filter accepts OK or ERROR, got: ${String(value).slice(0, 40)}`);
+      where.push(canonical);
+      continue;
+    }
     where.push(clause);
     filterParams[`f_${key}`] = String(value).slice(0, 200);
   }
@@ -417,17 +431,34 @@ export function buildDashboardSql(opts: DashboardSqlOptions): Record<Section, st
     // client prices each bucket with its own model mix instead of smearing
     // the window total by token volume (which reversed day-to-day
     // comparisons when the mix shifted).
+    // #6(r20): bounded AND lossless — the top 12 models by billed volume keep
+    // their identity; everything else folds into an explicit '(other models)'
+    // row per bucket. Max rows = 2200 buckets x 13 ids = 28,600 < LIMIT, so
+    // the tail of the window can never silently vanish. ('(other models)'
+    // prices at 0 unless the price book names it — identical to any unpriced
+    // model, and visibly labeled.)
     cost_buckets: `
+    WITH billed AS (
+      SELECT
+        FORMAT_TIMESTAMP('%FT%TZ', TIMESTAMP_TRUNC(timestamp, ${G})) AS ts,
+        COALESCE(${MODEL_EXPR}, '(unknown)') AS model_id,
+        COALESCE(CAST(${PROMPT_TOK_EXPR} AS INT64), 0) AS p,
+        COALESCE(CAST(${COMPLETION_TOK_EXPR} AS INT64), 0) AS c
+      FROM ${T}
+      WHERE event_type = 'LLM_RESPONSE' AND ${W}
+    ),
+    top_models AS (
+      SELECT model_id FROM billed GROUP BY model_id ORDER BY SUM(p + c) DESC LIMIT 12
+    )
     SELECT
-      FORMAT_TIMESTAMP('%FT%TZ', TIMESTAMP_TRUNC(timestamp, ${G})) AS ts,
-      COALESCE(${MODEL_EXPR}, '(unknown)') AS model_id,
-      COALESCE(SUM(COALESCE(CAST(${PROMPT_TOK_EXPR} AS INT64), 0)), 0) AS prompt_tokens,
-      COALESCE(SUM(COALESCE(CAST(${COMPLETION_TOK_EXPR} AS INT64), 0)), 0) AS completion_tokens
-    FROM ${T}
-    WHERE event_type = 'LLM_RESPONSE' AND ${W}
+      ts,
+      IF(model_id IN (SELECT model_id FROM top_models), model_id, '(other models)') AS model_id,
+      SUM(p) AS prompt_tokens,
+      SUM(c) AS completion_tokens
+    FROM billed
     GROUP BY ts, model_id
     ORDER BY ts ASC
-    LIMIT 4400`,
+    LIMIT 30000`,
 
     // Sessions rank as whole sessions; models are a breakdown label, so a
     // multi-model session is one row, not several competing partial rows.

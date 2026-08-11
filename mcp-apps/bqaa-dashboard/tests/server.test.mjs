@@ -526,6 +526,28 @@ test("a malformed auth cookie is an absent credential, never a 500 (#3-r12)", as
   }
 });
 
+test("two concurrent refreshes never trade panels for admission (#1-r20)", async () => {
+  const port = PORT + 113;
+  // every creation is slow, so the two 11-job fan-outs genuinely overlap
+  const srv = startServer({ ...FAKE_ENV, BQAA_FAKE_BQ: "slow_create_all", BQAA_QUERY_TIMEOUT_MS: "8000" }, port);
+  try {
+    await waitFor(`http://localhost:${port}/healthz`);
+    const [a, b] = await Promise.all([
+      fetch(`http://localhost:${port}/api/dashboard?time_range_hours=24`).then((r) => r.json()),
+      fetch(`http://localhost:${port}/api/dashboard?time_range_hours=48`).then((r) => r.json()),
+    ]);
+    for (const [name, resp] of [["first", a], ["second", b]]) {
+      const errs = Object.values(resp.data?.meta?.section_errors ?? {});
+      assert.ok(
+        !errs.some((e) => /busy/i.test(e)),
+        `${name} refresh must queue, not fail panels: ${errs.join("; ")}`,
+      );
+    }
+  } finally {
+    srv.child.kill();
+  }
+});
+
 test("malformed JSON keeps the API error contract (#19)", async () => {
   const res = await fetch(`${BASE}/api/ask`, {
     method: "POST",
