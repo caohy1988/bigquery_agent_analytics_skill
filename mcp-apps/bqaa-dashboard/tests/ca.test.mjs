@@ -342,3 +342,29 @@ test("gid-less retries make later pairings permanently ambiguous (#1-r11)", () =
   assert.equal(r.scope?.verified, false, "ambiguous ownership can never verify");
   assert.equal(r.sql, null, "no SQL may be presented beside rows it may not own");
 });
+
+// ---- twelfth-review: '#' comments and expression field access
+
+test("'#' comments cannot hide widening SQL (#1-r12)", () => {
+  const scope = { startIso: "2026-08-06T00:00:00Z", endIso: "2026-08-07T00:00:00Z", agent: "billing" };
+  // the exact published repro: '#' tails hide OR TRUE from a two-pass lexer
+  const hidden =
+    `SELECT 1 FROM t WHERE timestamp BETWEEN '${scope.startIso}' AND '${scope.endIso}'\n` +
+    `  AND agent = 'billing' # '\nOR TRUE # '\n`;
+  assert.equal(verifyScope(hidden, scope), false, "BigQuery executes the OR TRUE — we must see it");
+  // and a benign '#' comment does not unbalance a good query
+  const benign = `SELECT 1 FROM t WHERE timestamp BETWEEN '${scope.startIso}' AND '${scope.endIso}' AND agent = 'billing' # note's\n`;
+  assert.equal(verifyScope(benign, scope), true);
+});
+
+test("parenthesized STRUCT field access never certifies (#2-r12)", () => {
+  const scope = { startIso: "2026-08-06T00:00:00Z", endIso: "2026-08-07T00:00:00Z", agent: "billing" };
+  // the exact published repro: both predicates are CONSTANTS over struct
+  // fields named timestamp/agent — they constrain nothing
+  const struct =
+    "SELECT * FROM `proj.data.agent_events`\n" +
+    `WHERE (STRUCT(TIMESTAMP('${scope.startIso}') AS timestamp)).timestamp\n` +
+    `      BETWEEN '${scope.startIso}' AND '${scope.endIso}'\n` +
+    `  AND (STRUCT('billing' AS agent)).agent = 'billing'`;
+  assert.equal(verifyScope(struct, scope, "proj.data.agent_events"), false);
+});

@@ -279,7 +279,8 @@ function lexSql(sql: string): { code: string; literals: string[] } | null {
   while (i < n) {
     const two = sql.slice(i, i + 2);
     const c = sql[i];
-    if (two === "--") {
+    if (two === "--" || c === "#") {
+      // #1(r12): GoogleSQL also treats '#' as a line comment
       while (i < n && sql[i] !== "\n") i++;
       out += " ";
     } else if (two === "/*") {
@@ -412,8 +413,12 @@ function checkBlock(
     // table name — so constant structs named timestamp/agent never count
     const ownQualifiers = new Set([alias, name.toLowerCase().split(".").pop() ?? null].filter(Boolean) as string[]);
     const qualifierOk = (q: string | undefined): boolean => q == null || ownQualifiers.has(q.toLowerCase());
+    // #2(r12): the column is either qualified by an IDENTIFIER (checked
+    // against this scan's alias below) or NOT preceded by a dot at all —
+    // `(STRUCT(...)).timestamp` is a constant field access, not this scan's
+    // column, and must never count
     const timeRe = new RegExp(
-      `(?:\\b([A-Za-z_]\\w*)\\.)?\\btimestamp\\b\\s+BETWEEN\\s+(?:TIMESTAMP\\s*\\(\\s*)?${LIT_RE}\\s*\\)?\\s+AND\\s+(?:TIMESTAMP\\s*\\(\\s*)?${LIT_RE}\\s*\\)?`,
+      `(?:\\b([A-Za-z_]\\w*)\\.|(?<![.\\w]))\\btimestamp\\b\\s+BETWEEN\\s+(?:TIMESTAMP\\s*\\(\\s*)?${LIT_RE}\\s*\\)?\\s+AND\\s+(?:TIMESTAMP\\s*\\(\\s*)?${LIT_RE}\\s*\\)?`,
       "i",
     );
     const tm = timeRe.exec(where);
@@ -421,7 +426,7 @@ function checkBlock(
       return false;
     }
     if (scope.agent) {
-      const am = new RegExp(`(?:\\b([A-Za-z_]\\w*)\\.)?\\bagent\\b\\s*=\\s*${LIT_RE}`, "i").exec(where);
+      const am = new RegExp(`(?:\\b([A-Za-z_]\\w*)\\.|(?<![.\\w]))\\bagent\\b\\s*=\\s*${LIT_RE}`, "i").exec(where);
       if (!am || !qualifierOk(am[1]) || literals[Number(am[2])] !== scope.agent) return false;
     }
   }

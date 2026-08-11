@@ -509,6 +509,23 @@ test("permanently hung creations hold their slots — the cap never lies (#5-r11
   }
 });
 
+test("a malformed auth cookie is an absent credential, never a 500 (#3-r12)", async () => {
+  const port = PORT + 112;
+  const srv = startServer({ BQAA_AUTH_TOKEN: "s3cret" }, port);
+  try {
+    await waitFor(`http://localhost:${port}/healthz`);
+    const api = await fetch(`http://localhost:${port}/api/dashboard`, { headers: { Cookie: "bqaa_token=%" } });
+    assert.equal(api.status, 401, "API route: undecodable cookie → unauthorized");
+    const mcp = await rpc(`http://localhost:${port}`, "tools/list", {}, { Cookie: "bqaa_token=%" });
+    assert.equal(mcp.status, 401, "MCP route: undecodable cookie → unauthorized");
+    // a VALID cookie still authenticates
+    const ok = await fetch(`http://localhost:${port}/api/dashboard`, { headers: { Cookie: "bqaa_token=s3cret" } });
+    assert.equal(ok.status, 200);
+  } finally {
+    srv.child.kill();
+  }
+});
+
 test("malformed JSON keeps the API error contract (#19)", async () => {
   const res = await fetch(`${BASE}/api/ask`, {
     method: "POST",

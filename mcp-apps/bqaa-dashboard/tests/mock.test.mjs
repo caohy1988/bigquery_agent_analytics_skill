@@ -98,3 +98,31 @@ test("mockTracesList round-trips exactly to mockTrace (explorer truth)", () => {
   const scoped = mockTracesList(720, false, "no-such-agent");
   assert.deepEqual(scoped, [], "an unknown agent filter returns no traces");
 });
+
+test("list timestamps ARE the drill-down timestamps (#4-r12)", () => {
+  for (const row of mockErrorTraces(720)) {
+    const events = mockTrace(row.trace_id);
+    const lastEvent = Math.max(...events.map((e) => Date.parse(e.timestamp)));
+    assert.equal(row.last_ts, new Date(lastEvent).toISOString(), `${row.trace_id} list vs drill-down`);
+  }
+  for (const row of mockTracesList(720)) {
+    const events = mockTrace(row.trace_id);
+    const times = events.map((e) => Date.parse(e.timestamp));
+    assert.equal(row.last_ts, new Date(Math.max(...times)).toISOString());
+    assert.equal(row.start_ts, new Date(Math.min(...times)).toISOString());
+  }
+});
+
+test("mockTrace honors the requested window (#4-r12)", () => {
+  const oldest = mockErrorTraces(720).at(-1);
+  const all = mockTrace(oldest.trace_id);
+  assert.ok(all.length > 0);
+  // that trace is hours old — a 1h window excludes every event
+  const narrow = mockTrace(oldest.trace_id, 1);
+  assert.deepEqual(narrow, [], "events outside the window must not be returned");
+  // a wide window returns them all, inside the range
+  const wide = mockTrace(oldest.trace_id, 720);
+  assert.equal(wide.length, all.length);
+  const cutoff = Date.now() - 720 * 3_600_000 - 60_000; // tolerance for the mock clock epoch
+  assert.ok(wide.every((e) => Date.parse(e.timestamp) >= cutoff));
+});

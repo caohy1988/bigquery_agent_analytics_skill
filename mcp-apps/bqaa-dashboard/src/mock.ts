@@ -322,19 +322,38 @@ const ERROR_TRACE_FIXTURE: Array<{ trace_id: string; error_events: number; sampl
 })();
 
 export function mockErrorTraces(timeRangeHours = 720): ErrorTraceRow[] {
-  // #6(r11): the fixture rows are spaced 1.5h apart going back in time — the
-  // requested window filters them exactly as the production query would
+  // #6(r11): the requested window filters exactly as production would.
+  // #4(r12): last_ts is the trace's ACTUAL newest event — list and
+  // drill-down can never disagree about when a trace happened.
   const cutoffMs = timeRangeHours * 3_600_000;
-  return ERROR_TRACE_FIXTURE.map((f, i) => ({
-    trace_id: f.trace_id,
-    last_ts: new Date(Date.now() - i * 5_400_000).toISOString(),
-    agents: f.agent,
-    error_events: f.error_events,
-    sample_errors: f.sample_error,
-  })).filter((r) => Date.now() - Date.parse(r.last_ts) <= cutoffMs);
+  return ERROR_TRACE_FIXTURE.map((f) => {
+    const events = mockTrace(f.trace_id);
+    return {
+      trace_id: f.trace_id,
+      last_ts: new Date(Math.max(...events.map((e) => Date.parse(e.timestamp)))).toISOString(),
+      agents: f.agent,
+      error_events: f.error_events,
+      sample_errors: f.sample_error,
+    };
+  }).filter((r) => MOCK_EPOCH - Date.parse(r.last_ts) <= cutoffMs);
 }
 
-export function mockTrace(traceId: string): TraceEvent[] {
+// #4(r12): ONE timestamp rule for every mock trace surface — the trace's
+// position in the shared id list fixes when it happened (1.5h apart, newest
+// first), and BOTH the summary lists and the drill-down derive from it. An
+// id outside the fixture anchors one hour ago.
+// One deterministic clock for every trace surface: captured once, so a list
+// call and a drill-down call milliseconds apart can never disagree about
+// when a trace happened.
+const MOCK_EPOCH = Date.now();
+
+function traceAnchorMs(traceId: string): number {
+  const ids = [...ERROR_TRACE_FIXTURE.map((f) => f.trace_id), ...HEALTHY_TRACE_IDS];
+  const i = ids.indexOf(traceId);
+  return MOCK_EPOCH - (i >= 0 ? i * 5_400_000 : 3_600_000);
+}
+
+export function mockTrace(traceId: string, timeRangeHours?: number): TraceEvent[] {
   const rand = mulberry32(traceId.length * 7919 + 17);
   const t0 = Date.now() - 3_600_000;
   const events: TraceEvent[] = [];
@@ -406,7 +425,16 @@ export function mockTrace(traceId: string): TraceEvent[] {
   }
   t += 900;
   push({ event_type: "LLM_RESPONSE", span_id: "s2", parent_span_id: "s1", llm_response: "Final answer.", latency_ms: 900 });
-  return events;
+  // shift the whole trace so its LAST event lands exactly on its anchor —
+  // the timestamp the explorer and error lists publish for it
+  const shift = traceAnchorMs(traceId) - Math.max(...events.map((e) => Date.parse(e.timestamp)));
+  const shifted = events.map((e) => ({ ...e, timestamp: new Date(Date.parse(e.timestamp) + shift).toISOString() }));
+  // and honor the requested window, exactly like the production query would
+  if (timeRangeHours != null) {
+    const cutoff = MOCK_EPOCH - timeRangeHours * 3_600_000;
+    return shifted.filter((e) => Date.parse(e.timestamp) >= cutoff);
+  }
+  return shifted;
 }
 
 // Trace-explorer list — derived by ROUND-TRIPPING mockTrace, so the summary a
@@ -419,21 +447,21 @@ export function mockTracesList(timeRangeHours = 720, errorsOnly = false, agentFi
   const ids = [...ERROR_TRACE_FIXTURE.map((f) => f.trace_id), ...(errorsOnly ? [] : HEALTHY_TRACE_IDS)];
   const cutoffMs = timeRangeHours * 3_600_000;
   const rows: TraceListRow[] = [];
-  for (const [i, id] of ids.entries()) {
-    const lastTs = Date.now() - i * 5_400_000; // 1.5h apart, matching mockErrorTraces
-    if (Date.now() - lastTs > cutoffMs) continue;
+  for (const id of ids) {
+    // #4(r12): every field comes from the drill-down events themselves
     const events = mockTrace(id);
+    const times = events.map((e) => Date.parse(e.timestamp));
+    const lastTs = Math.max(...times);
+    if (MOCK_EPOCH - lastTs > cutoffMs) continue;
     if (agentFilter && !events.some((e) => e.agent === agentFilter)) continue;
     const errors = events.filter(
       (e) => e.status === "ERROR" || e.event_type.endsWith("_ERROR") || e.error_message != null,
     ).length;
-    const times = events.map((e) => Date.parse(e.timestamp));
-    const durationMs = Math.max(...times) - Math.min(...times);
     rows.push({
       trace_id: id,
-      start_ts: new Date(lastTs - durationMs).toISOString(),
+      start_ts: new Date(Math.min(...times)).toISOString(),
       last_ts: new Date(lastTs).toISOString(),
-      duration_ms: durationMs,
+      duration_ms: lastTs - Math.min(...times),
       events: events.length,
       error_events: errors,
       agents: [...new Set(events.map((e) => e.agent).filter(Boolean))].slice(0, 5).join(","),

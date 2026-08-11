@@ -646,7 +646,7 @@ const TRACE_EVENT_CAP = 500;
 
 async function loadTrace(traceId: string, timeRangeHours: number, signal?: AbortSignal): Promise<TraceResult> {
   if (!TRACE_ID_RE.test(traceId)) throw new Error("Invalid trace_id");
-  if (CONFIG.mock) return { events: mockTrace(traceId), truncated: false, source: "mock" };
+  if (CONFIG.mock) return { events: mockTrace(traceId, timeRangeHours), truncated: false, source: "mock" }; // #4(r12): window applies
   const end = new Date();
   const start = new Date(end.getTime() - timeRangeHours * 3_600_000);
   // fetch cap+1 so truncation is reported instead of silently dropping events
@@ -1042,7 +1042,14 @@ function checkOrigin(req: express.Request, res: express.Response, next: express.
 // per the MCP authorization spec.
 function cookieToken(req: express.Request): string {
   const m = /(?:^|;\s*)bqaa_token=([^;]+)/.exec(req.headers.cookie ?? "");
-  return m ? decodeURIComponent(m[1]) : "";
+  if (!m) return "";
+  // #3(r12): a cookie that cannot be decoded is an ABSENT credential (→ 401),
+  // never an internal error — decodeURIComponent throws on e.g. "%"
+  try {
+    return decodeURIComponent(m[1]);
+  } catch {
+    return "";
+  }
 }
 
 function requireAuth(req: express.Request, res: express.Response, next: express.NextFunction): void {
