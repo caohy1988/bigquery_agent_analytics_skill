@@ -41,6 +41,7 @@ import {
   WIDGET_DIMENSIONS,
   WIDGET_MEASURES,
   widgetSpecError,
+  applyCostBucketBound,
 } from "./src/queries.js";
 import type {
   AskExchange,
@@ -190,6 +191,10 @@ function trackAbandonedCreation(work: Promise<unknown>): void {
 // aware with timer/listener cleanup on every terminal path). Reserved permits
 // convert one-by-one into live jobs, so widgets can never starve a refresh
 // into arbitrary failed panels and a refresh can never oversubscribe BigQuery.
+// #2(r22): admission pressure is an EXPECTED, retryable condition — a typed
+// error lets HTTP surfaces answer 503 + Retry-After instead of a false 500
+export class AdmissionError extends Error {}
+
 interface Reservation {
   remaining: number;
 }
@@ -221,7 +226,7 @@ async function reservePermits(weight: number, signal?: AbortSignal): Promise<Res
     return { remaining: weight };
   }
   if (admissionWaiters.length >= MAX_ADMISSION_WAITERS) {
-    throw new Error("Server busy: the refresh queue is full — retry shortly");
+    throw new AdmissionError("Server busy: the refresh queue is full — retry shortly");
   }
   await new Promise<void>((resolve, reject) => {
     const waiter: AdmissionWaiter = { weight, resolve, cleanup: () => {} };
@@ -235,7 +240,7 @@ async function reservePermits(weight: number, signal?: AbortSignal): Promise<Res
       // not found → already admitted; the caller's release path owns the permits
     };
     const timer = setTimeout(
-      () => drop(new Error("Server busy: timed out waiting for refresh capacity — retry shortly")),
+      () => drop(new AdmissionError("Server busy: timed out waiting for refresh capacity — retry shortly")),
       CONFIG.queryTimeoutMs * 2,
     );
     (timer as any).unref?.();
@@ -261,7 +266,7 @@ async function withJobSlot<T>(fn: () => Promise<T>, reservation?: Reservation): 
     reservation.remaining--;
     reservedPermits--; // the reserved permit converts into a live job
   } else if (capacityUsed() >= MAX_CONCURRENT_JOBS) {
-    throw new Error("Server busy: too many concurrent BigQuery jobs — retry shortly");
+    throw new AdmissionError("Server busy: too many concurrent BigQuery jobs — retry shortly");
   }
   inflightJobs++;
   try {
@@ -486,7 +491,12 @@ async function bigQueryDashboard(
     hitl: hitl ?? [],
     delegation: delegation ?? [],
     agentsList: (agentRows ?? []).map((r: any) => r.agent),
-    costBuckets: costBuckets ?? [],
+    ...(() => {
+      // #1(r22): truncation is measured server-side (cap+1 fetch) and
+      // published explicitly to EVERY consumer
+      const bounded = applyCostBucketBound(costBuckets ?? []);
+      return { costBuckets: bounded.rows, cost_buckets_truncated: bounded.truncated };
+    })(),
   };
 }
 
@@ -777,6 +787,9 @@ function summarize(d: DashboardData): string {
   if (worstTool) lines.push(`- highest tool failure rate: ${worstTool.tool_name} at ${worstTool.fail_rate_pct}% of ${n(worstTool.total_calls)} calls`);
   const failed = Object.keys(d.meta.section_errors ?? {});
   if (failed.length) lines.push(`- WARNING: ${failed.length} panel(s) failed to load: ${failed.join(", ")}`);
+  if (d.cost_buckets_truncated) {
+    lines.push("- WARNING: the per-model cost series is TRUNCATED for this window — do not treat cost-over-time as exact; narrow the time range.");
+  }
   lines.push("Compatible MCP App hosts will render the interactive dashboard.");
   return lines.join("\n");
 }
@@ -1293,6 +1306,16 @@ function requestAbort(req: express.Request, res: express.Response): AbortSignal 
   return ac.signal;
 }
 
+// #2(r22): overload answers 503 with Retry-After; anything else stays 500
+function sendQueryError(res: express.Response, e: unknown): void {
+  if (e instanceof AdmissionError) {
+    res.setHeader("Retry-After", String(Math.max(1, Math.ceil(CONFIG.queryTimeoutMs / 1000))));
+    res.status(503).json({ error: e.message });
+    return;
+  }
+  res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
+}
+
 app.get("/api/dashboard", checkOrigin, requireAuth, async (req, res) => {
   try {
     const hours = Math.min(MAX_HOURS, Math.max(1, Math.trunc(Number(req.query.time_range_hours)) || CONFIG.defaultHours));
@@ -1300,7 +1323,7 @@ app.get("/api/dashboard", checkOrigin, requireAuth, async (req, res) => {
     const data = await loadDashboard(hours, agentRaw || null, requestAbort(req, res));
     res.json({ data });
   } catch (e) {
-    res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
+    sendQueryError(res, e);
   }
 });
 
@@ -1315,7 +1338,7 @@ app.get("/api/trace", checkOrigin, requireAuth, async (req, res) => {
     const trace = await loadTrace(traceId, hours, requestAbort(req, res));
     res.json({ data: trace.events, truncated: trace.truncated, source: trace.source });
   } catch (e) {
-    res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
+    sendQueryError(res, e);
   }
 });
 
@@ -1328,7 +1351,7 @@ app.get("/api/traces", checkOrigin, requireAuth, async (req, res) => {
     const rows = await loadTraces(hours, limit, errorsOnly, agent, requestAbort(req, res));
     res.json({ data: rows, source: sourceLabel() });
   } catch (e) {
-    res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
+    sendQueryError(res, e);
   }
 });
 
@@ -1378,7 +1401,7 @@ app.get("/api/widget", checkOrigin, requireAuth, async (req, res) => {
       res.status(400).json({ error: e.message });
       return;
     }
-    res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
+    sendQueryError(res, e);
   }
 });
 
@@ -1402,7 +1425,7 @@ app.post("/api/ask", checkOrigin, requireAuth, async (req, res) => {
     const data = await ask(question, history, scope, requestAbort(req, res));
     res.json({ data });
   } catch (e) {
-    res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
+    sendQueryError(res, e);
   }
 });
 

@@ -6,7 +6,7 @@
 import "./styles.css";
 import { App } from "@modelcontextprotocol/ext-apps";
 import { mockAsk, mockDashboard, mockTrace, mockTracesList, mockWidget } from "./mock.js";
-import { COST_BUCKETS_ROW_LIMIT, WIDGET_DIMENSIONS, WIDGET_MEASURES } from "./queries.js";
+import { WIDGET_DIMENSIONS, WIDGET_MEASURES } from "./queries.js";
 import { buildSpans } from "./spans.js";
 import type {
   AskResult,
@@ -459,10 +459,10 @@ function renderCost(d: DashboardData, main: HTMLElement): void {
   // export — the action only exists when the pricing inputs are available
   const trend = chartCard(
     "Estimated cost over time",
-    "apportioned by token volume",
+    "each bucket priced with its own model mix",
     [],
     "full",
-    modelsErr || costTsErr || (d.costBuckets?.length ?? 0) >= COST_BUCKETS_ROW_LIMIT
+    modelsErr || costTsErr || d.cost_buckets_truncated
       ? undefined
       : {
           filename: "cost-over-time.csv",
@@ -484,9 +484,9 @@ function renderCost(d: DashboardData, main: HTMLElement): void {
     emptyNote(trend.body, costTsErr);
     return renderCostRest(d, main, rows, null);
   }
-  if ((d.costBuckets?.length ?? 0) >= COST_BUCKETS_ROW_LIMIT) {
-    // #3(r21): a hit row bound means the series is incomplete — unavailable
-    // beats inexact
+  if (d.cost_buckets_truncated) {
+    // #1(r22): the server MEASURED the overflow (cap+1 fetch) — an exactly
+    // cap-sized complete series stays trusted; a flagged one is unavailable
     emptyNote(trend.body, "cost series exceeds the transport bound for this window — narrow the time range");
     return renderCostRest(d, main, rows, null);
   }
@@ -1547,14 +1547,49 @@ const embedded = window.parent !== window;
 // agent filter arriving via a share link, applied on the first fetch
 let pendingAgent: string | undefined = HASH_STATE.agent || undefined;
 
+let syncingHash = false;
 function syncHash(): void {
   if (embedded) return; // hash state is for shareable browser URLs
   const q = new URLSearchParams();
   q.set("view", currentView);
   q.set("range", rangeEl.value);
   if (agentEl.value) q.set("agent", agentEl.value);
+  syncingHash = true;
   history.replaceState(null, "", `#${q}`);
+  syncingHash = false;
 }
+
+// #4(r22): hash state applies on NAVIGATION too, not only at startup — a
+// pasted fragment or back/forward switches the view and re-scopes once,
+// without a reload. Only validated values apply; self-written hashes are
+// ignored via the syncingHash guard.
+window.addEventListener("hashchange", () => {
+  if (embedded || syncingHash) return;
+  const state = parseHashState();
+  let scopeChanged = false;
+  const view = VIEWS.find((v) => v.id === state.view)?.id;
+  if (view && view !== currentView) {
+    traceFocus = false;
+    currentView = view;
+  }
+  if (state.range && state.range !== rangeEl.value && [...rangeEl.options].some((o) => o.value === state.range)) {
+    rangeEl.value = state.range;
+    rangeTouched = true;
+    effectiveHours = null;
+    scopeChanged = true;
+  }
+  const agent = state.agent ?? "";
+  if (agent !== agentEl.value && (agent === "" || [...agentEl.options].some((o) => o.value === agent))) {
+    agentEl.value = agent;
+    scopeChanged = true;
+  }
+  renderTabs();
+  renderView();
+  if (scopeChanged) {
+    invalidateTrace();
+    scheduleRefresh();
+  }
+});
 
 function renderTabs(): void {
   tabsEl.replaceChildren();
@@ -2182,6 +2217,7 @@ async function showTrace(traceId: string): Promise<void> {
   traceCard = { traceId, view: currentView, events: null, truncated: false, error: null };
   renderView();
   document.getElementById("trace-card")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  focusTraceCard(); // #3(r22): the clicked list button was just replaced
   if (embedded) embeddedTraceBusy = true;
   try {
     const { events, truncated } = await fetchTrace(traceId, abort.signal);
@@ -2210,6 +2246,18 @@ async function showTrace(traceId: string): Promise<void> {
     }
   }
   renderView();
+  focusTraceCard(); // #3(r22): the loaded render also replaced the focus target
+}
+
+// #3(r22): rerenders replace the element that held keyboard focus — when
+// focus fell back to BODY, move it into the trace card (the first waterfall
+// row once loaded, else Close) so keyboard flows continue from the card.
+function focusTraceCard(): void {
+  if (document.activeElement !== document.body) return; // the user still has a target
+  const card = document.getElementById("trace-card");
+  if (!card) return;
+  const target = card.querySelector<HTMLElement>(".wf-row") ?? card.querySelector<HTMLElement>(".trace-close");
+  target?.focus();
 }
 
 function invalidateTrace(): void {

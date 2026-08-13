@@ -120,6 +120,9 @@ export interface DashboardData {
   timeseries: TimeBucket[];
   latencyByAgent: AgentLatencyRow[];
   costBuckets?: CostBucketRow[]; // billed tokens per (bucket, model) (#3-r19)
+  // #1(r22): TRUE when the (bucket, model) cardinality exceeded the transport
+  // bound — the cost series is incomplete and must not be presented as exact
+  cost_buckets_truncated?: boolean;
   toolStats: ToolStatRow[];
   modelComparison: ModelComparisonRow[];
   topSessions: SessionTokenRow[];

@@ -64,6 +64,8 @@ export function mockDashboard(
       timeseries: [], latencyByAgent: [], toolStats: [],
       modelComparison: [], topSessions: [], hitl: [], delegation: [],
       agentsList: AGENTS,
+      costBuckets: [],
+      cost_buckets_truncated: false,
       meta: {
         start: start.toISOString(), end: end.toISOString(), granularity,
         agent: agentFilter, source: "mock", bytes_processed: null, cache_hit: false,
@@ -268,6 +270,7 @@ export function mockDashboard(
     delegation,
     agentsList: AGENTS,
     costBuckets,
+    cost_buckets_truncated: false, // the mock series is always complete
   };
 }
 

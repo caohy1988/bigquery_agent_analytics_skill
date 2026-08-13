@@ -290,11 +290,17 @@ function whereClause(agentFilter: boolean): string {
   return `timestamp BETWEEN @start AND @end${agentFilter ? " AND agent = @agent" : ""}`;
 }
 
-// #3(r21): when cost_buckets returns exactly this many rows, the window's
-// (bucket, model) cardinality exceeded the transport bound and the series is
-// INCOMPLETE — consumers must mark the cost trend unavailable, never publish
-// a partial series as exact.
+// #1(r22): the query fetches CAP+1 rows so truncation is a FACT, not an
+// inference — a complete result of exactly CAP rows stays trusted, and an
+// overflowing one is flagged explicitly on every surface (UI, HTTP, MCP)
+// via applyCostBucketBound.
 export const COST_BUCKETS_ROW_LIMIT = 30000;
+
+export function applyCostBucketBound<T>(rows: T[]): { rows: T[]; truncated: boolean } {
+  return rows.length > COST_BUCKETS_ROW_LIMIT
+    ? { rows: rows.slice(0, COST_BUCKETS_ROW_LIMIT), truncated: true }
+    : { rows, truncated: false };
+}
 
 export function buildDashboardSql(opts: DashboardSqlOptions): Record<Section, string> {
   const T = opts.table;
@@ -455,7 +461,7 @@ export function buildDashboardSql(opts: DashboardSqlOptions): Record<Section, st
     WHERE event_type = 'LLM_RESPONSE' AND ${W}
     GROUP BY ts, model_id
     ORDER BY ts ASC
-    LIMIT ${COST_BUCKETS_ROW_LIMIT}`,
+    LIMIT ${COST_BUCKETS_ROW_LIMIT + 1}`,
 
     // Sessions rank as whole sessions; models are a breakdown label, so a
     // multi-model session is one row, not several competing partial rows.

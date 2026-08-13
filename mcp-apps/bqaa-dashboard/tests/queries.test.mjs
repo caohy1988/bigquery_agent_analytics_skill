@@ -339,7 +339,7 @@ test("cost buckets keep real model identity with a detectable bound (#3-r21)", (
   // instead of publishing a partial series
   assert.ok(!sections.cost_buckets.includes("(other models)"), "no folding — identity survives to pricing");
   assert.match(sections.cost_buckets, /GROUP BY ts, model_id/);
-  assert.match(sections.cost_buckets, new RegExp(`LIMIT ${COST_BUCKETS_ROW_LIMIT}`));
+  assert.match(sections.cost_buckets, new RegExp(`LIMIT ${COST_BUCKETS_ROW_LIMIT + 1}`), "cap+1 makes overflow observable (#1-r22)");
   assert.equal(typeof COST_BUCKETS_ROW_LIMIT, "number");
 });
 
@@ -348,4 +348,25 @@ test("the refresh budget floor derives from the section count (#4-r20)", () => {
   assert.equal(SECTIONS.length, 11);
   assert.equal(splitBudget(SECTIONS.length * 10_485_760, SECTIONS.length), 10_485_760);
   assert.throws(() => splitBudget(SECTIONS.length * 10_485_760 - 1, SECTIONS.length), /minimum/);
+});
+
+import { applyCostBucketBound } from "../src/queries.js";
+
+test("cost truncation is measured, not inferred (#1-r22)", () => {
+  const rows = (n) => Array.from({ length: n }, (_, i) => ({ ts: `t${i}` }));
+  // cap-1: complete, trusted
+  const under = applyCostBucketBound(rows(COST_BUCKETS_ROW_LIMIT - 1));
+  assert.equal(under.truncated, false);
+  assert.equal(under.rows.length, COST_BUCKETS_ROW_LIMIT - 1);
+  // exactly cap: COMPLETE — the r21 length sentinel wrongly rejected this
+  const exact = applyCostBucketBound(rows(COST_BUCKETS_ROW_LIMIT));
+  assert.equal(exact.truncated, false);
+  assert.equal(exact.rows.length, COST_BUCKETS_ROW_LIMIT);
+  // cap+1: overflow is a measured FACT, rows bounded to the cap
+  const over = applyCostBucketBound(rows(COST_BUCKETS_ROW_LIMIT + 1));
+  assert.equal(over.truncated, true);
+  assert.equal(over.rows.length, COST_BUCKETS_ROW_LIMIT);
+  // and the query fetches cap+1 so the overflow is observable
+  const sections = buildAllSections({ table: "`p.d.t`", granularity: "day", agentFilter: false });
+  assert.match(sections.cost_buckets, new RegExp(`LIMIT ${COST_BUCKETS_ROW_LIMIT + 1}`));
 });

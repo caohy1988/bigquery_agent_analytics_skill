@@ -551,6 +551,34 @@ test("two concurrent refreshes never trade panels for admission (#1-r20)", async
   }
 });
 
+test("dashboard payload publishes explicit cost-truncation state (#1-r22)", async () => {
+  const res = await fetch(`${BASE}/api/dashboard?time_range_hours=24`);
+  const { data } = await res.json();
+  assert.equal(typeof data.cost_buckets_truncated, "boolean", "every consumer sees the flag");
+  assert.equal(data.cost_buckets_truncated, false, "the small fake series is complete");
+});
+
+test("admission pressure answers 503 with Retry-After, never 500 (#2-r22)", async () => {
+  const port = PORT + 115;
+  const srv = startServer({ ...FAKE_ENV, BQAA_FAKE_BQ: "stall_create_all", BQAA_QUERY_TIMEOUT_MS: "600" }, port);
+  try {
+    await waitFor(`http://localhost:${port}/healthz`);
+    // saturate the pool with twenty hung weight-1 widgets
+    await Promise.all(
+      Array.from({ length: 20 }, () =>
+        fetch(`http://localhost:${port}/api/widget?measure=events&dimension=agent`).then((r) => r.json()),
+      ),
+    );
+    const probe = await fetch(`http://localhost:${port}/api/widget?measure=events&dimension=agent`);
+    assert.equal(probe.status, 503, "overload is retryable, not an internal error");
+    assert.ok(Number(probe.headers.get("retry-after")) >= 1, "Retry-After is present");
+    const body = await probe.json();
+    assert.match(body.error ?? "", /busy/i);
+  } finally {
+    srv.child.kill();
+  }
+});
+
 test("a refresh queues behind mixed widget traffic — no failed panels (#1-r21)", async () => {
   const port = PORT + 114;
   const srv = startServer({ ...FAKE_ENV, BQAA_FAKE_BQ: "slow_create_all", BQAA_QUERY_TIMEOUT_MS: "8000" }, port);
