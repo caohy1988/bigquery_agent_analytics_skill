@@ -42,6 +42,7 @@ import {
   WIDGET_MEASURES,
   widgetSpecError,
   applyCostBucketBound,
+  applyModelBound,
 } from "./src/queries.js";
 import type {
   AskExchange,
@@ -115,6 +116,14 @@ const CONFIG = {
 // outright in production builds, and every payload it produces is labeled —
 // synthetic rows must be impossible to mistake for live telemetry.
 const FAKE_BQ = process.env.NODE_ENV !== "production" ? (process.env.BQAA_FAKE_BQ ?? "") : "";
+// #3(r24): a deterministic Conversational Analytics seam so Ask concurrency
+// tests never touch ADC or googleapis. "slow" answers after a delay (holding
+// its admission slot the whole time); production refuses it like BQAA_FAKE_BQ.
+const FAKE_CA = process.env.NODE_ENV !== "production" ? (process.env.BQAA_FAKE_CA ?? "") : "";
+if (process.env.BQAA_FAKE_CA && process.env.NODE_ENV === "production") {
+  console.error("BQAA_FAKE_CA is test-only and cannot be enabled in production builds");
+  process.exit(1);
+}
 if (process.env.BQAA_FAKE_BQ && process.env.NODE_ENV === "production") {
   console.error("BQAA_FAKE_BQ is test-only and cannot be enabled in production builds");
   process.exit(1);
@@ -486,7 +495,10 @@ async function bigQueryDashboard(
     timeseries: timeseries ?? [],
     latencyByAgent: latencyByAgent ?? [],
     toolStats: toolStats ?? [],
-    modelComparison: modelComparison ?? [],
+    ...(() => {
+      const bounded = applyModelBound(modelComparison ?? []);
+      return { modelComparison: bounded.rows, models_truncated: bounded.truncated };
+    })(),
     topSessions: topSessions ?? [],
     hitl: hitl ?? [],
     delegation: delegation ?? [],
@@ -570,6 +582,14 @@ async function ask(question: string, history: AskExchange[], scope: AskScope, si
   }
   inflightAsk++;
   try {
+    if (FAKE_CA) {
+      // deferred deterministic answer — the slot is held for the duration
+      await new Promise((r) => setTimeout(r, FAKE_CA === "slow" ? 1500 : 50));
+      return {
+        ...mockAsk(question, normScope),
+        answer: "(FAKE_CA test seam) deterministic answer — no Google API was called.",
+      };
+    }
     return await askConversational(
       {
         project: CONFIG.project,
@@ -787,6 +807,9 @@ function summarize(d: DashboardData, willRender: boolean): string {
   if (worstTool) lines.push(`- highest tool failure rate: ${worstTool.tool_name} at ${worstTool.fail_rate_pct}% of ${n(worstTool.total_calls)} calls`);
   const failed = Object.keys(d.meta.section_errors ?? {});
   if (failed.length) lines.push(`- WARNING: ${failed.length} panel(s) failed to load: ${failed.join(", ")}`);
+  if (d.models_truncated) {
+    lines.push("- WARNING: the model breakdown is TRUNCATED (too many distinct model ids) — model comparison and cost pricing are incomplete.");
+  }
   if (d.cost_buckets_truncated) {
     lines.push("- WARNING: the per-model cost series is TRUNCATED for this window — do not treat cost-over-time as exact; narrow the time range.");
   }
@@ -1147,15 +1170,24 @@ function originAllowed(origin: string): boolean {
 // loopback origins in local development. Server-to-server clients send no
 // Origin header and pass through.
 const LOOPBACK_ORIGIN_RE = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/;
+// #2(r24): the loopback exemption exists for LOCAL DEVELOPMENT — a publicly
+// bound server (BQAA_HOST=0.0.0.0 / non-loopback) must not trust arbitrary
+// localhost origins, which any local process on a client machine can forge.
+const SERVER_BINDS_LOOPBACK = /^(127\.|localhost$|::1$)/.test(CONFIG.host);
+
+// One shared trust predicate for BOTH the Origin check and CORS headers.
+function isTrustedOrigin(origin: string): boolean {
+  return (
+    originAllowed(origin) ||
+    (CONFIG.canonicalOrigin !== "" && origin === CONFIG.canonicalOrigin) ||
+    (SERVER_BINDS_LOOPBACK && LOOPBACK_ORIGIN_RE.test(origin))
+  );
+}
 
 function checkOrigin(req: express.Request, res: express.Response, next: express.NextFunction): void {
   const origin = req.headers.origin;
   if (origin) {
-    const trusted =
-      originAllowed(origin) ||
-      (CONFIG.canonicalOrigin !== "" && origin === CONFIG.canonicalOrigin) ||
-      LOOPBACK_ORIGIN_RE.test(origin);
-    if (!trusted) {
+    if (!isTrustedOrigin(origin)) {
       res.status(403).json({ error: "Origin not allowed. Configure BQAA_ALLOWED_ORIGINS or BQAA_CANONICAL_ORIGIN." });
       return;
     }
@@ -1191,14 +1223,8 @@ function requireAuth(req: express.Request, res: express.Response, next: express.
 
 app.use(
   cors({
-    origin: (origin, cb) =>
-      cb(
-        null,
-        !origin ||
-          originAllowed(origin) ||
-          (CONFIG.canonicalOrigin !== "" && origin === CONFIG.canonicalOrigin) ||
-          LOOPBACK_ORIGIN_RE.test(origin),
-      ),
+    // #2(r24): CORS shares the SAME trust predicate as checkOrigin
+    origin: (origin, cb) => cb(null, !origin || isTrustedOrigin(origin)),
   }),
 );
 app.use(express.json({ limit: "2mb" }));

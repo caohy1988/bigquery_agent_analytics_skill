@@ -296,6 +296,17 @@ function whereClause(agentFilter: boolean): string {
 // via applyCostBucketBound.
 export const COST_BUCKETS_ROW_LIMIT = 30000;
 
+// #4(r24): the model breakdown is bounded the same way — producer-controlled
+// model_id values must not be able to exhaust server or browser memory. The
+// query fetches CAP+1 so overflow is MEASURED, and a truncated breakdown
+// makes model comparison and the price book unavailable rather than silently
+// dropping tail identity (which would misprice cost).
+export const MODELS_ROW_LIMIT = 200;
+
+export function applyModelBound<T>(rows: T[]): { rows: T[]; truncated: boolean } {
+  return rows.length > MODELS_ROW_LIMIT ? { rows: rows.slice(0, MODELS_ROW_LIMIT), truncated: true } : { rows, truncated: false };
+}
+
 export function applyCostBucketBound<T>(rows: T[]): { rows: T[]; truncated: boolean } {
   return rows.length > COST_BUCKETS_ROW_LIMIT
     ? { rows: rows.slice(0, COST_BUCKETS_ROW_LIMIT), truncated: true }
@@ -440,7 +451,8 @@ export function buildDashboardSql(opts: DashboardSqlOptions): Record<Section, st
       ROUND(AVG(ttft_ms), 0) AS avg_ttft_ms
     FROM llm_events
     GROUP BY model_id
-    ORDER BY calls DESC`,
+    ORDER BY calls DESC
+    LIMIT ${MODELS_ROW_LIMIT + 1}`,
 
     // #3(r19): EXACT cost buckets — billed tokens per (bucket, model), so the
     // client prices each bucket with its own model mix instead of smearing

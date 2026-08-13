@@ -123,6 +123,9 @@ export interface DashboardData {
   // #1(r22): TRUE when the (bucket, model) cardinality exceeded the transport
   // bound — the cost series is incomplete and must not be presented as exact
   cost_buckets_truncated?: boolean;
+  // #4(r24): TRUE when distinct model_id count exceeded the transport bound —
+  // model comparison and price-book pricing would be incomplete
+  models_truncated?: boolean;
   toolStats: ToolStatRow[];
   modelComparison: ModelComparisonRow[];
   topSessions: SessionTokenRow[];

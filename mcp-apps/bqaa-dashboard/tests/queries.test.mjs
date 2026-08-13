@@ -370,3 +370,15 @@ test("cost truncation is measured, not inferred (#1-r22)", () => {
   const sections = buildAllSections({ table: "`p.d.t`", granularity: "day", agentFilter: false });
   assert.match(sections.cost_buckets, new RegExp(`LIMIT ${COST_BUCKETS_ROW_LIMIT + 1}`));
 });
+
+import { applyModelBound, MODELS_ROW_LIMIT } from "../src/queries.js";
+
+test("model breakdown is bounded with measured overflow (#4-r24)", () => {
+  const rows = (n) => Array.from({ length: n }, (_, i) => ({ model_id: `m${i}` }));
+  assert.equal(applyModelBound(rows(MODELS_ROW_LIMIT)).truncated, false, "exactly cap is complete");
+  const over = applyModelBound(rows(MODELS_ROW_LIMIT + 1));
+  assert.equal(over.truncated, true);
+  assert.equal(over.rows.length, MODELS_ROW_LIMIT);
+  const sections = buildAllSections({ table: "`p.d.t`", granularity: "day", agentFilter: false });
+  assert.match(sections.models, new RegExp(`LIMIT ${MODELS_ROW_LIMIT + 1}`), "cap+1 makes overflow observable");
+});

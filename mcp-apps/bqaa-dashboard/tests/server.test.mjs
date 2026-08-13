@@ -579,10 +579,14 @@ test("admission pressure answers 503 with Retry-After, never 500 (#2-r22)", asyn
   }
 });
 
-test("Ask saturation answers 503 with Retry-After (#2-r23)", async () => {
+test("Ask saturation answers 503 with Retry-After (#2-r23, hermetic via #3-r24)", async () => {
   const port = PORT + 116;
-  // non-mock ask against the fake seam: three slow asks hold the cap
-  const srv = startServer({ ...FAKE_ENV, BQAA_FAKE_BQ: "stall_create_all", BQAA_QUERY_TIMEOUT_MS: "600" }, port);
+  // #3(r24): BQAA_FAKE_CA=slow holds each Ask slot ~1.5s WITHOUT touching
+  // ADC or googleapis — the test is deterministic with no credentials at all
+  const srv = startServer(
+    { ...FAKE_ENV, BQAA_FAKE_BQ: "ok", BQAA_FAKE_CA: "slow", GOOGLE_APPLICATION_CREDENTIALS: "/nonexistent/creds.json" },
+    port,
+  );
   try {
     await waitFor(`http://localhost:${port}/healthz`);
     const ask = () =>
@@ -612,6 +616,42 @@ test("only the app tool claims rendering; data-only metrics stay neutral (#3-r23
     !/will render/.test(data.body.result.content[0].text),
     "a data-only tool must not promise a rendered dashboard",
   );
+});
+
+test("public binds do not trust loopback origins (#2-r24)", async () => {
+  const port = PORT + 117;
+  const srv = startServer(
+    { ...FAKE_ENV, BQAA_FAKE_BQ: "ok", BQAA_HOST: "0.0.0.0", BQAA_ALLOWED_ORIGINS: "https://ok.example" },
+    port,
+  );
+  try {
+    await waitFor(`http://localhost:${port}/healthz`);
+    const loopback = await fetch(`http://localhost:${port}/api/dashboard?time_range_hours=24`, {
+      headers: { Origin: "http://localhost:7777" },
+    });
+    assert.equal(loopback.status, 403, "a publicly bound server must not trust forged loopback origins");
+    const allowed = await fetch(`http://localhost:${port}/api/dashboard?time_range_hours=24`, {
+      headers: { Origin: "https://ok.example" },
+    });
+    assert.equal(allowed.status, 200, "the allowlist still works");
+  } finally {
+    srv.child.kill();
+  }
+});
+
+test("loopback binds keep the local-development exemption (#2-r24)", async () => {
+  // BASE binds 127.0.0.1 — localhost origins stay trusted for local dev
+  const res = await fetch(`${BASE}/api/dashboard?time_range_hours=24`, {
+    headers: { Origin: "http://localhost:5173" },
+  });
+  assert.equal(res.status, 200);
+});
+
+test("model breakdown truncation is measured and published (#4-r24)", async () => {
+  const res = await fetch(`${BASE}/api/dashboard?time_range_hours=24`);
+  const { data } = await res.json();
+  assert.equal(typeof data.models_truncated, "boolean", "every consumer sees the flag");
+  assert.equal(data.models_truncated, false, "the small fake model list is complete");
 });
 
 test("a refresh queues behind mixed widget traffic — no failed panels (#1-r21)", async () => {

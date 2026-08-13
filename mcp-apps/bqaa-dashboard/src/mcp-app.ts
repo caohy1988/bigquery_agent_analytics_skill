@@ -411,7 +411,11 @@ function loadPrices(): PriceBook {
 
 function renderCost(d: DashboardData, main: HTMLElement): void {
   const prices = loadPrices();
-  const modelsErr = sectionsFailed(d, "models");
+  // #4(r24): a truncated model breakdown cannot price cost truthfully —
+  // treat it exactly like a failed models section
+  const modelsErr =
+    sectionsFailed(d, "models") ??
+    (d.models_truncated ? "model breakdown truncated (too many distinct models) — cost pricing would be incomplete" : null);
   // #2(r15)/#3(r19): the cost-over-time series depends on the timeseries
   // (axis) AND cost_buckets (values) sections — either failing suppresses
   // the chart's export instead of offering a false file
@@ -716,6 +720,21 @@ let effectiveHours: number | null = null;
 
 function currentHours(): number {
   return effectiveHours ?? Number(rangeEl.value);
+}
+
+// #1(r24): the ACTIVE agent scope — a pending share-link/host agent outranks
+// the select while the refresh that will adopt it is still in flight. Every
+// query surface (Ask, traces, scope labels) must resolve through this, never
+// read agentEl.value directly.
+// The agent the CURRENTLY RUNNING refresh queried with — refresh() consumes
+// pendingAgent at start, so without this the pending scope would vanish for
+// the whole in-flight window (the round-24 Ask repro).
+let inflightAgent: string | undefined;
+
+function currentAgent(): string {
+  if (pendingAgent !== undefined) return pendingAgent; // queued, newest intent
+  if (inflightAgent !== undefined) return inflightAgent; // running refresh's scope
+  return agentEl.value; // published, authoritative
 }
 
 // #15: superseded standalone widget requests are aborted, not just ignored
@@ -1103,7 +1122,8 @@ async function submitQuestion(question: string): Promise<void> {
   const op = ++askOp;
   const abort = new AbortController();
   askAbort = abort;
-  const scope = { time_range_hours: currentHours(), ...(agentEl.value ? { agent: agentEl.value } : {}) };
+  const activeAgent = currentAgent(); // #1(r24): pending share-link agent included
+  const scope = { time_range_hours: currentHours(), ...(activeAgent ? { agent: activeAgent } : {}) };
   const scopeLabel = `last ${scope.time_range_hours}h${scope.agent ? ` · agent ${scope.agent}` : ""}`;
   try {
     let result: AskResult;
@@ -1288,7 +1308,7 @@ let tracesAbort: AbortController | null = null;
 let embeddedTracesBusy = false;
 
 function tracesKey(): string {
-  return `${currentHours()}|${agentEl.value}|${tracesState.errorsOnly}`;
+  return `${currentHours()}|${currentAgent()}|${tracesState.errorsOnly}`;
 }
 
 async function fetchTracesList(force = false): Promise<void> {
@@ -1308,7 +1328,7 @@ async function fetchTracesList(force = false): Promise<void> {
   // pass repaint themselves; the settle path repaints on completion.
   try {
     let rows: TraceListRow[];
-    const agent = agentEl.value || undefined;
+    const agent = currentAgent() || undefined; // #1(r24): pending scope included
     if (embedded && appBridge) {
       embeddedTracesBusy = true;
       try {
@@ -1633,7 +1653,7 @@ function updateScopeNotice(): void {
   document.getElementById("scope-warn")?.remove();
   const f = explore.spec.filters as Record<string, string | undefined> | undefined;
   const parts: string[] = (["model", "tool", "status"] as const).filter((k) => f?.[k]);
-  const globalAgent = pendingAgent !== undefined ? pendingAgent : agentEl.value;
+  const globalAgent = currentAgent();
   if (f?.agent && f.agent !== globalAgent) parts.unshift("agent");
   if (!parts.length) return;
   const warn = el("span", "pill warn", `${parts.join(" + ")} filter: Explore only`);
@@ -1677,6 +1697,7 @@ function renderView(): void {
 
 function setData(d: DashboardData): void {
   data = d;
+  inflightAgent = undefined; // the published meta.agent is authoritative now
   const hours = Math.round((Date.parse(d.meta.end) - Date.parse(d.meta.start)) / 3_600_000);
   // reflect the data's actual window in the range control when it matches a
   // preset; otherwise remember it so widget/trace/ask queries stay in sync
@@ -1879,6 +1900,7 @@ async function refresh(): Promise<void> {
   const pushed = pendingAgent;
   pendingAgent = undefined;
   const agent = pushed !== undefined ? pushed || undefined : agentEl.value || undefined;
+  inflightAgent = agent ?? ""; // #1(r24): the consumed scope stays visible to currentAgent()
   mainEl.classList.add("loading");
   statusEl.textContent = "Refreshing…";
   statusEl.classList.remove("error");
@@ -2322,6 +2344,7 @@ function scheduleRefresh(): void {
   refreshSeq++; // stale publication is dead from this instant
   inflightAbort?.abort(); // standalone work stops before the debounce, too
   pendingAgent = undefined; // #3(r8): a LOCAL choice outranks any queued host push
+  inflightAgent = undefined; // #1(r24): and outranks the superseded refresh's scope
   exploreSpecChanged(); // #15(r9): Explore results computed under the old scope are stale
   tracesGen++; // the trace-explorer list belongs to the old scope too
   tracesAbort?.abort();
