@@ -1579,15 +1579,29 @@ window.addEventListener("hashchange", () => {
     scopeChanged = true;
   }
   const agent = state.agent ?? "";
-  if (agent !== agentEl.value && (agent === "" || [...agentEl.options].some((o) => o.value === agent))) {
-    agentEl.value = agent;
-    scopeChanged = true;
+  let pendingHashAgent: string | undefined;
+  if (agent !== agentEl.value) {
+    if (agent === "" || [...agentEl.options].some((o) => o.value === agent)) {
+      agentEl.value = agent;
+      scopeChanged = true;
+    } else if (agent.length <= 200) {
+      // #1(r23): the agent may only exist in the TARGET range — the current
+      // range's option list cannot veto it. Carry it as the pending scope;
+      // the refresh queries with it and setData adopts meta.agent
+      // authoritatively (adding the option if needed) or shows the empty
+      // window that agent truly has.
+      pendingHashAgent = agent;
+      scopeChanged = true;
+    }
   }
   renderTabs();
   renderView();
   if (scopeChanged) {
     invalidateTrace();
     scheduleRefresh();
+    // AFTER scheduleRefresh: it clears pendingAgent (local-beats-host-push),
+    // but a hash navigation IS the newest local intent
+    if (pendingHashAgent !== undefined) pendingAgent = pendingHashAgent;
   }
 });
 
@@ -2245,8 +2259,37 @@ async function showTrace(traceId: string): Promise<void> {
       }
     }
   }
+  const restoreFocus = snapshotFocusForTrace(); // #4(r23): decide BEFORE replacing the DOM
   renderView();
-  focusTraceCard(); // #3(r22): the loaded render also replaced the focus target
+  restoreFocus();
+}
+
+// #4(r23): the loaded trace render must not STEAL focus — it may claim it
+// only when the user still owned the old trace card (or already lost focus
+// to BODY). A user who moved to another control mid-load keeps that control:
+// we re-find its recreated equivalent by wf-key, id, or class+label.
+function snapshotFocusForTrace(): () => void {
+  const prev = document.activeElement as HTMLElement | null;
+  if (!prev || prev === document.body || prev.closest("#trace-card")) {
+    return () => focusTraceCard();
+  }
+  const wfKey = prev.dataset?.wfKey;
+  const id = prev.id;
+  const cls = (prev.className || "").split(" ")[0];
+  const parentCls = ((prev.parentElement?.className as string) || "").split(" ")[0];
+  const text = prev.textContent;
+  return () => {
+    if (document.activeElement !== document.body) return; // their control survived
+    let target: HTMLElement | null = null;
+    if (wfKey) target = document.querySelector<HTMLElement>(`[data-wf-key="${CSS.escape(wfKey)}"]`);
+    else if (id) target = document.getElementById(id);
+    else if (cls) {
+      target = [...document.querySelectorAll<HTMLElement>(`.${CSS.escape(cls)}`)].find((e) => e.textContent === text) ?? null;
+    } else if (parentCls) {
+      target = document.querySelector<HTMLElement>(`.${CSS.escape(parentCls)} ${prev.tagName.toLowerCase()}`);
+    }
+    target?.focus(); // and if we cannot re-find it, we take NOTHING
+  };
 }
 
 // #3(r22): rerenders replace the element that held keyboard focus — when

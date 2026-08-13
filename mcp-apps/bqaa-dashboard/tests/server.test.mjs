@@ -579,6 +579,41 @@ test("admission pressure answers 503 with Retry-After, never 500 (#2-r22)", asyn
   }
 });
 
+test("Ask saturation answers 503 with Retry-After (#2-r23)", async () => {
+  const port = PORT + 116;
+  // non-mock ask against the fake seam: three slow asks hold the cap
+  const srv = startServer({ ...FAKE_ENV, BQAA_FAKE_BQ: "stall_create_all", BQAA_QUERY_TIMEOUT_MS: "600" }, port);
+  try {
+    await waitFor(`http://localhost:${port}/healthz`);
+    const ask = () =>
+      fetch(`http://localhost:${port}/api/ask`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question: "Which tool fails most?" }),
+      });
+    const three = [ask(), ask(), ask()];
+    await new Promise((r) => setTimeout(r, 150));
+    const fourth = await ask();
+    assert.equal(fourth.status, 503, "the fourth concurrent Ask is retryable overload");
+    assert.ok(Number(fourth.headers.get("retry-after")) >= 1, "Retry-After present");
+    const body = await fourth.json();
+    assert.match(body.error ?? "", /busy/i);
+    await Promise.all(three);
+  } finally {
+    srv.child.kill();
+  }
+});
+
+test("only the app tool claims rendering; data-only metrics stay neutral (#3-r23)", async () => {
+  const dash = await rpc(BASE, "tools/call", { name: "show_agent_dashboard", arguments: { time_range_hours: 24 } });
+  assert.match(dash.body.result.content[0].text, /will render the interactive dashboard/);
+  const data = await rpc(BASE, "tools/call", { name: "query_agent_metrics", arguments: { time_range_hours: 24 } });
+  assert.ok(
+    !/will render/.test(data.body.result.content[0].text),
+    "a data-only tool must not promise a rendered dashboard",
+  );
+});
+
 test("a refresh queues behind mixed widget traffic — no failed panels (#1-r21)", async () => {
   const port = PORT + 114;
   const srv = startServer({ ...FAKE_ENV, BQAA_FAKE_BQ: "slow_create_all", BQAA_QUERY_TIMEOUT_MS: "8000" }, port);

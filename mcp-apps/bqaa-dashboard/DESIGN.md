@@ -236,7 +236,7 @@ single CSP-safe file and the chart set is small and bespoke.
     overflow verified at 320/375/768 px.
 - **Shareable URLs**: `#view=…&range=…&agent=…` (state, not secrets).
 
-## 7. Testing strategy (`tests/`, `npm test` — 141 tests)
+## 7. Testing strategy (`tests/`, `npm test` — 146 tests)
 
 - **SQL contract tests** (`queries.test.mjs`): section coverage, partition
   predicates, parameterization/injection resistance, producer-alias coverage,

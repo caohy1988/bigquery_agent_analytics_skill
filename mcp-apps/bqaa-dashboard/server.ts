@@ -566,7 +566,7 @@ async function ask(question: string, history: AskExchange[], scope: AskScope, si
   if (CONFIG.mock) return mockAsk(question, normScope);
   if (signal?.aborted) throw new Error("Ask aborted before start"); // #8: never consume a slot for dead work
   if (inflightAsk >= MAX_CONCURRENT_ASK) {
-    throw new Error("Server busy: too many concurrent Ask requests — retry shortly");
+    throw new AdmissionError("Server busy: too many concurrent Ask requests — retry shortly"); // #2(r23): retryable 503, like every admission limit
   }
   inflightAsk++;
   try {
@@ -773,7 +773,7 @@ async function loadTrace(traceId: string, timeRangeHours: number, signal?: Abort
 
 const n = (v: number | null | undefined): string => (v == null ? "n/a" : v.toLocaleString("en-US"));
 
-function summarize(d: DashboardData): string {
+function summarize(d: DashboardData, willRender: boolean): string {
   const o = d.overview;
   const hours = Math.round((Date.parse(d.meta.end) - Date.parse(d.meta.start)) / 3_600_000);
   const topModel = d.modelComparison[0];
@@ -790,7 +790,7 @@ function summarize(d: DashboardData): string {
   if (d.cost_buckets_truncated) {
     lines.push("- WARNING: the per-model cost series is TRUNCATED for this window — do not treat cost-over-time as exact; narrow the time range.");
   }
-  lines.push("Compatible MCP App hosts will render the interactive dashboard.");
+  if (willRender) lines.push("Compatible MCP App hosts will render the interactive dashboard."); // #3(r23): only the APP tool may claim rendering
   return lines.join("\n");
 }
 
@@ -809,11 +809,15 @@ const metricArgs = {
   agent: z.string().max(200).optional().describe("Optional: restrict to a single agent name"),
 };
 
-async function metricsHandler(args: { time_range_hours?: number; agent?: string }, extra?: { signal?: AbortSignal }) {
-  const data = await loadDashboard(args.time_range_hours ?? CONFIG.defaultHours, args.agent ?? null, extra?.signal);
-  return {
-    content: [{ type: "text" as const, text: summarize(data) }],
-    structuredContent: { data } as any,
+// #3(r23): show_agent_dashboard renders an app; query_agent_metrics is
+// data-only and its summary must never promise a rendered dashboard.
+function metricsHandlerFor(willRender: boolean) {
+  return async (args: { time_range_hours?: number; agent?: string }, extra?: { signal?: AbortSignal }) => {
+    const data = await loadDashboard(args.time_range_hours ?? CONFIG.defaultHours, args.agent ?? null, extra?.signal);
+    return {
+      content: [{ type: "text" as const, text: summarize(data, willRender) }],
+      structuredContent: { data } as any,
+    };
   };
 }
 
@@ -907,7 +911,7 @@ registerAppTool(
     annotations: READ_ONLY_ANNOTATIONS,
     _meta: { ui: { resourceUri } },
   },
-  metricsHandler,
+  metricsHandlerFor(true),
 );
 
 server.registerTool(
@@ -920,7 +924,7 @@ server.registerTool(
     outputSchema: { data: z.unknown() },
     annotations: READ_ONLY_ANNOTATIONS,
   },
-  metricsHandler,
+  metricsHandlerFor(false),
 );
 
 server.registerTool(
@@ -1259,7 +1263,16 @@ app.get("/api/health", async (_req, res) => {
   const ok = bundle && bq.ok;
   if (!bq.ok) console.error(JSON.stringify({ ts: new Date().toISOString(), readiness: "bigquery", detail: bq.detail }));
   const bigquery = CONFIG.mock ? "mock" : bq.ok ? "ok" : "unavailable";
-  res.status(ok ? 200 : 503).json({ ok, mock: CONFIG.mock, uiBundle: bundle, bigquery });
+  res.status(ok ? 200 : 503).json({
+    ok,
+    mock: CONFIG.mock,
+    uiBundle: bundle,
+    bigquery,
+    // in-band deployment identity (Cloud Run stamps K_REVISION; BQAA_BUILD_SHA
+    // may be injected at deploy time) — no secrets, no config values
+    revision: process.env.K_REVISION ?? null,
+    build: process.env.BQAA_BUILD_SHA ?? null,
+  });
 });
 
 // Browser-shareable view: the shell is static; all data endpoints are guarded.
