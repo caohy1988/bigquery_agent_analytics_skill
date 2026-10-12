@@ -53,7 +53,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterator, TypeVar
+from typing import Any, Callable, Iterator, NamedTuple, TypeVar
 
 
 BQAA_EVENT_TYPES = {
@@ -1030,9 +1030,9 @@ def cleanup_stale_state(root: str | Path, ttl_hours: float) -> int:
     ]
     queue = base / "queue"
     if queue.is_dir():
-        # Events no adapter run got to (or that a dying hook never finished)
-        # and the locks of sessions that have gone quiet.
-        paths += [p for p in queue.iterdir() if p.name.isdigit() or p.name.startswith(".lock-")]
+        # Events no adapter run got to, or that a dying hook never finished.
+        # Not the lock files, which stay (see QUEUE_LOCKS).
+        paths += [p for p in queue.iterdir() if p.name.isdigit()]
     for path in paths:
         if not path.is_file():
             continue
@@ -1441,53 +1441,96 @@ def run_claude_hook(hook_name: str, payload: dict[str, Any] | None = None) -> No
 
 # Each event is a file named by its 12-digit sequence number in
 # BQAA_STATE_DIR/queue: the hook name, a newline, the payload, then a line
-# with QUEUE_END and the session key, written last.
+# with QUEUE_END and the hook's token, written last. The token tells the
+# hook's own run its event apart from a newer one that got the same number
+# after it was applied.
 QUEUE_END = b"#bqaa-end"
+# Runs lock one of QUEUE_LOCKS files in the queue dir, picked by session.
+# They are never removed: a run could lock one just as it was unlinked, and
+# the next run would then lock a new file at the same path, so both would
+# apply the session's events at once. A fixed set keeps them few; sessions
+# that share one only wait for each other.
+QUEUE_LOCKS = 64
 
 
-def process_hook_queue(queue_dir: str | Path, session_key: str) -> int:
-    """Apply a session's queued hook events, oldest first. Returns how many.
+class _QueuedEvent(NamedTuple):
+    path: Path
+    hook_name: str
+    payload: Any  # None if it isn't JSON, and then error says why
+    error: str | None
+    token: str
+    time_ns: int  # when the hook wrote it
 
-    Each hook queues its event before it returns and then starts an
-    adapter run, which can start late (on macOS a hung syspolicyd holds up
-    interpreter launches for minutes). Whichever run takes the session's
-    lock first applies everything queued for the session, so a late event
-    still lands before the newer events that depend on it (UserPromptSubmit
-    before its Stop, PreToolUse before its PostToolUse). Each is applied as
-    of the time its hook ran. Only the session's own events are applied,
-    since sessions can run with different settings.
+    @property
+    def session(self) -> str | None:
+        """Whose event it is: the payload's top-level session_id, as the
+        adapter's state key reads it. None to apply it on its own."""
+        if not isinstance(self.payload, dict):
+            return None
+        return str(self.payload.get("session_id") or "") or None
+
+
+def process_hook_queue(queue_dir: str | Path, entry: str, token: str) -> int:
+    """Apply the queued hook events of entry's session, oldest first.
+    Returns how many.
+
+    Each hook queues its event (entry, with the hook's token) before it
+    returns and then starts an adapter run, which can start late (on macOS
+    a hung syspolicyd holds up interpreter launches for minutes). Whichever
+    run of a session gets the lock first applies everything queued for the
+    session, so a late event still lands before the newer events that
+    depend on it (UserPromptSubmit before its Stop, PreToolUse before its
+    PostToolUse). Each is applied as of the time its hook ran.
+
+    An event's session is the top-level session_id of its whole payload, so
+    every queued payload is read in full. One without a session_id, or that
+    isn't JSON, is applied on its own. Only the session's own events are
+    applied, since sessions can run with different settings.
     """
-    if session_key in ("", ".", "..") or "/" in session_key or "\0" in session_key:
-        raise ValueError(f"bad session key {session_key!r}")
+    if not (len(entry) == 12 and entry.isdigit()):
+        raise ValueError(f"bad queue entry {entry!r}")
     queue = Path(queue_dir)
-    lock = queue / f".lock-{session_key}"
-    with _file_lock(lock):
-        os.utime(lock)  # in use, so cleanup_stale_state leaves it alone
-        paths = _queued_events(queue, session_key)
-        if not paths:
+    own = _read_queued_event(queue / entry)
+    if own is None or own.token != token:
+        # Applied already, after everything queued for its session before it.
+        return 0
+    session = own.session
+    with _file_lock(_queue_lock(queue, session or entry)):
+        # Another run of the session may have applied it in the meantime.
+        own = _read_queued_event(own.path)
+        if own is None or own.token != token:
             return 0
+        events = [own] if session is None else _queued_events(queue, session)
         try:
             adapter = ClaudeHookBQAAAdapter()
         except Exception:
             # Nothing can be written with a config that doesn't parse. Drop
             # the events, as a direct run would, rather than let them pile up.
-            for path in paths:
-                path.unlink(missing_ok=True)
+            for event in events:
+                event.path.unlink(missing_ok=True)
             raise
-        for path in paths:
-            hook_name = "?"
+        for event in events:
             try:
-                hook_name, payload, time_ns = _read_queued_event(path)
-                with _event_clock(time_ns):
-                    adapter.process(hook_name, payload)
+                if event.error:
+                    # Most likely cut off when the hook stopped waiting for
+                    # stdin. Applying it as {} would only make up an event.
+                    raise ValueError(event.error)
+                with _event_clock(event.time_ns):
+                    adapter.process(event.hook_name, event.payload)
             except Exception as exc:
-                _log(adapter.config, f"ERROR hook={hook_name}: {exc}\n{traceback.format_exc()}")
+                _log(adapter.config, f"ERROR hook={event.hook_name}: {exc}\n{traceback.format_exc()}")
             finally:
-                path.unlink(missing_ok=True)
-        return len(paths)
+                event.path.unlink(missing_ok=True)
+        return len(events)
 
 
-def _queued_events(queue: Path, session_key: str) -> list[Path]:
+def _queue_lock(queue: Path, key: str) -> Path:
+    """The lock file for the events of key (a session, or a lone entry)."""
+    digest = hashlib.sha256(key.encode("utf-8", "surrogatepass")).digest()
+    return queue / f".lock-{int.from_bytes(digest[:4], 'big') % QUEUE_LOCKS:02d}"
+
+
+def _queued_events(queue: Path, session: str) -> list[_QueuedEvent]:
     """The session's complete queue entries, oldest first.
 
     An entry without its last line is still being written by a hook that
@@ -1495,47 +1538,47 @@ def _queued_events(queue: Path, session_key: str) -> list[Path]:
     picks it up. (One a dying hook left unfinished is purged by
     cleanup_stale_state.)
     """
-    last_line = b"\n" + QUEUE_END + b" " + session_key.encode() + b"\n"
     try:
         names = sorted((p.name for p in queue.iterdir() if p.name.isdigit()), key=int)
     except FileNotFoundError:
         return []
-    paths = []
+    events = []
     for name in names:
-        path = queue / name
-        try:
-            with path.open("rb") as handle:
-                size = handle.seek(0, os.SEEK_END)
-                handle.seek(max(0, size - len(last_line)))
-                if handle.read() == last_line:
-                    paths.append(path)
-        except FileNotFoundError:
-            continue
-    return paths
+        event = _read_queued_event(queue / name)
+        if event is not None and event.session == session:
+            events.append(event)
+    return events
 
 
-def _read_queued_event(path: Path) -> tuple[str, Any, int]:
-    """(hook name, payload, when the hook wrote it in ns) of a complete entry."""
-    with path.open("rb") as handle:
-        data = handle.read()
-        time_ns = os.fstat(handle.fileno()).st_mtime_ns
-    header, _, rest = data.partition(b"\n")
-    hook_name = header.decode("utf-8", "replace")
-    raw = rest[: rest.rfind(b"\n", 0, len(rest) - 1)].decode("utf-8", "replace")
+def _read_queued_event(path: Path) -> _QueuedEvent | None:
+    """The queue entry at path; None if it's gone or still being written."""
     try:
-        payload = json.loads(raw) if raw.strip() else {}
-    except json.JSONDecodeError as exc:
-        # Most likely cut off when the hook stopped waiting for stdin.
-        # Applying it as {} would only make up an event.
-        raise ValueError(f"{hook_name} payload isn't JSON: {exc}") from exc
-    return hook_name, payload, time_ns
+        with path.open("rb") as handle:
+            data = handle.read()
+            time_ns = os.fstat(handle.fileno()).st_mtime_ns
+    except FileNotFoundError:
+        return None
+    body, end, token = data.rpartition(b"\n" + QUEUE_END + b" ")
+    if not end or not token.endswith(b"\n") or b"\n" in token[:-1]:
+        return None
+    header, _, raw = body.partition(b"\n")
+    hook_name = header.decode("utf-8", "replace")
+    text = raw.decode("utf-8", "replace")
+    payload: Any = {}
+    error = None
+    if text.strip():
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError as exc:
+            payload, error = None, f"{hook_name} payload isn't JSON: {exc}"
+    return _QueuedEvent(path, hook_name, payload, error, token[:-1].decode("utf-8", "replace"), time_ns)
 
 
 def main(argv: list[str] | None = None) -> int:
     argv = argv or sys.argv[1:]
     if not argv:
         print(
-            "usage: bqaa_tracing.py <ClaudeHookName> | --queue <queue-dir> <session-key>",
+            "usage: bqaa_tracing.py <ClaudeHookName> | --queue <queue-dir> <entry> <token>",
             file=sys.stderr,
         )
         return 2
@@ -1546,8 +1589,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if hook_name == "--queue":
             # From hooks/common.sh: the event is in the queue, not on stdin.
-            _, queue_dir, session_key = argv
-            process_hook_queue(queue_dir, session_key)
+            _, queue_dir, entry, token = argv
+            process_hook_queue(queue_dir, entry, token)
         else:
             raw = sys.stdin.read()
             payload = _safe_json_loads(raw, {}) if raw.strip() else {}

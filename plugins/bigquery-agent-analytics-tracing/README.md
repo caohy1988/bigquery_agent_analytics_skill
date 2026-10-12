@@ -37,7 +37,9 @@ bounded by `BQAA_HOOK_WAIT_SECONDS` (default 1; see Reliability for the
 exact bound). So the agent never waits on Python startup, file locks, auth
 or BigQuery, nor on a sender that doesn't close stdin. Each `bqaa_hook.py`
 run applies all of its session's queued events,
-oldest first, each as of the time its hook ran. When one run starts late,
+oldest first, each as of the time its hook ran. An event's session is the
+top-level `session_id` of its payload, which `bqaa_hook.py` reads from the
+whole payload, wherever the field sits in it. When one run starts late,
 another applies its event in turn, so a late `UserPromptSubmit` still opens
 the trace before its `Stop` reads the reply, and timestamps and latencies
 come out as if nothing was late. Without `BQAA_PROJECT_ID`/`BQAA_DATASET`
@@ -473,7 +475,11 @@ ORDER BY rows_written DESC
   applies all of that session's queued events, oldest first. A late
   interpreter can't apply its event after a newer one, so a `Stop` never
   misses its `UserPromptSubmit` and a `PostToolUse` never misses its
-  `PreToolUse`. Events are stamped with the time their hook ran. If no
+  `PreToolUse`. Events are stamped with the time their hook ran. The
+  session comes from each whole payload's top-level `session_id`, so every
+  run reads all queued payloads (normally only a handful). The lock files
+  (`queue/.lock-00` to `.lock-63`, picked by session) are never removed, so
+  two runs can't both hold a session's lock. If no
   `bqaa_hook.py` run gets going for a session again, its queued events
   stay put until `BQAA_STATE_TTL_HOURS` purges them; past 10,000 queued
   events in all, hooks stop queueing new ones.

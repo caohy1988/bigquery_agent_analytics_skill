@@ -493,6 +493,24 @@ def _queued_entries(state_dir: Path) -> list[Path]:
     return sorted(p for p in queue.iterdir() if p.name.isdigit()) if queue.exists() else []
 
 
+def _recording_stub(tmp: Path) -> tuple[Path, Path]:
+    """A BQAA_PYTHON that only writes down the run each hook starts. Returns
+    (stub, record); see _recorded_runs."""
+    record = tmp / "runs"
+    return _write_stub(tmp / "recording-python", f"IFS=$'\\t'\nprintf '%s\\n' \"$*\" >> \"{record}\""), record
+
+
+def _recorded_runs(record: Path) -> list[tuple[str, ...]]:
+    """process_hook_queue's arguments for each run, in the order the hooks
+    started them."""
+    runs = []
+    for line in record.read_text(encoding="utf-8").splitlines():
+        _, flag, *args = line.split("\t")
+        assert flag == "--queue", line
+        runs.append(tuple(args))
+    return runs
+
+
 def _iso_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
@@ -814,6 +832,71 @@ def test_late_turns_keep_their_own_replies() -> None:
         assert rows[0]["trace_id"] == rows[1]["trace_id"] != rows[2]["trace_id"] == rows[3]["trace_id"]
 
 
+def test_late_hooks_group_by_top_level_session_id() -> None:
+    # 2026-10-12 review: the hook took the session from the first 1,024
+    # characters of the payload. A long prompt ahead of session_id filed the
+    # prompt's event on its own, so when its interpreter stalled, Stop's run
+    # didn't apply it first and the reply was dropped. A session_id inside
+    # tool_input, ahead of the top-level one, misfiled a PreToolUse the same
+    # way. Here both put the top-level session_id last.
+    with _tmpdir() as tmp, _drainer_lock_held(tmp / "spool"), _reaping(tmp / "pids") as pids:
+        slow = _write_stub(tmp / "slow-python", f'echo $$ >> "{pids}"\nsleep 4\nexec "{sys.executable}" "$@"')
+        slow_env, fast_env = _base_env(tmp, BQAA_PYTHON=str(slow)), _base_env(tmp)
+        transcript = tmp / "transcript.jsonl"
+        prompt = "list the files, " + "and then some more of them, " * 100
+        assert len(prompt) > 2048
+        _append_transcript(
+            transcript, {"type": "user", "message": {"role": "user", "content": prompt}, "timestamp": _iso_now()}
+        )
+        _run_hook(
+            "user_prompt_submit.sh",
+            {
+                "prompt": prompt,
+                "hook_event_name": "UserPromptSubmit",
+                "cwd": "/tmp",
+                "transcript_path": str(transcript),
+                "session_id": SESSION_ID,
+            },
+            slow_env,
+        )
+        time.sleep(0.1)
+        _append_transcript(
+            transcript,
+            {
+                "type": "assistant",
+                "message": {"model": "claude-test", "content": [{"type": "text", "text": "Listing the files."}]},
+                "timestamp": _iso_now(),
+            },
+        )
+        tool_input = {"session_id": "another-session", "command": "ls -la", "description": "List files"}
+        pre = {key: PRE_PAYLOAD[key] for key in reversed(PRE_PAYLOAD)}  # session_id last
+        _run_hook("pre_tool_use.sh", dict(pre, tool_input=tool_input), slow_env)
+        time.sleep(1.0)  # the tool runs
+        _run_hook("post_tool_use.sh", dict(POST_PAYLOAD, tool_input=tool_input), fast_env)
+        _run_hook(
+            "stop.sh",
+            {"session_id": SESSION_ID, "transcript_path": str(transcript), "hook_event_name": "Stop"},
+            fast_env,
+        )
+        _wait_for_exit(pids, timeout=20)
+
+        rows = {row["event_type"]: row for row in _spooled_rows(tmp / "spool")}
+        assert len(_spool_files(tmp / "spool")) == 4, sorted(rows)
+        assert sorted(rows) == ["LLM_REQUEST", "LLM_RESPONSE", "TOOL_COMPLETED", "TOOL_STARTING"], sorted(rows)
+        request, started, completed, response = (
+            rows[name] for name in ("LLM_REQUEST", "TOOL_STARTING", "TOOL_COMPLETED", "LLM_RESPONSE")
+        )
+        assert request["timestamp"] < started["timestamp"] < completed["timestamp"] < response["timestamp"], rows
+        assert {row["session_id"] for row in rows.values()} == {SESSION_ID}, rows
+        assert {row["trace_id"] for row in rows.values()} == {request["trace_id"]}, rows
+        assert json.loads(request["content"])["prompt"] == [{"role": "user", "content": prompt}]
+        assert json.loads(response["content"]) == {"response": "Listing the files."}, response["content"]
+        assert json.loads(started["content"])["args"] == tool_input, started["content"]
+        assert json.loads(completed["latency_ms"])["total_ms"] >= 900, completed["latency_ms"]
+        assert list((tmp / "state").glob("tool_*.json")) == []
+        assert _queued_entries(tmp / "state") == []
+
+
 def test_parallel_hooks_each_queue_their_event() -> None:
     # Parallel tool calls fire their PreToolUse hooks at the same time; each
     # event needs its own place in the queue.
@@ -838,18 +921,67 @@ def test_queue_applies_only_its_own_sessions_events() -> None:
     # Sessions can run with different settings (dataset, agent name, ...),
     # so an adapter run applies only its own session's events.
     with _tmpdir() as tmp, _drainer_lock_held(tmp / "spool"):
-        idle = _write_stub(tmp / "idle-python", "exit 0")
-        env = _base_env(tmp, BQAA_PYTHON=str(idle))
+        stub, record = _recording_stub(tmp)
+        env = _base_env(tmp, BQAA_PYTHON=str(stub))
         for session_id in ("session-a", "session-b"):
             _run_hook("pre_tool_use.sh", dict(PRE_PAYLOAD, session_id=session_id), env)
         assert len(_queued_entries(tmp / "state")) == 2
+        run_a, run_b = _recorded_runs(record)
         with _environ(_base_env(tmp)):
-            assert bqaa_tracing.process_hook_queue(tmp / "state" / "queue", "session-a") == 1
+            assert bqaa_tracing.process_hook_queue(*run_a) == 1
             assert [row["session_id"] for row in _spooled_rows(tmp / "spool")] == ["session-a"]
             assert len(_queued_entries(tmp / "state")) == 1
-            assert bqaa_tracing.process_hook_queue(tmp / "state" / "queue", "session-b") == 1
+            assert bqaa_tracing.process_hook_queue(*run_b) == 1
         assert sorted(row["session_id"] for row in _spooled_rows(tmp / "spool")) == ["session-a", "session-b"]
         assert _queued_entries(tmp / "state") == []
+
+
+def test_late_run_leaves_a_newer_event_with_its_number_alone() -> None:
+    # A run looks its event up by number. Once another run has applied it,
+    # the number can go to a newer event, maybe another session's; the
+    # token on the event's last line tells the late run it isn't its own.
+    with _tmpdir() as tmp, _drainer_lock_held(tmp / "spool"):
+        stub, record = _recording_stub(tmp)
+        env = _base_env(tmp, BQAA_PYTHON=str(stub))
+        _run_hook("pre_tool_use.sh", dict(PRE_PAYLOAD, session_id="session-a"), env)
+        with _environ(_base_env(tmp)):
+            (late_run,) = _recorded_runs(record)
+            assert bqaa_tracing.process_hook_queue(*late_run) == 1  # as another run of session-a would
+            _run_hook("pre_tool_use.sh", dict(PRE_PAYLOAD, session_id="session-b"), env)
+            newer_run = _recorded_runs(record)[1]
+            assert newer_run[1] == late_run[1] and newer_run[2] != late_run[2], (late_run, newer_run)
+            assert bqaa_tracing.process_hook_queue(*late_run) == 0
+        assert [row["session_id"] for row in _spooled_rows(tmp / "spool")] == ["session-a"]
+        assert len(_queued_entries(tmp / "state")) == 1
+
+
+def test_cleanup_leaves_queue_locks_in_place() -> None:
+    # 2026-10-12 review: cleanup_stale_state deleted queue lock files past
+    # the TTL. A run could lock one just as it was unlinked; the next run
+    # then made and locked a new file at the same path, and both applied the
+    # session's events at once. Lock files now stay put.
+    with _tmpdir() as tmp, _drainer_lock_held(tmp / "spool"):
+        _run_hook("pre_tool_use.sh", PRE_PAYLOAD, _base_env(tmp, BQAA_HOOK_WAIT_SECONDS="5"))
+        (lock,) = (tmp / "state" / "queue").glob(".lock-*")
+        # A run of the session holds the lock, which by age is past the TTL.
+        fd = os.open(lock, os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            long_ago = time.time() - 48 * 3600
+            os.utime(lock, (long_ago, long_ago))
+            bqaa_tracing.cleanup_stale_state(tmp / "state", 24)
+            assert lock.exists() and lock.stat().st_ino == os.fstat(fd).st_ino
+            # So the session's next run waits for the one holding it.
+            _run_hook("post_tool_use.sh", POST_PAYLOAD, _base_env(tmp))
+            time.sleep(1.0)
+            assert [row["event_type"] for row in _spooled_rows(tmp / "spool")] == ["TOOL_STARTING"]
+        finally:
+            os.close(fd)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and _queued_entries(tmp / "state"):
+            time.sleep(0.1)
+        assert _queued_entries(tmp / "state") == []
+        assert [row["event_type"] for row in _spooled_rows(tmp / "spool")] == ["TOOL_STARTING", "TOOL_COMPLETED"]
 
 
 def test_drainer_sends_spooled_row_unchanged() -> None:
@@ -1010,8 +1142,11 @@ def main() -> int:
         test_unconfigured_hook_does_not_start_python,
         test_late_hooks_still_apply_in_order,
         test_late_turns_keep_their_own_replies,
+        test_late_hooks_group_by_top_level_session_id,
         test_parallel_hooks_each_queue_their_event,
         test_queue_applies_only_its_own_sessions_events,
+        test_late_run_leaves_a_newer_event_with_its_number_alone,
+        test_cleanup_leaves_queue_locks_in_place,
         test_drainer_sends_spooled_row_unchanged,
         test_drainer_gives_up_on_hung_auth,
         test_drainer_gives_up_on_hung_insert,

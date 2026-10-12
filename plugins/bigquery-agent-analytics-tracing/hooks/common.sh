@@ -9,7 +9,9 @@
 #      the same deadline as the rest.
 #   2. It starts the Python adapter detached from the hook's stdio. That run
 #      applies all of the session's queued events, oldest first, so an event
-#      whose own run starts late still lands before newer ones.
+#      whose own run starts late still lands before newer ones. Python reads
+#      whose events they are (the top-level session_id) from the whole
+#      payloads; the hook doesn't look inside them.
 #   3. It waits for Python, at most BQAA_HOOK_WAIT_SECONDS (default 1) in
 #      all. Whole seconds: macOS ships bash 3.2, whose read -t takes no less.
 
@@ -95,19 +97,11 @@ if kill -0 "$CAT_PID"; then
 fi
 exec 4<&-
 
-# The session_id near the start of the payload says whose events these are.
-SESSION_KEY=""
-PAYLOAD_HEAD=""
-{ IFS= read -r _ && IFS= read -r -d '' -n 1024 PAYLOAD_HEAD; } <"$ENTRY"
-SESSION_RE='"session_id"[[:space:]]*:[[:space:]]*"([^"\\]+)"'
-if [[ "$PAYLOAD_HEAD" =~ $SESSION_RE ]]; then
-  SESSION_KEY="${BASH_REMATCH[1]//[^A-Za-z0-9._-]/}"
-  SESSION_KEY="${SESSION_KEY:0:64}"
-fi
-# No session: the event is applied on its own.
-[[ -n "$SESSION_KEY" ]] || SESSION_KEY="hook-$$-$RANDOM"
-# The last line marks the entry complete.
-printf '\n%s %s\n' "#bqaa-end" "$SESSION_KEY" >&5
+# The last line marks the entry complete. Its token tells this hook's run
+# its event apart from a newer one that gets the same number after this one
+# has been applied.
+TOKEN="$$-$RANDOM-$RANDOM"
+printf '\n%s %s\n' "#bqaa-end" "$TOKEN" >&5
 exec 5>&-
 
 # --- 2. and 3. Run the adapter and wait for it ---------------------------------
@@ -116,7 +110,7 @@ run_adapter() {
   # session's terminal goes away.
   trap '' HUP INT
   exec </dev/null
-  "$PYTHON_BIN" "$PLUGIN_DIR/scripts/bqaa_hook.py" --queue "$QUEUE_DIR" "$SESSION_KEY" >/dev/null
+  "$PYTHON_BIN" "$PLUGIN_DIR/scripts/bqaa_hook.py" --queue "$QUEUE_DIR" "${ENTRY##*/}" "$TOKEN" >/dev/null
 }
 
 # The subshell keeps the pipe on fd 3 open until Python exits, so read
