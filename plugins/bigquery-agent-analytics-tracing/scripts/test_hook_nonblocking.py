@@ -18,6 +18,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -281,12 +282,13 @@ def _stdin(text: str) -> Iterator[None]:
 
 
 def _run_hook(script: str, payload: object, env: dict[str, str]) -> tuple[float, subprocess.CompletedProcess]:
-    """Run hooks/<script> like the agent: payload on stdin, then wait for
-    the process to exit and for EOF on stdout and stderr."""
+    """Run hooks/<script> like the agent: payload on stdin (a str is sent
+    as is), then wait for the process to exit and for EOF on stdout and
+    stderr."""
     start = time.monotonic()
     proc = subprocess.run(
         ["bash", str(PLUGIN_ROOT / "hooks" / script)],
-        input=json.dumps(payload),
+        input=payload if isinstance(payload, str) else json.dumps(payload),
         capture_output=True,
         text=True,
         env=env,
@@ -604,9 +606,9 @@ def test_cut_off_payload_is_dropped_not_made_up() -> None:
             return log.read_text(encoding="utf-8") if log.exists() else ""
 
         deadline = time.monotonic() + 10
-        while time.monotonic() < deadline and "payload isn't JSON" not in logged():
+        while time.monotonic() < deadline and "payload can't be parsed" not in logged():
             time.sleep(0.1)
-        assert "PreToolUse payload isn't JSON" in logged(), logged()
+        assert "PreToolUse payload can't be parsed: JSONDecodeError" in logged(), logged()
         assert _spool_files(tmp / "spool") == []
         assert _queued_entries(tmp / "state") == []
 
@@ -897,6 +899,79 @@ def test_late_hooks_group_by_top_level_session_id() -> None:
         assert _queued_entries(tmp / "state") == []
 
 
+def test_numbers_freed_during_a_run_do_not_reorder_its_session() -> None:
+    # 2026-10-12 review: a run lists the queue, then reads the entries one
+    # by one. When another session's run removed its events in between, the
+    # next hooks got their numbers again: session a's UserPromptSubmit one
+    # the run had already passed, its Stop one the run hadn't reached yet.
+    # The run applied Stop with no open trace, which dropped the reply, and
+    # UserPromptSubmit was applied after it. Here the hooks only queue their
+    # events, and the runs go in-process so they interleave just that way.
+    with _tmpdir() as tmp, _drainer_lock_held(tmp / "spool"):
+        stub, record = _recording_stub(tmp)
+        hook_env = _base_env(tmp, BQAA_PYTHON=str(stub))
+        queue = tmp / "state" / "queue"
+        # So one run can go while the other holds its session's lock.
+        assert bqaa_tracing._queue_lock(queue, "session-a") != bqaa_tracing._queue_lock(queue, "session-b")
+        transcript = tmp / "transcript.jsonl"
+        turn = {"session_id": "session-a", "transcript_path": str(transcript), "cwd": "/tmp"}
+        _run_hook("session_start.sh", dict(turn, hook_event_name="SessionStart", source="startup"), hook_env)
+        _run_hook("pre_tool_use.sh", dict(PRE_PAYLOAD, session_id="session-b"), hook_env)
+        _run_hook("post_tool_use.sh", dict(POST_PAYLOAD, session_id="session-b"), hook_env)
+        start_run, b_run, _ = _recorded_runs(record)
+        read = bqaa_tracing._read_queued_event
+        interleaved = []
+
+        def read_then_interleave(path: Path):
+            event = read(path)
+            if path.name == b_run[1] and not interleaved:
+                interleaved.append(path.name)
+                # Session b's run applies its events and removes them...
+                assert bqaa_tracing.process_hook_queue(*b_run) == 2
+                # ...and session a's next turn goes by.
+                _append_transcript(
+                    transcript,
+                    {"type": "user", "message": {"role": "user", "content": "list files"}, "timestamp": _iso_now()},
+                )
+                _run_hook(
+                    "user_prompt_submit.sh", dict(turn, hook_event_name="UserPromptSubmit", prompt="list files"), hook_env
+                )
+                time.sleep(0.05)
+                _append_transcript(
+                    transcript,
+                    {
+                        "type": "assistant",
+                        "message": {"model": "claude-test", "content": [{"type": "text", "text": "Listing the files."}]},
+                        "timestamp": _iso_now(),
+                    },
+                )
+                time.sleep(0.05)
+                _run_hook("stop.sh", dict(turn, hook_event_name="Stop", stop_hook_active=False), hook_env)
+            return event
+
+        with _environ(_base_env(tmp)):
+            # SessionStart's run has listed the queue and just read session
+            # b's first event when all that happens.
+            bqaa_tracing._read_queued_event = read_then_interleave
+            try:
+                bqaa_tracing.process_hook_queue(*start_run)
+            finally:
+                bqaa_tracing._read_queued_event = read
+            assert interleaved, "the run never read session b's event"
+            for run in _recorded_runs(record):
+                bqaa_tracing.process_hook_queue(*run)
+
+        rows = sorted(_spooled_rows(tmp / "spool"), key=lambda row: row["timestamp"])
+        rows_a = [row for row in rows if row["session_id"] == "session-a"]
+        types_a = [row["event_type"] for row in rows_a]
+        assert types_a == ["LLM_REQUEST", "LLM_RESPONSE"], types_a
+        assert rows_a[0]["trace_id"] == rows_a[1]["trace_id"], rows_a
+        assert json.loads(rows_a[1]["content"]) == {"response": "Listing the files."}, rows_a[1]["content"]
+        rows_b = [row["event_type"] for row in rows if row["session_id"] == "session-b"]
+        assert rows_b == ["TOOL_STARTING", "TOOL_COMPLETED"], rows_b
+        assert _queued_entries(tmp / "state") == []
+
+
 def test_parallel_hooks_each_queue_their_event() -> None:
     # Parallel tool calls fire their PreToolUse hooks at the same time; each
     # event needs its own place in the queue.
@@ -915,6 +990,41 @@ def test_parallel_hooks_each_queue_their_event() -> None:
         spans = sorted(row["span_id"] for row in _spooled_rows(tmp / "spool"))
         assert spans == sorted(hashlib.sha256(t.encode()).hexdigest()[:16] for t in tool_use_ids), spans
         assert _queued_entries(tmp / "state") == []
+
+
+def test_hook_does_not_take_a_number_used_up_since_its_listing() -> None:
+    # Between a hook's listing of the queue and its taking the next number,
+    # a hook that started later can queue an event under that number, and a
+    # run apply and remove it. The number is in queue/last by then, and the
+    # first hook mustn't take it again. A FIFO in place of queue/last plays
+    # that out: the hook's first read finds no number used, the one after it
+    # has taken number 1 finds 1.
+    with _tmpdir() as tmp, _drainer_lock_held(tmp / "spool"):
+        stub, record = _recording_stub(tmp)
+        queue = tmp / "state" / "queue"
+        queue.mkdir(mode=0o700, parents=True)
+        last = queue / "last"
+        os.mkfifo(last)
+
+        def serve() -> None:
+            for value in ("", "000000000001", "000000000001"):
+                with last.open("w", encoding="ascii") as fifo:  # once the hook opens it
+                    fifo.write(value + "\n")
+
+        server = threading.Thread(target=serve, daemon=True)
+        server.start()
+        try:
+            _, proc = _run_hook("pre_tool_use.sh", PRE_PAYLOAD, _base_env(tmp, BQAA_PYTHON=str(stub)))
+        finally:
+            # Unblock the server if the hook read the FIFO fewer times.
+            while server.is_alive():
+                fd = os.open(last, os.O_RDONLY | os.O_NONBLOCK)
+                server.join(0.2)
+                os.close(fd)
+        assert proc.returncode == 0, proc
+        ((_, entry, _),) = _recorded_runs(record)
+        assert entry == "000000000002", entry
+        assert [path.name for path in _queued_entries(tmp / "state")] == [entry]
 
 
 def test_queue_applies_only_its_own_sessions_events() -> None:
@@ -936,23 +1046,39 @@ def test_queue_applies_only_its_own_sessions_events() -> None:
         assert _queued_entries(tmp / "state") == []
 
 
-def test_late_run_leaves_a_newer_event_with_its_number_alone() -> None:
-    # A run looks its event up by number. Once another run has applied it,
-    # the number can go to a newer event, maybe another session's; the
-    # token on the event's last line tells the late run it isn't its own.
+def test_queue_numbers_are_never_handed_out_twice() -> None:
+    # Runs read the queue in number order, so a number whose event is gone
+    # (applied, or purged by cleanup) stays used: the next hook gets a
+    # higher one. Numbers start over only if the queue dir is removed; the
+    # token on an event's last line then tells a late run that the newer
+    # event under its number isn't its own.
     with _tmpdir() as tmp, _drainer_lock_held(tmp / "spool"):
         stub, record = _recording_stub(tmp)
         env = _base_env(tmp, BQAA_PYTHON=str(stub))
-        _run_hook("pre_tool_use.sh", dict(PRE_PAYLOAD, session_id="session-a"), env)
+        state = tmp / "state"
+
+        def queue_event(session_id: str) -> tuple[str, ...]:
+            _run_hook("pre_tool_use.sh", dict(PRE_PAYLOAD, session_id=session_id), env)
+            return _recorded_runs(record)[-1]
+
         with _environ(_base_env(tmp)):
-            (late_run,) = _recorded_runs(record)
+            late_run = queue_event("session-a")
             assert bqaa_tracing.process_hook_queue(*late_run) == 1  # as another run of session-a would
-            _run_hook("pre_tool_use.sh", dict(PRE_PAYLOAD, session_id="session-b"), env)
-            newer_run = _recorded_runs(record)[1]
-            assert newer_run[1] == late_run[1] and newer_run[2] != late_run[2], (late_run, newer_run)
+            purged_run = queue_event("session-b")
+            long_ago = time.time() - 48 * 3600
+            os.utime(state / "queue" / purged_run[1], (long_ago, long_ago))
+            assert bqaa_tracing.cleanup_stale_state(state, 24) == 1
+            newer_run = queue_event("session-c")
+            numbers = [run[1] for run in (late_run, purged_run, newer_run)]
+            assert numbers == ["000000000001", "000000000002", "000000000003"], numbers
+            assert bqaa_tracing.process_hook_queue(*late_run) == 0
+
+            shutil.rmtree(state / "queue")
+            restarted_run = queue_event("session-d")
+            assert restarted_run[1] == late_run[1] and restarted_run[2] != late_run[2], (late_run, restarted_run)
             assert bqaa_tracing.process_hook_queue(*late_run) == 0
         assert [row["session_id"] for row in _spooled_rows(tmp / "spool")] == ["session-a"]
-        assert len(_queued_entries(tmp / "state")) == 1
+        assert [path.name for path in _queued_entries(state)] == [restarted_run[1]]
 
 
 def test_cleanup_leaves_queue_locks_in_place() -> None:
@@ -982,6 +1108,83 @@ def test_cleanup_leaves_queue_locks_in_place() -> None:
             time.sleep(0.1)
         assert _queued_entries(tmp / "state") == []
         assert [row["event_type"] for row in _spooled_rows(tmp / "spool")] == ["TOOL_STARTING", "TOOL_COMPLETED"]
+
+
+# ---------------------------------------------------------------------------
+# A payload Python can't parse holds up nothing else
+# ---------------------------------------------------------------------------
+
+
+def _deeply_nested(payload: dict, key: str) -> str:
+    """payload as JSON, with key's value nested deeper than json can parse."""
+    return json.dumps(dict(payload, **{key: "NESTED"})).replace('"NESTED"', "[" * 100_000 + "]" * 100_000)
+
+
+def _with_huge_integer(payload: dict, key: str) -> str:
+    """payload as JSON, with a 5,000-digit integer as key's value."""
+    return json.dumps(dict(payload, **{key: "NUMBER"})).replace('"NUMBER"', "9" * 5000)
+
+
+def test_payload_that_cannot_be_parsed_holds_up_no_other_event() -> None:
+    # 2026-10-12 review: every run parses every queued payload to find its
+    # session's events, and only a JSONDecodeError was caught. Deep nesting
+    # raises RecursionError and a 5,000-digit integer ValueError, so either
+    # one stopped every session's runs and stayed in the queue. Such an
+    # event is now applied on its own, which drops it with a log line, and
+    # the other runs pass it by.
+    with _tmpdir() as tmp, _drainer_lock_held(tmp / "spool"):
+        stub, record = _recording_stub(tmp)
+        hook_env = _base_env(tmp, BQAA_PYTHON=str(stub))
+        nested = _deeply_nested(dict(PRE_PAYLOAD, session_id="session-a"), "tool_input")
+        huge = _with_huge_integer(dict(POST_PAYLOAD, session_id="session-b"), "tool_response")
+        _run_hook("pre_tool_use.sh", dict(PRE_PAYLOAD, session_id="session-a"), hook_env)
+        _run_hook("pre_tool_use.sh", nested, hook_env)
+        _run_hook("pre_tool_use.sh", dict(PRE_PAYLOAD, session_id="session-b"), hook_env)
+        _run_hook("post_tool_use.sh", huge, hook_env)
+        a_run, nested_run, b_run, huge_run = _recorded_runs(record)
+        with _environ(_base_env(tmp)):
+            # Through main(), as bqaa_hook.py runs them.
+            for run in (a_run, b_run):
+                assert bqaa_tracing.main(["--queue", *run]) == 0
+            sessions = [row["session_id"] for row in _spooled_rows(tmp / "spool")]
+            assert sessions == ["session-a", "session-b"], sessions
+            assert [path.name for path in _queued_entries(tmp / "state")] == [nested_run[1], huge_run[1]]
+            for run in (nested_run, huge_run):
+                assert bqaa_tracing.main(["--queue", *run]) == 0
+        assert _queued_entries(tmp / "state") == []
+        assert len(_spool_files(tmp / "spool")) == 2
+        log = (tmp / "bqaa.log").read_text(encoding="utf-8")
+        assert "PreToolUse payload can't be parsed: RecursionError" in log, log[-3000:]
+        assert "PostToolUse payload can't be parsed: ValueError" in log, log[-3000:]
+
+
+def test_transcript_lines_that_cannot_be_parsed_are_skipped() -> None:
+    # Transcript lines get parsed too (tool results in them can hold any
+    # JSON). The same two kinds of line made a late UserPromptSubmit, or a
+    # Stop, fail, and the turn's reply was lost. They're passed over like
+    # any other line that isn't JSON.
+    with _tmpdir() as tmp:
+        transcript = tmp / "transcript.jsonl"
+        _append_transcript(
+            transcript,
+            {"type": "user", "message": {"role": "user", "content": "q"}, "timestamp": "2026-10-12T10:00:00.000Z"},
+            {
+                "type": "assistant",
+                "message": {"model": "claude-test", "content": [{"type": "text", "text": "reply"}]},
+                "timestamp": "2026-10-12T10:00:02.000Z",
+            },
+        )
+        lines = [
+            _with_huge_integer({"type": "user", "timestamp": "2026-10-12T10:00:03.000Z"}, "toolUseResult"),
+            _deeply_nested({"type": "user", "timestamp": "2026-10-12T10:00:04.000Z"}, "toolUseResult"),
+        ]
+        with transcript.open("a", encoding="utf-8") as handle:
+            handle.write("".join(line + "\n" for line in lines))
+        hook_ns = int(datetime(2026, 10, 12, 10, 0, 1, tzinfo=timezone.utc).timestamp()) * 1_000_000_000
+        with bqaa_tracing._event_clock(hook_ns):  # a UserPromptSubmit between the prompt and the reply
+            assert bqaa_tracing._line_count(str(transcript)) == 1
+        output, model, _, _ = bqaa_tracing._read_transcript_since(str(transcript), 1, 1 << 20)
+        assert (output, model) == ("reply", "claude-test"), (output, model)
 
 
 def test_drainer_sends_spooled_row_unchanged() -> None:
@@ -1143,10 +1346,14 @@ def main() -> int:
         test_late_hooks_still_apply_in_order,
         test_late_turns_keep_their_own_replies,
         test_late_hooks_group_by_top_level_session_id,
+        test_numbers_freed_during_a_run_do_not_reorder_its_session,
         test_parallel_hooks_each_queue_their_event,
+        test_hook_does_not_take_a_number_used_up_since_its_listing,
         test_queue_applies_only_its_own_sessions_events,
-        test_late_run_leaves_a_newer_event_with_its_number_alone,
+        test_queue_numbers_are_never_handed_out_twice,
         test_cleanup_leaves_queue_locks_in_place,
+        test_payload_that_cannot_be_parsed_holds_up_no_other_event,
+        test_transcript_lines_that_cannot_be_parsed_are_skipped,
         test_drainer_sends_spooled_row_unchanged,
         test_drainer_gives_up_on_hung_auth,
         test_drainer_gives_up_on_hung_insert,

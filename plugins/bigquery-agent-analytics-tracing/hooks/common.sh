@@ -4,7 +4,7 @@
 # never block or fail. Python is the part that can stall: on macOS a hung
 # syspolicyd blocks every launch of a non-Apple interpreter until launchd
 # replaces the daemon. So the hook runs only bash and base utilities
-# (dirname, cat, mkdir) and always exits 0 with no output:
+# (dirname, cat, mkdir, rarely rm) and always exits 0 with no output:
 #   1. It queues the event under the state dir, reading the payload under
 #      the same deadline as the rest.
 #   2. It starts the Python adapter detached from the hook's stdio. That run
@@ -45,9 +45,12 @@ WAIT_SECONDS=$((10#$WAIT_SECONDS))
 
 # --- 1. Queue the event ------------------------------------------------------
 # One file per event, named by a 12-digit sequence number; the format is
-# described next to QUEUE_END in bqaa_tracing.py. An event stays queued until
-# it's applied, so a hook that starts after another has returned always gets
-# a higher number than that one.
+# described next to QUEUE_END in bqaa_tracing.py. A number is never handed
+# out twice: a run records an event's number in queue/last before it removes
+# the event, and a hook keeps a number only if it's above queue/last once the
+# hook holds the file. So a hook that starts after another has returned
+# always gets a higher number than that one, and a run reading the queue in
+# order can't come across a newer event under a number it has already passed.
 QUEUE_DIR="${BQAA_STATE_DIR:-/tmp/bqaa-agent-tracing}"
 case "$QUEUE_DIR" in \~ | \~/*) QUEUE_DIR="$HOME${QUEUE_DIR:1}" ;; esac
 QUEUE_DIR="$QUEUE_DIR/queue"
@@ -63,21 +66,42 @@ CAT_BIN=/bin/cat
 shopt -s nullglob
 QUEUED=("$QUEUE_DIR"/[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9])
 ((${#QUEUED[@]} < QUEUE_MAX)) || exit 0
+
+# Sets USED to the number in queue/last: no event gets it or a lower one.
+read_used() {
+  local raw=""
+  read -r raw <"$QUEUE_DIR/last"
+  if [[ "$raw" =~ ^[0-9]{1,12}$ ]]; then USED=$((10#$raw)); else USED=0; fi
+}
+
 LAST=0
 for entry in "${QUEUED[@]}"; do
   n=$((10#${entry##*/}))
   ((n > LAST)) && LAST=$n
 done
+# Start above queue/last too. (The check below is what keeps a number from
+# being taken twice; this only saves trying numbers that are used up.)
+read_used
+((USED > LAST)) && LAST=$USED
 # noclobber: the redirection creates the file or fails if another hook just
 # took that number.
 set -C
 ENTRY=""
-for ((n = LAST + 1; n <= LAST + 64; n++)); do
-  printf -v candidate '%s/%012d' "$QUEUE_DIR" "$n"
-  if exec 5>"$candidate"; then
+for ((tries = 0; tries < 64; tries++)); do
+  LAST=$((LAST + 1))
+  printf -v candidate '%s/%012d' "$QUEUE_DIR" "$LAST"
+  exec 5>"$candidate" || continue
+  # Since the listing, a later hook may have queued an event under this
+  # number and a run applied and removed it. A run raises queue/last before
+  # it removes an event, so if the number was used, queue/last shows it now.
+  read_used
+  if ((USED < LAST)); then
     ENTRY="$candidate"
     break
   fi
+  exec 5>&-
+  rm -f "$candidate"
+  ((USED > LAST)) && LAST=$USED
 done
 set +C
 [[ -n "$ENTRY" ]] || exit 0
@@ -98,8 +122,9 @@ fi
 exec 4<&-
 
 # The last line marks the entry complete. Its token tells this hook's run
-# its event apart from a newer one that gets the same number after this one
-# has been applied.
+# its event apart from a newer one with the same number, which can only
+# happen if the queue dir was removed in between and the numbers started
+# over.
 TOKEN="$$-$RANDOM-$RANDOM"
 printf '\n%s %s\n' "#bqaa-end" "$TOKEN" >&5
 exec 5>&-

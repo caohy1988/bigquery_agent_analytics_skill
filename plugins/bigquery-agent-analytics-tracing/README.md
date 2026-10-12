@@ -30,11 +30,11 @@ Agent hook (bash, <= BQAA_HOOK_WAIT_SECONDS in all, always exits 0)
 ```
 
 The hook script the agent waits on runs only bash and base utilities
-(`dirname`, `cat`, `mkdir`). It writes the event to a numbered file under
-`BQAA_STATE_DIR/queue`, starts `bqaa_hook.py` detached from the hook's
-stdio and waits for it. The whole hook, reading the payload included, is
-bounded by `BQAA_HOOK_WAIT_SECONDS` (default 1; see Reliability for the
-exact bound). So the agent never waits on Python startup, file locks, auth
+(`dirname`, `cat`, `mkdir`, rarely `rm`). It writes the event to a
+numbered file under `BQAA_STATE_DIR/queue`, starts `bqaa_hook.py` detached
+from the hook's stdio and waits for it. The whole hook, reading the
+payload included, is bounded by `BQAA_HOOK_WAIT_SECONDS` (default 1; see
+Reliability for the exact bound). So the agent never waits on Python startup, file locks, auth
 or BigQuery, nor on a sender that doesn't close stdin. Each `bqaa_hook.py`
 run applies all of its session's queued events,
 oldest first, each as of the time its hook ran. An event's session is the
@@ -479,7 +479,12 @@ ORDER BY rows_written DESC
   session comes from each whole payload's top-level `session_id`, so every
   run reads all queued payloads (normally only a handful). The lock files
   (`queue/.lock-00` to `.lock-63`, picked by session) are never removed, so
-  two runs can't both hold a session's lock. If no
+  two runs can't both hold a session's lock. Queue numbers are never
+  reused (`queue/last` holds the highest one removed so far), so a run
+  reading the queue in order can't find a newer event under a number it
+  has passed. A payload Python can't parse (cut off, nested too deeply, or
+  holding an integer too long to convert) is dropped with a log line and
+  holds up nothing else. If no
   `bqaa_hook.py` run gets going for a session again, its queued events
   stay put until `BQAA_STATE_TTL_HOURS` purges them; past 10,000 queued
   events in all, hooks stop queueing new ones.

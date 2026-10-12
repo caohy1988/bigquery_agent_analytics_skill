@@ -269,7 +269,8 @@ def _safe_json_loads(value: str | None, default: Any) -> Any:
         return default
     try:
         return json.loads(value)
-    except json.JSONDecodeError:
+    except (ValueError, RecursionError):
+        # JSONDecodeError, an integer too long to convert, or deep nesting.
         return default
 
 
@@ -1031,8 +1032,9 @@ def cleanup_stale_state(root: str | Path, ttl_hours: float) -> int:
     queue = base / "queue"
     if queue.is_dir():
         # Events no adapter run got to, or that a dying hook never finished.
-        # Not the lock files, which stay (see QUEUE_LOCKS).
+        # Not the lock files, which stay (see QUEUE_LOCKS), nor QUEUE_LAST.
         paths += [p for p in queue.iterdir() if p.name.isdigit()]
+    stale = []
     for path in paths:
         if not path.is_file():
             continue
@@ -1041,11 +1043,15 @@ def cleanup_stale_state(root: str | Path, ttl_hours: float) -> int:
         except FileNotFoundError:
             continue
         if mtime < cutoff:
-            try:
-                path.unlink()
-                removed += 1
-            except FileNotFoundError:
-                pass
+            stale.append(path)
+    # Their numbers stay used (see QUEUE_LAST).
+    _record_used(queue, [path for path in stale if path.parent == queue])
+    for path in stale:
+        try:
+            path.unlink()
+            removed += 1
+        except FileNotFoundError:
+            pass
     return removed
 
 
@@ -1441,10 +1447,19 @@ def run_claude_hook(hook_name: str, payload: dict[str, Any] | None = None) -> No
 
 # Each event is a file named by its 12-digit sequence number in
 # BQAA_STATE_DIR/queue: the hook name, a newline, the payload, then a line
-# with QUEUE_END and the hook's token, written last. The token tells the
-# hook's own run its event apart from a newer one that got the same number
-# after it was applied.
+# with QUEUE_END and the hook's token, written last.
 QUEUE_END = b"#bqaa-end"
+# A number is never handed out twice. Before a run removes an event it
+# raises the number in this file to the event's (see _record_used), and a
+# hook numbers its event above every queued one and keeps the number only
+# if it's above this one once the hook holds the file. Were a number freed
+# for reuse (another session's run removed the event under it), a run that
+# had already read past it could later find a newer event of its own
+# session there, such as a Stop, having missed the older UserPromptSubmit
+# that went to a lower number in between. The numbers start over only if
+# the queue dir is removed; the token then still tells the hook's own run
+# its event apart from a newer one with the same number.
+QUEUE_LAST = "last"
 # Runs lock one of QUEUE_LOCKS files in the queue dir, picked by session.
 # They are never removed: a run could lock one just as it was unlinked, and
 # the next run would then lock a new file at the same path, so both would
@@ -1456,18 +1471,13 @@ QUEUE_LOCKS = 64
 class _QueuedEvent(NamedTuple):
     path: Path
     hook_name: str
-    payload: Any  # None if it isn't JSON, and then error says why
+    payload: Any  # None if it can't be parsed, and then error says why
+    # Whose event it is: the payload's top-level session_id, as the
+    # adapter's state key reads it. None to apply it on its own.
+    session: str | None
     error: str | None
     token: str
     time_ns: int  # when the hook wrote it
-
-    @property
-    def session(self) -> str | None:
-        """Whose event it is: the payload's top-level session_id, as the
-        adapter's state key reads it. None to apply it on its own."""
-        if not isinstance(self.payload, dict):
-            return None
-        return str(self.payload.get("session_id") or "") or None
 
 
 def process_hook_queue(queue_dir: str | Path, entry: str, token: str) -> int:
@@ -1484,8 +1494,9 @@ def process_hook_queue(queue_dir: str | Path, entry: str, token: str) -> int:
 
     An event's session is the top-level session_id of its whole payload, so
     every queued payload is read in full. One without a session_id, or that
-    isn't JSON, is applied on its own. Only the session's own events are
-    applied, since sessions can run with different settings.
+    can't be parsed, is applied on its own; the latter is dropped with a log
+    line, and runs of other sessions just pass it by. Only the session's own
+    events are applied, since sessions can run with different settings.
     """
     if not (len(entry) == 12 and entry.isdigit()):
         raise ValueError(f"bad queue entry {entry!r}")
@@ -1501,6 +1512,8 @@ def process_hook_queue(queue_dir: str | Path, entry: str, token: str) -> int:
         if own is None or own.token != token:
             return 0
         events = [own] if session is None else _queued_events(queue, session)
+        # Before any of them is removed (see QUEUE_LAST).
+        _record_used(queue, [event.path for event in events])
         try:
             adapter = ClaudeHookBQAAAdapter()
         except Exception:
@@ -1513,7 +1526,9 @@ def process_hook_queue(queue_dir: str | Path, entry: str, token: str) -> int:
             try:
                 if event.error:
                     # Most likely cut off when the hook stopped waiting for
-                    # stdin. Applying it as {} would only make up an event.
+                    # stdin, or nested too deeply or holding too long a
+                    # number for json. Applying it as {} would only make up
+                    # an event.
                     raise ValueError(event.error)
                 with _event_clock(event.time_ns):
                     adapter.process(event.hook_name, event.payload)
@@ -1528,6 +1543,25 @@ def _queue_lock(queue: Path, key: str) -> Path:
     """The lock file for the events of key (a session, or a lone entry)."""
     digest = hashlib.sha256(key.encode("utf-8", "surrogatepass")).digest()
     return queue / f".lock-{int.from_bytes(digest[:4], 'big') % QUEUE_LOCKS:02d}"
+
+
+def _record_used(queue: Path, paths: list[Path]) -> None:
+    """Raise the number in QUEUE_LAST to the highest of paths' numbers.
+    Call it before removing them, so no hook hands those numbers out again."""
+    if not paths:
+        return
+    top = max(int(path.name) for path in paths)
+    last = queue / QUEUE_LAST
+    with _file_lock(queue / ".last.lock"):
+        try:
+            if int(last.read_text(encoding="ascii")) >= top:
+                return
+        except (OSError, ValueError):
+            pass
+        # Hooks read the file without a lock: replace it whole.
+        new = queue / ".last.new"
+        new.write_text(f"{top:012d}\n", encoding="ascii")
+        os.replace(new, last)
 
 
 def _queued_events(queue: Path, session: str) -> list[_QueuedEvent]:
@@ -1551,27 +1585,38 @@ def _queued_events(queue: Path, session: str) -> list[_QueuedEvent]:
 
 
 def _read_queued_event(path: Path) -> _QueuedEvent | None:
-    """The queue entry at path; None if it's gone or still being written."""
+    """The queue entry at path; None if it's gone, can't be read or is still
+    being written.
+
+    Every run reads every entry, so this doesn't raise: one bad payload
+    must not stop the runs of every session.
+    """
     try:
         with path.open("rb") as handle:
             data = handle.read()
             time_ns = os.fstat(handle.fileno()).st_mtime_ns
-    except FileNotFoundError:
+    except (OSError, MemoryError):
         return None
     body, end, token = data.rpartition(b"\n" + QUEUE_END + b" ")
     if not end or not token.endswith(b"\n") or b"\n" in token[:-1]:
         return None
     header, _, raw = body.partition(b"\n")
     hook_name = header.decode("utf-8", "replace")
-    text = raw.decode("utf-8", "replace")
     payload: Any = {}
-    error = None
-    if text.strip():
-        try:
+    session = error = None
+    try:
+        text = raw.decode("utf-8", "replace")
+        if text.strip():
             payload = json.loads(text)
-        except json.JSONDecodeError as exc:
-            payload, error = None, f"{hook_name} payload isn't JSON: {exc}"
-    return _QueuedEvent(path, hook_name, payload, error, token[:-1].decode("utf-8", "replace"), time_ns)
+        if isinstance(payload, dict):
+            session = str(payload.get("session_id") or "") or None
+    except Exception as exc:
+        # Not only JSONDecodeError: deep nesting raises RecursionError, an
+        # integer too long to convert ValueError.
+        payload, session, error = None, None, f"{hook_name} payload can't be parsed: {exc!r}"
+    return _QueuedEvent(
+        path, hook_name, payload, session, error, token[:-1].decode("utf-8", "replace"), time_ns
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
