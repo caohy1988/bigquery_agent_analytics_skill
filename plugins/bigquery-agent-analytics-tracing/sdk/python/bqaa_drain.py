@@ -16,8 +16,11 @@ Design choices:
 - When the Storage Write client or PyArrow are not available, falls back to
   ``bigquery.Client.insert_rows_json``. Same row contents in either path.
 - Retries transient failures (``ServiceUnavailable``, ``TooManyRequests``,
-  ``InternalServerError``, ``asyncio.TimeoutError``) with exponential backoff,
-  matching ADK's RetryConfig defaults.
+  ``InternalServerError``, timeouts) with exponential backoff, matching ADK's
+  RetryConfig defaults.
+- Every network or auth call (the ADC lookup, table checks, each write
+  attempt) runs under a hard ``BQAA_NETWORK_TIMEOUT_SECONDS`` timeout, so a
+  hung call can't pin the single drainer and its pidfile lock.
 - Rows that exhaust retries or hit non-retryable errors are moved to
   ``dead-letter/`` so they can be inspected and replayed.
 - Drainer exits after ``BQAA_DRAIN_IDLE_SECONDS`` of empty polling; the next
@@ -46,8 +49,17 @@ os.environ.setdefault("GRPC_ENABLE_FORK_SUPPORT", "1")
 from bqaa_tracing import (  # noqa: E402  (after env tweak)
     BQAAConfig,
     WRITER_LABEL,
+    _call_with_timeout,
     _log,
     bq_schema,
+)
+
+# The scopes BigQueryWriteAsyncClient asks ADC for by default; they cover
+# the insert_rows_json fallback too.
+_WRITE_SCOPES = (
+    "https://www.googleapis.com/auth/bigquery",
+    "https://www.googleapis.com/auth/bigquery.insertdata",
+    "https://www.googleapis.com/auth/cloud-platform",
 )
 
 
@@ -161,6 +173,23 @@ def _quarantine(path: Path, reason: str) -> None:
         pass
     except OSError:
         pass
+
+
+def _default_credentials(timeout: float) -> Any:
+    """Look up Application Default Credentials under a hard timeout.
+
+    Left to themselves, both clients do this lookup in their constructors
+    with no deadline, and it can probe the GCE metadata server or refresh a
+    token over the network.
+    """
+    import google.auth
+
+    credentials, _ = _call_with_timeout(
+        lambda: google.auth.default(default_scopes=_WRITE_SCOPES),
+        timeout,
+        "ADC lookup",
+    )
+    return credentials
 
 
 # ---------------------------------------------------------------------------
@@ -298,6 +327,7 @@ async def _write_batch_storage_api(
     retry: _RetryConfig,
     config: BQAAConfig,
     writer_label: str,
+    credentials: Any = None,
 ) -> bool:
     """Write a batch via the Storage Write API. Returns True on success."""
     import pyarrow as pa
@@ -325,7 +355,8 @@ async def _write_batch_storage_api(
         f"projects/{project}/datasets/{dataset}/tables/{table}/_default"
     )
 
-    client = BigQueryWriteAsyncClient()
+    timeout = config.network_timeout_seconds
+    client = BigQueryWriteAsyncClient(credentials=credentials)
     try:
         req = bq_storage_types.AppendRowsRequest(
             write_stream=write_stream,
@@ -361,7 +392,7 @@ async def _write_batch_storage_api(
                                 f"non_retryable_storage_error: {error_message}"
                             )
 
-                await asyncio.wait_for(_perform(), timeout=30.0)
+                await asyncio.wait_for(_perform(), timeout=timeout)
                 return True
 
             except (
@@ -395,7 +426,7 @@ async def _write_batch_storage_api(
             if close is not None:
                 result = close()
                 if asyncio.iscoroutine(result):
-                    await result
+                    await asyncio.wait_for(result, timeout=timeout)
         except Exception:
             pass
 
@@ -413,24 +444,27 @@ def _ensure_table_exists(
     location: str | None,
     auto_create_table: bool,
     auto_create_dataset: bool,
-) -> None:
+    credentials: Any = None,
+    timeout: float | None = None,
+) -> Any:
+    """Make sure the table exists; returns the client for the insert."""
     from google.cloud import bigquery
     from google.cloud.exceptions import NotFound
 
-    client = bigquery.Client(project=project, location=location)
+    client = bigquery.Client(project=project, location=location, credentials=credentials)
     dataset_id = f"{project}.{dataset}"
     if auto_create_dataset:
         try:
-            client.get_dataset(dataset_id)
+            client.get_dataset(dataset_id, timeout=timeout)
         except NotFound:
             ds = bigquery.Dataset(dataset_id)
             if location:
                 ds.location = location
-            client.create_dataset(ds)
+            client.create_dataset(ds, timeout=timeout)
     table_id = f"{project}.{dataset}.{table}"
     try:
-        client.get_table(table_id)
-        return
+        client.get_table(table_id, timeout=timeout)
+        return client
     except NotFound:
         if not auto_create_table:
             raise
@@ -441,7 +475,8 @@ def _ensure_table_exists(
     )
     bq_table.clustering_fields = ["event_type", "agent", "user_id"]
     bq_table.labels = {"adk_schema_version": "1"}
-    client.create_table(bq_table)
+    client.create_table(bq_table, timeout=timeout)
+    return client
 
 
 def _write_batch_insert_rows_json(
@@ -455,34 +490,44 @@ def _write_batch_insert_rows_json(
     config: BQAAConfig,
     auto_create_table: bool,
     auto_create_dataset: bool,
+    credentials: Any = None,
 ) -> bool:
     from google.api_core.exceptions import (
         InternalServerError,
         ServiceUnavailable,
         TooManyRequests,
     )
-    from google.cloud import bigquery
 
+    timeout = config.network_timeout_seconds
     try:
-        _ensure_table_exists(
-            project=project,
-            dataset=dataset,
-            table=table,
-            location=location,
-            auto_create_table=auto_create_table,
-            auto_create_dataset=auto_create_dataset,
+        client = _call_with_timeout(
+            lambda: _ensure_table_exists(
+                project=project,
+                dataset=dataset,
+                table=table,
+                location=location,
+                auto_create_table=auto_create_table,
+                auto_create_dataset=auto_create_dataset,
+                credentials=credentials,
+                timeout=timeout,
+            ),
+            timeout,
+            "BigQuery table check",
         )
     except Exception as exc:
         _log(config, f"DRAINER ensure_table_failed: {exc}")
         return False
 
-    client = bigquery.Client(project=project, location=location)
     table_id = f"{project}.{dataset}.{table}"
     attempt = 0
     delay = retry.initial_delay
     while True:
         try:
-            errors = client.insert_rows_json(table_id, rows)
+            errors = _call_with_timeout(
+                lambda: client.insert_rows_json(table_id, rows, timeout=timeout),
+                timeout,
+                "BigQuery insert",
+            )
             if errors:
                 _log(config, f"DRAINER insert_rows_json errors: {errors}")
                 return False
@@ -491,6 +536,7 @@ def _write_batch_insert_rows_json(
             ServiceUnavailable,
             TooManyRequests,
             InternalServerError,
+            TimeoutError,
         ) as exc:
             attempt += 1
             if attempt > retry.max_retries:
@@ -536,37 +582,47 @@ async def _drain_group_async(
 
     rows = [env.row for env in envelopes]
     success = False
-    if use_storage_api:
-        success = await _write_batch_storage_api(
-            project=project,
-            dataset=dataset,
-            table=table,
-            location=location,
-            rows=rows,
-            retry=retry,
-            config=config,
-            writer_label=writer_label or WRITER_LABEL,
+    try:
+        credentials = await asyncio.to_thread(
+            _default_credentials, config.network_timeout_seconds
         )
-        if not success:
-            _log(config, "DRAINER storage_api_failed, falling back to insert_rows_json")
+    except Exception as exc:
+        _log(config, f"DRAINER auth_failed: {exc}")
+    else:
+        if use_storage_api:
+            success = await _write_batch_storage_api(
+                project=project,
+                dataset=dataset,
+                table=table,
+                location=location,
+                rows=rows,
+                retry=retry,
+                config=config,
+                writer_label=writer_label or WRITER_LABEL,
+                credentials=credentials,
+            )
+            if not success:
+                _log(config, "DRAINER storage_api_failed, falling back to insert_rows_json")
 
-    if not success:
-        # Fallback / second attempt path. Run in a thread so the event loop
-        # isn't blocked by the synchronous BQ client. Use the per-envelope
-        # auto-create policy that the producer recorded in the spool, not a
-        # hard-coded default that would silently override their settings.
-        success = await asyncio.to_thread(
-            _write_batch_insert_rows_json,
-            project=project,
-            dataset=dataset,
-            table=table,
-            location=location,
-            rows=rows,
-            retry=retry,
-            config=config,
-            auto_create_table=auto_create_table,
-            auto_create_dataset=auto_create_dataset,
-        )
+        if not success:
+            # Fallback / second attempt path. Run in a thread so the event
+            # loop isn't blocked by the synchronous BQ client. Use the
+            # per-envelope auto-create policy that the producer recorded in
+            # the spool, not a hard-coded default that would silently
+            # override their settings.
+            success = await asyncio.to_thread(
+                _write_batch_insert_rows_json,
+                project=project,
+                dataset=dataset,
+                table=table,
+                location=location,
+                rows=rows,
+                retry=retry,
+                config=config,
+                auto_create_table=auto_create_table,
+                auto_create_dataset=auto_create_dataset,
+                credentials=credentials,
+            )
 
     if success:
         for env in envelopes:

@@ -15,9 +15,11 @@ and per-channel reference snippets.
 ## How it works
 
 ```
-Claude Code hook (bash)  ->  bqaa_hook.py  ->  spool/event-*.json   (sync, ~1 ms)
-                                             |
-                                             +-> spawn detached drainer
+Agent hook (bash, waits <= BQAA_HOOK_WAIT_SECONDS, always exits 0)
+        |
+        +-> bqaa_hook.py (background)  ->  spool/event-*.json   (~1 ms)
+                                         |
+                                         +-> spawn detached drainer
                                                        |
                                                        v
                               bqaa_drain.py  ->  BigQuery Storage Write API
@@ -25,7 +27,15 @@ Claude Code hook (bash)  ->  bqaa_hook.py  ->  spool/event-*.json   (sync, ~1 ms
                                                    dead-lettered on failure)
 ```
 
-The hot path that runs inside the agent process never blocks on BigQuery.
+The hook script the agent waits on runs only bash and base utilities
+(`dirname`, `cat`). It starts `bqaa_hook.py` detached from the hook's stdio
+and waits at most `BQAA_HOOK_WAIT_SECONDS` (default 1) for it, so the agent
+never waits on Python startup, file locks, auth or BigQuery. When Python
+finishes in time (the normal case) hooks stay in order; when it doesn't, the
+event is still spooled once Python gets going. Without
+`BQAA_PROJECT_ID`/`BQAA_DATASET` (and outside dry-run) the hook exits
+without starting Python at all.
+
 The drainer is a single-instance background process (enforced by
 `fcntl.flock`) that batches spooled rows and writes them via the
 `BigQueryWriteAsyncClient` Storage Write API. If the Storage Write client
@@ -65,6 +75,8 @@ export BQAA_DRAIN_POLL_SECONDS="0.5"
 export BQAA_TRANSCRIPT_MAX_BYTES="262144"     # 256 KB cap for SubagentStop transcripts
 export BQAA_STATE_TTL_HOURS="24"              # purge orphaned state files older than this
 export BQAA_WRITER_LABEL="bqaa-coding-agent-plugin/0.1.0"   # see "Writer attribution" below
+export BQAA_HOOK_WAIT_SECONDS="1"             # whole seconds a hook waits for bqaa_hook.py; 0 = never wait
+export BQAA_NETWORK_TIMEOUT_SECONDS="30"      # hard timeout on each ADC lookup / BigQuery call
 ```
 
 ### Authentication
@@ -441,10 +453,17 @@ ORDER BY rows_written DESC
 
 ## Reliability
 
-- **No agent latency from BigQuery.** The hook only writes to a local
-  JSONL file then exits. Even if BigQuery is degraded, your agent sees
-  the same per-tool overhead (~5–20 ms for spool + Popen, plus Python
-  startup).
+- **Hooks never block the agent.** The hook script waits at most
+  `BQAA_HOOK_WAIT_SECONDS` for `bqaa_hook.py`, which only writes a local
+  spool file, and always exits 0 with no output. Normally you see the
+  spool + Popen cost (~5–20 ms) plus Python startup. If Python can't start
+  (on macOS a hung `syspolicyd` can block launching a non-Apple interpreter
+  for many minutes) or anything else stalls, a tool call pays at most the
+  wait. Each hook also has a 10 s `timeout` in `plugin.json` as a backstop
+  (the default is 600 s).
+- **Hard network timeouts.** Every ADC lookup and BigQuery call, in the
+  drainer and in direct-write mode, gives up after
+  `BQAA_NETWORK_TIMEOUT_SECONDS` (default 30).
 - **Single-writer drainer.** Multiple hook fires can't double-write
   because the drainer is gated by `fcntl.flock` on a pidfile. The
   drainer exits after `BQAA_DRAIN_IDLE_SECONDS` of empty polling; the

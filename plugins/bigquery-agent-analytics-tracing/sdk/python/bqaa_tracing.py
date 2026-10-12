@@ -2,11 +2,19 @@
 
 Architecture
 ------------
+Hook wrapper (hooks/common.sh, what the agent waits on):
+  Starts this module in the background and waits at most
+  BQAA_HOOK_WAIT_SECONDS for it, so the host agent never waits on Python
+  startup, file locks, auth or BigQuery.
+
 Hook subprocess (hot path):
   1. Build the BQAA row (existing logic).
   2. Append a JSONL line to BQAA_SPOOL_DIR (sync, ~1 ms).
   3. Spawn a detached drainer subprocess (idempotent via flock).
   4. Exit. The host agent never blocks on BigQuery.
+
+Every network or auth call (direct writes here, the drainer's writes) runs
+under a hard BQAA_NETWORK_TIMEOUT_SECONDS timeout.
 
 Drainer subprocess (background, see bqaa_drain.py):
   - Holds an exclusive flock so only one drainer runs per spool dir.
@@ -35,13 +43,14 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator, TypeVar
 
 
 BQAA_EVENT_TYPES = {
@@ -69,6 +78,7 @@ SENSITIVE_KEYS = {
     "token",
 }
 
+DEFAULT_LOG_FILE = "/tmp/bqaa-agent-tracing.log"
 DEFAULT_SPOOL_DIR = "/tmp/bqaa-agent-tracing/spool"
 DEFAULT_STATE_DIR = "/tmp/bqaa-agent-tracing"
 DEFAULT_TRANSCRIPT_MAX_BYTES = 256 * 1024  # 256 KB streamed cap per stop event.
@@ -76,6 +86,7 @@ DEFAULT_STATE_TTL_HOURS = 24
 DEFAULT_DRAIN_IDLE_SECONDS = 8.0
 DEFAULT_DRAIN_BATCH_SIZE = 50
 DEFAULT_DRAIN_POLL_SECONDS = 0.5
+DEFAULT_NETWORK_TIMEOUT_SECONDS = 30.0
 
 # Writer identity. Mirrors how the ADK BQAA plugin tags its Storage Write
 # requests (`google-adk-bq-logger/<version>`) so adopters can attribute
@@ -109,6 +120,35 @@ def _timestamp_ms() -> int:
 def _iso_timestamp(value: datetime | None = None) -> str:
     ts = value or _utc_now()
     return ts.isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+_T = TypeVar("_T")
+
+
+def _call_with_timeout(fn: Callable[[], _T], timeout: float, what: str) -> _T:
+    """Run fn() on a daemon thread and give up after timeout seconds.
+
+    ADC lookups (metadata-server probes, token refreshes) and BigQuery
+    requests can hang well past their own retry deadlines. A daemon thread
+    can't be cancelled, but it won't keep the process alive once the caller
+    has moved on.
+    """
+    outcome: dict[str, Any] = {}
+
+    def run() -> None:
+        try:
+            outcome["value"] = fn()
+        except BaseException as exc:  # re-raised in the caller's thread
+            outcome["error"] = exc
+
+    worker = threading.Thread(target=run, name=f"bqaa {what}", daemon=True)
+    worker.start()
+    worker.join(timeout)
+    if worker.is_alive():
+        raise TimeoutError(f"{what} timed out after {timeout:g}s")
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome["value"]
 
 
 def _hex_id(chars: int) -> str:
@@ -281,7 +321,7 @@ class BQAAConfig:
     auto_create_dataset: bool = False
     location: str | None = None
     max_content_length: int = 5000
-    log_file: str = "/tmp/bqaa-agent-tracing.log"
+    log_file: str = DEFAULT_LOG_FILE
     spool_dir: str = DEFAULT_SPOOL_DIR
     state_dir: str = DEFAULT_STATE_DIR
     state_ttl_hours: float = DEFAULT_STATE_TTL_HOURS
@@ -290,6 +330,7 @@ class BQAAConfig:
     drain_batch_size: int = DEFAULT_DRAIN_BATCH_SIZE
     drain_poll_seconds: float = DEFAULT_DRAIN_POLL_SECONDS
     writer_label: str = WRITER_LABEL
+    network_timeout_seconds: float = DEFAULT_NETWORK_TIMEOUT_SECONDS
 
     @classmethod
     def from_env(cls) -> "BQAAConfig":
@@ -311,7 +352,7 @@ class BQAAConfig:
             == "true",
             location=os.environ.get("BQAA_LOCATION") or None,
             max_content_length=int(os.environ.get("BQAA_MAX_CONTENT_LENGTH", "5000")),
-            log_file=os.environ.get("BQAA_LOG_FILE", "/tmp/bqaa-agent-tracing.log"),
+            log_file=os.environ.get("BQAA_LOG_FILE", DEFAULT_LOG_FILE),
             spool_dir=os.environ.get("BQAA_SPOOL_DIR", DEFAULT_SPOOL_DIR),
             state_dir=os.environ.get("BQAA_STATE_DIR", DEFAULT_STATE_DIR),
             state_ttl_hours=float(
@@ -330,6 +371,11 @@ class BQAAConfig:
                 os.environ.get("BQAA_DRAIN_POLL_SECONDS", str(DEFAULT_DRAIN_POLL_SECONDS))
             ),
             writer_label=os.environ.get("BQAA_WRITER_LABEL") or WRITER_LABEL,
+            network_timeout_seconds=float(
+                os.environ.get(
+                    "BQAA_NETWORK_TIMEOUT_SECONDS", str(DEFAULT_NETWORK_TIMEOUT_SECONDS)
+                )
+            ),
         )
 
 
@@ -605,8 +651,14 @@ class BigQueryAgentAnalyticsLogger:
         _ensure_drainer(self.config)
 
     def _direct_insert(self, bq_row: dict[str, Any]) -> None:
-        self._ensure_table()
-        errors = self._client.insert_rows_json(self._table_id, [bq_row])
+        timeout = self.config.network_timeout_seconds
+        # Creating the client runs the ADC lookup, so it's inside the bound too.
+        _call_with_timeout(self._ensure_table, timeout, "BigQuery table check")
+        errors = _call_with_timeout(
+            lambda: self._client.insert_rows_json(self._table_id, [bq_row], timeout=timeout),
+            timeout,
+            "BigQuery insert",
+        )
         if errors:
             raise RuntimeError(f"BigQuery insert failed: {errors}")
 
@@ -616,21 +668,22 @@ class BigQueryAgentAnalyticsLogger:
         from google.cloud import bigquery
         from google.cloud.exceptions import NotFound
 
+        timeout = self.config.network_timeout_seconds
         self._client = self._client or bigquery.Client(
             project=self.config.project_id, location=self.config.location
         )
         dataset_id = f"{self.config.project_id}.{self.config.dataset}"
         if self.config.auto_create_dataset:
             try:
-                self._client.get_dataset(dataset_id)
+                self._client.get_dataset(dataset_id, timeout=timeout)
             except NotFound:
                 dataset = bigquery.Dataset(dataset_id)
                 if self.config.location:
                     dataset.location = self.config.location
-                self._client.create_dataset(dataset)
+                self._client.create_dataset(dataset, timeout=timeout)
 
         try:
-            self._client.get_table(self._table_id)
+            self._client.get_table(self._table_id, timeout=timeout)
         except NotFound:
             if not self.config.auto_create_table:
                 raise
@@ -641,7 +694,7 @@ class BigQueryAgentAnalyticsLogger:
             )
             table.clustering_fields = ["event_type", "agent", "user_id"]
             table.labels = {"adk_schema_version": "1"}
-            self._client.create_table(table)
+            self._client.create_table(table, timeout=timeout)
         self._table_ready = True
 
     @property
@@ -1246,10 +1299,14 @@ def _tool_status(result: Any) -> tuple[str, str | None]:
 
 
 def _log(config: BQAAConfig, message: str) -> None:
-    if not config.log_file:
+    _append_log(config.log_file, message)
+
+
+def _append_log(log_file: str, message: str) -> None:
+    if not log_file:
         return
     try:
-        with open(config.log_file, "a", encoding="utf-8") as handle:
+        with open(log_file, "a", encoding="utf-8") as handle:
             handle.write(f"[{_iso_timestamp()}] {message}\n")
     except OSError:
         pass
@@ -1266,15 +1323,18 @@ def main(argv: list[str] | None = None) -> int:
         print("usage: bqaa_tracing.py <ClaudeHookName>", file=sys.stderr)
         return 2
     hook_name = argv[0]
-    raw = sys.stdin.read()
-    payload = _safe_json_loads(raw, {}) if raw.strip() else {}
-    config = BQAAConfig.from_env()
+    log_file = os.environ.get("BQAA_LOG_FILE", DEFAULT_LOG_FILE)
+    # Hooks should never break the calling agent, so even a malformed config
+    # or payload only ends up in the log.
     try:
+        raw = sys.stdin.read()
+        payload = _safe_json_loads(raw, {}) if raw.strip() else {}
+        config = BQAAConfig.from_env()
         ClaudeHookBQAAAdapter(BigQueryAgentAnalyticsLogger(config)).process(
             hook_name, payload
         )
-    except Exception as exc:  # Hooks should never break the calling agent.
-        _log(config, f"ERROR hook={hook_name}: {exc}\n{traceback.format_exc()}")
+    except Exception as exc:
+        _append_log(log_file, f"ERROR hook={hook_name}: {exc}\n{traceback.format_exc()}")
     return 0
 
 
