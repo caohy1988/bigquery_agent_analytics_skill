@@ -578,6 +578,9 @@ ORDER BY events DESC;
   `BQAA_HOOK_WAIT_SECONDS` (default 1) no matter what Python, auth or
   BigQuery are doing. Multi-minute stalls on every tool call mean an older
   copy of the plugin is installed; update it and start a new session.
+- Rows arrive late: while Python can't start, events wait in
+  `BQAA_STATE_DIR/queue/`. The session's next hook whose Python gets going
+  writes them, in order and with the times their hooks ran.
 - Rows stuck in spool: check `BQAA_SPOOL_DIR/dead-letter/` and
   `BQAA_LOG_FILE`.
 - Claude Code rows missing: restart Claude Code after installing the

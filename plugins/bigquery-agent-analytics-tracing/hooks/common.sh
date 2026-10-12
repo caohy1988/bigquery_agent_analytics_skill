@@ -1,11 +1,19 @@
 #!/bin/bash
 # Shared body of every hook script. The agent waits for the hook before it
 # goes on (PreToolUse and PostToolUse wrap every tool call), so this must
-# never block or fail. Besides bash itself it only runs base utilities
-# (dirname, cat), starts the Python adapter detached from the hook's stdio,
-# waits at most BQAA_HOOK_WAIT_SECONDS (default 1) for it, and always exits
-# 0. Python is the part that can stall: on macOS a hung syspolicyd blocks
-# every launch of a non-Apple interpreter until launchd replaces the daemon.
+# never block or fail. Python is the part that can stall: on macOS a hung
+# syspolicyd blocks every launch of a non-Apple interpreter until launchd
+# replaces the daemon. So the hook runs only bash and base utilities
+# (dirname, cat, mkdir) and always exits 0 with no output:
+#   1. It queues the event under the state dir, reading the payload under
+#      the same deadline as the rest.
+#   2. It starts the Python adapter detached from the hook's stdio. That run
+#      applies all of the session's queued events, oldest first, so an event
+#      whose own run starts late still lands before newer ones.
+#   3. It waits for Python, at most BQAA_HOOK_WAIT_SECONDS (default 1) in
+#      all. Whole seconds: macOS ships bash 3.2, whose read -t takes no less.
+
+exec 2>/dev/null
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_DIR="$(dirname "$SCRIPT_DIR")"
@@ -28,32 +36,97 @@ case "${BQAA_DRY_RUN:-false}" in
     ;;
 esac
 
-# Drain stdin up front so the agent's write completes even if Python never
-# starts.
-CAT_BIN=/bin/cat
-[[ -x "$CAT_BIN" ]] || CAT_BIN="cat"
-PAYLOAD="$("$CAT_BIN" 2>/dev/null)" || PAYLOAD=""
-
-# macOS ships bash 3.2, whose read -t only takes whole seconds.
+SECONDS=0
 WAIT_SECONDS="${BQAA_HOOK_WAIT_SECONDS:-1}"
 [[ "$WAIT_SECONDS" =~ ^[0-9]+$ ]] || WAIT_SECONDS=1
 WAIT_SECONDS=$((10#$WAIT_SECONDS))
 
+# --- 1. Queue the event ------------------------------------------------------
+# One file per event, named by a 12-digit sequence number; the format is
+# described next to QUEUE_END in bqaa_tracing.py. An event stays queued until
+# it's applied, so a hook that starts after another has returned always gets
+# a higher number than that one.
+QUEUE_DIR="${BQAA_STATE_DIR:-/tmp/bqaa-agent-tracing}"
+case "$QUEUE_DIR" in \~ | \~/*) QUEUE_DIR="$HOME${QUEUE_DIR:1}" ;; esac
+QUEUE_DIR="$QUEUE_DIR/queue"
+# If adapter runs never get going, stop queueing well before /tmp fills up.
+QUEUE_MAX=10000
+CAT_BIN=/bin/cat
+[[ -x "$CAT_BIN" ]] || CAT_BIN="cat"
+
+# Payloads can hold prompts and tool output: only the queue dir itself needs
+# to be private, its parents are shared with the state files.
+# shellcheck disable=SC2174
+[[ -d "$QUEUE_DIR" ]] || mkdir -p -m 700 "$QUEUE_DIR" || exit 0
+shopt -s nullglob
+QUEUED=("$QUEUE_DIR"/[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9])
+((${#QUEUED[@]} < QUEUE_MAX)) || exit 0
+LAST=0
+for entry in "${QUEUED[@]}"; do
+  n=$((10#${entry##*/}))
+  ((n > LAST)) && LAST=$n
+done
+# noclobber: the redirection creates the file or fails if another hook just
+# took that number.
+set -C
+ENTRY=""
+for ((n = LAST + 1; n <= LAST + 64; n++)); do
+  printf -v candidate '%s/%012d' "$QUEUE_DIR" "$n"
+  if exec 5>"$candidate"; then
+    ENTRY="$candidate"
+    break
+  fi
+done
+set +C
+[[ -n "$ENTRY" ]] || exit 0
+
+printf '%s\n' "$HOOK_NAME" >&5
+# cat copies the payload in the background and holds the write end of the
+# pipe read on fd 4 until it's done. Don't wait for it past the deadline: a
+# sender may write the payload and never close stdin.
+READ_SECONDS=$((WAIT_SECONDS > 0 ? WAIT_SECONDS : 1))
+exec 4< <(exec "$CAT_BIN" 3>&1 >&5) || exit 0
+CAT_PID=$!
+read -r -t "$READ_SECONDS" -u 4 _ || true
+if kill -0 "$CAT_PID"; then
+  kill "$CAT_PID"
+  # Until it's gone, so it can't write after the last line.
+  read -r -t 1 -u 4 _ || true
+fi
+exec 4<&-
+
+# The session_id near the start of the payload says whose events these are.
+SESSION_KEY=""
+PAYLOAD_HEAD=""
+{ IFS= read -r _ && IFS= read -r -d '' -n 1024 PAYLOAD_HEAD; } <"$ENTRY"
+SESSION_RE='"session_id"[[:space:]]*:[[:space:]]*"([^"\\]+)"'
+if [[ "$PAYLOAD_HEAD" =~ $SESSION_RE ]]; then
+  SESSION_KEY="${BASH_REMATCH[1]//[^A-Za-z0-9._-]/}"
+  SESSION_KEY="${SESSION_KEY:0:64}"
+fi
+# No session: the event is applied on its own.
+[[ -n "$SESSION_KEY" ]] || SESSION_KEY="hook-$$-$RANDOM"
+# The last line marks the entry complete.
+printf '\n%s %s\n' "#bqaa-end" "$SESSION_KEY" >&5
+exec 5>&-
+
+# --- 2. and 3. Run the adapter and wait for it ---------------------------------
 run_adapter() {
   # Ignore HUP/INT so an event that outlives the wait still lands when the
   # session's terminal goes away.
   trap '' HUP INT
-  exec </dev/null 2>/dev/null
-  "$PYTHON_BIN" "$PLUGIN_DIR/scripts/bqaa_hook.py" "$HOOK_NAME" <<<"$PAYLOAD" >/dev/null
+  exec </dev/null
+  "$PYTHON_BIN" "$PLUGIN_DIR/scripts/bqaa_hook.py" --queue "$QUEUE_DIR" "$SESSION_KEY" >/dev/null
 }
 
 # The subshell keeps the pipe on fd 3 open until Python exits, so read
-# returns as soon as Python is done (hooks stay in order in the normal case)
-# or after WAIT_SECONDS. Nothing left running holds the hook's own stdout or
-# stderr, so the agent isn't kept waiting for EOF either.
+# returns as soon as Python is done (the normal case) or when the time is
+# up. Nothing left running holds the hook's own stdout or stderr, so the
+# agent isn't kept waiting for EOF either.
+WAIT_LEFT=$((WAIT_SECONDS - SECONDS))
 if exec 3< <(run_adapter); then
-  if ((WAIT_SECONDS > 0)); then
-    read -r -t "$WAIT_SECONDS" -u 3 _bqaa_done || true
+  if ((WAIT_LEFT > 0)); then
+    read -r -t "$WAIT_LEFT" -u 3 _ || true
   fi
   exec 3<&-
 else

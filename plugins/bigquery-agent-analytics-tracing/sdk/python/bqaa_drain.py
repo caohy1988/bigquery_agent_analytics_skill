@@ -21,6 +21,15 @@ Design choices:
 - Every network or auth call (the ADC lookup, table checks, each write
   attempt) runs under a hard ``BQAA_NETWORK_TIMEOUT_SECONDS`` timeout, so a
   hung call can't pin the single drainer and its pidfile lock.
+- ``insert_rows_json`` resends are idempotent as far as BigQuery allows:
+  every attempt carries the same insertIds (each row's content hash), which
+  BigQuery uses for best-effort dedupe. A timed-out insert keeps running on
+  its own thread, so it's never resent while it may still land: the backoff
+  is spent waiting for its result, and if it's still running after that the
+  batch is dead-lettered, though it may yet land.
+- The Storage Write API's default stream is at-least-once. An append that
+  times out may still have landed, so its retry, or the ``insert_rows_json``
+  fallback after it, can write those rows twice.
 - Rows that exhaust retries or hit non-retryable errors are moved to
   ``dead-letter/`` so they can be inspected and replayed.
 - Drainer exits after ``BQAA_DRAIN_IDLE_SECONDS`` of empty polling; the next
@@ -32,6 +41,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
 import random
@@ -50,6 +60,7 @@ from bqaa_tracing import (  # noqa: E402  (after env tweak)
     BQAAConfig,
     WRITER_LABEL,
     _call_with_timeout,
+    _CallTimedOut,
     _log,
     bq_schema,
 )
@@ -479,6 +490,12 @@ def _ensure_table_exists(
     return client
 
 
+def _insert_id(row: dict[str, Any]) -> str:
+    """The row's insertId: its content hash, so a resend carries the same one."""
+    canonical = json.dumps(row, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def _write_batch_insert_rows_json(
     *,
     project: str,
@@ -519,19 +536,33 @@ def _write_batch_insert_rows_json(
         return False
 
     table_id = f"{project}.{dataset}.{table}"
+    # Left to itself the client makes up new insertIds on every call, so a
+    # resend of a row that did land would write it again.
+    row_ids = [_insert_id(row) for row in rows]
     attempt = 0
     delay = retry.initial_delay
     while True:
+        sleep_for = min(delay * (1 + random.random()), retry.max_delay)
         try:
-            errors = _call_with_timeout(
-                lambda: client.insert_rows_json(table_id, rows, timeout=timeout),
-                timeout,
-                "BigQuery insert",
-            )
-            if errors:
-                _log(config, f"DRAINER insert_rows_json errors: {errors}")
-                return False
-            return True
+            try:
+                errors = _call_with_timeout(
+                    lambda: client.insert_rows_json(
+                        table_id, rows, row_ids=row_ids, timeout=timeout
+                    ),
+                    timeout,
+                    "BigQuery insert",
+                )
+            except _CallTimedOut as timed_out:
+                if attempt >= retry.max_retries:
+                    raise
+                # The request may still land. Rather than send another copy
+                # while it's in flight, spend the backoff waiting for its
+                # result; if that's a failure, the retry goes out right away.
+                backoff, sleep_for = sleep_for, 0.0
+                errors = timed_out.result(backoff)
+        except _CallTimedOut as exc:
+            _log(config, f"DRAINER {exc}, not resending while it may still land")
+            return False
         except (
             ServiceUnavailable,
             TooManyRequests,
@@ -545,12 +576,16 @@ def _write_batch_insert_rows_json(
                     f"DRAINER batch_dropped_after_{retry.max_retries + 1}: {exc}",
                 )
                 return False
-            sleep_for = min(delay * (1 + random.random()), retry.max_delay)
             time.sleep(sleep_for)
             delay *= retry.multiplier
+            continue
         except Exception as exc:
             _log(config, f"DRAINER unexpected_error: {exc}\n{traceback.format_exc()}")
             return False
+        if errors:
+            _log(config, f"DRAINER insert_rows_json errors: {errors}")
+            return False
+        return True
 
 
 # ---------------------------------------------------------------------------

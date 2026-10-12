@@ -11,6 +11,7 @@ written to a temp dir, so no network or GCP credentials are needed.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextlib
 import fcntl
 import hashlib
@@ -21,7 +22,9 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
@@ -122,12 +125,28 @@ class NotFound(Exception):
     pass
 ''',
     "google/cloud/bigquery.py": '''
+import json
 import os
+import threading
 import time
+import uuid
 
 import google.auth
 
 CALLS = []
+# What the table holds. Like BigQuery, a row whose insertId was already
+# seen is dropped.
+TABLE = []
+_SEEN_IDS = set()
+_LOCK = threading.Lock()
+_GENERATE_UUID = object()
+
+
+def _insert_step(index):
+    plan = json.loads(os.environ.get("FAKE_BIGQUERY_INSERT_PLAN") or "[]")
+    if index < len(plan):
+        return plan[index]
+    return {"delay": float(os.environ.get("FAKE_BIGQUERY_INSERT_DELAY", "0"))}
 
 
 class SchemaField:
@@ -179,11 +198,27 @@ class Client:
         CALLS.append(("create_table", table.table_id, timeout))
         return table
 
-    def insert_rows_json(self, table, json_rows, row_ids=None, skip_invalid_rows=None,
+    def insert_rows_json(self, table, json_rows, row_ids=_GENERATE_UUID, skip_invalid_rows=None,
                          ignore_unknown_values=None, template_suffix=None, retry=None,
                          timeout=None):
-        CALLS.append(("insert_rows_json", table, timeout, list(json_rows)))
-        time.sleep(float(os.environ.get("FAKE_BIGQUERY_INSERT_DELAY", "0")))
+        rows = list(json_rows)
+        if row_ids is _GENERATE_UUID:
+            # The real client's default: a fresh insertId per row on every call.
+            row_ids = [uuid.uuid4().hex for _ in rows]
+        row_ids = list(row_ids)
+        with _LOCK:
+            step = _insert_step(sum(1 for call in CALLS if call[0] == "insert_rows_json"))
+            CALLS.append(("insert_rows_json", table, timeout, rows, row_ids))
+        time.sleep(step.get("delay", 0))
+        with _LOCK:
+            for row_id, row in zip(row_ids, rows):
+                if row_id is None or row_id not in _SEEN_IDS:
+                    TABLE.append(row)
+                    _SEEN_IDS.add(row_id)
+        if step.get("error"):
+            # The rows landed but the response didn't make it back.
+            from google.api_core import exceptions
+            raise getattr(exceptions, step["error"])("fake: committed, then the response failed")
         return []
 ''',
 }
@@ -260,6 +295,49 @@ def _run_hook(script: str, payload: object, env: dict[str, str]) -> tuple[float,
     return time.monotonic() - start, proc
 
 
+def _run_hook_holding_stdin(
+    script: str, payload: object, env: dict[str, str], hold: float = STALL_SECONDS
+) -> tuple[float, int | None, bytes, bytes]:
+    """Like _run_hook, but the sender writes the payload (a str is sent as
+    is) and then keeps stdin open for `hold` seconds. Returns (elapsed,
+    returncode, stdout, stderr); returncode is None if the hook was still
+    running."""
+    proc = subprocess.Popen(
+        ["bash", str(PLUGIN_ROOT / "hooks" / script)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
+    output: dict[str, bytes] = {}
+
+    def drain(name: str, stream) -> None:
+        output[name] = stream.read()
+
+    readers = [
+        threading.Thread(target=drain, args=(name, stream), daemon=True)
+        for name, stream in (("stdout", proc.stdout), ("stderr", proc.stderr))
+    ]
+    start = time.monotonic()
+    try:
+        proc.stdin.write((payload if isinstance(payload, str) else json.dumps(payload)).encode())
+        proc.stdin.flush()
+        for reader in readers:
+            reader.start()
+        try:
+            proc.wait(timeout=hold)
+        except subprocess.TimeoutExpired:
+            return time.monotonic() - start, None, b"", b""
+        for reader in readers:
+            reader.join(max(0.0, start + hold - time.monotonic()))
+        return time.monotonic() - start, proc.returncode, output.get("stdout", b""), output.get("stderr", b"")
+    finally:
+        proc.stdin.close()
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+
+
 def _write_stub(path: Path, body: str) -> Path:
     """An executable to use as BQAA_PYTHON in place of the real interpreter."""
     path.write_text("#!/bin/bash\n" + body + "\n", encoding="utf-8")
@@ -277,6 +355,21 @@ def _reaping(pidfile: Path) -> Iterator[Path]:
             for raw in pidfile.read_text().split():
                 with contextlib.suppress(ProcessLookupError, ValueError):
                     os.kill(int(raw), signal.SIGKILL)
+
+
+def _wait_for_exit(pidfile: Path, timeout: float) -> None:
+    """Wait until every pid a stub recorded in pidfile has exited."""
+    deadline = time.monotonic() + timeout
+    pids = [int(raw) for raw in pidfile.read_text().split()] if pidfile.exists() else []
+    for pid in pids:
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            raise AssertionError(f"pid {pid} still running after {timeout}s")
 
 
 @contextlib.contextmanager
@@ -391,6 +484,42 @@ def _dead_letters(config: bqaa_tracing.BQAAConfig) -> list[Path]:
     return sorted(dead.glob("*.json")) if dead.exists() else []
 
 
+def _spooled_rows(spool: Path) -> list[dict]:
+    return [json.loads(path.read_text(encoding="utf-8"))["row"] for path in _spool_files(spool)]
+
+
+def _queued_entries(state_dir: Path) -> list[Path]:
+    queue = state_dir / "queue"
+    return sorted(p for p in queue.iterdir() if p.name.isdigit()) if queue.exists() else []
+
+
+def _iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _append_transcript(path: Path, *items: dict) -> None:
+    with path.open("a", encoding="utf-8") as handle:
+        for item in items:
+            handle.write(json.dumps(item) + "\n")
+
+
+def _insert_once(config: bqaa_tracing.BQAAConfig, retry: bqaa_drain._RetryConfig) -> tuple[Path, float]:
+    """Spool one row and send it down the insert_rows_json path."""
+    path = _spool_tool_event(config)
+    ((key, batch),) = bqaa_drain._group_envelopes([bqaa_drain._read_envelope(path)]).items()
+    start = time.monotonic()
+    asyncio.run(
+        bqaa_drain._drain_group_async(
+            key=key, envelopes=batch, retry=retry, config=config, use_storage_api=False
+        )
+    )
+    return path, time.monotonic() - start
+
+
+def _insert_calls(bigquery) -> list[tuple]:
+    return [call for call in bigquery.CALLS if call[0] == "insert_rows_json"]
+
+
 # ---------------------------------------------------------------------------
 # Hook latency: the agent must never wait on Python, auth or BigQuery
 # ---------------------------------------------------------------------------
@@ -426,6 +555,42 @@ def test_hook_returns_fast_when_bigquery_auth_hangs() -> None:
         assert elapsed < HOOK_DEADLINE_SECONDS, f"hook held the agent for {elapsed:.1f}s"
         assert proc.returncode == 0, proc
         assert proc.stdout == "" and proc.stderr == "", proc
+
+
+def test_hook_returns_when_agent_keeps_stdin_open() -> None:
+    # 2026-10-11 review: the hook read stdin to EOF before its bounded wait
+    # began, so a sender that wrote the payload but never closed the pipe
+    # held the hook until the host's timeout killed it. Reading the payload
+    # counts against the same deadline, and what was sent still gets queued.
+    with _tmpdir() as tmp, _drainer_lock_held(tmp / "spool"):
+        elapsed, returncode, stdout, stderr = _run_hook_holding_stdin("pre_tool_use.sh", PRE_PAYLOAD, _base_env(tmp))
+        assert returncode is not None and elapsed < HOOK_DEADLINE_SECONDS, f"hook held the agent for {elapsed:.1f}s"
+        assert returncode == 0 and stdout == b"" and stderr == b"", (returncode, stdout, stderr)
+        files = _wait_for_spool_files(tmp / "spool", count=1, timeout=10)
+        assert len(files) == 1, files
+        _assert_tool_starting_envelope(files[0])
+
+
+def test_cut_off_payload_is_dropped_not_made_up() -> None:
+    # A sender that stops partway and never closes stdin leaves the hook
+    # with half a payload at the deadline. That's logged and dropped rather
+    # than applied as an empty payload, which would invent an event.
+    with _tmpdir() as tmp, _drainer_lock_held(tmp / "spool"):
+        partial = json.dumps(PRE_PAYLOAD)[:80]
+        elapsed, returncode, stdout, stderr = _run_hook_holding_stdin("pre_tool_use.sh", partial, _base_env(tmp))
+        assert returncode is not None and elapsed < HOOK_DEADLINE_SECONDS, f"hook held the agent for {elapsed:.1f}s"
+        assert returncode == 0 and stdout == b"" and stderr == b"", (returncode, stdout, stderr)
+        log = tmp / "bqaa.log"
+
+        def logged() -> str:
+            return log.read_text(encoding="utf-8") if log.exists() else ""
+
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and "payload isn't JSON" not in logged():
+            time.sleep(0.1)
+        assert "PreToolUse payload isn't JSON" in logged(), logged()
+        assert _spool_files(tmp / "spool") == []
+        assert _queued_entries(tmp / "state") == []
 
 
 def test_direct_write_gives_up_on_hung_auth() -> None:
@@ -555,6 +720,138 @@ def test_unconfigured_hook_does_not_start_python() -> None:
             assert marker.exists() == expect_python, label
 
 
+# ---------------------------------------------------------------------------
+# Order: an event whose Python starts late still lands before newer ones
+# ---------------------------------------------------------------------------
+
+
+def test_late_hooks_still_apply_in_order() -> None:
+    # 2026-10-11 review: each hook's own Python applied its event, so when
+    # UserPromptSubmit's started late, Stop's ran first, found no open trace
+    # and dropped the reply; a late PreToolUse likewise landed after its
+    # PostToolUse. Here the first two hooks' interpreters stall for 4 s
+    # while the last two start at once.
+    with _tmpdir() as tmp, _drainer_lock_held(tmp / "spool"), _reaping(tmp / "pids") as pids:
+        slow = _write_stub(tmp / "slow-python", f'echo $$ >> "{pids}"\nsleep 4\nexec "{sys.executable}" "$@"')
+        slow_env, fast_env = _base_env(tmp, BQAA_PYTHON=str(slow)), _base_env(tmp)
+        transcript = tmp / "transcript.jsonl"
+        turn = {"session_id": SESSION_ID, "transcript_path": str(transcript), "cwd": "/tmp"}
+        _append_transcript(
+            transcript, {"type": "user", "message": {"role": "user", "content": "list files"}, "timestamp": _iso_now()}
+        )
+        _run_hook("user_prompt_submit.sh", dict(turn, hook_event_name="UserPromptSubmit", prompt="list files"), slow_env)
+        # The reply is in the transcript before the prompt's event is applied.
+        time.sleep(0.1)
+        _append_transcript(
+            transcript,
+            {
+                "type": "assistant",
+                "message": {
+                    "model": "claude-test",
+                    "content": [{"type": "text", "text": "Listing the files."}],
+                    "usage": {"input_tokens": 7, "output_tokens": 3},
+                },
+                "timestamp": _iso_now(),
+            },
+            {"type": "last-prompt", "lastPrompt": "list files"},  # Claude Code writes some lines unstamped
+        )
+        _run_hook("pre_tool_use.sh", PRE_PAYLOAD, slow_env)
+        time.sleep(1.0)  # the tool runs
+        _run_hook("post_tool_use.sh", POST_PAYLOAD, fast_env)
+        _run_hook("stop.sh", dict(turn, hook_event_name="Stop", stop_hook_active=False), fast_env)
+        # The stalled interpreters get going too; they must not add or redo anything.
+        _wait_for_exit(pids, timeout=20)
+
+        rows = {row["event_type"]: row for row in _spooled_rows(tmp / "spool")}
+        assert len(_spool_files(tmp / "spool")) == 4, sorted(rows)
+        assert sorted(rows) == ["LLM_REQUEST", "LLM_RESPONSE", "TOOL_COMPLETED", "TOOL_STARTING"], sorted(rows)
+        request, started, completed, response = (
+            rows[name] for name in ("LLM_REQUEST", "TOOL_STARTING", "TOOL_COMPLETED", "LLM_RESPONSE")
+        )
+        # Stamped when each hook ran, not when its event was applied.
+        assert request["timestamp"] < started["timestamp"] < completed["timestamp"] < response["timestamp"], rows
+        assert {row["trace_id"] for row in rows.values()} == {request["trace_id"]}, rows
+        assert started["parent_span_id"] == completed["parent_span_id"] == request["span_id"] == response["span_id"]
+        assert started["span_id"] == completed["span_id"]
+        assert json.loads(response["content"]) == {"response": "Listing the files."}, response["content"]
+        assert json.loads(response["attributes"])["model"] == "claude-test"
+        assert json.loads(completed["latency_ms"])["total_ms"] >= 900, completed["latency_ms"]
+        assert list((tmp / "state").glob("tool_*.json")) == []
+        assert _queued_entries(tmp / "state") == []
+
+
+def test_late_turns_keep_their_own_replies() -> None:
+    # Two whole turns go by before any interpreter gets going. Each Stop is
+    # applied after the next turn's reply is in the transcript too, yet
+    # reports only its own.
+    with _tmpdir() as tmp, _drainer_lock_held(tmp / "spool"), _reaping(tmp / "pids") as pids:
+        slow = _write_stub(tmp / "slow-python", f'echo $$ >> "{pids}"\nsleep 4\nexec "{sys.executable}" "$@"')
+        slow_env = _base_env(tmp, BQAA_PYTHON=str(slow), BQAA_HOOK_WAIT_SECONDS="0")
+        transcript = tmp / "transcript.jsonl"
+        turn = {"session_id": SESSION_ID, "transcript_path": str(transcript), "cwd": "/tmp"}
+        for n, env in ((1, slow_env), (2, _base_env(tmp))):
+            _append_transcript(
+                transcript, {"type": "user", "message": {"role": "user", "content": f"q{n}"}, "timestamp": _iso_now()}
+            )
+            _run_hook("user_prompt_submit.sh", dict(turn, hook_event_name="UserPromptSubmit", prompt=f"q{n}"), slow_env)
+            time.sleep(0.05)
+            _append_transcript(
+                transcript,
+                {
+                    "type": "assistant",
+                    "message": {"model": "claude-test", "content": [{"type": "text", "text": f"reply {n}"}]},
+                    "timestamp": _iso_now(),
+                },
+            )
+            time.sleep(0.05)
+            # Turn 1's Stop stalls too; turn 2's runs at once and applies everything.
+            _run_hook("stop.sh", dict(turn, hook_event_name="Stop", stop_hook_active=False), env)
+        _wait_for_exit(pids, timeout=20)
+
+        rows = sorted(_spooled_rows(tmp / "spool"), key=lambda row: row["timestamp"])
+        assert [row["event_type"] for row in rows] == ["LLM_REQUEST", "LLM_RESPONSE"] * 2, rows
+        assert [json.loads(row["content"]) for row in rows[1::2]] == [{"response": "reply 1"}, {"response": "reply 2"}]
+        assert rows[0]["trace_id"] == rows[1]["trace_id"] != rows[2]["trace_id"] == rows[3]["trace_id"]
+
+
+def test_parallel_hooks_each_queue_their_event() -> None:
+    # Parallel tool calls fire their PreToolUse hooks at the same time; each
+    # event needs its own place in the queue.
+    with _tmpdir() as tmp, _drainer_lock_held(tmp / "spool"):
+        env = _base_env(tmp, BQAA_HOOK_WAIT_SECONDS="5")
+        tool_use_ids = [f"toolu_parallel_{n}" for n in range(8)]
+        with concurrent.futures.ThreadPoolExecutor(len(tool_use_ids)) as pool:
+            runs = list(
+                pool.map(
+                    lambda tool_use_id: _run_hook("pre_tool_use.sh", dict(PRE_PAYLOAD, tool_use_id=tool_use_id), env),
+                    tool_use_ids,
+                )
+            )
+        assert all(proc.returncode == 0 and proc.stdout == proc.stderr == "" for _, proc in runs), runs
+        _wait_for_spool_files(tmp / "spool", count=len(tool_use_ids), timeout=10)
+        spans = sorted(row["span_id"] for row in _spooled_rows(tmp / "spool"))
+        assert spans == sorted(hashlib.sha256(t.encode()).hexdigest()[:16] for t in tool_use_ids), spans
+        assert _queued_entries(tmp / "state") == []
+
+
+def test_queue_applies_only_its_own_sessions_events() -> None:
+    # Sessions can run with different settings (dataset, agent name, ...),
+    # so an adapter run applies only its own session's events.
+    with _tmpdir() as tmp, _drainer_lock_held(tmp / "spool"):
+        idle = _write_stub(tmp / "idle-python", "exit 0")
+        env = _base_env(tmp, BQAA_PYTHON=str(idle))
+        for session_id in ("session-a", "session-b"):
+            _run_hook("pre_tool_use.sh", dict(PRE_PAYLOAD, session_id=session_id), env)
+        assert len(_queued_entries(tmp / "state")) == 2
+        with _environ(_base_env(tmp)):
+            assert bqaa_tracing.process_hook_queue(tmp / "state" / "queue", "session-a") == 1
+            assert [row["session_id"] for row in _spooled_rows(tmp / "spool")] == ["session-a"]
+            assert len(_queued_entries(tmp / "state")) == 1
+            assert bqaa_tracing.process_hook_queue(tmp / "state" / "queue", "session-b") == 1
+        assert sorted(row["session_id"] for row in _spooled_rows(tmp / "spool")) == ["session-a", "session-b"]
+        assert _queued_entries(tmp / "state") == []
+
+
 def test_drainer_sends_spooled_row_unchanged() -> None:
     with _tmpdir() as tmp, _fake_google_importable(tmp / "fake"):
         with _environ(_base_env(tmp, BQAA_NETWORK_TIMEOUT_SECONDS="7")):
@@ -564,9 +861,14 @@ def test_drainer_sends_spooled_row_unchanged() -> None:
             asyncio.run(bqaa_drain._drain_once(config, use_storage_api=False))
         from google.cloud import bigquery
 
-        inserts = [call for call in bigquery.CALLS if call[0] == "insert_rows_json"]
-        assert inserts == [("insert_rows_json", "test-project.test_dataset.agent_events", 7.0, [spooled_row])], inserts
+        # The insertId is the row's content hash, so a resend of the same
+        # row carries the same one.
+        insert_id = hashlib.sha256(json.dumps(spooled_row, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        assert _insert_calls(bigquery) == [
+            ("insert_rows_json", "test-project.test_dataset.agent_events", 7.0, [spooled_row], [insert_id])
+        ], _insert_calls(bigquery)
         assert all(call[2] == 7.0 for call in bigquery.CALLS), bigquery.CALLS
+        assert bigquery.TABLE == [spooled_row]
         assert not path.exists()
         assert _dead_letters(config) == []
 
@@ -612,10 +914,93 @@ def test_drainer_gives_up_on_hung_insert() -> None:
         assert len(_dead_letters(config)) == 1
 
 
+# ---------------------------------------------------------------------------
+# Retries never write a row twice
+# ---------------------------------------------------------------------------
+
+
+def test_drainer_takes_late_insert_result_instead_of_resending() -> None:
+    # 2026-10-11 review: a timed-out insert was retried while the first
+    # request was still running on its thread; both landed, so the row was
+    # written twice and the batch reported success.
+    with _tmpdir() as tmp, _fake_google_importable(tmp / "fake"):
+        plan = json.dumps([{"delay": 1.0}, {"delay": 0}])
+        env = _base_env(tmp, BQAA_NETWORK_TIMEOUT_SECONDS="0.3", FAKE_BIGQUERY_INSERT_PLAN=plan)
+        with _environ(env):
+            config = bqaa_tracing.BQAAConfig.from_env()
+            path, _ = _insert_once(config, bqaa_drain._RetryConfig(max_retries=1, initial_delay=1.0, max_delay=1.0))
+        from google.cloud import bigquery
+
+        assert len(_insert_calls(bigquery)) == 1, _insert_calls(bigquery)
+        assert len(bigquery.TABLE) == 1, bigquery.TABLE
+        assert not path.exists()
+        assert _dead_letters(config) == []
+
+
+def test_drainer_does_not_resend_while_insert_is_in_flight() -> None:
+    # If the timed-out request still hasn't finished by the time a retry
+    # is due, sending another copy could write the row twice; the batch is
+    # dead-lettered instead (it may still land).
+    with _tmpdir() as tmp, _fake_google_importable(tmp / "fake"):
+        env = _base_env(tmp, BQAA_NETWORK_TIMEOUT_SECONDS="0.3", FAKE_BIGQUERY_INSERT_PLAN='[{"delay": 3.0}]')
+        with _environ(env):
+            config = bqaa_tracing.BQAAConfig.from_env()
+            path, elapsed = _insert_once(config, bqaa_drain._RetryConfig(max_retries=3, initial_delay=0.5, max_delay=0.5))
+        from google.cloud import bigquery
+
+        assert elapsed < 2.0, f"drainer waited {elapsed:.1f}s"
+        assert not path.exists()
+        assert len(_dead_letters(config)) == 1
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not bigquery.TABLE:
+            time.sleep(0.1)
+        time.sleep(0.5)
+        assert len(_insert_calls(bigquery)) == 1, _insert_calls(bigquery)
+        assert len(bigquery.TABLE) == 1, bigquery.TABLE
+
+
+def test_drainer_retries_reuse_insert_ids() -> None:
+    # A request can land even though its response fails. The retry sends
+    # the same insertIds, so BigQuery drops the second copy.
+    with _tmpdir() as tmp, _fake_google_importable(tmp / "fake"):
+        env = _base_env(tmp, FAKE_BIGQUERY_INSERT_PLAN='[{"error": "ServiceUnavailable"}, {}]')
+        with _environ(env):
+            config = bqaa_tracing.BQAAConfig.from_env()
+            path, _ = _insert_once(config, bqaa_drain._RetryConfig(max_retries=1, initial_delay=0.01, max_delay=0.01))
+        from google.cloud import bigquery
+
+        calls = _insert_calls(bigquery)
+        assert len(calls) == 2, calls
+        assert calls[0][4] == calls[1][4], calls
+        assert len(bigquery.TABLE) == 1, bigquery.TABLE
+        assert not path.exists()
+        assert _dead_letters(config) == []
+
+
+def test_drainer_resends_at_once_when_late_insert_fails() -> None:
+    # The timed-out request finishes during the backoff, but with an error:
+    # the backoff has been spent waiting on it, so the resend goes out then.
+    with _tmpdir() as tmp, _fake_google_importable(tmp / "fake"):
+        plan = json.dumps([{"delay": 0.6, "error": "ServiceUnavailable"}, {}])
+        env = _base_env(tmp, BQAA_NETWORK_TIMEOUT_SECONDS="0.3", FAKE_BIGQUERY_INSERT_PLAN=plan)
+        with _environ(env):
+            config = bqaa_tracing.BQAAConfig.from_env()
+            path, elapsed = _insert_once(config, bqaa_drain._RetryConfig(max_retries=1, initial_delay=2.0, max_delay=2.0))
+        from google.cloud import bigquery
+
+        assert elapsed < 1.5, f"drainer took {elapsed:.1f}s"
+        calls = _insert_calls(bigquery)
+        assert len(calls) == 2 and calls[0][4] == calls[1][4], calls
+        assert len(bigquery.TABLE) == 1, bigquery.TABLE
+        assert not path.exists()
+
+
 def main() -> int:
     for test in (
         test_hook_returns_fast_when_python_cannot_start,
         test_hook_returns_fast_when_bigquery_auth_hangs,
+        test_hook_returns_when_agent_keeps_stdin_open,
+        test_cut_off_payload_is_dropped_not_made_up,
         test_direct_write_gives_up_on_hung_auth,
         test_hook_fails_open_when_python_fails,
         test_main_fails_open_on_bad_input,
@@ -623,9 +1008,17 @@ def main() -> int:
         test_healthy_hook_does_not_sit_out_the_wait_and_drainer_sends,
         test_stalled_hook_still_enqueues_event_after_returning,
         test_unconfigured_hook_does_not_start_python,
+        test_late_hooks_still_apply_in_order,
+        test_late_turns_keep_their_own_replies,
+        test_parallel_hooks_each_queue_their_event,
+        test_queue_applies_only_its_own_sessions_events,
         test_drainer_sends_spooled_row_unchanged,
         test_drainer_gives_up_on_hung_auth,
         test_drainer_gives_up_on_hung_insert,
+        test_drainer_takes_late_insert_result_instead_of_resending,
+        test_drainer_does_not_resend_while_insert_is_in_flight,
+        test_drainer_retries_reuse_insert_ids,
+        test_drainer_resends_at_once_when_late_insert_fails,
     ):
         test()
     print("hook nonblocking tests passed")

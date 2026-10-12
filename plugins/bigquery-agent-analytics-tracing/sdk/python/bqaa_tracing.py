@@ -3,15 +3,18 @@
 Architecture
 ------------
 Hook wrapper (hooks/common.sh, what the agent waits on):
-  Starts this module in the background and waits at most
-  BQAA_HOOK_WAIT_SECONDS for it, so the host agent never waits on Python
-  startup, file locks, auth or BigQuery.
+  Queues the event under BQAA_STATE_DIR/queue, starts this module in the
+  background and waits at most BQAA_HOOK_WAIT_SECONDS in all, so the host
+  agent never waits on Python startup, file locks, auth or BigQuery.
 
-Hook subprocess (hot path):
-  1. Build the BQAA row (existing logic).
-  2. Append a JSONL line to BQAA_SPOOL_DIR (sync, ~1 ms).
-  3. Spawn a detached drainer subprocess (idempotent via flock).
-  4. Exit. The host agent never blocks on BigQuery.
+Hook subprocess (hot path, ``--queue``, see process_hook_queue):
+  1. Apply the session's queued events oldest first, each as of the time
+     its hook ran, so an event whose own run starts late still lands
+     before the newer events of its session.
+  2. Build the BQAA row (existing logic).
+  3. Append a JSONL line to BQAA_SPOOL_DIR (sync, ~1 ms).
+  4. Spawn a detached drainer subprocess (idempotent via flock).
+  5. Exit. The host agent never blocks on BigQuery.
 
 Every network or auth call (direct writes here, the drainer's writes) runs
 under a hard BQAA_NETWORK_TIMEOUT_SECONDS timeout.
@@ -109,12 +112,38 @@ WRITER_PLUGIN_VERSION = "0.1.0"
 WRITER_LABEL = f"{WRITER_PLUGIN_NAME}/{WRITER_PLUGIN_VERSION}"
 
 
+# While a queued hook event is applied, the time its hook ran (see
+# _event_clock), so row timestamps, latencies and the transcript window come
+# out the same however late the event is applied.
+_EVENT_TIME_NS: int | None = None
+
+
 def _utc_now() -> datetime:
+    if _EVENT_TIME_NS is not None:
+        seconds, nanos = divmod(_EVENT_TIME_NS, 1_000_000_000)
+        return datetime.fromtimestamp(seconds, timezone.utc).replace(microsecond=nanos // 1000)
     return datetime.now(timezone.utc)
 
 
 def _timestamp_ms() -> int:
+    if _EVENT_TIME_NS is not None:
+        return _EVENT_TIME_NS // 1_000_000
     return int(time.time() * 1000)
+
+
+def _event_time_ms() -> int | None:
+    return None if _EVENT_TIME_NS is None else _EVENT_TIME_NS // 1_000_000
+
+
+@contextlib.contextmanager
+def _event_clock(time_ns: int) -> Iterator[None]:
+    """Take time_ns as the current time for everything done inside."""
+    global _EVENT_TIME_NS
+    saved, _EVENT_TIME_NS = _EVENT_TIME_NS, time_ns
+    try:
+        yield
+    finally:
+        _EVENT_TIME_NS = saved
 
 
 def _iso_timestamp(value: datetime | None = None) -> str:
@@ -125,13 +154,34 @@ def _iso_timestamp(value: datetime | None = None) -> str:
 _T = TypeVar("_T")
 
 
+class _CallTimedOut(TimeoutError):
+    """A call outlived its timeout. It keeps running on its own thread, so a
+    request it made may still land."""
+
+    def __init__(self, message: str, worker: threading.Thread, outcome: dict[str, Any]):
+        super().__init__(message)
+        self._worker = worker
+        self._outcome = outcome
+
+    def result(self, wait: float) -> Any:
+        """Wait up to `wait` more seconds for the call, then return its
+        value or raise its error. Raises self if it's still running."""
+        self._worker.join(wait)
+        if self._worker.is_alive():
+            raise self
+        if "error" in self._outcome:
+            raise self._outcome["error"]
+        return self._outcome["value"]
+
+
 def _call_with_timeout(fn: Callable[[], _T], timeout: float, what: str) -> _T:
     """Run fn() on a daemon thread and give up after timeout seconds.
 
     ADC lookups (metadata-server probes, token refreshes) and BigQuery
     requests can hang well past their own retry deadlines. A daemon thread
     can't be cancelled, but it won't keep the process alive once the caller
-    has moved on.
+    has moved on. On timeout raises _CallTimedOut, which can still collect
+    the call's result.
     """
     outcome: dict[str, Any] = {}
 
@@ -145,7 +195,7 @@ def _call_with_timeout(fn: Callable[[], _T], timeout: float, what: str) -> _T:
     worker.start()
     worker.join(timeout)
     if worker.is_alive():
-        raise TimeoutError(f"{what} timed out after {timeout:g}s")
+        raise _CallTimedOut(f"{what} timed out after {timeout:g}s", worker, outcome)
     if "error" in outcome:
         raise outcome["error"]
     return outcome["value"]
@@ -237,10 +287,27 @@ def _text_from_content(content: Any) -> str:
     return ""
 
 
+def _transcript_time_ms(item: Any) -> int | None:
+    """When a transcript line was written, from its "timestamp" field."""
+    stamp = item.get("timestamp") if isinstance(item, dict) else None
+    if not isinstance(stamp, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return int(parsed.timestamp() * 1000)
+
+
 def _read_transcript_since(
-    path: str, start_line: int, max_bytes: int
+    path: str, start_line: int, max_bytes: int, until_ms: int | None = None
 ) -> tuple[str, str, dict[str, int], bool]:
     """Stream-read the transcript and stop after max_bytes of output text.
+
+    With until_ms, assistant lines stamped after it are left out: applied
+    late, a Stop can find the next turn in the transcript already.
 
     Returns (output_text, model, usage, was_truncated).
     """
@@ -261,6 +328,8 @@ def _read_transcript_since(
                 continue
             item = _safe_json_loads(line, {})
             if item.get("type") != "assistant":
+                continue
+            if until_ms is not None and (_transcript_time_ms(item) or 0) > until_ms:
                 continue
             message = item.get("message") or {}
             model = message.get("model") or model
@@ -945,7 +1014,8 @@ class StateStore:
 
 
 def cleanup_stale_state(root: str | Path, ttl_hours: float) -> int:
-    """Remove state and per-tool files older than ttl_hours. Returns count."""
+    """Remove state, per-tool and hook queue files older than ttl_hours.
+    Returns count."""
     if ttl_hours <= 0:
         return 0
     base = Path(root).expanduser()
@@ -953,11 +1023,18 @@ def cleanup_stale_state(root: str | Path, ttl_hours: float) -> int:
         return 0
     cutoff = time.time() - ttl_hours * 3600
     removed = 0
-    for path in base.iterdir():
+    paths = [
+        path
+        for path in base.iterdir()
+        if path.name.startswith(("state_", "tool_")) and path.name.endswith(".json")
+    ]
+    queue = base / "queue"
+    if queue.is_dir():
+        # Events no adapter run got to (or that a dying hook never finished)
+        # and the locks of sessions that have gone quiet.
+        paths += [p for p in queue.iterdir() if p.name.isdigit() or p.name.startswith(".lock-")]
+    for path in paths:
         if not path.is_file():
-            continue
-        name = path.name
-        if not (name.startswith("state_") or name.startswith("tool_")) or not name.endswith(".json"):
             continue
         try:
             mtime = path.stat().st_mtime
@@ -1133,6 +1210,7 @@ class ClaudeHookBQAAAdapter:
             transcript,
             int(state.get("transcript_start_line") or 0),
             self.config.transcript_max_bytes,
+            until_ms=_event_time_ms(),
         )
         output = output or str(payload.get("response") or "(No response captured)")
         start_ms = int(state.get("current_start_ms") or _timestamp_ms())
@@ -1270,13 +1348,53 @@ class ClaudeHookBQAAAdapter:
 
 
 def _line_count(path: str) -> int:
+    """Lines in the transcript as of the current hook.
+
+    Applied late, a UserPromptSubmit can find the reply in the transcript
+    already, and Stop reads the reply from this line on. So the count ends
+    at the last line stamped no later than the hook ran.
+    """
     if not path:
         return 0
     transcript = Path(path).expanduser()
     if not transcript.exists():
         return 0
-    with transcript.open("r", encoding="utf-8", errors="replace") as handle:
-        return sum(1 for _ in handle)
+    hook_ms = _event_time_ms()
+    if hook_ms is None:
+        with transcript.open("r", encoding="utf-8", errors="replace") as handle:
+            return sum(1 for _ in handle)
+    total, later, stamped = 0, None, False
+    for line in _lines_from_end(transcript):
+        if later is None:
+            stamp = _transcript_time_ms(_safe_json_loads(line.decode("utf-8", "replace"), None))
+            if stamp is not None:
+                stamped = True
+                if stamp <= hook_ms:
+                    later = total
+        total += 1
+    if later is None:
+        return 0 if stamped else total
+    return total - later
+
+
+def _lines_from_end(path: Path, block_size: int = 1 << 20) -> Iterator[bytes]:
+    """The file's lines (as iterating over it yields them), last first."""
+    with path.open("rb") as handle:
+        end = handle.seek(0, os.SEEK_END)
+        if end == 0:
+            return
+        handle.seek(end - 1)
+        if handle.read(1) == b"\n":
+            end -= 1
+        position, head = end, b""
+        while position > 0:
+            step = min(block_size, position)
+            position -= step
+            handle.seek(position)
+            lines = (handle.read(step) + head).split(b"\n")
+            head = lines.pop(0)
+            yield from reversed(lines)
+        yield head
 
 
 def _tool_origin(tool_name: Any) -> str:
@@ -1307,7 +1425,7 @@ def _append_log(log_file: str, message: str) -> None:
         return
     try:
         with open(log_file, "a", encoding="utf-8") as handle:
-            handle.write(f"[{_iso_timestamp()}] {message}\n")
+            handle.write(f"[{_iso_timestamp(datetime.now(timezone.utc))}] {message}\n")
     except OSError:
         pass
 
@@ -1317,22 +1435,126 @@ def run_claude_hook(hook_name: str, payload: dict[str, Any] | None = None) -> No
     adapter.process(hook_name, payload or {})
 
 
+# ----------------------------------------------------------------------------
+# Hook queue (filled by hooks/common.sh)
+# ----------------------------------------------------------------------------
+
+# Each event is a file named by its 12-digit sequence number in
+# BQAA_STATE_DIR/queue: the hook name, a newline, the payload, then a line
+# with QUEUE_END and the session key, written last.
+QUEUE_END = b"#bqaa-end"
+
+
+def process_hook_queue(queue_dir: str | Path, session_key: str) -> int:
+    """Apply a session's queued hook events, oldest first. Returns how many.
+
+    Each hook queues its event before it returns and then starts an
+    adapter run, which can start late (on macOS a hung syspolicyd holds up
+    interpreter launches for minutes). Whichever run takes the session's
+    lock first applies everything queued for the session, so a late event
+    still lands before the newer events that depend on it (UserPromptSubmit
+    before its Stop, PreToolUse before its PostToolUse). Each is applied as
+    of the time its hook ran. Only the session's own events are applied,
+    since sessions can run with different settings.
+    """
+    if session_key in ("", ".", "..") or "/" in session_key or "\0" in session_key:
+        raise ValueError(f"bad session key {session_key!r}")
+    queue = Path(queue_dir)
+    lock = queue / f".lock-{session_key}"
+    with _file_lock(lock):
+        os.utime(lock)  # in use, so cleanup_stale_state leaves it alone
+        paths = _queued_events(queue, session_key)
+        if not paths:
+            return 0
+        try:
+            adapter = ClaudeHookBQAAAdapter()
+        except Exception:
+            # Nothing can be written with a config that doesn't parse. Drop
+            # the events, as a direct run would, rather than let them pile up.
+            for path in paths:
+                path.unlink(missing_ok=True)
+            raise
+        for path in paths:
+            hook_name = "?"
+            try:
+                hook_name, payload, time_ns = _read_queued_event(path)
+                with _event_clock(time_ns):
+                    adapter.process(hook_name, payload)
+            except Exception as exc:
+                _log(adapter.config, f"ERROR hook={hook_name}: {exc}\n{traceback.format_exc()}")
+            finally:
+                path.unlink(missing_ok=True)
+        return len(paths)
+
+
+def _queued_events(queue: Path, session_key: str) -> list[Path]:
+    """The session's complete queue entries, oldest first.
+
+    An entry without its last line is still being written by a hook that
+    hasn't returned, so nothing queued after it depends on it; its own run
+    picks it up. (One a dying hook left unfinished is purged by
+    cleanup_stale_state.)
+    """
+    last_line = b"\n" + QUEUE_END + b" " + session_key.encode() + b"\n"
+    try:
+        names = sorted((p.name for p in queue.iterdir() if p.name.isdigit()), key=int)
+    except FileNotFoundError:
+        return []
+    paths = []
+    for name in names:
+        path = queue / name
+        try:
+            with path.open("rb") as handle:
+                size = handle.seek(0, os.SEEK_END)
+                handle.seek(max(0, size - len(last_line)))
+                if handle.read() == last_line:
+                    paths.append(path)
+        except FileNotFoundError:
+            continue
+    return paths
+
+
+def _read_queued_event(path: Path) -> tuple[str, Any, int]:
+    """(hook name, payload, when the hook wrote it in ns) of a complete entry."""
+    with path.open("rb") as handle:
+        data = handle.read()
+        time_ns = os.fstat(handle.fileno()).st_mtime_ns
+    header, _, rest = data.partition(b"\n")
+    hook_name = header.decode("utf-8", "replace")
+    raw = rest[: rest.rfind(b"\n", 0, len(rest) - 1)].decode("utf-8", "replace")
+    try:
+        payload = json.loads(raw) if raw.strip() else {}
+    except json.JSONDecodeError as exc:
+        # Most likely cut off when the hook stopped waiting for stdin.
+        # Applying it as {} would only make up an event.
+        raise ValueError(f"{hook_name} payload isn't JSON: {exc}") from exc
+    return hook_name, payload, time_ns
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = argv or sys.argv[1:]
     if not argv:
-        print("usage: bqaa_tracing.py <ClaudeHookName>", file=sys.stderr)
+        print(
+            "usage: bqaa_tracing.py <ClaudeHookName> | --queue <queue-dir> <session-key>",
+            file=sys.stderr,
+        )
         return 2
     hook_name = argv[0]
     log_file = os.environ.get("BQAA_LOG_FILE", DEFAULT_LOG_FILE)
     # Hooks should never break the calling agent, so even a malformed config
     # or payload only ends up in the log.
     try:
-        raw = sys.stdin.read()
-        payload = _safe_json_loads(raw, {}) if raw.strip() else {}
-        config = BQAAConfig.from_env()
-        ClaudeHookBQAAAdapter(BigQueryAgentAnalyticsLogger(config)).process(
-            hook_name, payload
-        )
+        if hook_name == "--queue":
+            # From hooks/common.sh: the event is in the queue, not on stdin.
+            _, queue_dir, session_key = argv
+            process_hook_queue(queue_dir, session_key)
+        else:
+            raw = sys.stdin.read()
+            payload = _safe_json_loads(raw, {}) if raw.strip() else {}
+            config = BQAAConfig.from_env()
+            ClaudeHookBQAAAdapter(BigQueryAgentAnalyticsLogger(config)).process(
+                hook_name, payload
+            )
     except Exception as exc:
         _append_log(log_file, f"ERROR hook={hook_name}: {exc}\n{traceback.format_exc()}")
     return 0
