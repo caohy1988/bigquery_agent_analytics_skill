@@ -6,7 +6,9 @@
 # replaces the daemon. So the hook runs only bash and base utilities
 # (dirname, cat, mkdir, rarely rm) and always exits 0 with no output:
 #   1. It queues the event under the state dir, reading the payload under
-#      the same deadline as the rest.
+#      the same deadline as the rest. A full queue gets one bounded Python
+#      cleanup run first: entries past the TTL are pruned so queueing can
+#      resume.
 #   2. It starts the Python adapter detached from the hook's stdio. That run
 #      applies all of the session's queued events, oldest first, so an event
 #      whose own run starts late still lands before newer ones. Python reads
@@ -51,13 +53,42 @@ WAIT_SECONDS=$((10#$WAIT_SECONDS))
 # hook holds the file. So a hook that starts after another has returned
 # always gets a higher number than that one, and a run reading the queue in
 # order can't come across a newer event under a number it has already passed.
-QUEUE_DIR="${BQAA_STATE_DIR:-/tmp/bqaa-agent-tracing}"
-case "$QUEUE_DIR" in \~ | \~/*) QUEUE_DIR="$HOME${QUEUE_DIR:1}" ;; esac
-QUEUE_DIR="$QUEUE_DIR/queue"
+STATE_DIR="${BQAA_STATE_DIR:-/tmp/bqaa-agent-tracing}"
+case "$STATE_DIR" in \~ | \~/*) STATE_DIR="$HOME${STATE_DIR:1}" ;; esac
+QUEUE_DIR="$STATE_DIR/queue"
 # If adapter runs never get going, stop queueing well before /tmp fills up.
 QUEUE_MAX=10000
 CAT_BIN=/bin/cat
 [[ -x "$CAT_BIN" ]] || CAT_BIN="cat"
+
+# Run one detached Python job, waiting at most the rest of the hook's budget
+# for it. The subshell keeps the pipe on fd 3 open until Python exits, so
+# read returns as soon as it is done (the normal case) or when the time is
+# up. Nothing left running holds the hook's own stdout or stderr, so the
+# agent isn't kept waiting for EOF either.
+launch_python() {
+  local job="$1"
+  if exec 3< <("$job"); then
+    local wait_left=$((WAIT_SECONDS - SECONDS))
+    if ((wait_left > 0)); then
+      read -r -t "$wait_left" -u 3 _ || true
+    fi
+    exec 3<&-
+  else
+    ("$job" >/dev/null) &
+  fi
+}
+
+# A full queue can be all-expired entries: adapter runs never got going, so
+# the TTL cleanup they run never happened. Give Python one bounded shot at
+# it (cleanup_stale_state records the pruned numbers before unlinking, so
+# they stay used), then look again.
+# shellcheck disable=SC2329  # invoked indirectly via launch_python
+run_cleanup() {
+  trap '' HUP INT
+  exec </dev/null
+  "$PYTHON_BIN" "$PLUGIN_DIR/scripts/bqaa_hook.py" --cleanup "$STATE_DIR" >/dev/null
+}
 
 # Payloads can hold prompts and tool output: only the queue dir itself needs
 # to be private, its parents are shared with the state files.
@@ -65,7 +96,11 @@ CAT_BIN=/bin/cat
 [[ -d "$QUEUE_DIR" ]] || mkdir -p -m 700 "$QUEUE_DIR" || exit 0
 shopt -s nullglob
 QUEUED=("$QUEUE_DIR"/[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9])
-((${#QUEUED[@]} < QUEUE_MAX)) || exit 0
+if ((${#QUEUED[@]} >= QUEUE_MAX)); then
+  launch_python run_cleanup
+  QUEUED=("$QUEUE_DIR"/[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9])
+  ((${#QUEUED[@]} < QUEUE_MAX)) || exit 0
+fi
 
 # Sets USED to the number in queue/last: no event gets it or a lower one.
 read_used() {
@@ -130,6 +165,7 @@ printf '\n%s %s\n' "#bqaa-end" "$TOKEN" >&5
 exec 5>&-
 
 # --- 2. and 3. Run the adapter and wait for it ---------------------------------
+# shellcheck disable=SC2329  # invoked indirectly via launch_python
 run_adapter() {
   # Ignore HUP/INT so an event that outlives the wait still lands when the
   # session's terminal goes away.
@@ -138,17 +174,5 @@ run_adapter() {
   "$PYTHON_BIN" "$PLUGIN_DIR/scripts/bqaa_hook.py" --queue "$QUEUE_DIR" "${ENTRY##*/}" "$TOKEN" >/dev/null
 }
 
-# The subshell keeps the pipe on fd 3 open until Python exits, so read
-# returns as soon as Python is done (the normal case) or when the time is
-# up. Nothing left running holds the hook's own stdout or stderr, so the
-# agent isn't kept waiting for EOF either.
-WAIT_LEFT=$((WAIT_SECONDS - SECONDS))
-if exec 3< <(run_adapter); then
-  if ((WAIT_LEFT > 0)); then
-    read -r -t "$WAIT_LEFT" -u 3 _ || true
-  fi
-  exec 3<&-
-else
-  (run_adapter >/dev/null) &
-fi
+launch_python run_adapter
 exit 0

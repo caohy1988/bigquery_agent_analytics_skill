@@ -7,6 +7,10 @@ run the real hooks/*.sh scripts the way the agent does (JSON payload on
 stdin, then wait for exit and EOF on stdout/stderr) and run the drainer
 in-process. Google client libraries are replaced by a small fake package
 written to a temp dir, so no network or GCP credentials are needed.
+Subprocesses that could import google run it with site disabled (see
+_isolated_python), so no site customization can restore the real one, and
+the fake package records each import's origin so tests can assert where
+google actually came from.
 """
 from __future__ import annotations
 
@@ -82,7 +86,16 @@ _CONFIG_PREFIXES = ("BQAA_", "GCP_PROJECT_ID", "GOOGLE_CLOUD_PROJECT", "BQ_DATAS
 # calls. Delays come from env vars so the same package works in-process and
 # inside the hook subprocess (via PYTHONPATH).
 FAKE_GOOGLE = {
-    "google/__init__.py": "",
+    "google/__init__.py": '''
+import os
+
+# So tests can prove hook/drainer subprocesses imported google from here
+# (the fake root) and not from a restored real installation.
+_origin_log = os.environ.get("FAKE_GOOGLE_ORIGIN_LOG")
+if _origin_log:
+    with open(_origin_log, "a", encoding="utf-8") as _handle:
+        _handle.write(__file__ + "\\n")
+''',
     "google/auth/__init__.py": '''
 import os
 import time
@@ -392,21 +405,33 @@ def _write_fake_google(root: Path) -> Path:
         path = root / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(source.lstrip("\n"), encoding="utf-8")
-    # A subprocess with root on PYTHONPATH can still start with the real
-    # `google` already in sys.modules: a legacy *-nspkg.pth from an
-    # installed google package preloads it as a namespace package during
-    # site initialization, so the fake regular package here never shadows
-    # it and hook/drainer subprocesses would call the real BigQuery. site
-    # imports sitecustomize after the .pth files, so purging google* there
-    # makes later imports resolve fresh, with root first on sys.path. A
-    # no-op where nothing preloaded `google`.
-    (root / "sitecustomize.py").write_text(
-        "import sys\n"
-        "for _name in [name for name in list(sys.modules) if name == 'google' or name.startswith('google.')]:\n"
-        "    del sys.modules[_name]\n",
-        encoding="utf-8",
-    )
     return root
+
+
+def _isolated_python(tmp: Path) -> Path:
+    """A BQAA_PYTHON that runs the interpreter with -S: site never runs, so
+    no .pth files, sitecustomize or usercustomize execute and site-packages
+    never lands on sys.path. Purging a preloaded google is not enough — an
+    installed package's legacy *-nspkg.pth preloads the real one during site
+    initialization, and a usercustomize or site.addsitedir call can restore
+    it after any purge. With -S and the fake root on PYTHONPATH, the fake
+    root is the only place hook/drainer subprocesses can import google from.
+    """
+    return _write_stub(tmp / "isolated-python", f'exec "{sys.executable}" -S "$@"')
+
+
+def _assert_google_imports_from(origin_log: Path, fake_root: Path, timeout: float = 10) -> None:
+    """Fail loudly unless hook/drainer subprocesses imported google from the
+    fake root. The fake package logs its own __file__ there on import."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline and not origin_log.exists():
+        time.sleep(0.05)
+    origins = origin_log.read_text(encoding="utf-8").splitlines() if origin_log.exists() else []
+    assert origins, f"no subprocess imported google: {origin_log} missing or empty"
+    expected = (fake_root / "google" / "__init__.py").resolve()
+    for origin in origins:
+        got = Path(origin).resolve()
+        assert got == expected, f"a subprocess imported google from {got}, not the fake root's {expected}"
 
 
 @contextlib.contextmanager
@@ -578,17 +603,21 @@ def test_hook_returns_fast_when_bigquery_auth_hangs() -> None:
     # building the client runs an ADC lookup that can hang (metadata server
     # probe, token refresh) and had no timeout.
     with _tmpdir() as tmp:
+        fake = _write_fake_google(tmp / "fake")
         env = _base_env(
             tmp,
+            BQAA_PYTHON=str(_isolated_python(tmp)),
             BQAA_DIRECT_WRITE="true",
             BQAA_NETWORK_TIMEOUT_SECONDS="1",
             FAKE_GOOGLE_ADC_DELAY=str(STALL_SECONDS),
-            PYTHONPATH=str(_write_fake_google(tmp / "fake")),
+            FAKE_GOOGLE_ORIGIN_LOG=str(tmp / "origins.log"),
+            PYTHONPATH=str(fake),
         )
         elapsed, proc = _run_hook("pre_tool_use.sh", PRE_PAYLOAD, env)
         assert elapsed < HOOK_DEADLINE_SECONDS, f"hook held the agent for {elapsed:.1f}s"
         assert proc.returncode == 0, proc
         assert proc.stdout == "" and proc.stderr == "", proc
+        _assert_google_imports_from(tmp / "origins.log", fake)
 
 
 def test_hook_returns_when_agent_keeps_stdin_open() -> None:
@@ -704,7 +733,14 @@ def test_healthy_hook_does_not_sit_out_the_wait_and_drainer_sends() -> None:
     # The drainer outlives the hook; if it (or anything else) held the
     # hook's pipe open, every tool call would pay the full wait.
     with _tmpdir() as tmp:
-        env = _base_env(tmp, PYTHONPATH=str(_write_fake_google(tmp / "fake")), BQAA_DRAIN_IDLE_SECONDS="1")
+        fake = _write_fake_google(tmp / "fake")
+        env = _base_env(
+            tmp,
+            BQAA_PYTHON=str(_isolated_python(tmp)),
+            PYTHONPATH=str(fake),
+            FAKE_GOOGLE_ORIGIN_LOG=str(tmp / "origins.log"),
+            BQAA_DRAIN_IDLE_SECONDS="1",
+        )
         elapsed, proc = _run_hook("pre_tool_use.sh", PRE_PAYLOAD, env)
         assert proc.returncode == 0, proc
         assert elapsed < 0.9, f"healthy hook took {elapsed:.2f}s"
@@ -713,6 +749,56 @@ def test_healthy_hook_does_not_sit_out_the_wait_and_drainer_sends() -> None:
             time.sleep(0.1)
         assert _spool_files(tmp / "spool") == [], "drainer never sent the spooled event"
         assert not (tmp / "spool" / "dead-letter").exists()
+        _assert_google_imports_from(tmp / "origins.log", fake)
+
+
+def test_usercustomize_cannot_restore_a_real_google() -> None:
+    # 2026-10-12 review: the fake root used to rely on a sitecustomize purge
+    # of the google an nspkg .pth preloads, but usercustomize runs after
+    # sitecustomize, and reprocessing the .pth files (site.addsitedir) puts
+    # the real google back in sys.modules ahead of the fake on PYTHONPATH —
+    # hook/drainer subprocesses then called the real BigQuery. They now run
+    # with -S, so none of that executes. This usercustomize plants an
+    # imposter google the same way the restore would: if site ever runs in
+    # those subprocesses again, the origin assertion names the imposter, and
+    # its clientless bigquery module dead-letters the event.
+    with _tmpdir() as tmp:
+        fake = _write_fake_google(tmp / "fake")
+        (fake / "usercustomize.py").write_text(
+            "import os\n"
+            "import sys\n"
+            "from types import ModuleType\n"
+            "\n"
+            "def _imposter(name):\n"
+            "    module = ModuleType(name)\n"
+            "    module.__file__ = '/imposter-google/' + name.replace('.', '/') + '.py'\n"
+            "    log = os.environ.get('FAKE_GOOGLE_ORIGIN_LOG')\n"
+            "    if log and name == 'google':\n"
+            "        with open(log, 'a', encoding='utf-8') as handle:\n"
+            "            handle.write(module.__file__ + '\\n')\n"
+            "    return module\n"
+            "\n"
+            "for _name in ('google', 'google.auth', 'google.api_core', 'google.api_core.exceptions',\n"
+            "              'google.cloud', 'google.cloud.bigquery', 'google.cloud.exceptions'):\n"
+            "    sys.modules[_name] = _imposter(_name)\n",
+            encoding="utf-8",
+        )
+        env = _base_env(
+            tmp,
+            BQAA_PYTHON=str(_isolated_python(tmp)),
+            PYTHONPATH=str(fake),
+            FAKE_GOOGLE_ORIGIN_LOG=str(tmp / "origins.log"),
+            BQAA_DRAIN_IDLE_SECONDS="1",
+        )
+        elapsed, proc = _run_hook("pre_tool_use.sh", PRE_PAYLOAD, env)
+        assert proc.returncode == 0, proc
+        assert elapsed < 0.9, f"healthy hook took {elapsed:.2f}s"
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and _spool_files(tmp / "spool"):
+            time.sleep(0.1)
+        assert _spool_files(tmp / "spool") == [], "drainer never sent the spooled event"
+        assert not (tmp / "spool" / "dead-letter").exists()
+        _assert_google_imports_from(tmp / "origins.log", fake)
 
 
 def test_stalled_hook_still_enqueues_event_after_returning() -> None:
@@ -1124,6 +1210,43 @@ def test_cleanup_leaves_queue_locks_in_place() -> None:
         assert [row["event_type"] for row in _spooled_rows(tmp / "spool")] == ["TOOL_STARTING", "TOOL_COMPLETED"]
 
 
+def test_saturated_queue_of_expired_entries_is_pruned() -> None:
+    # 2026-10-12 review: at QUEUE_MAX (10,000) queued events the hook exited
+    # before starting Python, so when adapter runs never got going and every
+    # entry sat past the TTL, the TTL cleanup that frees the queue never ran
+    # and no event could ever be queued again. The hook now gives Python one
+    # bounded shot at the cleanup before dropping the event.
+    with _tmpdir() as tmp, _drainer_lock_held(tmp / "spool"):
+        queue = tmp / "state" / "queue"
+        queue.mkdir(parents=True)
+        long_ago = time.time() - 48 * 3600
+        payload = json.dumps(PRE_PAYLOAD)
+        for n in range(1, 10_001):
+            # Unfinished entries (no end line): nothing can apply them, and
+            # cleanup prunes them by age.
+            path = queue / f"{n:012d}"
+            path.write_text(f"PreToolUse\n{payload}\n", encoding="utf-8")
+            os.utime(path, (long_ago, long_ago))
+        elapsed, proc = _run_hook("pre_tool_use.sh", PRE_PAYLOAD, _base_env(tmp))
+        assert proc.returncode == 0 and proc.stdout == "" and proc.stderr == "", proc
+        assert elapsed < HOOK_DEADLINE_SECONDS, f"hook held the agent for {elapsed:.1f}s"
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline and _queued_entries(tmp / "state"):
+            time.sleep(0.2)
+        assert _queued_entries(tmp / "state") == [], "expired entries were never pruned"
+        # The pruned numbers stay used: no run is left to come across a newer
+        # event under a number it has already passed.
+        used = int((queue / "last").read_text(encoding="ascii"))
+        assert used >= 10_000, used
+        # And the queue takes events again, numbered above the pruned ones.
+        stub, record = _recording_stub(tmp)
+        _, proc = _run_hook("pre_tool_use.sh", PRE_PAYLOAD, _base_env(tmp, BQAA_PYTHON=str(stub)))
+        assert proc.returncode == 0, proc
+        ((_, entry, _),) = _recorded_runs(record)
+        assert int(entry) > 10_000, entry
+        assert [path.name for path in _queued_entries(tmp / "state")] == [entry]
+
+
 # ---------------------------------------------------------------------------
 # A payload Python can't parse holds up nothing else
 # ---------------------------------------------------------------------------
@@ -1355,6 +1478,7 @@ def main() -> int:
         test_main_fails_open_on_bad_input,
         test_hook_enqueues_tool_event_before_returning,
         test_healthy_hook_does_not_sit_out_the_wait_and_drainer_sends,
+        test_usercustomize_cannot_restore_a_real_google,
         test_stalled_hook_still_enqueues_event_after_returning,
         test_unconfigured_hook_does_not_start_python,
         test_late_hooks_still_apply_in_order,
@@ -1366,6 +1490,7 @@ def main() -> int:
         test_queue_applies_only_its_own_sessions_events,
         test_queue_numbers_are_never_handed_out_twice,
         test_cleanup_leaves_queue_locks_in_place,
+        test_saturated_queue_of_expired_entries_is_pruned,
         test_payload_that_cannot_be_parsed_holds_up_no_other_event,
         test_transcript_lines_that_cannot_be_parsed_are_skipped,
         test_drainer_sends_spooled_row_unchanged,

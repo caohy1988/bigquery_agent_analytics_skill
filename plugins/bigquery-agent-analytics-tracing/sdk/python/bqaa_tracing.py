@@ -1623,7 +1623,7 @@ def main(argv: list[str] | None = None) -> int:
     argv = argv or sys.argv[1:]
     if not argv:
         print(
-            "usage: bqaa_tracing.py <ClaudeHookName> | --queue <queue-dir> <entry> <token>",
+            "usage: bqaa_tracing.py <ClaudeHookName> | --queue <queue-dir> <entry> <token> | --cleanup <state-dir>",
             file=sys.stderr,
         )
         return 2
@@ -1636,6 +1636,12 @@ def main(argv: list[str] | None = None) -> int:
             # From hooks/common.sh: the event is in the queue, not on stdin.
             _, queue_dir, entry, token = argv
             process_hook_queue(queue_dir, entry, token)
+        elif hook_name == "--cleanup":
+            # From hooks/common.sh, when the queue is full: prune expired
+            # state so queueing can resume.
+            _, state_dir = argv
+            config = BQAAConfig.from_env()
+            cleanup_stale_state(state_dir, config.state_ttl_hours)
         else:
             raw = sys.stdin.read()
             payload = _safe_json_loads(raw, {}) if raw.strip() else {}
