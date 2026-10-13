@@ -392,6 +392,20 @@ def _write_fake_google(root: Path) -> Path:
         path = root / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(source.lstrip("\n"), encoding="utf-8")
+    # A subprocess with root on PYTHONPATH can still start with the real
+    # `google` already in sys.modules: a legacy *-nspkg.pth from an
+    # installed google package preloads it as a namespace package during
+    # site initialization, so the fake regular package here never shadows
+    # it and hook/drainer subprocesses would call the real BigQuery. site
+    # imports sitecustomize after the .pth files, so purging google* there
+    # makes later imports resolve fresh, with root first on sys.path. A
+    # no-op where nothing preloaded `google`.
+    (root / "sitecustomize.py").write_text(
+        "import sys\n"
+        "for _name in [name for name in list(sys.modules) if name == 'google' or name.startswith('google.')]:\n"
+        "    del sys.modules[_name]\n",
+        encoding="utf-8",
+    )
     return root
 
 
