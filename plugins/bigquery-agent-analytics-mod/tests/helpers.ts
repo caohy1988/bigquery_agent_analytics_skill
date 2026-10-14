@@ -1,0 +1,218 @@
+// Stubs for the parts of the host CLI the mod reaches through `$`, so every
+// test runs with no session, no GCP and no network: `$.http.fetch` answers
+// from a script the test controls, `$.fs` is a Map, `$.process.run` prints a
+// fake token, and `mock.clock` drives the flush timer.
+
+import { type Engine, type MockClock, mock } from 'claude-code/testing'
+import type { On, TurnStepChunk, TurnStepResult } from 'claude-code'
+
+export type FetchCall = { url: string; method: string; headers: Record<string, string>; body: string; answered: number | 'reject' | 'hang' }
+export type FetchReply = { status: number; text: string } | { reject: string } | { hang: true }
+export type StepReply = { chunks?: TurnStepChunk[]; result: Partial<TurnStepResult> }
+export type ToolReply = { result: unknown; text?: string } | { deny: string } | { isError: true; result: unknown; text?: string }
+
+export type World = {
+  clock: MockClock
+  fetches: FetchCall[]
+  // What `$.http.fetch` answers next; the last entry repeats.
+  replies: FetchReply[]
+  files: Map<string, string>
+  commands: string[][]
+  statusLines: (string | undefined)[]
+  logs: string[]
+  steps: StepReply[]
+  // What `$.process.run` (the token command) answers.
+  processReply: { exitCode: number; stdout: string; stderr: string }
+  // Makes `$.fs.write` refuse every write.
+  failWrites: boolean
+  // Rows from insertAll calls BigQuery answered 200 to, oldest first.
+  acceptedRows: () => Row[]
+  // How many stubbed model streams ended normally, and how many were closed.
+  stepsFinished: number
+  stepsClosed: number
+  toolReply: (e: { tool: string }) => ToolReply | Promise<ToolReply>
+  // Runs inside the prompt.submit stub before it answers, as the engine
+  // starts the prompt's turn before `next` resolves.
+  promptEntered: ((text: string) => Promise<void>) | null
+  // Rows the mod sent with insertAll, oldest first.
+  sentRows: () => Row[]
+  insertCalls: () => FetchCall[]
+  // Lets every `{ hang: true }` request answer now.
+  releaseHung: (status: number, text: string) => void
+}
+
+export type Row = {
+  timestamp: string
+  event_id: string
+  event_type: string
+  agent: string
+  session_id: string | null
+  invocation_id: string | null
+  user_id: string | null
+  trace_id: string | null
+  span_id: string | null
+  parent_span_id: string | null
+  content: string | null
+  content_parts: unknown[]
+  attributes: string | null
+  latency_ms: string | null
+  status: string
+  error_message: string | null
+  is_truncated: boolean
+}
+
+export const SESSION_ID = '5c4b1d2e-8f7a-4c3b-9d1e-2a6f0b7c8d9e'
+export const HOME = '/home/dev'
+export const DEAD_LETTER_DIR = `${HOME}/.bqaa-mod/dead-letter`
+export const DRY_RUN_DIR = `${HOME}/.bqaa-mod/dry-run`
+export const OPTIONS = { project: 'my-gcp-project', dataset: 'agent_analytics' } as const
+export const COMMAND = { origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 100 } } as const
+export const OK_INSERT = { status: 200, text: '{"kind":"bigquery#tableDataInsertAllResponse"}' }
+// The token the stubbed token command prints. Credential-shaped test values
+// are joined from pieces at run time, so no file holds a literal that a
+// secret scanner would match.
+export const ACCESS_TOKEN = ['ya29', 'test-access-token-0123456789'].join('.')
+
+export const USAGE = {
+  input_tokens: 1203,
+  output_tokens: 412,
+  cache_read_input_tokens: 18240,
+  cache_creation_input_tokens: 960,
+  model: 'example-model',
+}
+
+export function setUp(on: On, env: Record<string, string> = {}, store: Record<string, unknown> = {}): World {
+  const clock = mock.clock(on, { now: 0 })
+  mock.env(on, { HOME, USER: 'dev', ...env })
+  mock.store(on, store)
+  const hung: ((answer: { value: { status: number; ok: boolean; headers: Record<string, string>; text: string } }) => void)[] = []
+  const world: World = {
+    clock,
+    fetches: [],
+    replies: [OK_INSERT],
+    files: new Map(),
+    commands: [],
+    statusLines: [],
+    logs: [],
+    steps: [],
+    processReply: { exitCode: 0, stdout: `${ACCESS_TOKEN}\n`, stderr: '' },
+    failWrites: false,
+    acceptedRows: () =>
+      world
+        .insertCalls()
+        .filter(f => f.answered === 200)
+        .flatMap(f => (JSON.parse(f.body) as { rows: { json: Row }[] }).rows.map(r => r.json)),
+    stepsFinished: 0,
+    stepsClosed: 0,
+    toolReply: () => ({ result: 'ok', text: 'ok' }),
+    promptEntered: null,
+    insertCalls: () => world.fetches.filter(f => f.url.endsWith('/insertAll')),
+    sentRows: () => world.insertCalls().flatMap(f => (JSON.parse(f.body) as { rows: { json: Row }[] }).rows.map(r => r.json)),
+    releaseHung: (status, text) => {
+      for (const resolve of hung.splice(0)) resolve({ value: { status, ok: status >= 200 && status < 300, headers: {}, text } })
+    },
+  }
+
+  on('session.start', () => ({ cwd: '/work/my-repo' }))
+  on('session.end', ($, e) => ({ sessionId: e.sessionId }))
+  on('session.id', () => ({ value: SESSION_ID }))
+  on('session.version', () => ({ value: { version: '2.1.296', base: '2.1.296' } }))
+  on('command.register', ($, e) => ({ value: { command: e.name } }))
+  on('ui.status', ($, e) => {
+    world.statusLines.push(e.text)
+    return { value: undefined }
+  })
+  on('ui.log', ($, e) => {
+    world.logs.push(e.text)
+    return { value: undefined }
+  })
+  on('process.run', ($, e) => {
+    world.commands.push([...e.argv])
+    return { value: { ...world.processReply, isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+  on('http.fetch', ($, e) => {
+    const headers = { ...((e.init?.headers ?? {}) as Record<string, string>) }
+    const reply = (world.replies.length > 1 ? world.replies.shift() : world.replies[0]) as FetchReply
+    const answered = 'reject' in reply ? 'reject' : 'hang' in reply ? 'hang' : reply.status
+    world.fetches.push({ url: e.url, method: e.init?.method ?? 'GET', headers, body: String(e.init?.body ?? ''), answered })
+    if ('reject' in reply) return { deny: reply.reject }
+    if ('hang' in reply) return new Promise(resolve => hung.push(resolve))
+    return { value: { status: reply.status, ok: reply.status >= 200 && reply.status < 300, headers: {}, text: reply.text } }
+  })
+  on('fs.write', ($, e) => {
+    if (world.failWrites) return { deny: `EACCES: ${e.path}` }
+    world.files.set(e.path, e.text)
+    return { value: undefined }
+  })
+  on('fs.read', ($, e) => {
+    const text = world.files.get(e.path)
+    if (text === undefined) return { deny: `ENOENT: ${e.path}` }
+    return { value: text }
+  })
+  on('fs.exists', ($, e) => ({ value: [...world.files.keys()].some(p => p === e.path || p.startsWith(`${e.path}/`)) }))
+  on('fs.list', ($, e) => {
+    const prefix = `${e.path.replace(/\/$/, '')}/`
+    const entries = [...world.files.entries()]
+      .filter(([p]) => p.startsWith(prefix) && !p.slice(prefix.length).includes('/'))
+      .map(([p, text]) => ({ name: p.slice(prefix.length), kind: 'file' as const, size: text.length, mtimeMs: 0, isLink: false }))
+    return { value: entries }
+  })
+  on('turn.start', ($, e) => ({ turnId: e.turnId }))
+  on('turn.complete', ($, e) => ({ text: e.answer }))
+  on('prompt.submit', async ($, e) => {
+    if (world.promptEntered) await world.promptEntered(e.text)
+    return { text: e.text }
+  })
+  on('classic.SessionStart', () => ({}))
+  on('classic.SubagentStart', () => ({}))
+  on('classic.PermissionRequest', () => ({}))
+  on('tool.call', async ($, e) => (await world.toolReply(e as { tool: string })) as never)
+  on('turn.step', async function* ($, e) {
+    const reply = world.steps.shift() ?? { result: {} }
+    let finished = false
+    try {
+      for (const chunk of reply.chunks ?? []) yield chunk
+      const result: TurnStepResult = {
+        turnId: e.turnId,
+        index: e.index,
+        answer: '',
+        toolUses: [],
+        stopReason: 'end_turn',
+        usage: null,
+        ...reply.result,
+      }
+      finished = true
+      world.stepsFinished += 1
+      return result
+    } finally {
+      if (!finished) world.stepsClosed += 1
+    }
+  })
+  return world
+}
+
+// Reads a turn.step stream to its end, as the engine does, and returns the
+// result the plugins passed up.
+export async function runStep($: Engine, e: { turnId: string; index: number; model?: string; messageCount?: number; agentId?: string }): Promise<{ chunks: unknown[]; result: TurnStepResult }> {
+  const stream = $.turn.step({ model: 'example-model', messageCount: 1, ...e })
+  const chunks: unknown[] = []
+  let step = await stream.next()
+  while (step.done !== true) {
+    chunks.push(step.value)
+    step = await stream.next()
+  }
+  return { chunks, result: step.value }
+}
+
+export async function startSession($: Engine): Promise<void> {
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' })
+  await $.classic.SessionStart({ source: 'startup', session_id: SESSION_ID, model: 'example-model', cwd: '/work/my-repo' })
+}
+
+export const json = (text: string | null): Record<string, unknown> => (text === null ? {} : (JSON.parse(text) as Record<string, unknown>))
+
+export const byType = (rows: Row[], type: string): Row[] => rows.filter(r => r.event_type === type)
+
+export function deadLetterFiles(world: World): [string, string][] {
+  return [...world.files.entries()].filter(([p, text]) => p.startsWith(`${DEAD_LETTER_DIR}/`) && text.length > 0)
+}
