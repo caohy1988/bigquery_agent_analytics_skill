@@ -30,7 +30,10 @@ test('fixture session: prompt, four model requests, tools, a subagent, session e
   world.toolReply = async e => {
     if (e.tool === 'Read') return { result: { type: 'text' }, text: 'export async function flushOnce(queue: Row[]) {\n  const batch = queue.splice(0, 500)\n  await insertAll(batch)\n}\n' }
     if (e.tool === 'Agent') {
-      // The subagent runs while its Agent call is open, as in a session.
+      // The subagent runs while its Agent call is open, as in a session: its
+      // run starts with a turn.start that names its loop, then the
+      // settings-hook SubagentStart names its type.
+      await $.turn.start({ turnId: 'a91c7e2-turn-1', text: 'Where is flushOnce called?', agentId: 'a91c7e2' })
       await $.classic.SubagentStart({ agent_id: 'a91c7e2', agent_type: 'Explore' })
       world.steps.push({
         result: { answer: 'flushOnce is called from two places: the interval timer and /flush.', stopReason: 'end_turn', usage: { ...usage(1_902, 141, 0, 3_377), model: 'example-model' } },

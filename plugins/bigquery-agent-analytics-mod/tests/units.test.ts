@@ -7,9 +7,11 @@ import { expect, test } from 'claude-code/testing'
 import { classifyInsert, insertAllBody } from '../hooks/lib/bigquery.ts'
 import { destinationDir, resolveConfig, splitArgv } from '../hooks/lib/config.ts'
 import { FILE_PATTERN, MAX_FILE_BYTES, encodeLines, fileName, kindOf, parseFile } from '../hooks/lib/deadletter.ts'
+import { randomIds } from '../hooks/lib/ids.ts'
 import { BoundedQueue } from '../hooks/lib/queue.ts'
 import { buildRow, utf8Length } from '../hooks/lib/rows.ts'
 import { isSensitiveKey, limitsFor, newStats, redactDiagnostic, redactText, sanitize, toJsonColumn } from '../hooks/lib/sanitize.ts'
+import { Tracer } from '../hooks/lib/tracer.ts'
 
 import { utf8Bytes } from './helpers.ts'
 
@@ -543,6 +545,23 @@ test('a dead-letter file is complete only when its last line is a record matchin
   expect(parseFile(`${lines[0]}\n${lines[2]}\n`).complete).toBe(false)
   expect(parseFile(sealed.replace('session ended', 'session ender')).complete).toBe(false)
   expect(parseFile('').complete).toBe(false)
+})
+
+test('a session-start row written once the configuration is loaded keeps the time its event came', () => {
+  let now = 1_000
+  const rows: { event_type: string; timestamp: string; attributes: string | null }[] = []
+  const tracer = new Tracer({ now: () => now, ids: randomIds, config: () => resolveConfig({ project: 'p', dataset: 'd' }, {}), emit: row => rows.push(row) })
+  // The event came at 1,000; its row is written at 1,250, after setup.
+  now = 1_250
+  tracer.sessionStarted({ source: 'startup' }, 1_000)
+  now = 5_000
+  tracer.sessionEnded({ reason: 'other' })
+  expect(rows.map(row => [row.event_type, row.timestamp])).toEqual([
+    ['STATE_DELTA', '1970-01-01T00:00:01.000Z'],
+    ['STATE_DELTA', '1970-01-01T00:00:05.000Z'],
+  ])
+  // The session lasted from the event, not from the write.
+  expect((JSON.parse(rows[1]?.attributes ?? '{}') as { state_delta: { duration_ms: number } }).state_delta.duration_ms).toBe(4_000)
 })
 
 test('the queue drops its oldest rows past its row or byte bound', () => {

@@ -33,14 +33,21 @@ type TurnCtx = {
   steps: number
 }
 
+// One run of a subagent's (or teammate's) loop: its span under the main turn
+// it runs in.
 type LoopCtx = {
   agentId: string
   agentType: string
+  // Named by classic.SubagentStart, not guessed.
+  typeKnown: boolean
   traceId: string
   invocationId: string | null
   spanId: string
   parentSpanId: string | null
   lastStepSpan: string | null
+  // Its AGENT_STARTING row is written; its run's turn.complete was seen.
+  started: boolean
+  ended: boolean
 }
 
 export type StepCtx = {
@@ -177,16 +184,20 @@ export class Tracer {
     if (this.sessionStartedAt === null) this.sessionStartedAt = this.deps.now()
   }
 
-  // classic.SessionStart: startup, resume, clear, compact or fork.
-  sessionStarted(e: { session_id?: string; source: string; model?: string; permission_mode?: string; cwd?: string }): void {
+  // classic.SessionStart (startup, resume, clear, compact or fork), at
+  // `atMs`, the time the event came: its row can be written later, once the
+  // configuration is loaded.
+  sessionStarted(e: { session_id?: string; source: string; model?: string; permission_mode?: string; cwd?: string }, atMs?: number): void {
     if (e.session_id) this.sessionId = e.session_id
     if (e.cwd) this.cwd = e.cwd
+    const at = atMs ?? this.deps.now()
     if (e.source !== 'compact') {
-      this.sessionStartedAt = this.deps.now()
+      this.sessionStartedAt = at
       this.turnCount = 0
     }
     this.emit({
       eventType: 'STATE_DELTA',
+      timestampMs: at,
       ids: this.sessionIds(),
       content: { session_start: true },
       attributes: {
@@ -255,7 +266,14 @@ export class Tracer {
     })
   }
 
-  turnStarted(e: { turnId: string; text: string }): void {
+  turnStarted(e: { turnId: string; text: string; agentId?: string }): void {
+    // A subagent's or teammate's run (`agentId`, its loop): a turn of that
+    // loop inside the main turn, which it neither replaces nor counts as a
+    // turn of its own. No INVOCATION_STARTING.
+    if (e.agentId) {
+      this.loopRunStarted(e.agentId, e.turnId)
+      return
+    }
     this.main = {
       turnId: e.turnId,
       traceId: this.deps.ids.traceId(),
@@ -500,20 +518,19 @@ export class Tracer {
     if (fallback) fallback.permissionRequested = true
   }
 
-  // classic.SubagentStart: the subagent's own span, under the turn that
-  // started it.
+  // classic.SubagentStart: names the subagent's type. Its run usually began
+  // a moment before (turn.start with its loop id), and its AGENT_STARTING
+  // row waited for this; otherwise this starts the run's span.
   subagentStarted(e: { agent_id: string; agent_type: string }): void {
-    const loop: LoopCtx = {
-      agentId: e.agent_id,
-      agentType: e.agent_type || 'subagent',
-      traceId: this.main?.traceId ?? this.deps.ids.traceId(),
-      invocationId: this.main?.turnId ?? null,
-      spanId: this.deps.ids.spanId(),
-      parentSpanId: this.main?.spanId ?? null,
-      lastStepSpan: null,
+    const known = this.loops.get(e.agent_id)
+    let loop = known
+    if (!loop || loop.ended) {
+      loop = this.newLoop(e.agent_id, null, known)
+      remember(this.loops, e.agent_id, loop)
     }
-    remember(this.loops, e.agent_id, loop)
-    this.emitAgentStarting(loop, false)
+    loop.agentType = e.agent_type || loop.agentType
+    loop.typeKnown = true
+    if (!loop.started) this.emitAgentStarting(loop, false)
   }
 
   turnCompleted(e: TurnEnd): void {
@@ -533,6 +550,9 @@ export class Tracer {
         status: isFailure ? 'ERROR' : 'OK',
         errorMessage,
       })
+      // The run is over: a later run of the loop gets a span of its own,
+      // under the main turn it runs in.
+      loop.ended = true
       return
     }
     const turn = this.turnFor(e.turnId)
@@ -587,25 +607,50 @@ export class Tracer {
     return turn
   }
 
+  // The run a subagent's row belongs to. A run whose start this module did
+  // not see begins here; one whose SubagentStart never came (a managed
+  // policy can keep classic hooks from a person's plugin) gets its
+  // AGENT_STARTING row here, inferred unless its type is known.
   private loopFor(agentId: string, turnId: string | null): LoopCtx {
     const known = this.loops.get(agentId)
-    if (known) return known
-    // A subagent whose SubagentStart this module did not see.
-    const loop: LoopCtx = {
+    let loop = known
+    if (!loop || loop.ended) {
+      loop = this.newLoop(agentId, turnId, known)
+      remember(this.loops, agentId, loop)
+    }
+    if (!loop.started) this.emitAgentStarting(loop, !loop.typeKnown)
+    return loop
+  }
+
+  // turn.start with a loop id: a run of that loop begins under the current
+  // main turn. Its AGENT_STARTING row waits for the classic SubagentStart
+  // that names its type, or for the run's first row if that never comes.
+  private loopRunStarted(agentId: string, turnId: string): void {
+    const known = this.loops.get(agentId)
+    if (known && !known.ended) return
+    remember(this.loops, agentId, this.newLoop(agentId, turnId, known))
+  }
+
+  // A run's span, under the main turn now running: its trace, its
+  // invocation and its span as parent. A later run of a loop keeps the type
+  // an earlier one was named.
+  private newLoop(agentId: string, turnId: string | null, previous: LoopCtx | undefined): LoopCtx {
+    return {
       agentId,
-      agentType: 'subagent',
+      agentType: previous?.agentType ?? 'subagent',
+      typeKnown: previous?.typeKnown ?? false,
       traceId: this.main?.traceId ?? this.deps.ids.traceId(),
       invocationId: this.main?.turnId ?? turnId,
       spanId: this.deps.ids.spanId(),
       parentSpanId: this.main?.spanId ?? null,
       lastStepSpan: null,
+      started: false,
+      ended: false,
     }
-    remember(this.loops, agentId, loop)
-    this.emitAgentStarting(loop, true)
-    return loop
   }
 
   private emitAgentStarting(loop: LoopCtx, inferred: boolean): void {
+    loop.started = true
     this.emit({
       eventType: 'AGENT_STARTING',
       agent: loop.agentType,

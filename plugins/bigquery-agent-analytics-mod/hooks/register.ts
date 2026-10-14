@@ -34,6 +34,25 @@ let internalErrors = 0
 // raised first); handed over once it exists.
 const early: { row: BqaaRow; redactions: number }[] = []
 
+// Whether session.start has loaded the configuration: the options, the
+// environment and the host version. Until then `config` holds the defaults
+// register() starts with, so the session-start row, whose classic event the
+// host raises while session.start is still reading the environment, waits.
+let configured = false
+const awaitingConfig: (() => void)[] = []
+
+// `work` now if the configuration is loaded, else once session.start has
+// loaded it. Never waits: the hook calling this has called `next` already.
+function whenConfigured(work: () => void): void {
+  if (configured) safely(work)
+  else if (awaitingConfig.length < 10) awaitingConfig.push(work)
+}
+
+function configurationLoaded(): void {
+  configured = true
+  for (const work of awaitingConfig.splice(0)) safely(work)
+}
+
 const tracer = new Tracer({
   now: () => Date.now(),
   ids: randomIds,
@@ -213,6 +232,8 @@ async function deadLetterSummary($: EngineInterface): Promise<DeadLetterSummary>
 export const register: Register = (on, registered) => {
   options = registered
   config = resolveConfig(registered, {})
+  configured = false
+  awaitingConfig.length = 0
 
   on('session.start', async ($, e, next) => {
     try {
@@ -268,6 +289,8 @@ export const register: Register = (on, registered) => {
       internalErrors += 1
       $.ui.log(clean(`bqaa: setup failed, rows are not sent: ${errorText(err)}`), { to: 'debug' })
     }
+    // A session-start row that waited for the configuration is written now.
+    configurationLoaded()
     // Each in its own try: a refused name must not keep the others out.
     try {
       await $.command.register({ name: 'bqaa-status', description: 'BigQuery Agent Analytics: queue, sent, failed and dead-letter counts', immediate: true })
@@ -292,7 +315,11 @@ export const register: Register = (on, registered) => {
   // failure means here: the event goes on as if the mod were not there.
   on('classic.SessionStart', ($, e, next) => {
     const pending = next(e)
-    safely(() => tracer.sessionStarted(e))
+    // Its row carries what session.start loads (the user, the agent name,
+    // the writer mode, the host version): written now if that is done, else
+    // once it is, at the time the event came.
+    const at = Date.now()
+    whenConfigured(() => tracer.sessionStarted(e, at))
     return pending
   }).catch(($, e, next) => next(e))
 

@@ -198,7 +198,7 @@ create the table). The repo's `setup_gcp_prereqs.py` grants it.
 | --- | --- | --- | --- |
 | `classic.SessionStart` | `STATE_DELTA` | `{"session_start": true}` | `state_delta.start_source` (`startup`, `resume`, `clear`, `compact`, `fork`), `model`, `session_metadata` (project, cwd, `host_version`) |
 | `prompt.submit` (after it entered) | `USER_MESSAGE_RECEIVED` | `{"text_summary": prompt}` | `prompt_origin`, `submitted_during_turn` |
-| `turn.start` | `INVOCATION_STARTING` | `{}` | `turn_number`, `session_metadata` |
+| `turn.start` (main loop) | `INVOCATION_STARTING` | `{}` | `turn_number`, `session_metadata` |
 | `turn.step`, before the request | `LLM_REQUEST` | `{"prompt": [{"role": "user", "content": …}]}` on a turn's first request, `{"prompt": []}` after | `model`, `llm_config.effort`, `step_index`, `message_count` |
 | `turn.step`, response | `LLM_RESPONSE` | `{"tool_uses": [names], "response": text}` | `model`, `usage_metadata`, `finish_reason`; `latency_ms.total_ms`, `time_to_first_token_ms` |
 | `turn.step`, no response | `LLM_ERROR` (status `ERROR`) | `null` | `latency_ms.total_ms` |
@@ -209,6 +209,13 @@ create the table). The repo's `setup_gcp_prereqs.py` grants it.
 | `turn.complete` (main loop) | `AGENT_RESPONSE` (if it answered) and `INVOCATION_COMPLETED` / `INVOCATION_ERROR` | `{"response": answer}` / `{}` | `finish_reason`, `is_aborted`, `step_count`, turn `usage_metadata`, `latency_ms.total_ms` |
 | `classic.PermissionRequest` | (no row) | | sets `permission_requested` on the waiting tool's `TOOL_COMPLETED` |
 | `session.end` | `STATE_DELTA` | `{"session_end": true}` | `state_delta.reason`, `trace_count`, `duration_ms` |
+
+The host can raise `classic.SessionStart` before `session.start` has read
+the environment and the host version; its row waits until it has, keeping
+the event's time, so it carries the same user, agent name, writer mode and
+host version as the rows after it. A subagent's run starts with a
+`turn.start` of its own that names its loop (`agentId`): it writes no row,
+does not count as a turn, and leaves the main turn running.
 
 `usage_metadata` carries the names this repo's tracing plugin and analysis
 skill read (`prompt_tokens` = input + cache read + cache write,
@@ -241,6 +248,8 @@ plugin and the analysis skill's failure-rate query (ADK itself uses
   request is a span under it (its `LLM_REQUEST` and `LLM_RESPONSE` share it);
   a tool call is a span under the model request that asked for it; a subagent
   has its own span under the turn, and its requests and tools nest under that.
+  Each run of a subagent's loop (a teammate woken again, say) gets a span of
+  its own under the main turn it runs in.
 * `event_id`: 32-hex, unique per row, sent as insertAll's `insertId`. It is
   the dedup key: a row sent again (an ambiguous timeout, a backfill) has the
   same one. Use `QUALIFY event_id IS NULL OR ROW_NUMBER() OVER (PARTITION BY event_id ORDER BY timestamp) = 1`,
@@ -525,7 +534,10 @@ The test command runs the `tests/*.test.ts` files against the host CLI's own
 test kit, with no session, sign-in, GCP or network: `$.http.fetch`,
 `$.process.run`, `$.fs` and `$.store` are stubbed, and `mock.clock` drives the
 timers; the `$.fs` stubs measure files in UTF-8 bytes and refuse a file over
-4 MiB, as the host does. 120 tests cover the captured rows and their spans,
+4 MiB, as the host does. 127 tests cover the captured rows and their spans,
+subagent runs in the order the host raises them (one invocation and one
+trace for the turn, a span per run, a SubagentStart that comes late or never),
+the session-start row raised before or during `session.start`'s setup,
 the session id after `/clear` and `/resume` with no classic hooks (a refused
 read included), the non-blocking rules (`session.end` included), the queue
 bound, retries, timeouts, token refresh, table creation, partial inserts, 2xx
@@ -552,6 +564,10 @@ configuration.
 
 * Mods are early access; the events and `$` methods can change between
   host CLI releases. Tested with 2.1.296 and 2.1.299.
+* A subagent's run is told from a main-loop turn by the loop id its
+  `turn.start` carries (`agentId`, in the host's type declarations from
+  2.1.299). A host that raised `turn.start` for a subagent without it would
+  have that run recorded as a main-loop turn.
 * Writes use `tabledata.insertAll` (the legacy streaming API) because the
   Storage Write API is gRPC only and `$.http.fetch` is HTTP with text bodies.
   insertAll's quotas and pricing apply, and its `insertId` dedup is best

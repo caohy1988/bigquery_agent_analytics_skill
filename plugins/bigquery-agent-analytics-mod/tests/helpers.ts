@@ -238,9 +238,11 @@ export async function runStep($: Engine, e: { turnId: string; index: number; mod
   return { chunks, result: step.value }
 }
 
+// In the order the host raises them: the settings-hook SessionStart comes
+// before session.start has read the environment and the host version.
 export async function startSession($: Engine): Promise<void> {
-  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' })
   await $.classic.SessionStart({ source: 'startup', session_id: SESSION_ID, model: 'example-model', cwd: '/work/my-repo' })
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' })
 }
 
 export const json = (text: string | null): Record<string, unknown> => (text === null ? {} : (JSON.parse(text) as Record<string, unknown>))
