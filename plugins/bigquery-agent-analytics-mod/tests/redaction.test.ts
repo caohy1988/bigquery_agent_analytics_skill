@@ -6,7 +6,7 @@
 
 import { expect, test } from 'claude-code/testing'
 
-import { OPTIONS, type Row, type World, deadLetterRows, setUp, startSession } from './helpers.ts'
+import { OPTIONS, type Row, type World, deadLetterFiles, deadLetterRows, setUp, startSession } from './helpers.ts'
 
 const CANARY = ['canary', 'value', 'r'.repeat(12)].join('-')
 const REFUSED = { status: 403, text: '{"error":{"message":"permission denied","errors":[{"reason":"accessDenied"}]}}' }
@@ -95,4 +95,58 @@ test('plural and numbered credential names: no value leaves as a tool argument',
   expect({ sent: leaked(sent), parked: leaked(parked) }).toEqual({ sent: [], parked: [] })
   // A listed key keeps its value.
   expect((JSON.parse(sent[0]?.content ?? '{}') as { args: { description: string } }).args.description).toBe('read api_keys')
+})
+
+// Round eight: credentials in key names. A key that is not on the list keeps
+// its name unless the name itself holds a credential shape, a URL with
+// user-info or a credential-named parameter, or a credential-named value:
+// then the name becomes `[REDACTED_KEY:n]`. Each probe goes through capture,
+// the background writer's request and the dead-letter file; the secret must
+// be in no byte of any request body or parked file.
+const KEY_SECRET = ['synthetic', 'key', 'secret', '0123456789'].join('-')
+const TOKEN_KEY = ['ya29', KEY_SECRET].join('.')
+const USERINFO_KEY = `https://${['demo', KEY_SECRET].join(':')}@example.invalid/report`
+const QUERY_KEY = `https://example.invalid/report?access_token=${KEY_SECRET}&page=2`
+const NAMED_KEY = `password=${KEY_SECRET}`
+
+const nowhere = (world: World): boolean[] => [world.fetches.some(f => f.body.includes(KEY_SECRET)), deadLetterFiles(world).some(([, text]) => text.includes(KEY_SECRET))]
+
+const KEY_FORMS: [string, () => { result: unknown; text?: string }][] = [
+  ['a credential-shaped key in a structured result', () => ({ result: { [TOKEN_KEY]: 'unused' } })],
+  ['a URL key with user-info', () => ({ result: { [USERINFO_KEY]: { status: 200 } } })],
+  ['a URL key with a credential-named parameter', () => ({ result: { [QUERY_KEY]: null } })],
+  ['a credential-named assignment as a key', () => ({ result: { [NAMED_KEY]: 1 } })],
+  ['a credential key nested under listed keys', () => ({ result: { content: [{ type: 'text', text: 'ok', [TOKEN_KEY]: true }] } })],
+  ['credential keys in JSON text', () => ({ result: { type: 'text' }, text: JSON.stringify({ [TOKEN_KEY]: 'unused', [USERINFO_KEY]: { status: 200 } }) })],
+]
+
+for (const [form, reply] of KEY_FORMS) {
+  test(`key names: ${form} leaves neither in the request nor on disk`, { options: OPTIONS }, async ($, on) => {
+    const world = setUp(on)
+    world.replies = [REFUSED]
+    world.toolReply = reply
+    await startSession($)
+    await $.tool.call({ tool: 'Read', file_path: 'report.json' })
+    await world.clock.advance(5000)
+    const { sent, parked } = rows(world, 'TOOL_COMPLETED')
+    expect([sent.length, parked.length]).toEqual([1, 1])
+    // Every request body and every parked byte, not only property values.
+    expect(nowhere(world)).toEqual([false, false])
+    // The entry is kept, under a placeholder name.
+    for (const row of [...sent, ...parked]) expect(row.content ?? '').toMatch(/\[REDACTED_KEY:1\]/)
+  })
+}
+
+test('key names: a credential-bearing argument name leaves neither in the request nor on disk', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  world.replies = [REFUSED]
+  await startSession($)
+  await $.tool.call({ tool: 'mcp__reports__fetch', [USERINFO_KEY]: 'unused', [TOKEN_KEY]: 'unused', description: 'fetch the report' })
+  await world.clock.advance(5000)
+  const { sent, parked } = rows(world, 'TOOL_STARTING')
+  expect([sent.length, parked.length]).toEqual([1, 1])
+  expect(nowhere(world)).toEqual([false, false])
+  for (const row of [...sent, ...parked]) {
+    expect((JSON.parse(row.content ?? '{}') as { args: Record<string, unknown> }).args).toEqual({ '[REDACTED_KEY:1]': '[REDACTED]', '[REDACTED_KEY:2]': '[REDACTED]', description: 'fetch the report' })
+  }
 })

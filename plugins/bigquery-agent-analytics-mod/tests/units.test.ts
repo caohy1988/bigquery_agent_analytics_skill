@@ -473,6 +473,38 @@ test('text past the scanned window is dropped and marked, never passed on unscan
   expect(stats.truncated).toBe(true)
 })
 
+test('a key name holding a credential becomes a numbered placeholder, never one of its object\'s own names', () => {
+  const token = ['ya29', 'u'.repeat(24)].join('.')
+  const userinfo = `https://${['demo', 'p'.repeat(16)].join(':')}@example.invalid/report`
+  const query = `https://example.invalid/r?sig=${'s'.repeat(16)}&page=2`
+  const stats = newStats()
+  const out = sanitize(
+    {
+      result: { [token]: 'unused', [userinfo]: { status: 200 }, [query]: null, plain: 'y', ['k'.repeat(30_000)]: 1 },
+      text: JSON.stringify({ [token]: { content: 'kept' } }),
+      response: { '[REDACTED_KEY:1]': 'a', [token]: 'b' },
+    },
+    limitsFor(16384),
+    stats,
+  )
+  expect(out).toEqual({
+    // In order: the token, the URLs, a plain name (kept), a name too long to
+    // scan.
+    result: { '[REDACTED_KEY:1]': '[REDACTED]', '[REDACTED_KEY:2]': '[REDACTED]', '[REDACTED_KEY:3]': null, plain: '[REDACTED]', '[REDACTED_KEY:4]': '[REDACTED]' },
+    // In JSON text too.
+    text: '{"[REDACTED_KEY:1]":"[REDACTED]"}',
+    // A name shaped like a placeholder is not trusted, and numbering skips
+    // the object's own names: two entries in, two out.
+    response: { '[REDACTED_KEY:2]': '[REDACTED]', '[REDACTED_KEY:3]': '[REDACTED]' },
+  })
+  const text = JSON.stringify(out)
+  expect([text.includes('u'.repeat(24)), text.includes('p'.repeat(16)), text.includes('s'.repeat(16))]).toEqual([false, false, false])
+  // Each name replaced counts as a redaction, as each value does: seven
+  // names (four in result, one in text, two in response) and seven values
+  // (null has nothing to hide).
+  expect(stats.redactions).toBe(14)
+})
+
 test('the row\'s own fields are listed keys; observed values under other keys are not kept', () => {
   const stats = newStats()
   const content = sanitize({ session_end: true, args: { session_end: true, cmd: 'ls' } }, limitsFor(16384), stats)

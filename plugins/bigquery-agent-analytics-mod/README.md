@@ -469,7 +469,11 @@ column. Treat the dataset like the transcripts it mirrors.
 
   So `api_keys`, `token2`, `headers`, `env` and most of an MCP tool's own
   arguments lose their values, credential or not. A kept value is still
-  checked: its text goes through the two rules below.
+  checked: its text goes through the two rules below. So is a name that is
+  not on the list: one that holds a credential shape, a URL with user-info
+  or a credential-named parameter, or a credential-named value
+  (`password=…`), or is too long to scan, becomes `[REDACTED_KEY:n]`,
+  numbered within its object and never one of that object's own names.
 * **JSON in text:** text that looks like JSON (an object; a list that opens
   with a value, whether an object, a list, a string, a number, `true`,
   `false` or `null`, or is empty; or a JSON-encoded string whose text opens
@@ -534,7 +538,7 @@ The test command runs the `tests/*.test.ts` files against the host CLI's own
 test kit, with no session, sign-in, GCP or network: `$.http.fetch`,
 `$.process.run`, `$.fs` and `$.store` are stubbed, and `mock.clock` drives the
 timers; the `$.fs` stubs measure files in UTF-8 bytes and refuse a file over
-4 MiB, as the host does. 127 tests cover the captured rows and their spans,
+4 MiB, as the host does. 135 tests cover the captured rows and their spans,
 subagent runs in the order the host raises them (one invocation and one
 trace for the turn, a span per run, a SubagentStart that comes late or never),
 the session-start row raised before or during `session.start`'s setup,
@@ -550,8 +554,10 @@ backfill, the exit spill and its time bound, multibyte rows held to the
 file limit in bytes, dry run,
 redaction (the allowlist at any depth and in JSON inside text, whole values
 of any type, JSON nested in strings to any encoding depth, JSON-looking text
-too long or broken to parse however it opens, credential names in text with
-their parts, endings, plural and numbered forms, URLs and webhook URLs,
+too long or broken to parse however it opens, key names that hold a
+credential (in nested objects, JSON text and tool arguments), credential
+names in text with their parts, endings, plural and numbered forms, URLs and
+webhook URLs,
 credential-named lines whatever they hold, values past 5,000 characters and
 past the scanned window, credentials across a length cap, every diagnostic
 sink, and each review probe through capture, delivery and the dead-letter

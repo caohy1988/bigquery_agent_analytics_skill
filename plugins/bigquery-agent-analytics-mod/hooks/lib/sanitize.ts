@@ -334,6 +334,16 @@ function dropJsonText(text: string, stats: SanitizeStats, state: WalkState): str
   return marker
 }
 
+// A key name that is not on the list is copied only when the free-text
+// rules find nothing in it. One holding a credential shape, a URL with
+// user-info, a credential-named parameter or a credential-named value, or
+// one too long to scan within the budget, gives way to `[REDACTED_KEY:n]`:
+// numbered in order within its object, never one of that object's own
+// names, so no entry overwrites another.
+function placeholderNeeded(key: string, limits: Limits): boolean {
+  return key.length > limits.budgetChars + REDACT_MARGIN || redactText(key, newStats()) !== key
+}
+
 // JSON found in a string: walked under the same allowlist, then encoded
 // again. Past the depth budget it is dropped, not passed on unscanned.
 function walkJsonText(parsed: unknown, depth: number, allowed: number, limits: Limits, stats: SanitizeStats, state: WalkState): string {
@@ -413,6 +423,8 @@ function walk(value: unknown, depth: number, limits: Limits, stats: SanitizeStat
     }
     const out: { [key: string]: JsonValue } = {}
     const keys = Object.keys(obj)
+    const own = new Set(keys)
+    let placeholders = 0
     for (let i = 0; i < keys.length; i += 1) {
       const key = keys[i] as string
       if (i >= limits.maxKeys || state.remaining <= 0) {
@@ -422,22 +434,33 @@ function walk(value: unknown, depth: number, limits: Limits, stats: SanitizeStat
       }
       const raw = (obj as Record<string, unknown>)[key]
       if (raw === undefined || typeof raw === 'function' || typeof raw === 'symbol') continue
-      state.remaining -= jsonLength(key) + 2
+      // Decided by the name as it came; a listed name is made of listed
+      // words alone and is copied as it is.
+      const listed = isListedKey(key)
+      let name = key
+      if (!listed && placeholderNeeded(key, limits)) {
+        do {
+          placeholders += 1
+          name = `[REDACTED_KEY:${placeholders}]`
+        } while (own.has(name))
+        stats.redactions += 1
+      }
+      state.remaining -= jsonLength(name) + 2
       // Under a key that is not listed the whole value goes, whatever its
       // type; null has nothing to hide.
-      if (!isListedKey(key)) {
+      if (!listed) {
         if (raw === null) {
           state.remaining -= 4
-          out[key] = null
+          out[name] = null
         } else {
           stats.redactions += 1
           state.remaining -= 12
-          out[key] = MARKER
+          out[name] = MARKER
         }
         continue
       }
       const item = walk(raw, depth + 1, limits, stats, state)
-      if (item !== undefined) out[key] = item
+      if (item !== undefined) out[name] = item
     }
     return out
   } finally {
