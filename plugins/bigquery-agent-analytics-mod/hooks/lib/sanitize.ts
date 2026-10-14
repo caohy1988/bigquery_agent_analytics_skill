@@ -1,7 +1,15 @@
-// Bounded copies of event payloads: secrets redacted, long text cut, deep or
-// wide structures trimmed. Runs on the hot path, so its work is bounded by
-// the character budget rather than by the size of what the host CLI passed in
-// (a Write of a 2 MB file costs the same as one of 20 KB).
+// Bounded, redacted copies of what the agent, the model and its tools
+// produced. Redaction is structural where structure exists: any value under a
+// credential-named key goes whole, JSON inside strings is parsed and redacted
+// the same way, URLs lose their user-info, credential-named parameters and,
+// for webhook URLs, everything. Free text is scrubbed of well-known credential
+// shapes and of whatever follows a credential name and a separator on its line
+// (best effort: text has no structure to go by).
+//
+// Runs on the hot path, so its work is bounded by the character budget rather
+// than by the size of what the host CLI passed in (a Write of a 2 MB file costs
+// the same as one of 20 KB). Text past a budget is dropped and marked, never
+// passed on unscanned.
 
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue }
 
@@ -35,23 +43,89 @@ export const limitsFor = (maxPayloadChars: number): Limits => {
   return { budgetChars: budget, maxStringChars: budget, maxDepth: 12, maxKeys: 200, maxItems: 200 }
 }
 
-// A key names a credential when, with case and punctuation removed, it
-// contains one of these stems (`api_key`, `X-Api-Key`, `openaiApiKey` and
-// `my_api_key` all contain `apikey`), ends in `token` (`access_token`,
-// `X-Amz-Security-Token`; `max_tokens` does not, and its values are counts
-// anyway), is one of the short names below (too common inside other words to
-// match as stems), or has ADK's `temp:` prefix.
-const SENSITIVE_STEMS = ['password', 'passwd', 'passphrase', 'secret', 'apikey', 'accesskey', 'privatekey', 'signingkey', 'authorization', 'credential', 'signature', 'cookie']
-const SENSITIVE_NAMES = new Set(['auth', 'sig', 'jwt', 'bearer'])
+const MARKER = '[REDACTED]'
 
-export const isSensitiveKey = (key: string): boolean => {
-  if (key.toLowerCase().startsWith('temp:')) return true
-  const name = key.toLowerCase().replace(/[^a-z0-9]/g, '')
-  return SENSITIVE_NAMES.has(name) || name.endsWith('token') || SENSITIVE_STEMS.some(stem => name.includes(stem))
+// How far past a cut the text is scanned, so a credential that starts before
+// the cut is matched whole; the scanned text past the cut is dropped.
+const REDACT_MARGIN = 8192
+
+// ---- credential names --------------------------------------------------------
+
+// A key or name is a credential's when one of its parts, split on punctuation
+// and camelCase (`db_password`, `X-Api-Key`, `sessionCookie`, `MY_PWD`), is one
+// of these words...
+const SENSITIVE_WORDS = new Set([
+  'pass',
+  'passwd',
+  'password',
+  'passwords',
+  'passphrase',
+  'pwd',
+  'secret',
+  'secrets',
+  'token',
+  'auth',
+  'authorization',
+  'cookie',
+  'cookies',
+  'session',
+  'key',
+  'apikey',
+  'credential',
+  'credentials',
+  'private',
+  'bearer',
+  'jwt',
+  'sig',
+  'signature',
+])
+// ...ends with one of these (`rootpwd`, `accesstoken`, `usersession`)...
+const SENSITIVE_ENDINGS = [
+  'passwd',
+  'password',
+  'passphrase',
+  'pwd',
+  'secret',
+  'token',
+  'authorization',
+  'cookie',
+  'session',
+  'credential',
+  'credentials',
+  'bearer',
+  'jwt',
+  'signature',
+  'apikey',
+  'accesskey',
+  'privatekey',
+  'secretkey',
+  'signingkey',
+]
+// ...or contains one of these (`passwordhash`, `privatekeypem`). Short words
+// (`pass`, `key`, `auth`, `sig`) match only as a whole part: `bypass`,
+// `monkey`, `oauth` and `signal` are not credential names.
+const SENSITIVE_STEMS = ['password', 'passwd', 'apikey', 'accesskey', 'privatekey', 'secretkey', 'signingkey', 'credential']
+
+const nameParts = (name: string): string[] =>
+  name
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(part => part !== '')
+
+export const isSensitiveKey = (name: string): boolean => {
+  // ADK's per-invocation state.
+  if (name.toLowerCase().startsWith('temp:')) return true
+  return nameParts(name).some(
+    part => SENSITIVE_WORDS.has(part) || SENSITIVE_ENDINGS.some(end => part.endsWith(end)) || SENSITIVE_STEMS.some(stem => part.includes(stem)),
+  )
 }
 
-// Well-known credential shapes in free text. Every pattern is linear: no
-// unbounded quantifier sits next to another that can match the same text.
+// ---- free text ---------------------------------------------------------------
+
+// Well-known credential shapes. Every pattern is linear: no unbounded
+// quantifier sits next to another that can match the same text.
 const PATTERNS: readonly (readonly [RegExp, string])[] = [
   [/-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]{0,40}PRIVATE KEY-----|$)/g, '[REDACTED:private-key]'],
   [/\bsk-ant-[A-Za-z0-9_-]{16,}/g, '[REDACTED:api-key]'],
@@ -66,86 +140,92 @@ const PATTERNS: readonly (readonly [RegExp, string])[] = [
   [/\b[rs]k_(?:live|test)_[A-Za-z0-9]{16,}/g, '[REDACTED:stripe-key]'],
   [/\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, '[REDACTED:jwt]'],
   [/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{12,}/gi, '$1 [REDACTED]'],
-  // user:password@ inside a URL
-  [/(\b[a-z][a-z0-9+.-]{0,20}:\/\/[^\s:@/]{1,100}:)[^\s@/]{1,200}@/gi, '$1[REDACTED]@'],
-  // Signed-link and token query parameters (`?X-Goog-Signature=…`,
-  // `&X-Amz-Security-Token=…`, `&sig=…`, `?access_token=…`): the value goes,
-  // the name stays.
-  [
-    /([?&](?:[A-Za-z0-9_.-]{0,40}?(?:signature|credential|token|secret|password|passwd|api[_-]?key)|sig|key)=)(?!\[REDACTED)(?![0-9]+(?:[&#\s"']|$))[^&#\s"'<>]{3,}/gi,
-    '$1[REDACTED]',
-  ],
 ]
 
-// `key: value`, `key=value`, `"key": "value"` in text: key and separator
-// only. Whether the key names a credential is isSensitiveKey's call, the same
-// as for structured keys, and the value's extent is found by `valueEnd`.
-const ASSIGNMENT = /(["']?)([A-Za-z][A-Za-z0-9_.-]{0,63})\1[ \t]{0,5}([:=])[ \t]{0,5}/g
-// Unquoted values that stay: counts, booleans and null (`max_tokens: 1024`).
-const KEPT_VALUE = /^(?:-?[0-9][0-9.]*|true|false|null)$/
-const VALUE_CHARS = 4096
+// A URL: scheme, `://`, then everything up to a space, a quote, a bracket or
+// a backslash (where a URL inside escaped JSON ends).
+const URL_IN_TEXT = /\b[a-z][a-z0-9+.-]{1,20}:\/\/[^\s"'<>\\`]+/gi
+const URL_TRAILER = /[.,;:!?)\]}]+$/
+// Incoming-webhook URLs, whose path is the credential: removed whole.
+const WEBHOOK_URLS: readonly RegExp[] = [
+  /^https?:\/\/hooks\.slack\.com\/(?:services|workflows|triggers)\//i,
+  /^https?:\/\/(?:[a-z0-9-]+\.)?discord(?:app)?\.com\/api\/(?:v\d+\/)?webhooks\//i,
+  /^https?:\/\/[a-z0-9-]+\.webhook\.office\.com\//i,
+  /^https?:\/\/outlook\.office(?:365)?\.com\/webhook\//i,
+]
 
-// Where the value starting at `start` ends. A quoted value runs to its closing
-// quote, an object or list to its closing bracket; an unquoted value after
-// `=` is one word, after `:` the rest of the line up to a separator that ends
-// an inline value (all of it for a cookie header).
-function valueEnd(text: string, start: number, separator: string, key: string): number {
-  const limit = Math.min(text.length, start + VALUE_CHARS)
-  const first = text[start]
-  if (first === '"' || first === "'") {
-    for (let i = start + 1; i < limit; i += 1) {
-      const ch = text[i]
-      if (ch === '\\') i += 1
-      else if (ch === first) return i + 1
-      else if (ch === '\n' || ch === '\r') return i
-    }
-    return limit
+const decodeName = (name: string): string => {
+  try {
+    return decodeURIComponent(name.replace(/\+/g, ' '))
+  } catch {
+    return name
   }
-  if (first === '{' || first === '[') {
-    let depth = 0
-    let quote: string | null = null
-    for (let i = start; i < limit; i += 1) {
-      const ch = text[i]
-      if (quote !== null) {
-        if (ch === '\\') i += 1
-        else if (ch === quote) quote = null
-      } else if (ch === '"' || ch === "'") quote = ch
-      else if (ch === '{' || ch === '[') depth += 1
-      else if (ch === '}' || ch === ']') {
-        depth -= 1
-        if (depth === 0) return i + 1
-      }
-    }
-    return limit
-  }
-  const stop = separator === '=' ? /[\s"',;&]/ : /cookie/i.test(key) ? /[\r\n]/ : /[\r\n"',;})\]]/
-  for (let i = start; i < limit; i += 1) if (stop.test(text[i] as string)) return i
-  return limit
 }
 
-function redactAssignments(text: string, stats: SanitizeStats): string {
-  ASSIGNMENT.lastIndex = 0
+function redactUrl(url: string, stats: SanitizeStats): string {
+  if (WEBHOOK_URLS.some(pattern => pattern.test(url))) {
+    stats.redactions += 1
+    return '[REDACTED:webhook-url]'
+  }
+  // `user:password@` (or a bare token) before the host.
+  const out = url.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^/?#@]+@/i, (_: string, scheme: string) => {
+    stats.redactions += 1
+    return `${scheme}${MARKER}@`
+  })
+  // Query and fragment parameters with a credential's name.
+  return out.replace(/([?&#;])([^=&#;?/]+)=([^&#;]*)/g, (whole: string, separator: string, name: string, value: string) => {
+    if (value === '' || !isSensitiveKey(decodeName(name))) return whole
+    if (value !== MARKER) stats.redactions += 1
+    return `${separator}${name}=${MARKER}`
+  })
+}
+
+function redactUrls(text: string, stats: SanitizeStats): string {
+  URL_IN_TEXT.lastIndex = 0
+  if (!URL_IN_TEXT.test(text)) return text
+  URL_IN_TEXT.lastIndex = 0
+  return text.replace(URL_IN_TEXT, (match: string) => {
+    const trailer = URL_TRAILER.exec(match)?.[0] ?? ''
+    return redactUrl(match.slice(0, match.length - trailer.length), stats) + trailer
+  })
+}
+
+// A name and a separator: `name: value` and `name=value` (a header, a YAML or
+// .env line, a JSON key, an assignment), the name quoted or not, its quote
+// escaped or not.
+const NAMED_VALUE = /(^|[^A-Za-z0-9_.-])([A-Za-z_][A-Za-z0-9_.-]{0,99})(?:\\*["'])?[ \t]*([:=])[ \t]*/g
+
+// After a credential name, the value goes: to the end of its line, whatever is
+// in it (quotes, brackets and redaction markers are not trusted to end it),
+// or, for a query-style `?name=` / `&name=`, to the next `&`, `#`, `;` or
+// space.
+function redactNamedValues(text: string, stats: SanitizeStats): string {
+  NAMED_VALUE.lastIndex = 0
   let out = ''
   let copied = 0
-  for (let m = ASSIGNMENT.exec(text); m !== null; m = ASSIGNMENT.exec(text)) {
+  for (let m = NAMED_VALUE.exec(text); m !== null; m = NAMED_VALUE.exec(text)) {
     if (!isSensitiveKey(m[2] as string)) continue
     const start = m.index + m[0].length
-    const end = valueEnd(text, start, m[3] as string, m[2] as string)
+    let end: number
+    if (m[3] === '=' && /^[?&#;]$/.test(m[1] as string)) {
+      const stop = /[&#;\s]/.exec(text.slice(start))
+      end = stop === null ? text.length : start + stop.index
+    } else {
+      end = text.indexOf('\n', start)
+      if (end === -1) end = text.length
+      if (end > start && text[end - 1] === '\r') end -= 1
+    }
     const value = text.slice(start, end)
-    const first = value[0] ?? ''
-    const quoted = first === '"' || first === "'"
-    const nested = first === '{' || first === '['
-    if (value.trim() === '' || value.includes('[REDACTED') || (!quoted && !nested && KEPT_VALUE.test(value.trim()))) continue
-    const closed = quoted && value.length > 1 && value.endsWith(first)
-    const replacement = quoted ? `${first}[REDACTED]${closed ? first : ''}` : nested ? '"[REDACTED]"' : '[REDACTED]'
-    out += text.slice(copied, start) + replacement
+    if (value.trim() === '') continue
+    out += text.slice(copied, start) + MARKER
     copied = end
-    ASSIGNMENT.lastIndex = end
-    stats.redactions += 1
+    NAMED_VALUE.lastIndex = end
+    if (value !== MARKER) stats.redactions += 1
   }
   return copied === 0 ? text : out + text.slice(copied)
 }
 
+// The free-text rules: credential shapes, URLs, then credential-named values.
 export function redactText(input: string, stats: SanitizeStats): string {
   let out = input
   for (const [pattern, replacement] of PATTERNS) {
@@ -158,18 +238,27 @@ export function redactText(input: string, stats: SanitizeStats): string {
       return replacement.replace(/\$(\d)/g, (_, n: string) => groups[Number(n) - 1] ?? '')
     })
   }
-  return redactAssignments(out, stats)
+  out = redactUrls(out, stats)
+  return redactNamedValues(out, stats)
 }
 
 // Error text, dead-letter reasons and status lines: redacted first, then held
 // to `maxChars`, so a cut can never leave the start of a credential that, cut
 // short, no longer matches its pattern.
 export function redactDiagnostic(text: string, maxChars: number): string {
-  const window = text.length > maxChars + 4096 ? text.slice(0, maxChars + 4096) : text
+  const window = text.length > maxChars + REDACT_MARGIN ? text.slice(0, maxChars + REDACT_MARGIN) : text
   return cutAt(redactText(window, newStats()), maxChars)
 }
 
+// ---- bounded copies ------------------------------------------------------------
+
 type WalkState = { remaining: number; seen: WeakSet<object> }
+
+// Whose keys the walk checks: `observed` checks every key (data the agent, the
+// model or a tool produced), `envelope` none of this object's own keys but
+// every key below them (a row's `content`), `schema` none at all (the row's
+// `attributes`, written by this mod; their text still gets the text rules).
+type Trust = 'observed' | 'envelope' | 'schema'
 
 // Length of the marker a cut string ends with.
 const MARKER_RESERVE = 40
@@ -184,33 +273,70 @@ export const cutAt = (text: string, end: number): string => {
   return cut
 }
 
-// `input` redacted and, past `maxJson` characters of serialized JSON, cut
-// and marked. Returns the text and what it costs serialized. Redacts a
-// little past the cut, so a secret straddling it is not left half visible.
-function clipString(input: string, maxJson: number, stats: SanitizeStats): { text: string; cost: number } {
-  const window = input.length > maxJson + 256 ? input.slice(0, maxJson + 256) : input
-  const redacted = redactText(window, stats)
-  if (window.length === input.length) {
-    const cost = jsonLength(redacted)
-    if (cost <= maxJson) return { text: redacted, cost }
-  }
+// Already-redacted `text`, cut to `maxJson` characters of serialized JSON and
+// marked.
+function cutToFit(text: string, originalLength: number, maxJson: number, stats: SanitizeStats): { text: string; cost: number } {
   stats.truncated = true
   const room = Math.max(0, maxJson - MARKER_RESERVE)
-  let keep = Math.min(redacted.length, room)
-  let cut = cutAt(redacted, keep)
+  let keep = Math.min(text.length, room)
+  let cut = cutAt(text, keep)
   let cost = jsonLength(cut)
   // Escapes (quotes, newlines, control characters) make JSON longer than
   // the text: shrink until the serialized form fits.
   for (let i = 0; i < 8 && cost > room && keep > 0; i += 1) {
     keep = Math.max(0, Math.floor((keep * room) / cost) - 1)
-    cut = cutAt(redacted, keep)
+    cut = cutAt(text, keep)
     cost = jsonLength(cut)
   }
-  const text = `${cut}...[TRUNCATED ${input.length - cut.length} chars]`
-  return { text, cost: jsonLength(text) }
+  const out = `${cut}...[TRUNCATED ${Math.max(0, originalLength - cut.length)} chars]`
+  return { text: out, cost: jsonLength(out) }
 }
 
-function walk(value: unknown, depth: number, limits: Limits, stats: SanitizeStats, state: WalkState): JsonValue | undefined {
+// `input` redacted by the text rules and, past `maxJson` characters of
+// serialized JSON, cut and marked. Only a window reaching REDACT_MARGIN past
+// the cut is scanned; the rest of a longer input is dropped, not passed on.
+function clipString(input: string, maxJson: number, stats: SanitizeStats): { text: string; cost: number } {
+  const window = input.length > maxJson + REDACT_MARGIN ? input.slice(0, maxJson + REDACT_MARGIN) : input
+  const redacted = redactText(window, stats)
+  if (window.length === input.length) {
+    const cost = jsonLength(redacted)
+    if (cost <= maxJson) return { text: redacted, cost }
+  }
+  return cutToFit(redacted, input.length, maxJson, stats)
+}
+
+// Text that is JSON (an object, a list, or a JSON-encoded string, which may
+// hold JSON in turn), when it is short enough to be scanned whole: parsed, so
+// that it is redacted by its structure.
+const JSON_START = /^\s*["[{]/
+
+function parseJsonText(text: string, limits: Limits): { value: unknown } | null {
+  if (text.length > limits.budgetChars + REDACT_MARGIN || !JSON_START.test(text)) return null
+  try {
+    return { value: JSON.parse(text) as unknown }
+  } catch {
+    return null
+  }
+}
+
+// JSON found in a string: walked as observed data, then encoded again. Past
+// the depth budget it is dropped, not passed on unscanned.
+function walkJsonText(parsed: unknown, depth: number, allowed: number, limits: Limits, stats: SanitizeStats, state: WalkState): string {
+  if (depth >= limits.maxDepth) {
+    stats.truncated = true
+    const text = '[TRUNCATED: nested JSON too deep]'
+    state.remaining -= jsonLength(text)
+    return text
+  }
+  // Encoding the result again escapes it: give the walk half the room.
+  const inner = walk(parsed, depth + 1, limits, stats, { remaining: Math.floor(allowed / 2), seen: state.seen }, 'observed')
+  const encoded = JSON.stringify(inner === undefined ? null : inner)
+  const fitted = jsonLength(encoded) <= allowed ? { text: encoded, cost: jsonLength(encoded) } : cutToFit(encoded, encoded.length, allowed, stats)
+  state.remaining -= fitted.cost
+  return fitted.text
+}
+
+function walk(value: unknown, depth: number, limits: Limits, stats: SanitizeStats, state: WalkState, trust: Trust): JsonValue | undefined {
   if (value === null) {
     state.remaining -= 4
     return null
@@ -218,6 +344,12 @@ function walk(value: unknown, depth: number, limits: Limits, stats: SanitizeStat
   switch (typeof value) {
     case 'string': {
       const allowed = Math.max(0, Math.min(limits.maxStringChars, state.remaining))
+      if (trust !== 'schema') {
+        const parsed = parseJsonText(value, limits)
+        if (parsed !== null && parsed.value !== null && (typeof parsed.value === 'object' || typeof parsed.value === 'string')) {
+          return walkJsonText(parsed.value, depth, allowed, limits, stats, state)
+        }
+      }
       const { text, cost } = clipString(value, allowed, stats)
       state.remaining -= cost
       return text
@@ -249,6 +381,7 @@ function walk(value: unknown, depth: number, limits: Limits, stats: SanitizeStat
   if (ArrayBuffer.isView(obj)) return `[binary ${obj.byteLength} bytes]`
   if (obj instanceof ArrayBuffer) return `[binary ${obj.byteLength} bytes]`
   if (obj instanceof Date) return Number.isNaN(obj.getTime()) ? null : obj.toISOString()
+  const below: Trust = trust === 'schema' ? 'schema' : 'observed'
   state.seen.add(obj)
   state.remaining -= 2
   try {
@@ -261,7 +394,7 @@ function walk(value: unknown, depth: number, limits: Limits, stats: SanitizeStat
           break
         }
         state.remaining -= 1
-        const item = walk(obj[i], depth + 1, limits, stats, state)
+        const item = walk(obj[i], depth + 1, limits, stats, state, below)
         out.push(item === undefined ? null : item)
       }
       return out
@@ -278,13 +411,15 @@ function walk(value: unknown, depth: number, limits: Limits, stats: SanitizeStat
       const raw = (obj as Record<string, unknown>)[key]
       if (raw === undefined || typeof raw === 'function' || typeof raw === 'symbol') continue
       state.remaining -= jsonLength(key) + 2
-      if (isSensitiveKey(key) && raw !== null && typeof raw !== 'number' && typeof raw !== 'boolean') {
+      // Under a credential name the whole value goes, whatever its type;
+      // null has nothing to hide.
+      if (trust === 'observed' && raw !== null && isSensitiveKey(key)) {
         stats.redactions += 1
         state.remaining -= 12
-        out[key] = '[REDACTED]'
+        out[key] = MARKER
         continue
       }
-      const item = walk(raw, depth + 1, limits, stats, state)
+      const item = walk(raw, depth + 1, limits, stats, state, below)
       if (item !== undefined) out[key] = item
     }
     return out
@@ -293,11 +428,23 @@ function walk(value: unknown, depth: number, limits: Limits, stats: SanitizeStat
   }
 }
 
-// A JSON-safe, bounded, redacted copy of `value`.
-export function sanitize(value: unknown, limits: Limits, stats: SanitizeStats): JsonValue {
-  const out = walk(value, 0, limits, stats, { remaining: limits.budgetChars, seen: new WeakSet() })
-  return out === undefined ? null : out
-}
+const sanitizeAs = (trust: Trust) =>
+  (value: unknown, limits: Limits, stats: SanitizeStats): JsonValue => {
+    const out = walk(value, 0, limits, stats, { remaining: limits.budgetChars, seen: new WeakSet() }, trust)
+    return out === undefined ? null : out
+  }
+
+// A JSON-safe, bounded, redacted copy of observed data: every key is checked.
+export const sanitize = sanitizeAs('observed')
+
+// A row's `content`: its own top-level keys (`tool`, `args`, `result`,
+// `session_end`, ...) are the row's fields, so they are not checked; every
+// key in the observed data under them is.
+export const sanitizeContent = sanitizeAs('envelope')
+
+// A row's `attributes`, written by this mod (ids, model, token counts, session
+// metadata): no key is checked, text values still get the text rules.
+export const sanitizeAttributes = sanitizeAs('schema')
 
 // Serializes a sanitized value as the text of a BigQuery JSON column, held to
 // `maxChars`. Past it the column becomes a valid JSON object holding a prefix

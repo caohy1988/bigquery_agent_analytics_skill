@@ -634,3 +634,73 @@ test('a replayed file whose answer is malformed stays as it was', { options: OPT
   expect(world.files.get(path)).toBe(text)
   expect(await statusText($)).toMatch(/last backfill \(auto, .*\): 1 file\(s\), 0 rows sent, 1 left; stopped: HTTP 200 with a response that is not a valid insertAll answer/)
 })
+
+// The round-three probes, end to end: each payload reaches the mod as a tool
+// result (its text and its structure), BigQuery refuses the batch, so the row
+// goes out once in the request and is then parked on disk. The canary, built
+// at run time, must be in neither.
+const CANARY = ['canary', 'value', 'q'.repeat(12)].join('-')
+const SECRET_NUM = Number(['9876', '54321'].join(''))
+const SLACK_HOOK = `https://${['hooks', 'slack', 'com'].join('.')}/${['services', 'T0000', 'B0000', CANARY].join('/')}`
+const DISCORD_HOOK = `https://${['discord', 'com'].join('.')}/api/${['webhooks', '1234567890', CANARY].join('/')}`
+const OFFICE_HOOK = `https://contoso.${['webhook', 'office', 'com'].join('.')}/webhookb2/${CANARY}`
+const REFUSED = { status: 403, text: '{"error":{"message":"permission denied","errors":[{"reason":"accessDenied"}]}}' }
+
+const PROBES: [string, string | Record<string, unknown>, string][] = [
+  ['a cookie header with a redaction marker inside it', `Cookie: session=${CANARY}; csrf=[REDACTED]`, CANARY],
+  ['a credentials list mixing a marker and a secret', { credentials: ['[REDACTED]', CANARY] }, CANARY],
+  ['a password longer than 5,000 characters', { password: `${'x'.repeat(5000)}${CANARY}` }, CANARY],
+  ['a header value longer than 5,000 characters', `Authorization: ${'x'.repeat(5000)}${CANARY}`, CANARY],
+  ['a password in JSON inside JSON', { text: JSON.stringify({ password: CANARY }) }, CANARY],
+  ['a password three encodings deep', { a: JSON.stringify({ b: JSON.stringify({ c: JSON.stringify({ pwd: CANARY }) }) }) }, CANARY],
+  ['pass and pwd keys', { pass: CANARY, db: { root_pwd: CANARY, MY_PASS: CANARY } }, CANARY],
+  ['pass and pwd assignments in text', `export MY_PWD=${CANARY}\nPASS=${CANARY}\nmode=fast`, CANARY],
+  ['a numeric secret', { password: SECRET_NUM, pin: 1 }, String(SECRET_NUM)],
+  ['a numeric secret in text', `password: ${SECRET_NUM}`, String(SECRET_NUM)],
+  ['webhook URLs', `notify ${SLACK_HOOK} and ${DISCORD_HOOK} or ${OFFICE_HOOK}`, CANARY],
+  ['a URL with user-info and a signed parameter', `fetch https://${['user', CANARY].join(':')}@db.example.test/x?sig=${CANARY}&page=2`, CANARY],
+]
+
+for (const [label, payload, secret] of PROBES) {
+  test(`${label}: neither sent nor parked`, { options: OPTIONS }, async ($, on) => {
+    const world = setUp(on)
+    const text = typeof payload === 'string' ? payload : JSON.stringify(payload)
+    world.toolReply = () => ({ result: payload, text })
+    world.replies = [REFUSED]
+    await startSession($)
+    await $.tool.call({ tool: 'Read', file_path: 'synthetic.txt' })
+    await world.clock.advance(5000)
+    const sent = world.sentRows().filter(r => r.event_type === 'TOOL_COMPLETED')
+    const parked = deadLetterRows(world).filter(r => r.event_type === 'TOOL_COMPLETED')
+    expect(sent.length).toBe(1)
+    expect(parked.length).toBe(1)
+    expect(JSON.stringify(sent).includes(secret)).toBe(false)
+    expect(JSON.stringify(parked).includes(secret)).toBe(false)
+    expect(sent[0]?.content ?? '').toMatch(/REDACTED/)
+  })
+}
+
+test('the same probes as tool input: every credential-named argument goes whole', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  world.replies = [REFUSED]
+  await startSession($)
+  await $.tool.call({ tool: 'mcp__deploy__run', api_key: SECRET_NUM, env: { DB_PWD: CANARY, cookies: ['[REDACTED]', CANARY] }, note: JSON.stringify({ token: CANARY }), target: 'prod' })
+  await world.clock.advance(5000)
+  const [sent] = world.sentRows().filter(r => r.event_type === 'TOOL_STARTING')
+  const [parked] = deadLetterRows(world).filter(r => r.event_type === 'TOOL_STARTING')
+  for (const row of [sent, parked]) {
+    const text = JSON.stringify(row)
+    expect(text.includes(CANARY) || text.includes(String(SECRET_NUM))).toBe(false)
+    // What is not a credential is kept.
+    expect((JSON.parse(row?.content ?? '{}') as { args: { target: string } }).args.target).toBe('prod')
+  }
+})
+
+test('a credential in BigQuery error text goes whole even next to a redaction marker', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  world.replies = [{ status: 403, text: JSON.stringify({ error: { message: `denied for Cookie: session=${CANARY}; csrf=[REDACTED]\npassword: ${'x'.repeat(5000)}${CANARY}`, errors: [{ reason: 'accessDenied' }] } }) }]
+  await startSession($)
+  await world.clock.advance(5000)
+  expect(deadLetterFiles(world).length).toBe(1)
+  for (const text of await everySink($, world)) expect(text.includes(CANARY)).toBe(false)
+})

@@ -9,7 +9,7 @@ import { destinationDir, resolveConfig, splitArgv } from '../hooks/lib/config.ts
 import { FILE_PATTERN, MAX_FILE_BYTES, encodeLines, fileName, kindOf, parseFile } from '../hooks/lib/deadletter.ts'
 import { BoundedQueue } from '../hooks/lib/queue.ts'
 import { buildRow, utf8Length } from '../hooks/lib/rows.ts'
-import { limitsFor, newStats, redactDiagnostic, redactText, sanitize, toJsonColumn } from '../hooks/lib/sanitize.ts'
+import { isSensitiveKey, limitsFor, newStats, redactDiagnostic, redactText, sanitize, sanitizeAttributes, sanitizeContent, toJsonColumn } from '../hooks/lib/sanitize.ts'
 
 import { utf8Bytes } from './helpers.ts'
 
@@ -38,10 +38,10 @@ test('well-known credential shapes are redacted', () => {
     [`slack ${fake(['xo', 'xb-'], 'x', 20)}`, /\[REDACTED:slack-token\]/],
     [`stripe ${fake(['sk', '_live_'], 'x', 24)}`, /\[REDACTED:stripe-key\]/],
     [`jwt ${[fake(['ey', 'J'], 'x', 16), fake(['ey', 'J'], 'x', 16), 'x'.repeat(16)].join('.')}`, /\[REDACTED:jwt\]/],
-    [`curl -H "Authorization: Bearer ${'x'.repeat(20)}"`, /Bearer \[REDACTED\]/],
-    [`postgres://admin:${'x'.repeat(14)}@db.internal:5432/app`, /postgres:\/\/admin:\[REDACTED\]@db/],
+    [`curl -H "Authorization: Bearer ${'x'.repeat(20)}"`, /Authorization: \[REDACTED\]$/],
+    [`postgres://admin:${'x'.repeat(14)}@db.internal:5432/app`, /^postgres:\/\/\[REDACTED\]@db\.internal:5432\/app$/],
     [`export DB_PASSWORD=${'x'.repeat(14)}`, /DB_PASSWORD=\[REDACTED\]/],
-    [`{"client_secret": "${'x'.repeat(12)}"}`, /"client_secret": "\[REDACTED\]"/],
+    [`{"client_secret": "${'x'.repeat(12)}"}`, /^\{"client_secret": \[REDACTED\]$/],
     [`GITHUB_TOKEN=${'x'.repeat(16)}`, /GITHUB_TOKEN=\[REDACTED\]/],
     [[`-----BEGIN ${pemLabel}-----`, 'MIIEow', 'abc', `-----END ${pemLabel}-----`].join('\n'), /^\[REDACTED:private-key\]$/],
   ]
@@ -66,10 +66,21 @@ test('ordinary text, token counts and hashes are left alone', () => {
   for (const input of keep) expect(redact(input)).toEqual({ out: input, count: 0 })
 })
 
-test('credential keys are redacted in structured payloads; numbers are not', () => {
+test('credential keys are redacted in structured payloads, whole, whatever the value', () => {
   const stats = newStats()
   const out = sanitize(
-    { api_key: 'abc', headers: { Authorization: 'Bearer x', 'X-Api-Key': 'k' }, token: 'zzz', max_tokens: 5, password: null, 'temp:scratch': 'x' },
+    {
+      api_key: 'abc',
+      headers: { Authorization: 'Bearer x', 'X-Api-Key': 'k' },
+      token: 'zzz',
+      password: null,
+      'temp:scratch': 'x',
+      pwd: 1234,
+      secret: true,
+      credentials: ['[REDACTED]', 'opaque'],
+      session: { id: 'abc', user: 'u' },
+      max_tokens: 5,
+    },
     limitsFor(16384),
     stats,
   )
@@ -77,13 +88,27 @@ test('credential keys are redacted in structured payloads; numbers are not', () 
     api_key: '[REDACTED]',
     headers: { Authorization: '[REDACTED]', 'X-Api-Key': '[REDACTED]' },
     token: '[REDACTED]',
-    max_tokens: 5,
+    // Nothing to hide in null.
     password: null,
     'temp:scratch': '[REDACTED]',
+    pwd: '[REDACTED]',
+    secret: '[REDACTED]',
+    credentials: '[REDACTED]',
+    session: '[REDACTED]',
+    max_tokens: 5,
   })
-  expect(stats.redactions).toBe(5)
+  expect(stats.redactions).toBe(9)
   // Redaction alone is not truncation (as in the BQAA plugin).
   expect(stats.truncated).toBe(false)
+})
+
+test('credential names: components, endings and stems', () => {
+  for (const name of ['pass', 'PASS', 'MY_PWD', 'db_pwd', 'rootpwd', 'password', 'dbPassword', 'passwordHash', 'passwd', 'passphrase', 'secret', 'clientSecret', 'token', 'accessToken', 'X-Amz-Security-Token', 'accesstoken', 'auth', 'Authorization', 'Proxy-Authorization', 'cookie', 'Set-Cookie', 'cookies', 'sessionCookie', 'session', 'session_id', 'key', 'api_key', 'X-Api-Key', 'APIKey', 'apikey', 'privatekey', 'credential', 'credentials', 'private', 'private_key', 'bearer', 'jwt', 'sig', 'signature', 'temp:scratch']) {
+    expect([name, isSensitiveKey(name)]).toEqual([name, true])
+  }
+  for (const name of ['max_tokens', 'inputTokens', 'prompt_tokens', 'tokenizer', 'author', 'oauth_client_id', 'monkey', 'keyboard', 'signal', 'file_path', 'command', 'description', 'content', 'role', 'url', 'page']) {
+    expect([name, isSensitiveKey(name)]).toEqual([name, false])
+  }
 })
 
 test('credential keys match by stem: prefixed names, signatures and signed-link parameters', () => {
@@ -115,11 +140,11 @@ test('credential keys match by stem: prefixed names, signatures and signed-link 
     'https://acct.blob.example.test/c/b?sv=2024-01-01&sp=r&sig=[REDACTED]',
     'https://bucket.s3.example.test/k?X-Amz-Credential=[REDACTED]&X-Amz-Security-Token=[REDACTED]&X-Amz-Signature=[REDACTED]',
   ])
-  // Token counts and ordinary names are left alone.
+  // Token counts and ordinary names are left alone; a session id is not.
   expect(out.max_tokens).toBe(5)
   expect(out.usage).toEqual({ prompt_tokens: 9, total_tokens: 12 })
-  expect([out.tokenizer, out.author, out.session_id]).toEqual(['whitespace', 'dev', 'abc'])
-  expect(stats.redactions).toBe(12)
+  expect([out.tokenizer, out.author, out.session_id]).toEqual(['whitespace', 'dev', '[REDACTED]'])
+  expect(stats.redactions).toBe(13)
 })
 
 test('diagnostics are redacted before they are cut, so a cut never leaves part of a credential', () => {
@@ -355,28 +380,81 @@ test('error text is redacted before the answer classifier cuts it', () => {
   expect(partial.kind === 'partial' && !(partial.rejected.get(0) ?? fragment).includes(fragment)).toBe(true)
 })
 
-test('assignments in text use the structured key rules and lose their whole value', () => {
+test('a credential-named line loses everything after its separator, markers and quotes included', () => {
+  const long = `${'x'.repeat(5000)}tail-secret`
   const cases: [string, string][] = [
-    // Serialized JSON at any depth, quoted values whole (escapes kept to).
-    ['{"token":"abc def","nested":{"sessionCookie":"g\\"h i"}}', '{"token":"[REDACTED]","nested":{"sessionCookie":"[REDACTED]"}}'],
-    ['{"credentials": {"user": "u", "pass": "p, q"}, "next": 1}', '{"credentials": "[REDACTED]", "next": 1}'],
-    ['{"api_keys": ["k1", "k2"], "ok": true}', '{"api_keys": "[REDACTED]", "ok": true}'],
-    [`{'password': 'alpha beta gamma'}`, `{'password': '[REDACTED]'}`],
-    // YAML and headers: an unquoted value after a colon runs to the end of its line.
-    ['db:\n  password: alpha beta gamma\n  host: db.internal', 'db:\n  password: [REDACTED]\n  host: db.internal'],
+    ['Cookie: session=abc123; csrf=[REDACTED]', 'Cookie: [REDACTED]'],
     ['Authorization: Token abc123def\nAccept: json', 'Authorization: [REDACTED]\nAccept: json'],
-    ['Cookie: theme=dark; session=abc123', 'Cookie: [REDACTED]'],
-    // After `=`, an unquoted value ends at a space or separator.
-    ['export SESSION_TOKEN=abc123 NEXT=1', 'export SESSION_TOKEN=[REDACTED] NEXT=1'],
-    ['retry_token="a b" mode=fast', 'retry_token="[REDACTED]" mode=fast'],
-    // Code keeps its shape: a typed parameter loses its type name only.
-    ['function f(token: string, count: number) {', 'function f(token: [REDACTED], count: number) {'],
+    ['db:\n  password: alpha beta gamma\n  host: db.internal', 'db:\n  password: [REDACTED]\n  host: db.internal'],
+    ['export MY_PWD=abc def\nPASS=xyz\nmode=fast', 'export MY_PWD=[REDACTED]\nPASS=[REDACTED]\nmode=fast'],
+    ['password: 987654321', 'password: [REDACTED]'],
+    [`password: ${long}`, 'password: [REDACTED]'],
+    // JSON that is only part of the text, escaped or not: the rest of its line goes.
+    ['config {"user": "u", "password": "p", "next": 1}', 'config {"user": "u", "password": [REDACTED]'],
+    ['log {\\"password\\": \\"p\\", \\"user\\": \\"u\\"}', 'log {\\"password\\": [REDACTED]'],
+    // Code keeps the lines that do not name a credential.
+    ['function f(token: string) {\n  return token\n}', 'function f(token: [REDACTED]\n  return token\n}'],
   ]
   for (const [input, output] of cases) expect(redact(input).out).toBe(output)
-  // Counts, booleans, null and values another pattern already redacted stay.
-  for (const input of ['max_tokens: 1024', '"token": null', '"secret": false', 'refresh_token: 3600', 'Authorization: Bearer [REDACTED]']) {
-    expect(redact(input)).toEqual({ out: input, count: 0 })
+  for (const input of ['max_tokens: 1024', 'https://example.test/search?q=tokens&page=2', 'session 5c4b1d2e']) expect(redact(input)).toEqual({ out: input, count: 0 })
+})
+
+test('URLs: user-info, credential-named parameters and webhook URLs', () => {
+  const secret = 's'.repeat(24)
+  const slack = `https://${['hooks', 'slack', 'com'].join('.')}/${['services', 'T0', 'B0', secret].join('/')}`
+  const discord = `https://${['discord', 'com'].join('.')}/api/${['webhooks', '42', secret].join('/')}`
+  const office = `https://contoso.${['webhook', 'office', 'com'].join('.')}/webhookb2/${secret}`
+  const cases: [string, string][] = [
+    [`go to https://${['bob', secret].join(':')}@db.example.test/x`, 'go to https://[REDACTED]@db.example.test/x'],
+    [`https://h.example.test/cb?code=1&access_token=${secret}&page=2#id_token=${secret}`, 'https://h.example.test/cb?code=1&access_token=[REDACTED]&page=2#id_token=[REDACTED]'],
+    [`https://h.example.test/x?sig=${secret}&session=${secret}&key=${secret}`, 'https://h.example.test/x?sig=[REDACTED]&session=[REDACTED]&key=[REDACTED]'],
+    [`post to ${slack}, ${discord} and ${office}.`, 'post to [REDACTED:webhook-url], [REDACTED:webhook-url] and [REDACTED:webhook-url].'],
+  ]
+  for (const [input, output] of cases) {
+    expect(redact(input).out).toBe(output)
+    expect(redact(input).out.includes(secret)).toBe(false)
   }
+})
+
+test('JSON inside strings is parsed and redacted by structure, however deeply it is encoded', () => {
+  const secret = 'z'.repeat(20)
+  const once = JSON.stringify({ user: 'u', password: secret })
+  const twice = JSON.stringify({ text: once })
+  const thrice = JSON.stringify(JSON.stringify({ wrapper: twice }))
+  const stats = newStats()
+  const out = sanitize({ a: once, b: twice, c: thrice, d: JSON.stringify([{ pwd: 1 }, 'x']), e: '{not json: password}' }, limitsFor(16384), stats) as Record<string, string>
+  expect(out.a).toBe('{"user":"u","password":"[REDACTED]"}')
+  expect(out.b).toBe(JSON.stringify({ text: '{"user":"u","password":"[REDACTED]"}' }))
+  expect(JSON.stringify(out).includes(secret)).toBe(false)
+  expect(out.d).toBe('[{"pwd":"[REDACTED]"},"x"]')
+  // Not JSON: the text rules apply.
+  expect(out.e).toBe('{not json: password}')
+  expect(stats.truncated).toBe(false)
+  // Deeper than the walk goes: dropped and marked, never passed on unscanned.
+  let deep = JSON.stringify({ password: secret })
+  for (let i = 0; i < 8; i += 1) deep = JSON.stringify({ layer: deep })
+  const deepStats = newStats()
+  const deepOut = sanitize({ deep }, limitsFor(16384), deepStats)
+  expect(JSON.stringify(deepOut).includes(secret)).toBe(false)
+  expect(deepStats.truncated).toBe(true)
+})
+
+test('text past the scanned window is dropped and marked, never passed on unscanned', () => {
+  const secret = 'w'.repeat(24)
+  const stats = newStats()
+  // A credential far past the payload budget, with nothing before it to name it.
+  const out = sanitize({ result: `${'a'.repeat(40_000)} ${secret}`, note: `password: ${'b'.repeat(20_000)}${secret}` }, limitsFor(16384), stats)
+  expect(JSON.stringify(out).includes(secret)).toBe(false)
+  expect(stats.truncated).toBe(true)
+})
+
+test('a row\'s own fields are not name-checked; everything observed under them is', () => {
+  const stats = newStats()
+  const content = sanitizeContent({ session_end: true, args: { session_end: true, cmd: 'ls' } }, limitsFor(16384), stats)
+  expect(content).toEqual({ session_end: true, args: { session_end: '[REDACTED]', cmd: 'ls' } })
+  const attributes = sanitizeAttributes({ session_metadata: { cwd: `/home/dev/src/x?token=${'t'.repeat(12)}`, host_version: '2.1.296' }, usage_metadata: { prompt_tokens: 3 } }, limitsFor(16384), stats)
+  // Attribute keys are the mod's own; their text still goes through the text rules.
+  expect(attributes).toEqual({ session_metadata: { cwd: '/home/dev/src/x?token=[REDACTED]', host_version: '2.1.296' }, usage_metadata: { prompt_tokens: 3 } })
 })
 
 test('dead-letter files are JSONL, split by UTF-8 bytes under the file limit, and parsed tolerantly', () => {

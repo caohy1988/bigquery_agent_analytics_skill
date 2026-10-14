@@ -406,38 +406,48 @@ The table receives your prompts, the model's visible answers, tool arguments
 and tool results (the text the model read), cut to `maxPayloadChars` per
 column. Treat the dataset like the transcripts it mirrors.
 
-* **Redaction (best effort):** values under credential-like keys become
-  `[REDACTED]`. A key matches when its name, with case and punctuation
-  removed, contains `password`, `passwd`, `passphrase`, `secret`, `apikey`,
-  `accesskey`, `privatekey`, `signingkey`, `authorization`, `credential`,
-  `signature` or `cookie`, ends in `token`, is `auth`, `sig`, `jwt` or
-  `bearer`, or has ADK's `temp:` prefix: `my_api_key`, `X-Amz-Security-Token`
-  and `sessionCookie` all match, while token counts such as `max_tokens` are
-  numbers and stay. Free text is scrubbed of private-key blocks,
-  provider-style `sk-` keys, AWS access key ids, Google API keys and OAuth
-  tokens, GitHub/GitLab/npm/Slack/Stripe tokens, JWTs, `Bearer`/`Basic`
-  credentials, passwords in URLs, signed-link and token query parameters
-  (`X-Goog-Signature`, `X-Goog-Credential`, `X-Amz-Signature`,
-  `X-Amz-Credential`, `X-Amz-Security-Token`, `sig`, `access_token`, `key`,
-  ...) and assignments whose key matches by the same rules as a structured
-  key: `key: value`, `key=value`, `"key": "value"` and serialized JSON at any
-  depth (a tool result's text included). A quoted value goes whole, to its
-  closing quote, and so does an object or list under such a key; an unquoted
-  value after `:` goes to the end of its line, after `=` to the next space.
-  Counts, booleans and `null` stay. Patterns cannot catch every secret; do not
-  rely on them alone.
+* **Redaction by structure:** in what the agent, the model and the tools
+  produced (tool arguments and results, prompts, answers, error text), the
+  whole value under a credential-named key becomes `[REDACTED]`, whatever it
+  is: a string, a number, a boolean, a list or an object (`null` stays).
+  A name is a credential's when one of its parts, split on punctuation and
+  camelCase and compared without case, is `pass`, `passwd`, `password`,
+  `passphrase`, `pwd`, `secret`, `token`, `auth`, `authorization`, `cookie`,
+  `session`, `key`, `apikey`, `credential(s)`, `private`, `bearer`, `jwt`,
+  `sig` or `signature`; when a part ends with one of the longer words
+  (`rootpwd`, `accesstoken`); or when it has ADK's `temp:` prefix. So
+  `MY_PWD`, `db_password`, `X-Api-Key`, `sessionCookie`, `Set-Cookie` and
+  `session_id` all match, while `max_tokens`, `author`, `oauth` and `monkey`
+  do not. A string that is JSON, including JSON encoded inside JSON, is
+  parsed, redacted the same way at every level and encoded again (compactly);
+  past the walk's depth or size budget, what is left is dropped and the row
+  marked truncated. In URLs, the user-info part and credential-named query or
+  fragment parameters lose their values, and incoming-webhook URLs (Slack,
+  Discord, Office) are replaced whole. The row's own field names (the top
+  level of `content`, and `attributes`, which the mod writes itself) are not
+  name-checked, so `session_end` and `session_metadata` keep their values.
+* **Free text (best effort):** text has no structure to go by. It is scrubbed
+  of private-key blocks, provider-style `sk-` keys, AWS access key ids, Google
+  API keys and OAuth tokens, GitHub/GitLab/npm/Slack/Stripe tokens, JWTs and
+  `Bearer`/`Basic` credentials; and after a credential name followed by `:`
+  or `=` (a header, a YAML or `.env` line, a JSON key in text, an assignment)
+  everything to the end of the line is removed, whatever it holds, including
+  a redaction marker (`?name=` / `&name=` only to the next `&`). Code can lose
+  a little more than the credential (`token: string` loses its type name).
+  Patterns cannot catch every secret; do not rely on them alone.
 * **Diagnostics:** error text from BigQuery, the token command or the file
-  system is redacted before it is cut (including where BigQuery's error
-  messages and per-row insert errors are first held to their length), kept
-  or shown: in dead-letter reasons,
-  the status line, `/bqaa-status`, backfill reports, the debug log and the
-  transcript. A failing token command is named by its program only, never its
-  arguments.
+  system goes through the same free-text rules before it is cut (including
+  where BigQuery's error messages and per-row insert errors are first held to
+  their length), kept or shown: in dead-letter reasons, the status line,
+  `/bqaa-status`, backfill reports, the debug log and the transcript. A
+  failing token command is named by its program only, never its arguments.
 * **Truncation:** each payload column is held to `maxPayloadChars`,
   error messages to 4,096 characters; the copy is built within that budget, so
   a multi-megabyte tool input costs the hot path milliseconds (a test checks
-  under 100 ms for a 2,760,000-character Write). Cut rows have
-  `is_truncated = true`.
+  under 100 ms for a 2,760,000-character Write). A long string is scanned up
+  to 8,192 characters past where it is cut, so a credential across the cut is
+  still matched whole; anything further is dropped, never passed on unscanned.
+  Cut rows have `is_truncated = true`.
 * **Local files:** dead-letter and dry-run files hold the same redacted rows
   as the table; they are written with your user's default permissions.
 * **Token:** memory only; never written to rows, files, logs or status text.
@@ -453,15 +463,18 @@ The test command runs the `tests/*.test.ts` files against the host CLI's own
 test kit, with no session, sign-in, GCP or network: `$.http.fetch`,
 `$.process.run`, `$.fs` and `$.store` are stubbed, and `mock.clock` drives the
 timers; the `$.fs` stubs measure files in UTF-8 bytes and refuse a file over
-4 MiB, as the host does. 76 tests cover the captured rows and their spans, the
+4 MiB, as the host does. 95 tests cover the captured rows and their spans, the
 non-blocking rules (`session.end` included), the queue bound, retries,
 timeouts, token refresh, table creation, partial inserts, 2xx answers that
 are not valid insertAll responses, dead-letter files,
 replay that keeps two tables' rows apart, backfill, the exit spill and its
 time bound, multibyte rows held to the file limit in bytes, dry run,
-redaction (credential keys by stem, the same key rules in text and serialized
-tool results, signed links, credentials across a length cap, and every
-diagnostic sink),
+redaction (whole values under credential names of any type, name parts and
+endings, JSON nested in strings to any encoding depth, URLs and webhook URLs,
+credential-named lines whatever they hold, values past 5,000 characters and
+past the scanned window, credentials across a length cap, every diagnostic
+sink, and each review probe through capture, delivery and the dead-letter
+file),
 truncation (identifying fields survive a cut), refused environment reads
 (`BQAA_ACCESS_TOKEN` included), a re-fired `session.start`, and
 configuration.
