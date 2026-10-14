@@ -72,7 +72,9 @@ is what a person would have seen as the CLI hanging.
                                        $.http.fetch POST …/tables/{t}/insertAll
                                        (insertId = event_id, client timeout,
                                         30 s host cap)
-                                          │ 2xx            │ 408/429/5xx/network/timeout
+                                          │ 2xx, valid     │ 408/429/5xx/network/timeout,
+                                          │ insertAll      │ or a 2xx answer that does not
+                                          │ answer         │ parse as an insertAll response
                                           ▼                ▼
                                        sent          retry with backoff (1 s … 60 s),
                                                      3 retries, then dead-letter
@@ -348,7 +350,11 @@ GROUP BY model
   `$.http.fetch`; the token command has 15 seconds.
 * **Retries:** 408, 429, 5xx, quota 403s, network errors and timeouts back off
   exponentially (1 s doubling to 60 s, with jitter) and retry a batch up to 3
-  times with the same `insertId`s; a 401 refreshes the token first.
+  times with the same `insertId`s; a 401 refreshes the token first. A 2xx
+  answer counts as delivered only when it is a valid insertAll response: a
+  body cut off at the response limit, a non-JSON page or an `insertErrors`
+  entry that names no row of the batch leaves the outcome unknown, so the rows
+  are retried the same way and parked if the retries run out.
 * **Dead letter:** rows that exhaust retries go to `retry-*.jsonl`; rows
   BigQuery or the configuration refuses (400, 403 access denied, missing
   dataset, an invalid row reported by insertAll) go to `rejected-*.jsonl`;
@@ -413,10 +419,17 @@ column. Treat the dataset like the transcripts it mirrors.
   credentials, passwords in URLs, signed-link and token query parameters
   (`X-Goog-Signature`, `X-Goog-Credential`, `X-Amz-Signature`,
   `X-Amz-Credential`, `X-Amz-Security-Token`, `sig`, `access_token`, `key`,
-  ...) and `KEY=value` / `"key": "value"` pairs whose key names a credential.
-  Patterns cannot catch every secret; do not rely on them alone.
+  ...) and assignments whose key matches by the same rules as a structured
+  key: `key: value`, `key=value`, `"key": "value"` and serialized JSON at any
+  depth (a tool result's text included). A quoted value goes whole, to its
+  closing quote, and so does an object or list under such a key; an unquoted
+  value after `:` goes to the end of its line, after `=` to the next space.
+  Counts, booleans and `null` stay. Patterns cannot catch every secret; do not
+  rely on them alone.
 * **Diagnostics:** error text from BigQuery, the token command or the file
-  system is redacted before it is cut, kept or shown: in dead-letter reasons,
+  system is redacted before it is cut (including where BigQuery's error
+  messages and per-row insert errors are first held to their length), kept
+  or shown: in dead-letter reasons,
   the status line, `/bqaa-status`, backfill reports, the debug log and the
   transcript. A failing token command is named by its program only, never its
   arguments.
@@ -440,12 +453,15 @@ The test command runs the `tests/*.test.ts` files against the host CLI's own
 test kit, with no session, sign-in, GCP or network: `$.http.fetch`,
 `$.process.run`, `$.fs` and `$.store` are stubbed, and `mock.clock` drives the
 timers; the `$.fs` stubs measure files in UTF-8 bytes and refuse a file over
-4 MiB, as the host does. 67 tests cover the captured rows and their spans, the
+4 MiB, as the host does. 76 tests cover the captured rows and their spans, the
 non-blocking rules (`session.end` included), the queue bound, retries,
-timeouts, token refresh, table creation, partial inserts, dead-letter files,
+timeouts, token refresh, table creation, partial inserts, 2xx answers that
+are not valid insertAll responses, dead-letter files,
 replay that keeps two tables' rows apart, backfill, the exit spill and its
 time bound, multibyte rows held to the file limit in bytes, dry run,
-redaction (credential keys by stem, signed links, and every diagnostic sink),
+redaction (credential keys by stem, the same key rules in text and serialized
+tool results, signed links, credentials across a length cap, and every
+diagnostic sink),
 truncation (identifying fields survive a cut), refused environment reads
 (`BQAA_ACCESS_TOKEN` included), a re-fired `session.start`, and
 configuration.

@@ -317,6 +317,68 @@ test('insertAll answers are classified for retry, refresh, refusal or success', 
   expect(body.rows[0]?.insertId).toBe('e1')
 })
 
+test('a 2xx answer acknowledges rows only when it is a valid insertAll response', () => {
+  const unknown = (text: string) => classifyInsert({ status: 200, text }, 3).kind
+  // A body cut off mid-way, the wrong JSON shape, or entries that do not
+  // name a row of this batch: the outcome is not known, so the rows are kept.
+  for (const text of [
+    '{"insertErrors":[{"index":0,"errors":[{"reason":"invalid"',
+    '',
+    '[]',
+    'null',
+    '<html>OK</html>',
+    '{"insertErrors":{"index":0}}',
+    '{"insertErrors":[{"errors":[{"reason":"invalid"}]}]}',
+    '{"insertErrors":[{"index":7,"errors":[{"reason":"invalid"}]}]}',
+    '{"insertErrors":[{"index":0.5,"errors":[]}]}',
+    '{"insertErrors":[{"index":0,"errors":"invalid"}]}',
+    '{"insertErrors":[{"index":0,"errors":[null]}]}',
+    '{"error":{"code":500,"message":"backend"}}',
+  ]) {
+    expect(unknown(text)).toBe('retry')
+  }
+  expect(unknown('{"kind":"bigquery#tableDataInsertAllResponse"}')).toBe('ok')
+  expect(unknown('{"insertErrors":[]}')).toBe('ok')
+  expect(unknown('{"insertErrors":[{"index":1,"errors":[{"reason":"invalid","message":"bad"}]}]}')).toBe('partial')
+})
+
+test('error text is redacted before the answer classifier cuts it', () => {
+  const token = ['gh', 'p_', 'x'.repeat(36)].join('')
+  const fragment = token.slice(0, 8)
+  // The message cap is 1,000 characters, the non-JSON fallback 300: each
+  // token below runs past its cap.
+  const capped = classifyInsert({ status: 403, text: JSON.stringify({ error: { message: `${'e'.repeat(950)} ${token}` } }) }, 1)
+  const page = classifyInsert({ status: 400, text: `<html>${'p'.repeat(280)} ${token}</html>` }, 1)
+  const partial = classifyInsert({ status: 200, text: JSON.stringify({ insertErrors: [{ index: 0, errors: [{ reason: 'invalid', message: `${'e'.repeat(970)} ${token}` }] }] }) }, 1)
+  expect(capped.kind === 'rejected' && !capped.message.includes(fragment) && capped.message.length <= 1000).toBe(true)
+  expect(page.kind === 'rejected' && !page.message.includes(fragment)).toBe(true)
+  expect(partial.kind === 'partial' && !(partial.rejected.get(0) ?? fragment).includes(fragment)).toBe(true)
+})
+
+test('assignments in text use the structured key rules and lose their whole value', () => {
+  const cases: [string, string][] = [
+    // Serialized JSON at any depth, quoted values whole (escapes kept to).
+    ['{"token":"abc def","nested":{"sessionCookie":"g\\"h i"}}', '{"token":"[REDACTED]","nested":{"sessionCookie":"[REDACTED]"}}'],
+    ['{"credentials": {"user": "u", "pass": "p, q"}, "next": 1}', '{"credentials": "[REDACTED]", "next": 1}'],
+    ['{"api_keys": ["k1", "k2"], "ok": true}', '{"api_keys": "[REDACTED]", "ok": true}'],
+    [`{'password': 'alpha beta gamma'}`, `{'password': '[REDACTED]'}`],
+    // YAML and headers: an unquoted value after a colon runs to the end of its line.
+    ['db:\n  password: alpha beta gamma\n  host: db.internal', 'db:\n  password: [REDACTED]\n  host: db.internal'],
+    ['Authorization: Token abc123def\nAccept: json', 'Authorization: [REDACTED]\nAccept: json'],
+    ['Cookie: theme=dark; session=abc123', 'Cookie: [REDACTED]'],
+    // After `=`, an unquoted value ends at a space or separator.
+    ['export SESSION_TOKEN=abc123 NEXT=1', 'export SESSION_TOKEN=[REDACTED] NEXT=1'],
+    ['retry_token="a b" mode=fast', 'retry_token="[REDACTED]" mode=fast'],
+    // Code keeps its shape: a typed parameter loses its type name only.
+    ['function f(token: string, count: number) {', 'function f(token: [REDACTED], count: number) {'],
+  ]
+  for (const [input, output] of cases) expect(redact(input).out).toBe(output)
+  // Counts, booleans, null and values another pattern already redacted stay.
+  for (const input of ['max_tokens: 1024', '"token": null', '"secret": false', 'refresh_token: 3600', 'Authorization: Bearer [REDACTED]']) {
+    expect(redact(input)).toEqual({ out: input, count: 0 })
+  }
+})
+
 test('dead-letter files are JSONL, split by UTF-8 bytes under the file limit, and parsed tolerantly', () => {
   const line = (content: string) => ({
     v: 1 as const,

@@ -5,6 +5,7 @@
 
 import type { Config } from './config.ts'
 import { AGENT_EVENTS_SCHEMA, type BqaaRow } from './rows.ts'
+import { redactDiagnostic } from './sanitize.ts'
 
 const API = 'https://bigquery.googleapis.com/bigquery/v2'
 const seg = (s: string): string => encodeURIComponent(s)
@@ -65,27 +66,40 @@ const parseJson = <T>(text: string): T | null => {
   }
 }
 
+// Error text from an answer, redacted before it is cut: cut first, a
+// credential across the cap would leave a piece too short to match.
 export function apiErrorMessage(answer: HttpAnswer): string {
   const body = parseJson<ApiError>(answer.text)
-  const message = body?.error?.message ?? answer.text.slice(0, 300)
-  return `HTTP ${answer.status}: ${message}`.slice(0, 1000)
+  const message = body?.error?.message ?? redactDiagnostic(answer.text, 300)
+  return redactDiagnostic(`HTTP ${answer.status}: ${message}`, 1000)
 }
 
+// A 2xx answer counts as delivered only when it is an insertAll response: a
+// JSON object whose `insertErrors`, if any, each name a row of this batch and
+// list its errors. Anything else (a body cut at the response limit, a proxy's
+// page) leaves the outcome unknown, so the rows are kept and sent again with
+// the same insertIds.
 export function classifyInsert(answer: HttpAnswer, rowCount: number): InsertOutcome {
   const { status } = answer
   if (status >= 200 && status < 300) {
-    const body = parseJson<{ insertErrors?: { index: number; errors?: { reason?: string; message?: string }[] }[] }>(answer.text)
-    const errors = body?.insertErrors ?? []
-    if (errors.length === 0) return { kind: 'ok' }
+    const unknown: InsertOutcome = { kind: 'retry', message: `HTTP ${status} with a response that is not a valid insertAll answer; the rows are kept and sent again` }
+    const body = parseJson<unknown>(answer.text)
+    if (body === null || typeof body !== 'object' || Array.isArray(body) || 'error' in body) return unknown
+    const errors = (body as { insertErrors?: unknown }).insertErrors
+    if (errors === undefined) return { kind: 'ok' }
+    if (!Array.isArray(errors)) return unknown
     const rejected = new Map<number, string>()
     const retry = new Set<number>()
-    for (const entry of errors) {
-      if (typeof entry.index !== 'number' || entry.index < 0 || entry.index >= rowCount) continue
-      const reasons = entry.errors ?? []
-      const isRetryable = reasons.length > 0 && reasons.every(r => RETRYABLE_REASONS.has(r.reason ?? ''))
-      if (isRetryable) retry.add(entry.index)
-      else rejected.set(entry.index, reasons.map(r => `${r.reason ?? 'error'}: ${r.message ?? ''}`.trim()).join('; ').slice(0, 1000) || 'rejected')
+    for (const entry of errors as unknown[]) {
+      const index = (entry as { index?: unknown } | null)?.index
+      const reasons = (entry as { errors?: unknown } | null)?.errors
+      if (typeof index !== 'number' || !Number.isInteger(index) || index < 0 || index >= rowCount) return unknown
+      if (!Array.isArray(reasons) || reasons.some(r => r === null || typeof r !== 'object')) return unknown
+      const list = reasons as { reason?: unknown; message?: unknown }[]
+      if (list.length > 0 && list.every(r => RETRYABLE_REASONS.has(String(r.reason ?? '')))) retry.add(index)
+      else rejected.set(index, redactDiagnostic(list.map(r => `${String(r.reason ?? 'error')}: ${String(r.message ?? '')}`.trim()).join('; '), 1000) || 'rejected')
     }
+    if (rejected.size === 0 && retry.size === 0) return { kind: 'ok' }
     return { kind: 'partial', rejected, retry }
   }
   const body = parseJson<ApiError>(answer.text)

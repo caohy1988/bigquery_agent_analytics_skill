@@ -179,7 +179,7 @@ export class Writer {
   prefetchToken(): void {
     const c = this.config()
     if (!canDeliver(c) || c.dryRun) return
-    void this.getToken().catch(err => this.recordError(`auth: ${messageOf(err)}`))
+    void this.getToken().catch(err => this.recordError(`authentication: ${messageOf(err)}`))
   }
 
   private async flushLoop(): Promise<void> {
@@ -212,7 +212,7 @@ export class Writer {
     try {
       token = await this.getToken()
     } catch (err) {
-      await this.retryLater(batch, `auth: ${messageOf(err)}`)
+      await this.retryLater(batch, `authentication: ${messageOf(err)}`)
       return false
     }
     const answer = await this.post(insertAllUrl(c), insertAllBody(batch.map(q => q.row)), token, c.requestTimeoutMs)
@@ -246,7 +246,7 @@ export class Writer {
       }
       case 'auth':
         this.token = null
-        await this.retryLater(batch, `auth: ${outcome.message}`)
+        await this.retryLater(batch, `authentication: ${outcome.message}`)
         return false
       case 'not-found': {
         if (c.autoCreateTable && !this.createAttempted && !isDatasetMissing(outcome.message)) {
@@ -648,7 +648,7 @@ export class Writer {
       try {
         token = await this.getToken()
       } catch (err) {
-        report.error = diagnostic(`auth: ${messageOf(err)}`)
+        report.error = diagnostic(`authentication: ${messageOf(err)}`)
         left.push(...chunk)
         continue
       }

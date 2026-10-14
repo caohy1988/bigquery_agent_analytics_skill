@@ -75,14 +75,76 @@ const PATTERNS: readonly (readonly [RegExp, string])[] = [
     /([?&](?:[A-Za-z0-9_.-]{0,40}?(?:signature|credential|token|secret|password|passwd|api[_-]?key)|sig|key)=)(?!\[REDACTED)(?![0-9]+(?:[&#\s"']|$))[^&#\s"'<>]{3,}/gi,
     '$1[REDACTED]',
   ],
-  // KEY=value and "key": "value" where the key names a credential; a purely
-  // numeric value (max_tokens: 1024) is left alone, and so is a value already
-  // redacted.
-  [
-    /\b([A-Za-z0-9_.-]{0,40}?(?:password|passwd|passphrase|secret|signature|credential|api[_-]?key|access[_-]?key|private[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|session[_-]?token|client[_-]?secret|[_-]token)[A-Za-z0-9_.-]{0,20}["']?\s{0,5}[:=]\s{0,5}["']?)(?!\[REDACTED)(?![0-9]+\b)[^\s"',;&]{4,}/gi,
-    '$1[REDACTED]',
-  ],
 ]
+
+// `key: value`, `key=value`, `"key": "value"` in text: key and separator
+// only. Whether the key names a credential is isSensitiveKey's call, the same
+// as for structured keys, and the value's extent is found by `valueEnd`.
+const ASSIGNMENT = /(["']?)([A-Za-z][A-Za-z0-9_.-]{0,63})\1[ \t]{0,5}([:=])[ \t]{0,5}/g
+// Unquoted values that stay: counts, booleans and null (`max_tokens: 1024`).
+const KEPT_VALUE = /^(?:-?[0-9][0-9.]*|true|false|null)$/
+const VALUE_CHARS = 4096
+
+// Where the value starting at `start` ends. A quoted value runs to its closing
+// quote, an object or list to its closing bracket; an unquoted value after
+// `=` is one word, after `:` the rest of the line up to a separator that ends
+// an inline value (all of it for a cookie header).
+function valueEnd(text: string, start: number, separator: string, key: string): number {
+  const limit = Math.min(text.length, start + VALUE_CHARS)
+  const first = text[start]
+  if (first === '"' || first === "'") {
+    for (let i = start + 1; i < limit; i += 1) {
+      const ch = text[i]
+      if (ch === '\\') i += 1
+      else if (ch === first) return i + 1
+      else if (ch === '\n' || ch === '\r') return i
+    }
+    return limit
+  }
+  if (first === '{' || first === '[') {
+    let depth = 0
+    let quote: string | null = null
+    for (let i = start; i < limit; i += 1) {
+      const ch = text[i]
+      if (quote !== null) {
+        if (ch === '\\') i += 1
+        else if (ch === quote) quote = null
+      } else if (ch === '"' || ch === "'") quote = ch
+      else if (ch === '{' || ch === '[') depth += 1
+      else if (ch === '}' || ch === ']') {
+        depth -= 1
+        if (depth === 0) return i + 1
+      }
+    }
+    return limit
+  }
+  const stop = separator === '=' ? /[\s"',;&]/ : /cookie/i.test(key) ? /[\r\n]/ : /[\r\n"',;})\]]/
+  for (let i = start; i < limit; i += 1) if (stop.test(text[i] as string)) return i
+  return limit
+}
+
+function redactAssignments(text: string, stats: SanitizeStats): string {
+  ASSIGNMENT.lastIndex = 0
+  let out = ''
+  let copied = 0
+  for (let m = ASSIGNMENT.exec(text); m !== null; m = ASSIGNMENT.exec(text)) {
+    if (!isSensitiveKey(m[2] as string)) continue
+    const start = m.index + m[0].length
+    const end = valueEnd(text, start, m[3] as string, m[2] as string)
+    const value = text.slice(start, end)
+    const first = value[0] ?? ''
+    const quoted = first === '"' || first === "'"
+    const nested = first === '{' || first === '['
+    if (value.trim() === '' || value.includes('[REDACTED') || (!quoted && !nested && KEPT_VALUE.test(value.trim()))) continue
+    const closed = quoted && value.length > 1 && value.endsWith(first)
+    const replacement = quoted ? `${first}[REDACTED]${closed ? first : ''}` : nested ? '"[REDACTED]"' : '[REDACTED]'
+    out += text.slice(copied, start) + replacement
+    copied = end
+    ASSIGNMENT.lastIndex = end
+    stats.redactions += 1
+  }
+  return copied === 0 ? text : out + text.slice(copied)
+}
 
 export function redactText(input: string, stats: SanitizeStats): string {
   let out = input
@@ -96,7 +158,7 @@ export function redactText(input: string, stats: SanitizeStats): string {
       return replacement.replace(/\$(\d)/g, (_, n: string) => groups[Number(n) - 1] ?? '')
     })
   }
-  return out
+  return redactAssignments(out, stats)
 }
 
 // Error text, dead-letter reasons and status lines: redacted first, then held

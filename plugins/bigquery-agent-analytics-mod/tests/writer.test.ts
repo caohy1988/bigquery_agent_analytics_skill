@@ -233,7 +233,7 @@ test('a failing token command is reported, and rows wait for it', { options: OPT
   expect(world.fetches.length).toBe(0)
   const status = await statusText($)
   // The command is named by its program only: its arguments may hold secrets.
-  expect(status).toMatch(/auth: token command .gcloud. exited 1: ERROR: \(gcloud/)
+  expect(status).toMatch(/authentication: token command .gcloud. exited 1: ERROR: \(gcloud/)
   expect(status).toMatch(/queue: 1 rows/)
 })
 
@@ -441,9 +441,9 @@ test('a failing token command never puts credential text in a file, the status l
   // The diagnostics did reach those sinks, redacted.
   const parked = deadLetterFiles(world)
   expect(parked.length > 0).toBe(true)
-  for (const [, text] of parked) expect(text).toMatch(/"reason":"auth: token command `fake-token-tool` exited 1: ERROR: refresh failed for \[REDACTED:google-oauth-token\] password=\[REDACTED\]"/)
+  for (const [, text] of parked) expect(text).toMatch(/"reason":"authentication: token command `fake-token-tool` exited 1: ERROR: refresh failed for \[REDACTED:google-oauth-token\] password=\[REDACTED\]"/)
   expect(world.statusLines.some(l => (l ?? '').includes('parked after retries'))).toBe(true)
-  expect(await statusText($)).toMatch(/last backfill \(command, .*stopped: auth: token command .fake-token-tool. exited 1: .*\[REDACTED/)
+  expect(await statusText($)).toMatch(/last backfill \(command, .*stopped: authentication: token command .fake-token-tool. exited 1: .*\[REDACTED/)
   expect(world.logs.some(l => l.startsWith('bqaa backfill:') && l.includes('[REDACTED'))).toBe(true)
 })
 
@@ -549,4 +549,88 @@ test('/clear keeps the process sending, under the new session id', { options: OP
     ['TOOL_STARTING', 'after-clear-session'],
     ['TOOL_COMPLETED', 'after-clear-session'],
   ])
+})
+
+// A GitHub-style token, built at run time: 40 characters a pattern knows.
+const CUT_TOKEN = ['gh', 'p_', 'x'.repeat(36)].join('')
+// Its first characters, which must not survive a cut either.
+const FRAGMENT = CUT_TOKEN.slice(0, 4)
+
+test('a credential across the length cap of BigQuery error text is removed whole, everywhere', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  // The token ends just past the 1,000-character cap on error messages.
+  world.replies = [{ status: 403, text: JSON.stringify({ error: { message: `${'e'.repeat(950)} ${CUT_TOKEN}`, errors: [{ reason: 'accessDenied' }] } }) }]
+  await startSession($)
+  await world.clock.advance(5000)
+  expect(deadLetterFiles(world).length).toBe(1)
+  for (const text of await everySink($, world)) expect(text.includes(FRAGMENT)).toBe(false)
+  expect(deadLetterFiles(world)[0]?.[1] ?? '').toMatch(/"reason":"HTTP 403: e+ \[REDACTED/)
+})
+
+test('a credential across the cap on a non-JSON error body is removed whole', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  // A proxy's error page: the token sits across the 300 characters kept.
+  world.replies = [{ status: 400, text: `<html>${'p'.repeat(280)} ${CUT_TOKEN}</html>` }]
+  await startSession($)
+  await world.clock.advance(5000)
+  expect(deadLetterFiles(world).length).toBe(1)
+  for (const text of await everySink($, world)) expect(text.includes(FRAGMENT)).toBe(false)
+})
+
+test('a credential across the cap on a row\'s insert error is removed whole, sent or replayed', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  // Sent: the token runs past the 1,000-character cap on a row's reason.
+  const sent = { status: 200, text: JSON.stringify({ insertErrors: [{ index: 0, errors: [{ reason: 'invalid', message: `${'e'.repeat(955)} ${CUT_TOKEN}` }] }] }) }
+  // Replayed: the same for a parked row, whose reason is rewritten in its file.
+  const replayed = { status: 200, text: JSON.stringify({ insertErrors: [{ index: 0, errors: [{ reason: 'invalid', message: `${'e'.repeat(970)} ${CUT_TOKEN}` }] }] }) }
+  const path = `${PARTITION_DIR}/retry-20261013T200102003Z-previoussess-1.jsonl`
+  world.files.set(path, `${parkedLine(TABLE_REF, 'a'.repeat(32), 'previous-session')}\n`)
+  world.replies = [sent, replayed]
+  await startSession($)
+  await world.clock.advance(15_000)
+  expect(deadLetterFiles(world).filter(([, text]) => text.includes('"kind":"rejected"')).length).toBe(2)
+  for (const text of await everySink($, world)) expect(text.includes(FRAGMENT)).toBe(false)
+})
+
+test('a tool result sent as text keeps the redaction its keys get as structure', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  const secrets = { token: 'x'.repeat(12), sessionCookie: 'y'.repeat(12), password: 'alpha beta gamma', nested: { api_key: 'z'.repeat(12), credentials: { user: 'u', pass: 'w'.repeat(12) } } }
+  world.toolReply = () => ({ result: secrets, text: JSON.stringify(secrets) })
+  await startSession($)
+  await $.tool.call({ tool: 'Read', file_path: 'settings.json' })
+  await world.clock.advance(5000)
+  const [row] = world.sentRows().filter(r => r.event_type === 'TOOL_COMPLETED')
+  const content = row?.content ?? ''
+  for (const value of ['x'.repeat(12), 'y'.repeat(12), 'alpha', 'beta gamma', 'z'.repeat(12), 'w'.repeat(12)]) expect(content.includes(value)).toBe(false)
+  // Still the text the tool returned, with each value replaced.
+  expect((JSON.parse(content) as { result: string }).result).toBe('{"token":"[REDACTED]","sessionCookie":"[REDACTED]","password":"[REDACTED]","nested":{"api_key":"[REDACTED]","credentials":"[REDACTED]"}}')
+})
+
+test('a 2xx answer that is not a valid insertAll response keeps the rows: retried, then parked', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  // Cut off mid-object, as a body past the response limit can be.
+  world.replies = [{ status: 200, text: '{"insertErrors":[{"index":0,"errors":[{"reason":"invalid"' }]
+  await startSession($)
+  for (let t = 0; t < 4; t += 1) await world.clock.advance(5000)
+  // Four attempts with the same insertIds, none counted as sent.
+  const calls = world.insertCalls()
+  expect(calls.length).toBe(4)
+  const ids = (call: (typeof calls)[number]) => (JSON.parse(call.body) as { rows: { insertId: string }[] }).rows.map(r => r.insertId)
+  for (const call of calls) expect(ids(call)).toEqual(ids(calls[0] as (typeof calls)[number]))
+  const status = await statusText($)
+  expect(status).toMatch(/sent 0, dead-lettered 1/)
+  expect(deadLetterRows(world).map(r => r.event_type)).toEqual(['STATE_DELTA'])
+  expect(deadLetterFiles(world)[0]?.[0].startsWith(`${PARTITION_DIR}/retry-`)).toBe(true)
+})
+
+test('a replayed file whose answer is malformed stays as it was', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  const path = `${PARTITION_DIR}/spill-20261013T200102003Z-previoussess-1.jsonl`
+  const text = `${parkedLine(TABLE_REF, 'a'.repeat(32), 'previous-session')}\n`
+  world.files.set(path, text)
+  world.replies = [OK_INSERT, { status: 200, text: '{"insertErrors": {"index": 0}}' }]
+  await startSession($)
+  await world.clock.advance(15_000)
+  expect(world.files.get(path)).toBe(text)
+  expect(await statusText($)).toMatch(/last backfill \(auto, .*\): 1 file\(s\), 0 rows sent, 1 left; stopped: HTTP 200 with a response that is not a valid insertAll answer/)
 })
