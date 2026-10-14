@@ -685,13 +685,16 @@ export class Writer {
     report.rowsLeft += left.length + others.length
     // Nothing sent and nothing new to record: the file stays as it was.
     if (!changed) return
+    // What is left goes to new files first (rewritten reasons can make it
+    // outgrow one), and only once every one is written is the source emptied:
+    // `$.fs` has no rename or delete. A write that fails leaves the source as
+    // it was, so an unsent row is never held only in memory; rows sent
+    // meanwhile may go again, and event_id dedups them.
     const rest = [...left.map(lineText), ...others, ...unreadable]
-    const [first = '', ...more] = packLines(rest)
-    await this.io.writeFile(path, first)
-    // Rewritten reasons can make the rest outgrow one file.
-    for (const text of more) {
+    for (const text of packLines(rest)) {
       await this.io.writeFile(joinPath(dir, fileName(kindOf(name) ?? 'retry', this.io.now(), this.sessionId(), ++this.seq)), text)
     }
+    await this.io.writeFile(path, '')
   }
 
   // ---- status ------------------------------------------------------------

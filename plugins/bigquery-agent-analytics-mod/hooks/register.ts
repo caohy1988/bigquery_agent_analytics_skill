@@ -159,6 +159,21 @@ async function readEnv($: EngineInterface): Promise<EnvSnapshot> {
   }
 }
 
+// The session id, read again for each event: after /clear, /resume or
+// /branch the process goes on under a new id, and neither session.start nor,
+// where a managed policy keeps classic hooks from a user plugin,
+// classic.SessionStart says so. A read the host refuses leaves the id the
+// tracer has: the last one, or after a session change none. It cannot fail,
+// so hooks read it before passing the event on: a tool's own events (its
+// permission prompt, a subagent) then find the tool already started.
+async function readSessionId($: EngineInterface): Promise<void> {
+  try {
+    tracer.setSession({ sessionId: await $.session.id() })
+  } catch {
+    // The tracer keeps what it has.
+  }
+}
+
 // This table's dead-letter files, those elsewhere in the dead-letter
 // directory (other tables' subdirectories, at most 50 of them, and files from
 // the older flat layout), and files too large to read back.
@@ -272,7 +287,8 @@ export const register: Register = (on, registered) => {
     return next(e)
   })
 
-  // Observers: each calls `next` first. Their `.catch` spells out what a
+  // Observers: each calls `next` before it records anything, after reading
+  // the session id where it needs it. Their `.catch` spells out what a
   // failure means here: the event goes on as if the mod were not there.
   on('classic.SessionStart', ($, e, next) => {
     const pending = next(e)
@@ -280,7 +296,8 @@ export const register: Register = (on, registered) => {
     return pending
   }).catch(($, e, next) => next(e))
 
-  on('classic.SubagentStart', ($, e, next) => {
+  on('classic.SubagentStart', async ($, e, next) => {
+    await readSessionId($)
     const pending = next(e)
     safely(() => tracer.subagentStarted(e))
     return pending
@@ -296,6 +313,7 @@ export const register: Register = (on, registered) => {
     const submittedAt = Date.now()
     const entered = await next(e)
     if (entered.drop === undefined) {
+      await readSessionId($)
       safely(() =>
         tracer.promptSubmitted({
           text: entered.text,
@@ -310,13 +328,15 @@ export const register: Register = (on, registered) => {
     return entered
   }).catch(($, e, next) => next(e))
 
-  on('turn.start', ($, e, next) => {
+  on('turn.start', async ($, e, next) => {
+    await readSessionId($)
     const pending = next(e)
     safely(() => tracer.turnStarted(e))
     return pending
   })
 
   on('turn.step', async function* ($, e, next) {
+    await readSessionId($)
     const stream = next(e)
     let ctx: StepCtx | undefined
     safely(() => {
@@ -340,6 +360,7 @@ export const register: Register = (on, registered) => {
   })
 
   on('tool.call', async ($, e, next) => {
+    await readSessionId($)
     const pending = next(e)
     let ctx: ToolCtx | undefined
     safely(() => {
@@ -359,7 +380,8 @@ export const register: Register = (on, registered) => {
     return result
   }).catch(($, e, next) => next(e))
 
-  on('turn.complete', ($, e, next) => {
+  on('turn.complete', async ($, e, next) => {
+    await readSessionId($)
     const pending = next(e)
     safely(() => {
       tracer.turnCompleted({

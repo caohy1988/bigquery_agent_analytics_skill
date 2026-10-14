@@ -24,6 +24,9 @@ export type World = {
   steps: StepReply[]
   // What `$.process.run` (the token command) answers.
   processReply: { exitCode: number; stdout: string; stderr: string }
+  // What `$.session.id()` answers, and whether a policy refuses it.
+  sessionId: string
+  sessionIdRefused: boolean
   // Makes `$.fs.write` refuse every write.
   failWrites: boolean
   // Makes `$.fs.write` wait until `releaseWrites` is called.
@@ -109,6 +112,8 @@ export function setUp(on: On, env: Record<string, string> = {}, store: Record<st
     logs: [],
     steps: [],
     processReply: { exitCode: 0, stdout: `${ACCESS_TOKEN}\n`, stderr: '' },
+    sessionId: SESSION_ID,
+    sessionIdRefused: false,
     failWrites: false,
     hangWrites: false,
     releaseWrites: () => {
@@ -135,7 +140,7 @@ export function setUp(on: On, env: Record<string, string> = {}, store: Record<st
 
   on('session.start', () => ({ cwd: '/work/my-repo' }))
   on('session.end', ($, e) => ({ sessionId: e.sessionId }))
-  on('session.id', () => ({ value: SESSION_ID }))
+  on('session.id', () => (world.sessionIdRefused ? { deny: 'refused by policy' } : { value: world.sessionId }))
   on('session.version', () => ({ value: { version: '2.1.296', base: '2.1.296' } }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('ui.status', ($, e) => {

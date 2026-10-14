@@ -221,6 +221,9 @@ export class Tracer {
     this.others.clear()
     this.loops.clear()
     this.inflightTools.clear()
+    // After /clear, /resume or /branch the process goes on under another id:
+    // until it is read, rows carry none rather than the old one.
+    if (e.reason === 'clear' || e.reason === 'resume') this.sessionId = null
   }
 
   // prompt.submit, once the prompt entered (after `next` resolved).

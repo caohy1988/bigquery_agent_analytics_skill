@@ -319,6 +319,20 @@ function parseJsonText(text: string, limits: Limits): { value: unknown } | null 
   }
 }
 
+// Text that starts like a JSON object, or like a list that is laid out over
+// lines or opens with an object, a list or a string. When it is not parsed
+// whole (longer than the scan budget, or not valid JSON), its nested values
+// cannot be checked by name, and scrubbing it line by line would pass a
+// credential nested below its name's line: it is dropped and marked instead.
+const JSON_SHAPED = /^\s*(?:\{|\[[ \t]*(?:\r?\n|[{["]))/
+
+function dropJsonText(text: string, stats: SanitizeStats, state: WalkState): string {
+  stats.truncated = true
+  const marker = `[TRUNCATED: ${text.length} chars of JSON text that could not be parsed and checked]`
+  state.remaining -= jsonLength(marker)
+  return marker
+}
+
 // JSON found in a string: walked as observed data, then encoded again. Past
 // the depth budget it is dropped, not passed on unscanned.
 function walkJsonText(parsed: unknown, depth: number, allowed: number, limits: Limits, stats: SanitizeStats, state: WalkState): string {
@@ -349,6 +363,7 @@ function walk(value: unknown, depth: number, limits: Limits, stats: SanitizeStat
         if (parsed !== null && parsed.value !== null && (typeof parsed.value === 'object' || typeof parsed.value === 'string')) {
           return walkJsonText(parsed.value, depth, allowed, limits, stats, state)
         }
+        if (JSON_SHAPED.test(value)) return dropJsonText(value, stats, state)
       }
       const { text, cost } = clipString(value, allowed, stats)
       state.remaining -= cost

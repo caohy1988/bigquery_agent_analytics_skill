@@ -28,8 +28,10 @@ writing) reworks them because they could hang the CLI. A mod runs inside the
 host CLI, which lets this one keep a hard rule:
 
 * Each capture hook (prompt, turn, model request, tool and subagent events)
-  calls `next(e)` straight away, records what it saw into an in-memory queue
-  (synchronous, bounded work), and returns what `next` gave it, unchanged.
+  calls `next(e)`, records what it saw into an in-memory queue (synchronous,
+  bounded work), and returns what `next` gave it, unchanged. The one other
+  call a hook waits on is the host's `$.session.id()`, read for each event
+  (no network, no process; see Ids and spans).
 * No hook waits on the network or a process; a background writer driven by
   `$.clock` timers does that. Two lifecycle hooks do bounded work of their own
   before passing their event on: `session.start` sets the writer up and
@@ -56,7 +58,7 @@ is what a person would have seen as the CLI hanging.
  host CLI (engine)                             bigquery-agent-analytics-mod
  ───────────────────                          ───────────────────────────────────────────────
  classic.SessionStart ─┐
- prompt.submit ────────┤   hook: next(e) first,       Tracer: event -> BQAA row
+ prompt.submit ────────┤   hook: next(e),             Tracer: event -> BQAA row
  turn.start ───────────┤   then record (sync)  ─────▶ (ids, spans, redaction,
  turn.step (stream) ───┤                              truncation, is_truncated)
  tool.call ────────────┤                                     │ enqueue (sync)
@@ -223,7 +225,10 @@ plugin and the analysis skill's failure-rate query (ADK itself uses
 
 ### Ids and spans
 
-* `session_id`: the host CLI's session id (it changes after `/clear`).
+* `session_id`: the host CLI's session id, read again for each event, so the
+  rows after `/clear`, `/resume` or `/branch` carry the new one, even where
+  the classic hooks do not run (see Limitations). If the host refuses that
+  read after such a change, rows carry no session id rather than the old one.
 * `invocation_id`: the engine's turn id; a subagent's rows carry the turn that
   started it.
 * `trace_id`: one 32-hex trace per main-loop turn; a subagent started in that
@@ -368,15 +373,19 @@ GROUP BY model
   `is_truncated` set.
 * **Backfill:** `/bqaa-backfill` resends the files in the configured table's
   subdirectory to that table, and checks each line's recorded table first: a
-  line for another table stays in its file as written, and rows parked for
-  another table are sent only by a session configured for that table. `spill`
-  and `retry` files are also replayed 15 seconds after a session starts and
-  once BigQuery recovers in a session that parked rows. A file whose rows all
-  land is truncated to zero bytes (the API has no delete; empty files are safe
-  to remove). A file over 4 MiB, which the API cannot read, is reported by
-  `/bqaa-status` and the backfill instead of being passed over. Rows that fail
-  again stay, and a per-file lease in `$.store` keeps two sessions from
-  replaying the same file at once (best effort; `event_id` dedups the rest).
+  line for another table is kept as written, and rows parked for another
+  table are sent only by a session configured for that table. `spill` and
+  `retry` files are also replayed 15 seconds after a session starts and once
+  BigQuery recovers in a session that parked rows. A file whose rows all land
+  is truncated to zero bytes (the API has no delete; empty files are safe to
+  remove). What a replay leaves (rows that fail again, other tables' lines,
+  lines it cannot parse) is written to new files first, and only then is the
+  replayed file truncated: the API has no rename either, so a write that
+  fails leaves that file as it was (rows sent meanwhile may go again;
+  `event_id` dedups them). A file over 4 MiB, which the API cannot read, is
+  reported by `/bqaa-status` and the backfill instead of being passed over. A
+  per-file lease in `$.store` keeps two sessions from replaying the same file
+  at once (best effort; `event_id` dedups the rest).
 * **Fail open:** a hook's bookkeeping runs behind `.catch` or inside `try`;
   the writer never throws into a hook; every failure path ends in sent, on
   disk, or counted as dropped. An environment variable a policy refuses reads
@@ -421,7 +430,14 @@ column. Treat the dataset like the transcripts it mirrors.
   do not. A string that is JSON, including JSON encoded inside JSON, is
   parsed, redacted the same way at every level and encoded again (compactly);
   past the walk's depth or size budget, what is left is dropped and the row
-  marked truncated. In URLs, the user-info part and credential-named query or
+  marked truncated. A string that starts like a JSON object, or like a list
+  that opens with an object, a list, a string or a line break, but is not
+  parsed whole (longer than the 24,064 characters parsed at the default
+  `maxPayloadChars`, or not valid JSON, such as a document cut short) is
+  dropped and marked the same way, never scrubbed line by line. JSON that
+  follows other text in a string (a file view with line numbers, a log line)
+  gets the free-text rules below, which miss a value nested on a later line
+  than its credential name. In URLs, the user-info part and credential-named query or
   fragment parameters lose their values, and incoming-webhook URLs (Slack,
   Discord, Office) are replaced whole. The row's own field names (the top
   level of `content`, and `attributes`, which the mod writes itself) are not
@@ -463,14 +479,17 @@ The test command runs the `tests/*.test.ts` files against the host CLI's own
 test kit, with no session, sign-in, GCP or network: `$.http.fetch`,
 `$.process.run`, `$.fs` and `$.store` are stubbed, and `mock.clock` drives the
 timers; the `$.fs` stubs measure files in UTF-8 bytes and refuse a file over
-4 MiB, as the host does. 95 tests cover the captured rows and their spans, the
-non-blocking rules (`session.end` included), the queue bound, retries,
-timeouts, token refresh, table creation, partial inserts, 2xx answers that
-are not valid insertAll responses, dead-letter files,
-replay that keeps two tables' rows apart, backfill, the exit spill and its
+4 MiB, as the host does. 107 tests cover the captured rows and their spans,
+the session id after `/clear` and `/resume` with no classic hooks (a refused
+read included), the non-blocking rules (`session.end` included), the queue
+bound, retries, timeouts, token refresh, table creation, partial inserts, 2xx
+answers that are not valid insertAll responses, dead-letter files,
+replay that keeps two tables' rows apart and writes what it leaves before
+emptying a file (a failed write included), backfill, the exit spill and its
 time bound, multibyte rows held to the file limit in bytes, dry run,
 redaction (whole values under credential names of any type, name parts and
-endings, JSON nested in strings to any encoding depth, URLs and webhook URLs,
+endings, JSON nested in strings to any encoding depth, JSON text too long or
+broken to parse, URLs and webhook URLs,
 credential-named lines whatever they hold, values past 5,000 characters and
 past the scanned window, credentials across a length cap, every diagnostic
 sink, and each review probe through capture, delivery and the dead-letter
@@ -514,6 +533,12 @@ configuration.
 * Timestamps have millisecond precision.
 * An organization's web-fetch policy or `allowManagedModsOnly` can stop the
   mod; `/bqaa-status` and the debug log (start the CLI with `--debug`) say why.
+* Where an organization manages the host CLI, `classic.SessionStart`,
+  `classic.SubagentStart` and `classic.PermissionRequest` pass over a plugin
+  a person installs (`claude plugin validate` says so). Installed that way,
+  the mod records no session-start row, records each subagent with an
+  inferred `AGENT_STARTING` row typed `subagent`, and flags no permission
+  prompts; rows still carry the current session id.
 
 ## Files
 

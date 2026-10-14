@@ -422,14 +422,22 @@ test('JSON inside strings is parsed and redacted by structure, however deeply it
   const twice = JSON.stringify({ text: once })
   const thrice = JSON.stringify(JSON.stringify({ wrapper: twice }))
   const stats = newStats()
-  const out = sanitize({ a: once, b: twice, c: thrice, d: JSON.stringify([{ pwd: 1 }, 'x']), e: '{not json: password}' }, limitsFor(16384), stats) as Record<string, string>
+  const out = sanitize({ a: once, b: twice, c: thrice, d: JSON.stringify([{ pwd: 1 }, 'x']) }, limitsFor(16384), stats) as Record<string, string>
   expect(out.a).toBe('{"user":"u","password":"[REDACTED]"}')
   expect(out.b).toBe(JSON.stringify({ text: '{"user":"u","password":"[REDACTED]"}' }))
   expect(JSON.stringify(out).includes(secret)).toBe(false)
   expect(out.d).toBe('[{"pwd":"[REDACTED]"},"x"]')
-  // Not JSON: the text rules apply.
-  expect(out.e).toBe('{not json: password}')
   expect(stats.truncated).toBe(false)
+  // Shaped like JSON but not parsed whole (not valid, or past the budget):
+  // dropped and marked, never scrubbed line by line. Text that only starts
+  // with a bracket or a quote is not JSON-shaped and gets the text rules.
+  const shapedStats = newStats()
+  const shaped = sanitize({ invalid: '{not json: password}', long: JSON.stringify({ password: secret, pad: 'p'.repeat(30_000) }, null, 2), lines: '[\n  1,\n  {"note": "cut short"', list: '[1] first, [2] second', quoted: '"Hi," she said.' }, limitsFor(16384), shapedStats) as Record<string, string>
+  expect(shaped.invalid).toBe('[TRUNCATED: 20 chars of JSON text that could not be parsed and checked]')
+  expect(shaped.long).toMatch(/^\[TRUNCATED: \d+ chars of JSON text that could not be parsed and checked\]$/)
+  expect(shaped.lines).toBe('[TRUNCATED: 29 chars of JSON text that could not be parsed and checked]')
+  expect([shaped.list, shaped.quoted]).toEqual(['[1] first, [2] second', '"Hi," she said.'])
+  expect(shapedStats.truncated).toBe(true)
   // Deeper than the walk goes: dropped and marked, never passed on unscanned.
   let deep = JSON.stringify({ password: secret })
   for (let i = 0; i < 8; i += 1) deep = JSON.stringify({ layer: deep })

@@ -4,6 +4,11 @@
 
 import { type Engine, expect, test } from 'claude-code/testing'
 
+import { deadLetterPartition, resolveConfig } from '../hooks/lib/config.ts'
+import { type DeadLetterLine, encodeLines, parseFile } from '../hooks/lib/deadletter.ts'
+import { buildRow } from '../hooks/lib/rows.ts'
+import { type Io, Writer } from '../hooks/lib/writer.ts'
+
 import {
   COMMAND,
   DEAD_LETTER_DIR,
@@ -340,8 +345,10 @@ test('the next session replays spill files on its own', { options: OPTIONS }, as
   await startSession($)
   await world.clock.advance(15_000)
   expect(world.acceptedRows().some(r => r.event_id === 'a'.repeat(32))).toBe(true)
-  // The unreadable line is kept for a person to look at; the sent one is gone.
-  expect(world.files.get(path)).toBe('not json\n')
+  // The unreadable line is kept for a person to look at, in a new file; the
+  // source is emptied once that file is written.
+  expect(world.files.get(path)).toBe('')
+  expect(deadLetterFiles(world).map(([, text]) => text)).toEqual(['not json\n'])
 })
 
 test('replay sends only rows recorded for the configured table; other tables keep theirs', { options: OPTIONS }, async ($, on) => {
@@ -361,7 +368,11 @@ test('replay sends only rows recorded for the configured table; other tables kee
   expect(world.files.get(files.theirs)).toBe(before.get(files.theirs))
   expect(world.files.get(files.loose)).toBe(before.get(files.loose))
   expect(world.files.get(files.mine)).toBe('')
-  expect(world.files.get(files.mixed)).toBe(`${parkedLine(OTHER_TABLE, 'c'.repeat(32), 'their-session')}\n`)
+  // The mixed file's line for the other table moved, as written, to a new file
+  // in this table's directory before the mixed file was emptied.
+  expect(world.files.get(files.mixed)).toBe('')
+  const moved = deadLetterFiles(world).filter(([path]) => path.startsWith(`${PARTITION_DIR}/`))
+  expect(moved.map(([, text]) => text)).toEqual([`${parkedLine(OTHER_TABLE, 'c'.repeat(32), 'their-session')}\n`])
   const status = await statusText($)
   expect(status).toMatch(/2 rows sent, 1 left, 1 of them for another table/)
   expect(status).toMatch(/2 more file\(s\) in .* for other tables or an older layout/)
@@ -536,6 +547,7 @@ test('/clear keeps the process sending, under the new session id', { options: OP
   const world = setUp(on)
   await startSession($)
   await $.session.end({ reason: 'clear', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+  world.sessionId = 'after-clear-session'
   await $.classic.SessionStart({ source: 'clear', session_id: 'after-clear-session' })
   await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
   await world.clock.advance(5000)
@@ -703,4 +715,145 @@ test('a credential in BigQuery error text goes whole even next to a redaction ma
   await world.clock.advance(5000)
   expect(deadLetterFiles(world).length).toBe(1)
   for (const text of await everySink($, world)) expect(text.includes(CANARY)).toBe(false)
+})
+
+// Round four. Formatted JSON documents whose credential sits on a later line
+// than its name, too long to parse whole: they must not reach delivery or disk.
+const credentialDocuments = {
+  object: (padding: number) => JSON.stringify({ credentials: { value: CANARY }, padding: 'x'.repeat(padding) }, null, 2),
+  list: (padding: number) => JSON.stringify([{ credentials: { value: CANARY } }, 'x'.repeat(padding)], null, 2),
+  'list led by a number': (padding: number) => JSON.stringify([1, { credentials: { value: CANARY } }, 'x'.repeat(padding)], null, 2),
+}
+const credentialDocument = credentialDocuments.object
+
+for (const [shape, document] of Object.entries(credentialDocuments)) {
+  for (const sink of ['sent', 'parked'] as const) {
+    test(`a formatted JSON ${shape} past the parse budget is dropped and marked, not scrubbed line by line (${sink})`, { options: OPTIONS }, async ($, on) => {
+      const world = setUp(on)
+      if (sink === 'parked') world.replies = [REFUSED]
+      world.toolReply = () => ({ result: { type: 'text' }, text: document(30_000) })
+      await startSession($)
+      await $.tool.call({ tool: 'Read', file_path: 'large-config.json' })
+      await world.clock.advance(5000)
+      const rows = (sink === 'sent' ? world.sentRows() : deadLetterRows(world)).filter(r => r.event_type === 'TOOL_COMPLETED')
+      expect(rows.length).toBe(1)
+      expect(JSON.stringify(rows).includes(CANARY)).toBe(false)
+      expect(rows[0]?.is_truncated).toBe(true)
+      expect((JSON.parse(rows[0]?.content ?? '{}') as { result: string }).result).toMatch(/^\[TRUNCATED: \d+ chars of JSON text that could not be parsed and checked\]$/)
+    })
+  }
+}
+
+test('formatted JSON within the budget is still redacted by its structure', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  world.toolReply = () => ({ result: { type: 'text' }, text: credentialDocument(100) })
+  await startSession($)
+  await $.tool.call({ tool: 'Read', file_path: 'small-config.json' })
+  await world.clock.advance(5000)
+  const [row] = world.sentRows().filter(r => r.event_type === 'TOOL_COMPLETED')
+  expect(JSON.stringify(row).includes(CANARY)).toBe(false)
+  expect(JSON.parse((JSON.parse(row?.content ?? '{}') as { result: string }).result)).toEqual({ credentials: '[REDACTED]', padding: 'x'.repeat(100) })
+})
+
+test('JSON text that does not parse is dropped, not scrubbed line by line', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  // Cut off before its end, as a tool's own output limit can leave it.
+  world.toolReply = () => ({ result: { type: 'text' }, text: credentialDocument(100).slice(0, -20) })
+  await startSession($)
+  await $.tool.call({ tool: 'Read', file_path: 'cut-config.json' })
+  await world.clock.advance(5000)
+  const [row] = world.sentRows().filter(r => r.event_type === 'TOOL_COMPLETED')
+  expect(JSON.stringify(row).includes(CANARY)).toBe(false)
+  expect(row?.is_truncated).toBe(true)
+})
+
+test('after /clear the next rows carry the new session id, with no classic hook to say so', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  // No classic.SessionStart: a managed policy can keep classic hooks from a
+  // user plugin, and session.start does not fire after /clear.
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' })
+  await $.session.end({ reason: 'clear', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+  world.sessionId = 'session-after-clear'
+  await $.turn.start({ turnId: 'turn-after-clear', text: 'after clear' })
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
+  await world.clock.advance(5000)
+  expect(world.sentRows().map(r => [r.event_type, r.session_id])).toEqual([
+    ['STATE_DELTA', SESSION_ID],
+    ['INVOCATION_STARTING', 'session-after-clear'],
+    ['TOOL_STARTING', 'session-after-clear'],
+    ['TOOL_COMPLETED', 'session-after-clear'],
+  ])
+})
+
+test('after a session change, a refused id read leaves rows with no session id, never the old one', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' })
+  await $.session.end({ reason: 'resume', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+  world.sessionIdRefused = true
+  await $.turn.start({ turnId: 'turn-after-resume', text: 'after resume' })
+  await world.clock.advance(5000)
+  const [started] = world.sentRows().filter(r => r.event_type === 'INVOCATION_STARTING')
+  expect(started?.session_id).toBe(null)
+})
+
+// A replay whose leftovers outgrow one file (every row refused with a long
+// reason), run against a file system that can fail every write but the
+// source's own.
+async function splitReplay(failNewFiles: boolean) {
+  const config = resolveConfig({ project: 'replay-project', dataset: 'events', deadLetterDir: '/replay/dead-letter' }, {})
+  const source = `${deadLetterPartition(config)}/spill-20261013T200102003Z-replay-1.jsonl`
+  const lines: DeadLetterLine[] = Array.from({ length: 1000 }, (_, i) => ({
+    v: 1,
+    kind: 'spill',
+    reason: 'session ended',
+    attempts: 0,
+    failed_at: '2026-10-13T20:01:02.003Z',
+    table: 'replay-project.events.agent_events',
+    row: buildRow({ eventType: 'TOOL_COMPLETED', timestampMs: 0, eventId: String(i).padStart(32, '0'), agent: 'coding-agent', sessionId: 's', invocationId: 't', userId: 'u', traceId: null, spanId: null, parentSpanId: null, content: { result: 'r'.repeat(2200) }, attributes: {}, maxPayloadChars: 16384 }).row,
+  }))
+  const encoded = encodeLines(lines)
+  expect(encoded.length).toBe(1)
+  const files = new Map<string, string>([[source, encoded[0] as string]])
+  const refusal = (count: number) => JSON.stringify({ insertErrors: Array.from({ length: count }, (_, index) => ({ index, errors: [{ reason: 'invalid', message: 'm'.repeat(900) }] })) })
+  const io: Io = {
+    now: () => 0,
+    after: () => ({ cancel: () => undefined }),
+    fetch: async (_url, init) => ({ status: 200, text: refusal((JSON.parse(init.body) as { rows: unknown[] }).rows.length) }),
+    runCommand: async () => ({ exitCode: 0, stdout: 'a'.repeat(24), stderr: '' }),
+    envToken: async () => undefined,
+    readFile: async path => files.get(path) ?? '',
+    writeFile: async (path, text) => {
+      if (failNewFiles && path !== source) throw new Error('disk full')
+      files.set(path, text)
+    },
+    listDir: async () => [{ name: source.split('/').pop() as string, kind: 'file', size: utf8Bytes(encoded[0] as string) }],
+    storeGet: async () => undefined,
+    storeSet: async () => undefined,
+    storeDelete: async () => undefined,
+    status: () => undefined,
+    debug: () => undefined,
+  }
+  const writer = new Writer(io, () => config, () => 'replay-session')
+  const report = await writer.backfill(['spill'], 'command')
+  const ids = [...files.values()].flatMap(text => parseFile(text).lines.map(line => line.row.event_id))
+  return { files, source, report, ids }
+}
+
+test('a replay that splits what is left writes every part before emptying its source', async () => {
+  const { files, source, report, ids } = await splitReplay(false)
+  expect(report.error).toBe(null)
+  // Lengths, not contents: a failure message holding megabytes of rows
+  // would not reach the test report.
+  expect(files.get(source)?.length).toBe(0)
+  // At least two new files, holding every refused row exactly once.
+  expect(files.size >= 3).toBe(true)
+  expect(ids.length).toBe(1000)
+  expect(new Set(ids).size).toBe(1000)
+})
+
+test('a write that fails while a replay splits leaves the source whole', async () => {
+  const { files, source, report, ids } = await splitReplay(true)
+  expect(report.error ?? '').toMatch(/disk full/)
+  expect(parseFile(files.get(source) ?? '').lines.length).toBe(1000)
+  expect(new Set(ids).size).toBe(1000)
 })
