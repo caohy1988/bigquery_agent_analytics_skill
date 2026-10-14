@@ -1,10 +1,17 @@
 // The text `/bqaa-status` prints. Plain lines: the model reads a command's
-// output too, so it carries counts and states, never a payload or a token.
+// output too, so it carries counts and states, never a payload or a token,
+// and the whole text is redacted once more on its way out.
 
 import { type Config, tableRef } from './config.ts'
+import { redactDiagnostic } from './sanitize.ts'
 import type { BackfillReport, Writer } from './writer.ts'
 
-export type DeadLetterSummary = { files: number; bytes: number; byKind: Record<string, number> } | { error: string }
+// This table's dead-letter files (`dir`), the files elsewhere in the
+// dead-letter directory (other tables' subdirectories, an older flat
+// layout), and files too large to read back.
+export type DeadLetterSummary =
+  | { dir: string; files: number; bytes: number; byKind: Record<string, number>; oversized: string[]; elsewhere: number }
+  | { error: string }
 
 const ago = (now: number, at: number | null): string => {
   if (at === null) return 'never'
@@ -15,6 +22,8 @@ const ago = (now: number, at: number | null): string => {
 }
 
 const kb = (bytes: number): string => (bytes < 1024 ? `${bytes} B` : `${(bytes / 1024).toFixed(1)} KB`)
+
+const names = (list: readonly string[]): string => `${list.slice(0, 5).join(', ')}${list.length > 5 ? ', ...' : ''}`
 
 export function formatStatus(args: {
   config: Config
@@ -43,16 +52,18 @@ export function formatStatus(args: {
     const kinds = Object.entries(d.byKind)
       .map(([kind, n]) => `${n} ${kind}`)
       .join(', ')
-    lines.push(`dead-letter: ${d.files} file(s), ${kb(d.bytes)}${kinds ? ` (${kinds})` : ''} in ${c.deadLetterDir}`)
+    lines.push(`dead-letter: ${d.files} file(s), ${kb(d.bytes)}${kinds ? ` (${kinds})` : ''} in ${d.dir}`)
+    if (d.oversized.length > 0) lines.push(`dead-letter: ${d.oversized.length} file(s) over the 4 MiB read limit, not replayed: ${names(d.oversized)}`)
+    if (d.elsewhere > 0) lines.push(`dead-letter: ${d.elsewhere} more file(s) in ${c.deadLetterDir} for other tables or an older layout, not replayed under this configuration`)
   }
   if (args.isBackfilling) lines.push('backfill: running')
   else if (args.backfill) {
     const b = args.backfill
     lines.push(
-      `last backfill (${b.trigger}, ${ago(now, b.finishedAt)}): ${b.files} file(s), ${b.rowsSent} rows sent, ${b.rowsLeft} left${b.skippedFiles ? `, ${b.skippedFiles} skipped` : ''}${b.error ? `; stopped: ${b.error.slice(0, 200)}` : ''}`,
+      `last backfill (${b.trigger}, ${ago(now, b.finishedAt)}): ${b.files} file(s), ${b.rowsSent} rows sent, ${b.rowsLeft} left${b.otherTableRows ? `, ${b.otherTableRows} of them for another table` : ''}${b.skippedFiles ? `, ${b.skippedFiles} skipped` : ''}${b.oversizedFiles.length ? `, ${b.oversizedFiles.length} too large to read` : ''}${b.error ? `; stopped: ${b.error.slice(0, 200)}` : ''}`,
     )
   }
   lines.push(`redactions ${k.redactions}, truncated rows ${k.truncatedRows}; session ${args.sessionId ?? 'unknown'}`)
   for (const problem of c.problems) lines.push(`problem: ${problem}`)
-  return lines.join('\n')
+  return redactDiagnostic(lines.join('\n'), 8000)
 }

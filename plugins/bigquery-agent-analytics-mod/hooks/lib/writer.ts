@@ -1,17 +1,19 @@
 // The background writer. Hooks only call `enqueue` (synchronous, in memory);
 // everything that touches the network, a process or the disk runs here, from
-// timers, never inside a hook's dispatch (session.end's bounded spill aside).
+// timers, never inside a hook's dispatch (session end's bounded spill write
+// aside, which starts no request).
 //
 // Delivery: batched tabledata.insertAll with a client-side timeout, retries
 // with exponential backoff, then a local dead-letter file. Every failure path
 // keeps the rows (on disk) or counts them as dropped; none throws into a hook.
+// Every diagnostic is redacted before it is cut, kept, written or shown.
 
-import { type Config, canDeliver, joinPath, tableRef } from './config.ts'
+import { type Config, canDeliver, deadLetterPartition, destinationDir, joinPath, tableRef } from './config.ts'
 import { type HttpAnswer, classifyInsert, createTableBody, insertAllBody, insertAllUrl, isDatasetMissing, tablesUrl } from './bigquery.ts'
-import { type DeadLetterKind, type DeadLetterLine, MAX_FILE_CHARS, encodeLines, fileName, kindOf, parseFile } from './deadletter.ts'
+import { type DeadLetterKind, type DeadLetterLine, HOST_FILE_BYTES, MAX_FILE_BYTES, encodeLines, fileName, kindOf, lineText, packLines, parseFile } from './deadletter.ts'
 import { BoundedQueue, type Queued } from './queue.ts'
-import { type BqaaRow, rowBytes } from './rows.ts'
-import { newStats, redactText } from './sanitize.ts'
+import { type BqaaRow, fitRow, rowBytes } from './rows.ts'
+import { redactDiagnostic } from './sanitize.ts'
 import { errorText } from './tracer.ts'
 
 export type Timer = { cancel: () => void }
@@ -60,7 +62,11 @@ export type BackfillReport = {
   files: number
   rowsSent: number
   rowsLeft: number
+  // Of rowsLeft, lines recorded for another table: kept as they were.
+  otherTableRows: number
   skippedFiles: number
+  // Files over the 4 MiB `$.fs.read` limit, which cannot be read back.
+  oversizedFiles: string[]
   error: string | null
   finishedAt: number | null
 }
@@ -68,8 +74,16 @@ export type BackfillReport = {
 const TIMED_OUT = Symbol('timed out')
 const MAX_BATCHES_PER_TICK = 10
 const LEASE_MS = 10 * 60 * 1000
+// Longest diagnostic kept: the last error, a report's error, a line's reason.
+const DIAGNOSTIC_CHARS = 1000
 
-const firstLine = (text: string): string => (text.split('\n').find(l => l.trim() !== '') ?? '').trim().slice(0, 300)
+const diagnostic = (text: string, maxChars = DIAGNOSTIC_CHARS): string => redactDiagnostic(text, maxChars)
+// An error's own message, without the `Error: ` errorText puts first.
+const messageOf = (err: unknown): string => (err instanceof Error ? err.message : errorText(err))
+const firstLine = (text: string): string => (text.split('\n').find(l => l.trim() !== '') ?? '').trim()
+// The token command, named by its program only: its arguments can hold a
+// credential (a key file, a header, a password).
+const programName = (argv: readonly string[]): string => (argv[0] ?? '').split(/[\\/]/).pop() || 'command'
 
 export class Writer {
   readonly queue: BoundedQueue
@@ -165,7 +179,7 @@ export class Writer {
   prefetchToken(): void {
     const c = this.config()
     if (!canDeliver(c) || c.dryRun) return
-    void this.getToken().catch(err => this.recordError(`auth: ${errorText(err)}`))
+    void this.getToken().catch(err => this.recordError(`auth: ${messageOf(err)}`))
   }
 
   private async flushLoop(): Promise<void> {
@@ -198,7 +212,7 @@ export class Writer {
     try {
       token = await this.getToken()
     } catch (err) {
-      await this.retryLater(batch, `auth: ${errorText(err)}`)
+      await this.retryLater(batch, `auth: ${messageOf(err)}`)
       return false
     }
     const answer = await this.post(insertAllUrl(c), insertAllBody(batch.map(q => q.row)), token, c.requestTimeoutMs)
@@ -299,10 +313,11 @@ export class Writer {
 
   private async retryLater(batch: Queued[], message: string): Promise<void> {
     const c = this.config()
+    const reason = diagnostic(message)
     this.consecutiveFailures += 1
     this.counters.retries += 1
     this.pause()
-    this.recordError(message)
+    this.recordError(reason)
     const exhausted: Queued[] = []
     const keep: Queued[] = []
     for (const q of batch) {
@@ -313,19 +328,20 @@ export class Writer {
     this.queue.unshift(keep)
     if (exhausted.length > 0) {
       this.counters.failed += exhausted.length
-      await this.deadLetter('retry', exhausted, message)
-      this.setStatus(`BQAA: ${exhausted.length} row(s) parked after retries (${message.slice(0, 80)}); /bqaa-backfill sends them`)
+      await this.deadLetter('retry', exhausted, reason)
+      this.setStatus(`BQAA: ${exhausted.length} row(s) parked after retries (${reason.slice(0, 80)}); /bqaa-backfill sends them`)
     }
   }
 
   private async reject(batch: Queued[], message: string): Promise<void> {
+    const reason = diagnostic(message)
     this.consecutiveFailures += 1
     this.pause()
     this.counters.failed += batch.length
     this.counters.rejected += batch.length
-    this.recordError(message)
-    await this.deadLetter('rejected', batch, message)
-    this.setStatus(`BQAA: ${batch.length} row(s) refused (${message.slice(0, 80)}); fix, then /bqaa-backfill`)
+    this.recordError(reason)
+    await this.deadLetter('rejected', batch, reason)
+    this.setStatus(`BQAA: ${batch.length} row(s) refused (${reason.slice(0, 80)}); fix, then /bqaa-backfill`)
   }
 
   // While BigQuery is unreachable, rows past 80% of the queue go to disk
@@ -340,15 +356,16 @@ export class Writer {
   // Error text reaches /bqaa-status (which the model reads) and the debug
   // log: redacted like any payload, in case a command echoed a credential.
   private recordError(message: string): void {
-    const clean = redactText(message, newStats()).slice(0, 1000)
+    const clean = diagnostic(message)
     this.lastError = { message: clean, at: this.io.now() }
     this.io.debug(`bqaa: ${clean}`)
   }
 
   private setStatus(text: string | undefined): void {
-    if (text === this.statusText) return
-    this.statusText = text
-    this.io.status(text)
+    const clean = text === undefined ? undefined : diagnostic(text, 300)
+    if (clean === this.statusText) return
+    this.statusText = clean
+    this.io.status(clean)
   }
 
   private async post(url: string, body: string, token: string, timeoutMs: number): Promise<HttpAnswer | { error: string }> {
@@ -387,12 +404,11 @@ export class Writer {
         return fromEnv
       }
       if (c.accessTokenCommand.length === 0) throw new Error('no access token source: set BQAA_ACCESS_TOKEN or accessTokenCommand')
+      const command = `token command \`${programName(c.accessTokenCommand)}\``
       const result = await this.io.runCommand(c.accessTokenCommand, c.tokenCommandTimeoutMs)
-      if (result.exitCode !== 0) {
-        throw new Error(`\`${c.accessTokenCommand.join(' ')}\` exited ${result.exitCode}: ${firstLine(result.stderr)}`)
-      }
+      if (result.exitCode !== 0) throw new Error(`${command} exited ${result.exitCode}: ${diagnostic(firstLine(result.stderr), 300)}`)
       const value = result.stdout.trim().split(/\s+/)[0] ?? ''
-      if (!/^[A-Za-z0-9._~+/=-]{16,}$/.test(value)) throw new Error(`\`${c.accessTokenCommand.join(' ')}\` printed no access token`)
+      if (!/^[A-Za-z0-9._~+/=-]{16,}$/.test(value)) throw new Error(`${command} printed no access token`)
       this.token = { value, expiresAt: this.io.now() + c.tokenTtlMs }
       return value
     })()
@@ -415,14 +431,22 @@ export class Writer {
       this.io.debug(`bqaa: created ${tableRef(c)} (day-partitioned on timestamp, clustered on event_type, agent, user_id)`)
       return true
     }
-    this.recordError(`create table: HTTP ${answer.status}: ${answer.text.slice(0, 300)}`)
+    this.recordError(`create table: HTTP ${answer.status}: ${answer.text}`)
     return false
   }
 
+  // Dry run: the rows as JSONL files beside the dead-letter directory, each
+  // file within the file limit in bytes.
+  private async writeDryRunFiles(rows: readonly Queued[], c: Config): Promise<void> {
+    for (const text of packLines(rows.map(q => JSON.stringify(fitRow(q.row, MAX_FILE_BYTES - 1))))) {
+      const name = fileName('spill', this.io.now(), this.sessionId(), ++this.seq).replace(/^spill-/, 'dry-run-')
+      await this.io.writeFile(joinPath(c.dryRunDir, name), text)
+    }
+  }
+
   private async writeDryRun(batch: Queued[], c: Config): Promise<boolean> {
-    const name = fileName('spill', this.io.now(), this.sessionId(), ++this.seq).replace(/^spill-/, 'dry-run-')
     try {
-      await this.io.writeFile(joinPath(c.dryRunDir, name), batch.map(q => JSON.stringify(q.row)).join('\n') + '\n')
+      await this.writeDryRunFiles(batch, c)
       this.succeeded(batch.length)
       return true
     } catch (err) {
@@ -431,15 +455,17 @@ export class Writer {
     }
   }
 
+  // Into this table's own subdirectory, each line naming the table.
   private async deadLetter(kind: DeadLetterKind, rows: Queued[], reason: string): Promise<void> {
     if (rows.length === 0) return
     const c = this.config()
     const at = this.io.now()
     const failedAt = new Date(at).toISOString()
+    const dir = deadLetterPartition(c)
     const lines: DeadLetterLine[] = rows.map(q => ({ v: 1, kind, reason, attempts: q.attempts, failed_at: failedAt, table: tableRef(c), row: q.row }))
     for (const text of encodeLines(lines)) {
       const count = text.split('\n').length - 1
-      const path = joinPath(c.deadLetterDir, fileName(kind, at, this.sessionId(), ++this.seq))
+      const path = joinPath(dir, fileName(kind, at, this.sessionId(), ++this.seq))
       try {
         if (c.deadLetterDir === '') throw new Error('no dead-letter directory')
         await this.io.writeFile(path, text)
@@ -454,75 +480,35 @@ export class Writer {
 
   // ---- session end -------------------------------------------------------
 
-  // Called from session.end, inside the engine's short end-of-session bound:
-  // one request if a token is in hand and time allows, then whatever is not
-  // confirmed sent goes to a spill file. Never throws.
-  async drainForExit(budgetMs: number): Promise<{ sent: number; spilled: number }> {
+  // Called from session.end when the process is ending, inside the engine's
+  // short end-of-session bound. Starts no request: the rows still queued, and
+  // rows whose request has not answered (it may yet land; event_id dedups),
+  // go to a spill file the next session sends, or in a dry run to the dry-run
+  // files. Waits at most `budgetMs` for those writes. Never throws.
+  async spillForExit(budgetMs: number): Promise<{ spilled: number }> {
     const c = this.config()
-    let sent = 0
-    const start = this.io.now()
-    const sendBy = start + Math.max(0, budgetMs - 250)
     this.closing = true
-    try {
-      if (this.soon) {
-        this.soon.cancel()
-        this.soon = null
+    this.soon?.cancel()
+    this.soon = null
+    const rows = [...(this.inFlight ? this.inFlightRows : []), ...this.queue.takeAll()]
+    if (rows.length === 0) return { spilled: 0 }
+    const toDryRun = c.dryRun && c.dryRunDir !== ''
+    const write = (async (): Promise<void> => {
+      if (!toDryRun) {
+        this.counters.spilled += rows.length
+        await this.deadLetter('spill', rows, 'session ended before these rows were confirmed sent')
+        return
       }
-      if (this.inFlight && budgetMs > 0) await this.raceUntil(this.inFlight, sendBy)
-      // A request still running may yet land: its rows are spilled too, and
-      // event_id lets a query drop the duplicate.
-      const unconfirmed = this.inFlight ? [...this.inFlightRows] : []
-      let rest = this.queue.takeAll()
-      if (rest.length > 0 && canDeliver(c)) {
-        if (c.dryRun) {
-          if (await this.writeDryRun(rest, c)) {
-            sent += rest.length
-            rest = []
-          } else {
-            rest = this.queue.takeAll()
-          }
-        } else {
-          const tokenOk = this.token !== null && this.io.now() < this.token.expiresAt
-          const left = sendBy - this.io.now()
-          // Not when BigQuery is backing us off, nor while an earlier request
-          // is still hanging: a second would most likely hang too.
-          if (tokenOk && left > 100 && this.pauseTimer === null && this.inFlight === null) {
-            const first = rest.slice(0, c.maxBatchRows)
-            let bytes = 0
-            let fit = 0
-            for (const q of first) {
-              if (fit > 0 && bytes + q.bytes > c.maxBatchBytes) break
-              bytes += q.bytes
-              fit += 1
-            }
-            const batch = rest.slice(0, fit)
-            const answer = await this.post(insertAllUrl(c), insertAllBody(batch.map(q => q.row)), (this.token as { value: string }).value, Math.min(c.requestTimeoutMs, left))
-            if (!('error' in answer)) {
-              const outcome = classifyInsert(answer, batch.length)
-              if (outcome.kind === 'ok') {
-                this.succeeded(batch.length)
-                sent += batch.length
-                rest = rest.slice(fit)
-              } else if (outcome.kind === 'partial') {
-                const unsent = batch.filter((_, i) => outcome.rejected.has(i) || outcome.retry.has(i))
-                this.succeeded(batch.length - unsent.length)
-                sent += batch.length - unsent.length
-                rest = [...unsent, ...rest.slice(fit)]
-              }
-            }
-          }
-        }
+      try {
+        await this.writeDryRunFiles(rows, c)
+        this.counters.sent += rows.length
+      } catch (err) {
+        this.counters.dropped += rows.length
+        this.recordError(`dry run write at exit failed (${rows.length} rows lost): ${errorText(err)}`)
       }
-      const spill = [...unconfirmed, ...rest]
-      if (spill.length > 0) {
-        this.counters.spilled += spill.length
-        await this.deadLetter('spill', spill, 'session ended before these rows were confirmed sent')
-      }
-      return { sent, spilled: spill.length }
-    } catch (err) {
-      this.recordError(`exit drain failed: ${errorText(err)}`)
-      return { sent, spilled: 0 }
-    }
+    })()
+    await this.raceUntil(write, this.io.now() + budgetMs)
+    return { spilled: toDryRun ? 0 : rows.length }
   }
 
   private raceUntil(work: Promise<unknown>, until: number): Promise<unknown> {
@@ -537,12 +523,24 @@ export class Writer {
 
   // ---- backfill ----------------------------------------------------------
 
-  // Sends the rows parked in dead-letter files. A file whose rows all land is
-  // truncated to zero bytes (`$.fs` has no delete); rows that fail again stay.
+  // Sends the rows parked for this table. A file whose rows all land is
+  // truncated to zero bytes (`$.fs` has no delete); rows that fail again
+  // stay, and so does every line recorded for another table, as written.
   backfill(kinds: DeadLetterKind[], trigger: BackfillReport['trigger']): Promise<BackfillReport> {
     if (this.backfilling) return this.backfilling
     const run = this.backfillRun(kinds, trigger).catch(err => {
-      const report: BackfillReport = { trigger, files: 0, rowsSent: 0, rowsLeft: 0, skippedFiles: 0, error: errorText(err), finishedAt: this.io.now() }
+      const report: BackfillReport = {
+        trigger,
+        files: 0,
+        rowsSent: 0,
+        rowsLeft: 0,
+        otherTableRows: 0,
+        skippedFiles: 0,
+        oversizedFiles: [],
+        error: diagnostic(errorText(err)),
+        finishedAt: this.io.now(),
+      }
+      this.backfillReport = report
       return report
     })
     this.backfilling = run.finally(() => {
@@ -557,7 +555,7 @@ export class Writer {
 
   private async backfillRun(kinds: DeadLetterKind[], trigger: BackfillReport['trigger']): Promise<BackfillReport> {
     const c = this.config()
-    const report: BackfillReport = { trigger, files: 0, rowsSent: 0, rowsLeft: 0, skippedFiles: 0, error: null, finishedAt: null }
+    const report: BackfillReport = { trigger, files: 0, rowsSent: 0, rowsLeft: 0, otherTableRows: 0, skippedFiles: 0, oversizedFiles: [], error: null, finishedAt: null }
     const finish = (): BackfillReport => {
       report.finishedAt = this.io.now()
       this.backfillReport = report
@@ -567,27 +565,31 @@ export class Writer {
       report.error = c.dryRun ? 'dry run: nothing is sent to BigQuery' : 'not configured: set project and dataset'
       return finish()
     }
+    // Only this table's subdirectory: rows parked for another table wait for
+    // a session configured with that table.
+    const dir = deadLetterPartition(c)
     let entries: readonly { name: string; kind: string; size: number }[] = []
     try {
-      entries = await this.io.listDir(c.deadLetterDir)
+      entries = await this.io.listDir(dir)
     } catch {
       return finish()
     }
-    const files = entries
-      .filter(e => e.kind === 'file' && e.size > 0 && e.size <= MAX_FILE_CHARS + 1024 * 1024)
-      .filter(e => {
-        const kind = kindOf(e.name)
-        return kind !== null && kinds.includes(kind)
-      })
-      .map(e => e.name)
-      .sort()
+    const files: string[] = []
+    for (const e of entries) {
+      const kind = kindOf(e.name)
+      if (e.kind !== 'file' || e.size === 0 || kind === null || !kinds.includes(kind)) continue
+      // `$.fs.read` refuses a file over 4 MiB: say so rather than pass it by.
+      if (e.size > HOST_FILE_BYTES) report.oversizedFiles.push(e.name)
+      else files.push(e.name)
+    }
+    files.sort()
     const me = this.sessionId() ?? 'unknown'
     for (const name of files) {
       if (report.error) {
         report.skippedFiles += 1
         continue
       }
-      const leaseKey = `lease:${name}`
+      const leaseKey = `lease:${destinationDir(tableRef(c))}/${name}`
       try {
         const lease = (await this.io.storeGet(leaseKey)) as { by?: string; until?: number } | undefined
         if (lease && typeof lease.until === 'number' && lease.until > this.io.now() && lease.by !== me) {
@@ -599,7 +601,7 @@ export class Writer {
         // No store: go on without the lease; event_id still dedups in SQL.
       }
       try {
-        await this.backfillFile(joinPath(c.deadLetterDir, name), c, report)
+        await this.backfillFile(dir, name, c, report)
         report.files += 1
       } finally {
         try {
@@ -612,37 +614,47 @@ export class Writer {
     return finish()
   }
 
-  private async backfillFile(path: string, c: Config, report: BackfillReport): Promise<void> {
-    const text = await this.io.readFile(path)
-    const { lines, unreadable } = parseFile(text)
+  private async backfillFile(dir: string, name: string, c: Config, report: BackfillReport): Promise<void> {
+    const path = joinPath(dir, name)
+    const { lines, raw, unreadable } = parseFile(await this.io.readFile(path))
+    // A line is sent only to the table it records. Others stay as written.
+    const table = tableRef(c)
+    const mine: DeadLetterLine[] = []
+    const others: string[] = []
+    lines.forEach((line, i) => {
+      if (line.table === table) mine.push(line)
+      else others.push(raw[i] as string)
+    })
+    report.otherTableRows += others.length
     const left: DeadLetterLine[] = []
+    let changed = false
     let index = 0
-    while (index < lines.length) {
+    while (index < mine.length) {
       if (report.error) {
-        left.push(...lines.slice(index))
+        left.push(...mine.slice(index))
         break
       }
       let bytes = 0
       let end = index
-      while (end < lines.length && end - index < c.maxBatchRows) {
-        const size = rowBytes((lines[end] as DeadLetterLine).row)
+      while (end < mine.length && end - index < c.maxBatchRows) {
+        const size = rowBytes((mine[end] as DeadLetterLine).row)
         if (end > index && bytes + size > c.maxBatchBytes) break
         bytes += size
         end += 1
       }
-      const chunk = lines.slice(index, end)
+      const chunk = mine.slice(index, end)
       index = end
       let token: string
       try {
         token = await this.getToken()
       } catch (err) {
-        report.error = `auth: ${errorText(err)}`
+        report.error = diagnostic(`auth: ${messageOf(err)}`)
         left.push(...chunk)
         continue
       }
       const answer = await this.post(insertAllUrl(c), insertAllBody(chunk.map(l => l.row)), token, c.requestTimeoutMs)
       if ('error' in answer) {
-        report.error = answer.error
+        report.error = diagnostic(answer.error)
         left.push(...chunk)
         continue
       }
@@ -650,27 +662,36 @@ export class Writer {
       if (outcome.kind === 'ok') {
         report.rowsSent += chunk.length
         this.counters.sent += chunk.length
+        changed = true
         continue
       }
       if (outcome.kind === 'partial') {
         chunk.forEach((line, i) => {
           const reason = outcome.rejected.get(i)
-          if (reason !== undefined) left.push({ ...line, kind: 'rejected', reason, attempts: line.attempts + 1 })
+          if (reason !== undefined) left.push({ ...line, kind: 'rejected', reason: diagnostic(reason), attempts: line.attempts + 1 })
           else if (outcome.retry.has(i)) left.push(line)
           else {
             report.rowsSent += 1
             this.counters.sent += 1
           }
         })
+        changed = true
         continue
       }
       if (outcome.kind === 'auth') this.token = null
-      report.error = outcome.message
+      report.error = diagnostic(outcome.message)
       left.push(...chunk)
     }
-    report.rowsLeft += left.length
-    const rest = left.map(l => JSON.stringify(l)).concat(unreadable)
-    await this.io.writeFile(path, rest.length === 0 ? '' : `${rest.join('\n')}\n`)
+    report.rowsLeft += left.length + others.length
+    // Nothing sent and nothing new to record: the file stays as it was.
+    if (!changed) return
+    const rest = [...left.map(lineText), ...others, ...unreadable]
+    const [first = '', ...more] = packLines(rest)
+    await this.io.writeFile(path, first)
+    // Rewritten reasons can make the rest outgrow one file.
+    for (const text of more) {
+      await this.io.writeFile(joinPath(dir, fileName(kindOf(name) ?? 'retry', this.io.now(), this.sessionId(), ++this.seq)), text)
+    }
   }
 
   // ---- status ------------------------------------------------------------

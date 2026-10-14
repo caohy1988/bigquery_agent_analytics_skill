@@ -1,5 +1,6 @@
-// A fixture session run through the mod, end to end, whose insertAll rows are
-// printed (stderr, one `BQAA_SAMPLE_ROW <json>` line each) so the README and
+// A fixture session run through the mod, end to end, whose insertAll rows
+// (the session-end row from its spill file) are printed (stderr, one
+// `BQAA_SAMPLE_ROW <json>` line each) so the README and
 // the demo page can show real output of the mod; the README's "Sample rows"
 // section has the command that regenerates examples/sample-rows.jsonl.
 //
@@ -9,7 +10,7 @@
 
 import { expect, test } from 'claude-code/testing'
 
-import { OPTIONS, SESSION_ID, byType, runStep, setUp, startSession } from './helpers.ts'
+import { OPTIONS, SESSION_ID, byType, deadLetterRows, runStep, setUp, startSession } from './helpers.ts'
 
 // The test runner has a console (its output goes to stderr); the hooks
 // environment's declarations do not list one.
@@ -94,7 +95,9 @@ test('fixture session: prompt, four model requests, tools, a subagent, session e
   await world.clock.advance(5000)
   await $.session.end({ reason: 'prompt_input_exit', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
 
-  const rows = world.acceptedRows()
+  // What insertAll took, then the session-end row: session end writes it to
+  // a spill file, unchanged, for the next session to send.
+  const rows = [...world.acceptedRows(), ...deadLetterRows(world)]
   expect(byType(rows, 'LLM_RESPONSE').length).toBe(5)
   expect(byType(rows, 'TOOL_COMPLETED').length).toBe(4)
   expect(byType(rows, 'AGENT_COMPLETED').length).toBe(1)

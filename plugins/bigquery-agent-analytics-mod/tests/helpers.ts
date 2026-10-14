@@ -1,7 +1,8 @@
 // Stubs for the parts of the host CLI the mod reaches through `$`, so every
 // test runs with no session, no GCP and no network: `$.http.fetch` answers
-// from a script the test controls, `$.fs` is a Map, `$.process.run` prints a
-// fake token, and `mock.clock` drives the flush timer.
+// from a script the test controls, `$.fs` is a Map held to the host's limits
+// (UTF-8 bytes, 4 MiB a file), `$.process.run` prints a fake token, and
+// `mock.clock` drives the flush timer.
 
 import { type Engine, type MockClock, mock } from 'claude-code/testing'
 import type { On, TurnStepChunk, TurnStepResult } from 'claude-code'
@@ -25,6 +26,9 @@ export type World = {
   processReply: { exitCode: number; stdout: string; stderr: string }
   // Makes `$.fs.write` refuse every write.
   failWrites: boolean
+  // Makes `$.fs.write` wait until `releaseWrites` is called.
+  hangWrites: boolean
+  releaseWrites: () => void
   // Rows from insertAll calls BigQuery answered 200 to, oldest first.
   acceptedRows: () => Row[]
   // How many stubbed model streams ended normally, and how many were closed.
@@ -64,6 +68,9 @@ export type Row = {
 export const SESSION_ID = '5c4b1d2e-8f7a-4c3b-9d1e-2a6f0b7c8d9e'
 export const HOME = '/home/dev'
 export const DEAD_LETTER_DIR = `${HOME}/.bqaa-mod/dead-letter`
+// The table OPTIONS point at, and the dead-letter subdirectory its files go to.
+export const TABLE_REF = 'my-gcp-project.agent_analytics.agent_events'
+export const PARTITION_DIR = `${DEAD_LETTER_DIR}/${TABLE_REF}`
 export const DRY_RUN_DIR = `${HOME}/.bqaa-mod/dry-run`
 export const OPTIONS = { project: 'my-gcp-project', dataset: 'agent_analytics' } as const
 export const COMMAND = { origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 100 } } as const
@@ -72,6 +79,11 @@ export const OK_INSERT = { status: 200, text: '{"kind":"bigquery#tableDataInsert
 // are joined from pieces at run time, so no file holds a literal that a
 // secret scanner would match.
 export const ACCESS_TOKEN = ['ya29', 'test-access-token-0123456789'].join('.')
+
+// The host's file limit and how it measures files: UTF-8 bytes. Measured here
+// with the standard encoder, independently of the mod's own counting.
+export const HOST_FILE_BYTES = 4 * 1024 * 1024
+export const utf8Bytes = (text: string): number => new TextEncoder().encode(text).length
 
 export const USAGE = {
   input_tokens: 1203,
@@ -86,6 +98,7 @@ export function setUp(on: On, env: Record<string, string> = {}, store: Record<st
   mock.env(on, { HOME, USER: 'dev', ...env })
   mock.store(on, store)
   const hung: ((answer: { value: { status: number; ok: boolean; headers: Record<string, string>; text: string } }) => void)[] = []
+  const heldWrites: { path: string; text: string; resolve: (answer: { value: undefined }) => void }[] = []
   const world: World = {
     clock,
     fetches: [],
@@ -97,6 +110,13 @@ export function setUp(on: On, env: Record<string, string> = {}, store: Record<st
     steps: [],
     processReply: { exitCode: 0, stdout: `${ACCESS_TOKEN}\n`, stderr: '' },
     failWrites: false,
+    hangWrites: false,
+    releaseWrites: () => {
+      for (const held of heldWrites.splice(0)) {
+        world.files.set(held.path, held.text)
+        held.resolve({ value: undefined })
+      }
+    },
     acceptedRows: () =>
       world
         .insertCalls()
@@ -141,21 +161,30 @@ export function setUp(on: On, env: Record<string, string> = {}, store: Record<st
   })
   on('fs.write', ($, e) => {
     if (world.failWrites) return { deny: `EACCES: ${e.path}` }
+    if (utf8Bytes(e.text) > HOST_FILE_BYTES) return { deny: `${e.path}: over the 4 MiB file limit` }
+    if (world.hangWrites) return new Promise(resolve => heldWrites.push({ path: e.path, text: e.text, resolve }))
     world.files.set(e.path, e.text)
     return { value: undefined }
   })
   on('fs.read', ($, e) => {
     const text = world.files.get(e.path)
     if (text === undefined) return { deny: `ENOENT: ${e.path}` }
+    if (utf8Bytes(text) > HOST_FILE_BYTES) return { deny: `${e.path}: over the 4 MiB file limit` }
     return { value: text }
   })
   on('fs.exists', ($, e) => ({ value: [...world.files.keys()].some(p => p === e.path || p.startsWith(`${e.path}/`)) }))
+  // Files with their size in bytes, and subdirectories, as the host lists them.
   on('fs.list', ($, e) => {
     const prefix = `${e.path.replace(/\/$/, '')}/`
-    const entries = [...world.files.entries()]
-      .filter(([p]) => p.startsWith(prefix) && !p.slice(prefix.length).includes('/'))
-      .map(([p, text]) => ({ name: p.slice(prefix.length), kind: 'file' as const, size: text.length, mtimeMs: 0, isLink: false }))
-    return { value: entries }
+    const entries = new Map<string, { name: string; kind: 'file' | 'dir'; size: number; mtimeMs: number; isLink: boolean }>()
+    for (const [p, text] of world.files) {
+      if (!p.startsWith(prefix)) continue
+      const rest = p.slice(prefix.length)
+      const slash = rest.indexOf('/')
+      if (slash === -1) entries.set(rest, { name: rest, kind: 'file', size: utf8Bytes(text), mtimeMs: 0, isLink: false })
+      else entries.set(rest.slice(0, slash), { name: rest.slice(0, slash), kind: 'dir', size: 0, mtimeMs: 0, isLink: false })
+    }
+    return { value: [...entries.values()] }
   })
   on('turn.start', ($, e) => ({ turnId: e.turnId }))
   on('turn.complete', ($, e) => ({ text: e.answer }))
@@ -215,4 +244,16 @@ export const byType = (rows: Row[], type: string): Row[] => rows.filter(r => r.e
 
 export function deadLetterFiles(world: World): [string, string][] {
   return [...world.files.entries()].filter(([p, text]) => p.startsWith(`${DEAD_LETTER_DIR}/`) && text.length > 0)
+}
+
+// The rows parked in dead-letter files, file by file in name (time) order.
+export function deadLetterRows(world: World): Row[] {
+  return deadLetterFiles(world)
+    .sort(([a], [b]) => (a < b ? -1 : 1))
+    .flatMap(([, text]) =>
+      text
+        .trim()
+        .split('\n')
+        .map(l => (JSON.parse(l) as { row: Row }).row),
+    )
 }

@@ -35,34 +35,20 @@ export const limitsFor = (maxPayloadChars: number): Limits => {
   return { budgetChars: budget, maxStringChars: budget, maxDepth: 12, maxKeys: 200, maxItems: 200 }
 }
 
-// Keys whose values are credentials, compared with case and punctuation
-// removed (`api_key`, `X-Api-Key` and `apiKey` all match `apikey`).
-const SENSITIVE_KEYS = new Set([
-  'apikey',
-  'xapikey',
-  'authorization',
-  'proxyauthorization',
-  'password',
-  'passwd',
-  'secret',
-  'clientsecret',
-  'token',
-  'accesstoken',
-  'refreshtoken',
-  'idtoken',
-  'authtoken',
-  'sessiontoken',
-  'bearertoken',
-  'privatekey',
-  'secretkey',
-  'secretaccesskey',
-  'cookie',
-  'setcookie',
-  'credentials',
-])
+// A key names a credential when, with case and punctuation removed, it
+// contains one of these stems (`api_key`, `X-Api-Key`, `openaiApiKey` and
+// `my_api_key` all contain `apikey`), ends in `token` (`access_token`,
+// `X-Amz-Security-Token`; `max_tokens` does not, and its values are counts
+// anyway), is one of the short names below (too common inside other words to
+// match as stems), or has ADK's `temp:` prefix.
+const SENSITIVE_STEMS = ['password', 'passwd', 'passphrase', 'secret', 'apikey', 'accesskey', 'privatekey', 'signingkey', 'authorization', 'credential', 'signature', 'cookie']
+const SENSITIVE_NAMES = new Set(['auth', 'sig', 'jwt', 'bearer'])
 
-export const isSensitiveKey = (key: string): boolean =>
-  key.toLowerCase().startsWith('temp:') || SENSITIVE_KEYS.has(key.toLowerCase().replace(/[^a-z0-9]/g, ''))
+export const isSensitiveKey = (key: string): boolean => {
+  if (key.toLowerCase().startsWith('temp:')) return true
+  const name = key.toLowerCase().replace(/[^a-z0-9]/g, '')
+  return SENSITIVE_NAMES.has(name) || name.endsWith('token') || SENSITIVE_STEMS.some(stem => name.includes(stem))
+}
 
 // Well-known credential shapes in free text. Every pattern is linear: no
 // unbounded quantifier sits next to another that can match the same text.
@@ -82,10 +68,18 @@ const PATTERNS: readonly (readonly [RegExp, string])[] = [
   [/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{12,}/gi, '$1 [REDACTED]'],
   // user:password@ inside a URL
   [/(\b[a-z][a-z0-9+.-]{0,20}:\/\/[^\s:@/]{1,100}:)[^\s@/]{1,200}@/gi, '$1[REDACTED]@'],
-  // KEY=value and "key": "value" where the key names a credential; a purely
-  // numeric value (max_tokens: 1024) is left alone.
+  // Signed-link and token query parameters (`?X-Goog-Signature=…`,
+  // `&X-Amz-Security-Token=…`, `&sig=…`, `?access_token=…`): the value goes,
+  // the name stays.
   [
-    /\b([A-Za-z0-9_.-]{0,40}?(?:password|passwd|secret|api[_-]?key|private[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|session[_-]?token|client[_-]?secret|[_-]token)[A-Za-z0-9_.-]{0,20}["']?\s{0,5}[:=]\s{0,5}["']?)(?![0-9]+\b)[^\s"',;&]{4,}/gi,
+    /([?&](?:[A-Za-z0-9_.-]{0,40}?(?:signature|credential|token|secret|password|passwd|api[_-]?key)|sig|key)=)(?!\[REDACTED)(?![0-9]+(?:[&#\s"']|$))[^&#\s"'<>]{3,}/gi,
+    '$1[REDACTED]',
+  ],
+  // KEY=value and "key": "value" where the key names a credential; a purely
+  // numeric value (max_tokens: 1024) is left alone, and so is a value already
+  // redacted.
+  [
+    /\b([A-Za-z0-9_.-]{0,40}?(?:password|passwd|passphrase|secret|signature|credential|api[_-]?key|access[_-]?key|private[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|session[_-]?token|client[_-]?secret|[_-]token)[A-Za-z0-9_.-]{0,20}["']?\s{0,5}[:=]\s{0,5}["']?)(?!\[REDACTED)(?![0-9]+\b)[^\s"',;&]{4,}/gi,
     '$1[REDACTED]',
   ],
 ]
@@ -105,6 +99,14 @@ export function redactText(input: string, stats: SanitizeStats): string {
   return out
 }
 
+// Error text, dead-letter reasons and status lines: redacted first, then held
+// to `maxChars`, so a cut can never leave the start of a credential that, cut
+// short, no longer matches its pattern.
+export function redactDiagnostic(text: string, maxChars: number): string {
+  const window = text.length > maxChars + 4096 ? text.slice(0, maxChars + 4096) : text
+  return cutAt(redactText(window, newStats()), maxChars)
+}
+
 type WalkState = { remaining: number; seen: WeakSet<object> }
 
 // Length of the marker a cut string ends with.
@@ -113,7 +115,7 @@ const MARKER_RESERVE = 40
 const jsonLength = (text: string): number => JSON.stringify(text).length
 
 // Never end a cut between the two halves of a surrogate pair.
-const cutAt = (text: string, end: number): string => {
+export const cutAt = (text: string, end: number): string => {
   let cut = text.slice(0, Math.max(0, end))
   const last = cut.charCodeAt(cut.length - 1)
   if (last >= 0xd800 && last <= 0xdbff) cut = cut.slice(0, -1)

@@ -2,7 +2,7 @@
 // (schema version 2, with `event_id`), and the table definition the mod
 // creates when the table is missing.
 
-import { type JsonValue, type Limits, type SanitizeStats, limitsFor, newStats, sanitize, toJsonColumn } from './sanitize.ts'
+import { type JsonValue, type Limits, type SanitizeStats, cutAt, limitsFor, newStats, sanitize, toJsonColumn } from './sanitize.ts'
 
 export type ContentPart = {
   mime_type: string | null
@@ -101,8 +101,53 @@ export function buildRow(input: RowInput): BuiltRow {
   return { row, redactions: stats.redactions }
 }
 
-// Approximate bytes a row adds to an insertAll body.
-export const rowBytes = (row: BqaaRow): number => JSON.stringify(row).length + 64
+// Bytes `text` takes as UTF-8, the encoding the host writes files in. A lone
+// surrogate counts as the three-byte replacement character it is written as.
+export function utf8Length(text: string): number {
+  let bytes = 0
+  for (let i = 0; i < text.length; i += 1) {
+    const code = text.charCodeAt(i)
+    if (code < 0x80) bytes += 1
+    else if (code < 0x800) bytes += 2
+    else if (code >= 0xd800 && code <= 0xdbff && i + 1 < text.length) {
+      const low = text.charCodeAt(i + 1)
+      if (low >= 0xdc00 && low <= 0xdfff) {
+        bytes += 4
+        i += 1
+      } else bytes += 3
+    } else bytes += 3
+  }
+  return bytes
+}
+
+// Bytes a row adds to an insertAll body: its JSON as UTF-8 plus the
+// `insertId` wrapper. Never fewer than its characters, so a byte budget
+// also holds a body to the host's 4 MiB, counted in characters.
+export const rowBytes = (row: BqaaRow): number => utf8Length(JSON.stringify(row)) + 64
+
+// A JSON column cut to a `{truncated, original_chars, preview}` object.
+const shrinkColumn = (text: string | null | undefined, keep: number): string | null | undefined =>
+  typeof text !== 'string' || text.length <= keep ? text : JSON.stringify({ truncated: true, original_chars: text.length, preview: cutAt(text, keep) })
+
+// `row`, or a copy whose JSON fits in `maxBytes` of UTF-8: its payload
+// columns cut to valid-JSON prefixes and `is_truncated` set. For a row too
+// large for a dead-letter or dry-run file on its own.
+export function fitRow(row: BqaaRow, maxBytes: number): BqaaRow {
+  if (utf8Length(JSON.stringify(row)) <= maxBytes) return row
+  let keep = Math.max(0, ...[row.content, row.attributes, row.error_message].map(v => (typeof v === 'string' ? v.length : 0)))
+  for (let i = 0; i < 40 && keep > 0; i += 1) {
+    keep = Math.floor(keep / 2)
+    const fitted: BqaaRow = {
+      ...row,
+      content: shrinkColumn(row.content, keep) as string | null,
+      attributes: shrinkColumn(row.attributes, keep) as string | null,
+      error_message: typeof row.error_message === 'string' ? cutAt(row.error_message, keep) : row.error_message,
+      is_truncated: true,
+    }
+    if (utf8Length(JSON.stringify(fitted)) <= maxBytes) return fitted
+  }
+  return { ...row, content: null, attributes: null, error_message: null, is_truncated: true }
+}
 
 // The BQAA `agent_events` schema (v2) in the REST API's TableSchema form.
 export const AGENT_EVENTS_SCHEMA = {

@@ -5,11 +5,13 @@
 import { expect, test } from 'claude-code/testing'
 
 import { classifyInsert, insertAllBody } from '../hooks/lib/bigquery.ts'
-import { resolveConfig, splitArgv } from '../hooks/lib/config.ts'
-import { FILE_PATTERN, MAX_FILE_CHARS, encodeLines, fileName, kindOf, parseFile } from '../hooks/lib/deadletter.ts'
+import { destinationDir, resolveConfig, splitArgv } from '../hooks/lib/config.ts'
+import { FILE_PATTERN, MAX_FILE_BYTES, encodeLines, fileName, kindOf, parseFile } from '../hooks/lib/deadletter.ts'
 import { BoundedQueue } from '../hooks/lib/queue.ts'
-import { buildRow } from '../hooks/lib/rows.ts'
-import { limitsFor, newStats, redactText, sanitize, toJsonColumn } from '../hooks/lib/sanitize.ts'
+import { buildRow, utf8Length } from '../hooks/lib/rows.ts'
+import { limitsFor, newStats, redactDiagnostic, redactText, sanitize, toJsonColumn } from '../hooks/lib/sanitize.ts'
+
+import { utf8Bytes } from './helpers.ts'
 
 const redact = (text: string) => {
   const stats = newStats()
@@ -59,6 +61,7 @@ test('ordinary text, token counts and hashes are left alone', () => {
     'session 5c4b1d2e-8f7a-4c3b-9d1e-2a6f0b7c8d9e',
     'The tokenizer splits words.',
     'Read the README and run npm test',
+    'https://example.test/search?q=tokens&page=2',
   ]
   for (const input of keep) expect(redact(input)).toEqual({ out: input, count: 0 })
 })
@@ -81,6 +84,69 @@ test('credential keys are redacted in structured payloads; numbers are not', () 
   expect(stats.redactions).toBe(5)
   // Redaction alone is not truncation (as in the BQAA plugin).
   expect(stats.truncated).toBe(false)
+})
+
+test('credential keys match by stem: prefixed names, signatures and signed-link parameters', () => {
+  const stats = newStats()
+  const signed = `https://storage.example.test/b/o?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Credential=${'c'.repeat(24)}&X-Goog-Expires=900&X-Goog-Signature=${'d'.repeat(64)}`
+  const shared = `https://acct.blob.example.test/c/b?sv=2024-01-01&sp=r&sig=${'s'.repeat(24)}`
+  const presigned = `https://bucket.s3.example.test/k?X-Amz-Credential=${'c'.repeat(20)}&X-Amz-Security-Token=${'t'.repeat(40)}&X-Amz-Signature=${'f'.repeat(64)}`
+  const out = sanitize(
+    {
+      signature: 's'.repeat(20),
+      my_api_key: 'x'.repeat(16),
+      openaiApiKey: 'x'.repeat(12),
+      x_amz_security_token: 'x'.repeat(12),
+      sessionCookie: 'x'.repeat(12),
+      db_passphrase: 'x'.repeat(12),
+      links: [signed, shared, presigned],
+      max_tokens: 5,
+      usage: { prompt_tokens: 9, total_tokens: 12 },
+      tokenizer: 'whitespace',
+      author: 'dev',
+      session_id: 'abc',
+    },
+    limitsFor(16384),
+    stats,
+  ) as Record<string, unknown>
+  for (const key of ['signature', 'my_api_key', 'openaiApiKey', 'x_amz_security_token', 'sessionCookie', 'db_passphrase']) expect(out[key]).toBe('[REDACTED]')
+  expect(out.links).toEqual([
+    'https://storage.example.test/b/o?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Credential=[REDACTED]&X-Goog-Expires=900&X-Goog-Signature=[REDACTED]',
+    'https://acct.blob.example.test/c/b?sv=2024-01-01&sp=r&sig=[REDACTED]',
+    'https://bucket.s3.example.test/k?X-Amz-Credential=[REDACTED]&X-Amz-Security-Token=[REDACTED]&X-Amz-Signature=[REDACTED]',
+  ])
+  // Token counts and ordinary names are left alone.
+  expect(out.max_tokens).toBe(5)
+  expect(out.usage).toEqual({ prompt_tokens: 9, total_tokens: 12 })
+  expect([out.tokenizer, out.author, out.session_id]).toEqual(['whitespace', 'dev', 'abc'])
+  expect(stats.redactions).toBe(12)
+})
+
+test('diagnostics are redacted before they are cut, so a cut never leaves part of a credential', () => {
+  // The token starts four characters before the cut: cut first and redacted
+  // second, its first characters would be too short to match, and would show.
+  const token = ['ya29', 'x'.repeat(40)].join('.')
+  const out = redactDiagnostic(`${'e'.repeat(295)} ${token} and more`, 300)
+  expect(out.length <= 300).toBe(true)
+  expect(out.includes('ya29')).toBe(false)
+  expect(redactDiagnostic(`password=${'p'.repeat(30)}`, 1000)).toBe('password=[REDACTED]')
+  // Redacting twice changes nothing.
+  expect(redactDiagnostic(redactDiagnostic(`key ${token} password=${'p'.repeat(30)}`, 1000), 1000)).toBe('key [REDACTED:google-oauth-token] password=[REDACTED]')
+})
+
+test('UTF-8 length matches the standard encoder', () => {
+  for (const text of ['', 'abc', '\u00e9', '\u754c', '\u{1F600}', 'a\u754cb\u{1F600}c', '\uD800', 'x\uDC00y', '\u754c'.repeat(1000)]) {
+    expect(utf8Length(text)).toBe(utf8Bytes(text))
+  }
+})
+
+test('each table gets its own dead-letter subdirectory, with a safe and distinct name', () => {
+  expect(destinationDir('my-gcp-project.agent_analytics.agent_events')).toBe('my-gcp-project.agent_analytics.agent_events')
+  expect(destinationDir('example.com:proj.ds.t')).toBe('example.com%3Aproj.ds.t')
+  const tables = ['p.d.a/b', 'p.d.a%2Fb', 'p.d.t*', 'p.d.t!', 'p.d.t \u754c']
+  const dirs = tables.map(destinationDir)
+  for (const dir of dirs) expect(/^[A-Za-z0-9._%-]+$/.test(dir)).toBe(true)
+  expect(new Set(dirs).size).toBe(tables.length)
 })
 
 test('long text is cut, marked, and flagged as truncated, within the column cap', () => {
@@ -251,15 +317,31 @@ test('insertAll answers are classified for retry, refresh, refusal or success', 
   expect(body.rows[0]?.insertId).toBe('e1')
 })
 
-test('dead-letter files are JSONL, split under the 4 MiB file limit, and parsed tolerantly', () => {
-  const row = { event_type: 'TOOL_STARTING', timestamp: '2026-10-13T00:00:00.000Z', content: 'z'.repeat(400_000) } as never
-  const lines = Array.from({ length: 20 }, () => ({ v: 1 as const, kind: 'retry' as const, reason: 'r', attempts: 4, failed_at: 'f', table: 't', row }))
-  const files = encodeLines(lines)
-  expect(files.length > 1).toBe(true)
-  for (const text of files) expect(text.length <= MAX_FILE_CHARS).toBe(true)
+test('dead-letter files are JSONL, split by UTF-8 bytes under the file limit, and parsed tolerantly', () => {
+  const line = (content: string) => ({
+    v: 1 as const,
+    kind: 'retry' as const,
+    reason: 'r',
+    attempts: 4,
+    failed_at: 'f',
+    table: 't',
+    row: { event_type: 'TOOL_STARTING', timestamp: '2026-10-13T00:00:00.000Z', content, is_truncated: false } as never,
+  })
+  // 400,000 three-byte characters a line: 1.2 MB of UTF-8 in 400,000 characters.
+  const files = encodeLines(Array.from({ length: 20 }, () => line('\u754c'.repeat(400_000))))
+  expect(files.length >= 8).toBe(true)
+  for (const text of files) expect(utf8Bytes(text) <= MAX_FILE_BYTES).toBe(true)
   expect(files.flatMap(f => parseFile(f).lines).length).toBe(20)
-  const parsed = parseFile(`${files[0]?.split('\n')[0]}\n{broken\n\n`)
+  // A row too large for a file on its own has its payload cut to fit and is
+  // marked truncated, rather than failing the write.
+  const [alone] = encodeLines([line('\u754c'.repeat(1_200_000))])
+  expect(utf8Bytes(alone ?? '') <= MAX_FILE_BYTES).toBe(true)
+  expect((parseFile(alone ?? '').lines[0]?.row as { is_truncated: boolean } | undefined)?.is_truncated).toBe(true)
+  // Lines come back with their text as written, so a line can be kept as is.
+  const first = files[0]?.split('\n')[0] ?? ''
+  const parsed = parseFile(`${first}\n{broken\n\n`)
   expect(parsed.lines.length).toBe(1)
+  expect(parsed.raw).toEqual([first])
   expect(parsed.unreadable).toEqual(['{broken'])
   const name = fileName('spill', Date.parse('2026-10-13T23:52:17.123Z'), '5c4b1d2e-8f7a', 3)
   expect(name).toBe('spill-20261013T235217123Z-5c4b1d2e8f7a-3.jsonl')

@@ -4,7 +4,24 @@
 
 import { type Engine, expect, test } from 'claude-code/testing'
 
-import { COMMAND, DEAD_LETTER_DIR, DRY_RUN_DIR, OK_INSERT, OPTIONS, SESSION_ID, deadLetterFiles, json, setUp, startSession } from './helpers.ts'
+import {
+  COMMAND,
+  DEAD_LETTER_DIR,
+  DRY_RUN_DIR,
+  HOST_FILE_BYTES,
+  OK_INSERT,
+  OPTIONS,
+  PARTITION_DIR,
+  SESSION_ID,
+  TABLE_REF,
+  type World,
+  deadLetterFiles,
+  deadLetterRows,
+  json,
+  setUp,
+  startSession,
+  utf8Bytes,
+} from './helpers.ts'
 
 const UNAVAILABLE = { status: 503, text: '{"error":{"code":503,"message":"The service is currently unavailable.","status":"UNAVAILABLE"}}' }
 const TABLE_MISSING = {
@@ -22,6 +39,64 @@ const DENIED = {
 const UNAUTHENTICATED = { status: 401, text: '{"error":{"code":401,"message":"Request had invalid authentication credentials.","status":"UNAUTHENTICATED"}}' }
 
 const statusText = async ($: Engine): Promise<string> => (await $.command.run({ command: 'bqaa-status', args: '', ...COMMAND })).text ?? ''
+
+// The mod keeps each dead-letter file to 3 MiB of UTF-8.
+const FILE_CAP = 3 * 1024 * 1024
+
+const END = { reason: 'prompt_input_exit', sessionId: SESSION_ID, resume: { id: SESSION_ID } } as const
+
+// A row parked by an earlier session, and its dead-letter line.
+const parkedRow = (eventId: string, sessionId: string) => ({
+  timestamp: '2026-10-13T20:01:02.003Z',
+  event_id: eventId,
+  event_type: 'STATE_DELTA',
+  agent: 'coding-agent',
+  session_id: sessionId,
+  invocation_id: null,
+  user_id: 'dev',
+  trace_id: null,
+  span_id: 'bbbbbbbbbbbbbbbb',
+  parent_span_id: null,
+  content: '{"session_end":true}',
+  content_parts: [],
+  attributes: '{}',
+  latency_ms: null,
+  status: 'OK',
+  error_message: null,
+  is_truncated: false,
+})
+const parkedLine = (table: string, eventId: string, sessionId: string): string =>
+  JSON.stringify({ v: 1, kind: 'spill', reason: 'session ended', attempts: 0, failed_at: '2026-10-13T20:01:02.003Z', table, row: parkedRow(eventId, sessionId) })
+
+const OTHER_TABLE = 'other-project.private_dataset.agent_events'
+const OTHER_OPTIONS = { project: 'other-project', dataset: 'private_dataset' }
+
+// Parked rows for two tables: each table's files in its own subdirectory, a
+// line for the other table inside this table's subdirectory (moved there by
+// hand, say), and a file in the dead-letter directory itself.
+function parkForTwoTables(world: World): { mine: string; theirs: string; mixed: string; loose: string } {
+  const files = {
+    mine: `${PARTITION_DIR}/spill-20261013T200102003Z-mine-1.jsonl`,
+    theirs: `${DEAD_LETTER_DIR}/${OTHER_TABLE}/spill-20261013T200102003Z-theirs-1.jsonl`,
+    mixed: `${PARTITION_DIR}/retry-20261013T200102003Z-mixed-1.jsonl`,
+    loose: `${DEAD_LETTER_DIR}/spill-20261013T200102003Z-loose-1.jsonl`,
+  }
+  world.files.set(files.mine, `${parkedLine(TABLE_REF, 'a'.repeat(32), 'mine-session')}\n`)
+  world.files.set(files.theirs, `${parkedLine(OTHER_TABLE, 'b'.repeat(32), 'their-session')}\n`)
+  world.files.set(files.mixed, `${parkedLine(OTHER_TABLE, 'c'.repeat(32), 'their-session')}\n${parkedLine(TABLE_REF, 'd'.repeat(32), 'mine-session')}\n`)
+  world.files.set(files.loose, `${parkedLine(OTHER_TABLE, 'e'.repeat(32), 'their-session')}\n`)
+  return files
+}
+
+// Credential-shaped failure text, put together at run time. SECRET must never
+// reach a sink: dead-letter files, the status line, the debug log, the
+// transcript, or a command's output.
+const SECRET = ['canary', 'secret', 'x'.repeat(16)].join('-')
+const LEAKY = `${['ya29', SECRET].join('.')} password=${SECRET}`
+
+async function everySink($: Engine, world: World, extra: string[] = []): Promise<string[]> {
+  return [...world.files.values(), ...world.statusLines.map(l => l ?? ''), ...world.logs, await statusText($), ...extra]
+}
 
 test('a failed request is retried with the same insertIds, then succeeds', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on)
@@ -51,7 +126,7 @@ test('rows that exhaust their retries go to a dead-letter file, and are replayed
   const files = deadLetterFiles(world)
   expect(files.length).toBe(1)
   const [path, text] = files[0] as [string, string]
-  expect(path.startsWith(`${DEAD_LETTER_DIR}/retry-`)).toBe(true)
+  expect(path.startsWith(`${PARTITION_DIR}/retry-`)).toBe(true)
   const lines = text.trim().split('\n').map(l => JSON.parse(l) as { kind: string; attempts: number; table: string; reason: string; row: { event_type: string } })
   expect(lines.map(l => l.row.event_type)).toEqual(['STATE_DELTA', 'TOOL_STARTING', 'TOOL_COMPLETED'])
   expect(lines[0]).toMatchObject({ kind: 'retry', attempts: 4, table: 'my-gcp-project.agent_analytics.agent_events' })
@@ -113,7 +188,7 @@ test('a missing dataset is not created: the rows are refused and parked', { opti
   await world.clock.advance(5000)
   expect(world.fetches.length).toBe(1)
   const [file] = deadLetterFiles(world)
-  expect(file?.[0].startsWith(`${DEAD_LETTER_DIR}/rejected-`)).toBe(true)
+  expect(file?.[0].startsWith(`${PARTITION_DIR}/rejected-`)).toBe(true)
   expect(await statusText($)).toMatch(/1 refused/)
 })
 
@@ -125,7 +200,7 @@ test('a permission error parks rows as refused; /bqaa-backfill sends them once f
   await world.clock.advance(5000)
   expect(world.insertCalls().length).toBe(1)
   const [file] = deadLetterFiles(world)
-  expect(file?.[0].startsWith(`${DEAD_LETTER_DIR}/rejected-`)).toBe(true)
+  expect(file?.[0].startsWith(`${PARTITION_DIR}/rejected-`)).toBe(true)
   expect(world.statusLines.at(-1) ?? '').toMatch(/refused/)
   // Refused rows are not replayed automatically.
   await world.clock.advance(60_000)
@@ -157,7 +232,8 @@ test('a failing token command is reported, and rows wait for it', { options: OPT
   await world.clock.advance(5000)
   expect(world.fetches.length).toBe(0)
   const status = await statusText($)
-  expect(status).toMatch(/auth: .*gcloud auth application-default print-access-token. exited 1: ERROR: \(gcloud/)
+  // The command is named by its program only: its arguments may hold secrets.
+  expect(status).toMatch(/auth: token command .gcloud. exited 1: ERROR: \(gcloud/)
   expect(status).toMatch(/queue: 1 rows/)
 })
 
@@ -190,89 +266,208 @@ test('rows BigQuery reports as invalid are parked; the rest land', { options: OP
   expect(await statusText($)).toMatch(/sent 2, dead-lettered 1 \(1 refused\)/)
 })
 
-test('session end sends what is queued when it can', { options: OPTIONS }, async ($, on) => {
+test('session end starts no request: it spills what is queued, and the next session sends it', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on)
   await startSession($)
   await world.clock.settle()
   await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
-  await $.session.end({ reason: 'prompt_input_exit', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
-  expect(world.acceptedRows().map(r => r.event_type)).toEqual(['STATE_DELTA', 'TOOL_STARTING', 'TOOL_COMPLETED', 'STATE_DELTA'])
-  expect(deadLetterFiles(world).length).toBe(0)
+  // A token is in hand and BigQuery answers, yet session end sends nothing.
+  await $.session.end(END)
+  expect(world.fetches.length).toBe(0)
+  const [file] = deadLetterFiles(world)
+  expect(file?.[0].startsWith(`${PARTITION_DIR}/spill-`)).toBe(true)
+  const spilled = deadLetterRows(world)
+  expect(spilled.map(r => r.event_type)).toEqual(['STATE_DELTA', 'TOOL_STARTING', 'TOOL_COMPLETED', 'STATE_DELTA'])
+  // The next session replays the file 15 seconds after it starts.
+  await startSession($)
+  await world.clock.advance(15_000)
+  const sent = new Set(world.acceptedRows().map(r => r.event_id))
+  expect(spilled.every(r => sent.has(r.event_id))).toBe(true)
+  expect(world.files.get(file?.[0] ?? '')).toBe('')
 })
 
-test('session end spills to disk when a request is stuck, bounded by its budget', { options: OPTIONS }, async ($, on) => {
+test('session end does not wait for a stuck request: its rows are spilled too', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on)
   world.replies = [{ hang: true }]
   await startSession($)
   await world.clock.advance(5000)
   expect(world.insertCalls().length).toBe(1)
   await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
-  let ended = false
-  const ending = $.session.end({ reason: 'other', sessionId: SESSION_ID, resume: { id: SESSION_ID } }).then(() => {
-    ended = true
-  })
-  for (let i = 0; i < 20 && !ended; i += 1) await world.clock.advance(100)
-  await ending
+  // Returns without the clock moving: nothing waits on the request.
+  await $.session.end({ ...END, reason: 'other' })
   // No second request was started behind the stuck one.
   expect(world.insertCalls().length).toBe(1)
-  const [file] = deadLetterFiles(world)
-  expect(file?.[0].startsWith(`${DEAD_LETTER_DIR}/spill-`)).toBe(true)
-  const types = (file?.[1] ?? '')
-    .trim()
-    .split('\n')
-    .map(l => (JSON.parse(l) as { row: { event_type: string } }).row.event_type)
   // The stuck batch (it may yet land; event_id dedups) and everything after it.
-  expect(types).toEqual(['STATE_DELTA', 'TOOL_STARTING', 'TOOL_COMPLETED', 'STATE_DELTA'])
+  expect(deadLetterRows(world).map(r => r.event_type)).toEqual(['STATE_DELTA', 'TOOL_STARTING', 'TOOL_COMPLETED', 'STATE_DELTA'])
   world.releaseHung(200, '{}')
 })
 
-test('with BQAA_EXIT_FLUSH_MS=0 session end never touches the network', { options: OPTIONS }, async ($, on) => {
+test('a spill write that hangs holds session end no longer than its budget', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  await startSession($)
+  await world.clock.settle()
+  world.hangWrites = true
+  let ended = false
+  const ending = $.session.end(END).then(() => {
+    ended = true
+  })
+  await world.clock.advance(500)
+  expect(ended).toBe(false)
+  // BQAA_EXIT_FLUSH_MS defaults to 800 ms.
+  await world.clock.advance(400)
+  await ending
+  expect(ended).toBe(true)
+  expect(world.fetches.length).toBe(0)
+  world.releaseWrites()
+})
+
+test('with BQAA_EXIT_FLUSH_MS=0 session end does not wait for its spill write', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on, { BQAA_EXIT_FLUSH_MS: '0' })
   await startSession($)
   await world.clock.settle()
-  await $.session.end({ reason: 'prompt_input_exit', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+  world.hangWrites = true
+  await $.session.end(END)
   expect(world.fetches.length).toBe(0)
-  expect(deadLetterFiles(world).length).toBe(1)
+  // The write was started all the same.
+  world.releaseWrites()
+  expect(deadLetterRows(world).map(r => r.event_type)).toEqual(['STATE_DELTA', 'STATE_DELTA'])
 })
 
 test('the next session replays spill files on its own', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on)
-  const row = {
-    timestamp: '2026-10-13T20:01:02.003Z',
-    event_id: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-    event_type: 'STATE_DELTA',
-    agent: 'coding-agent',
-    session_id: 'previous-session',
-    invocation_id: null,
-    user_id: 'dev',
-    trace_id: null,
-    span_id: 'bbbbbbbbbbbbbbbb',
-    parent_span_id: null,
-    content: '{"session_end":true}',
-    content_parts: [],
-    attributes: '{}',
-    latency_ms: null,
-    status: 'OK',
-    error_message: null,
-    is_truncated: false,
-  }
-  const path = `${DEAD_LETTER_DIR}/spill-20261013T200102003Z-previoussess-1.jsonl`
-  world.files.set(path, `${JSON.stringify({ v: 1, kind: 'spill', reason: 'session ended', attempts: 0, failed_at: '2026-10-13T20:01:02.003Z', table: 'x', row })}\nnot json\n`)
+  const path = `${PARTITION_DIR}/spill-20261013T200102003Z-previoussess-1.jsonl`
+  world.files.set(path, `${parkedLine(TABLE_REF, 'a'.repeat(32), 'previous-session')}\nnot json\n`)
   await startSession($)
   await world.clock.advance(15_000)
-  expect(world.acceptedRows().some(r => r.event_id === 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')).toBe(true)
+  expect(world.acceptedRows().some(r => r.event_id === 'a'.repeat(32))).toBe(true)
   // The unreadable line is kept for a person to look at; the sent one is gone.
   expect(world.files.get(path)).toBe('not json\n')
 })
 
-test('a file another session is replaying is left to it', { options: OPTIONS }, async ($, on) => {
-  const name = 'spill-20261013T200102003Z-othersession-1.jsonl'
-  const world = setUp(on, {}, { [`lease:${name}`]: { by: 'other-session', until: Date.now() + 60_000 } })
-  world.files.set(`${DEAD_LETTER_DIR}/${name}`, '{"v":1}\n')
+test('replay sends only rows recorded for the configured table; other tables keep theirs', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  const files = parkForTwoTables(world)
+  const before = new Map(world.files)
   await startSession($)
   await world.clock.advance(15_000)
-  expect(world.files.get(`${DEAD_LETTER_DIR}/${name}`)).toBe('{"v":1}\n')
+  // Every request went to this table, and none carried another table's row.
+  expect(world.insertCalls().length > 0).toBe(true)
+  for (const call of world.insertCalls()) expect(call.url).toBe('https://bigquery.googleapis.com/bigquery/v2/projects/my-gcp-project/datasets/agent_analytics/tables/agent_events/insertAll')
+  const sent = world.acceptedRows()
+  expect(sent.some(r => r.session_id === 'their-session')).toBe(false)
+  expect(sent.filter(r => r.session_id === 'mine-session').map(r => r.event_id).sort()).toEqual(['a'.repeat(32), 'd'.repeat(32)])
+  // The other table's files are as they were, byte for byte; in the mixed
+  // file the line for the other table is all that is left, unchanged.
+  expect(world.files.get(files.theirs)).toBe(before.get(files.theirs))
+  expect(world.files.get(files.loose)).toBe(before.get(files.loose))
+  expect(world.files.get(files.mine)).toBe('')
+  expect(world.files.get(files.mixed)).toBe(`${parkedLine(OTHER_TABLE, 'c'.repeat(32), 'their-session')}\n`)
+  const status = await statusText($)
+  expect(status).toMatch(/2 rows sent, 1 left, 1 of them for another table/)
+  expect(status).toMatch(/2 more file\(s\) in .* for other tables or an older layout/)
+})
+
+test('configured for the other table, replay sends its rows there and leaves this table\'s alone', { options: OTHER_OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  const files = parkForTwoTables(world)
+  const before = new Map(world.files)
+  await startSession($)
+  await world.clock.advance(15_000)
+  expect(world.insertCalls().length > 0).toBe(true)
+  for (const call of world.insertCalls()) expect(call.url).toBe('https://bigquery.googleapis.com/bigquery/v2/projects/other-project/datasets/private_dataset/tables/agent_events/insertAll')
+  const sent = world.acceptedRows()
+  expect(sent.some(r => r.session_id === 'mine-session')).toBe(false)
+  expect(sent.filter(r => r.session_id === 'their-session').map(r => r.event_id)).toEqual(['b'.repeat(32)])
+  for (const path of [files.mine, files.mixed, files.loose]) expect(world.files.get(path)).toBe(before.get(path))
+  expect(world.files.get(files.theirs)).toBe('')
+})
+
+test('a file another session is replaying is left to it', { options: OPTIONS }, async ($, on) => {
+  const name = 'spill-20261013T200102003Z-othersession-1.jsonl'
+  const world = setUp(on, {}, { [`lease:${TABLE_REF}/${name}`]: { by: 'other-session', until: Date.now() + 60_000 } })
+  world.files.set(`${PARTITION_DIR}/${name}`, '{"v":1}\n')
+  await startSession($)
+  await world.clock.advance(15_000)
+  expect(world.files.get(`${PARTITION_DIR}/${name}`)).toBe('{"v":1}\n')
   expect(await statusText($)).toMatch(/1 skipped/)
+})
+
+test('multibyte rows: dead-letter files stay within the limit in bytes, and every row is replayed', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  // 15,000 three-byte characters per tool result: about 45 KB of UTF-8 a row,
+  // 5 MB for the 120 calls, though only 1.8 million characters.
+  world.toolReply = () => ({ result: { type: 'text' }, text: '界'.repeat(15_000) })
+  await startSession($)
+  await world.clock.settle()
+  for (let i = 0; i < 120; i += 1) await $.tool.call({ tool: 'Read', file_path: `f${i}.ts` })
+  await $.session.end(END)
+  const files = deadLetterFiles(world)
+  expect(files.length > 1).toBe(true)
+  for (const [, text] of files) expect(utf8Bytes(text) <= FILE_CAP).toBe(true)
+  expect(deadLetterRows(world).filter(r => r.event_type === 'TOOL_COMPLETED').length).toBe(120)
+  // The next session reads every file back and sends every row.
+  await startSession($)
+  await world.clock.advance(15_000)
+  expect(world.acceptedRows().filter(r => r.event_type === 'TOOL_COMPLETED').length).toBe(120)
+  for (const call of world.insertCalls()) expect(call.body.length <= HOST_FILE_BYTES).toBe(true)
+  expect(deadLetterFiles(world).length).toBe(0)
+})
+
+test('a dead-letter file over the 4 MiB read limit is reported, not skipped silently', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  const name = 'spill-20261013T200102003Z-oversized-1.jsonl'
+  const text = '界'.repeat(1_500_000)
+  world.files.set(`${PARTITION_DIR}/${name}`, text)
+  await startSession($)
+  await world.clock.advance(15_000)
+  expect(world.files.get(`${PARTITION_DIR}/${name}`)).toBe(text)
+  expect(await statusText($)).toMatch(new RegExp(`1 file\\(s\\) over the 4 MiB read limit, not replayed: ${name.replace(/\./g, '\\.')}`))
+})
+
+test('a failing token command never puts credential text in a file, the status line, a log or a command', { options: { ...OPTIONS, accessTokenCommand: 'fake-token-tool --profile argcanaryprofile' } }, async ($, on) => {
+  const world = setUp(on)
+  world.processReply = { exitCode: 1, stdout: '', stderr: `ERROR: refresh failed for ${LEAKY}\n` }
+  await startSession($)
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
+  // Four attempts, then the rows are parked; the automatic replay at 15 s
+  // stops on the same failure, and so does /bqaa-backfill.
+  for (let t = 0; t < 6; t += 1) await world.clock.advance(5000)
+  const started = await $.command.run({ command: 'bqaa-backfill', args: '', ...COMMAND })
+  await world.clock.settle()
+  for (const text of await everySink($, world, [started.text ?? ''])) {
+    expect(text.includes(SECRET)).toBe(false)
+    expect(text.includes('argcanaryprofile')).toBe(false)
+  }
+  // The diagnostics did reach those sinks, redacted.
+  const parked = deadLetterFiles(world)
+  expect(parked.length > 0).toBe(true)
+  for (const [, text] of parked) expect(text).toMatch(/"reason":"auth: token command `fake-token-tool` exited 1: ERROR: refresh failed for \[REDACTED:google-oauth-token\] password=\[REDACTED\]"/)
+  expect(world.statusLines.some(l => (l ?? '').includes('parked after retries'))).toBe(true)
+  expect(await statusText($)).toMatch(/last backfill \(command, .*stopped: auth: token command .fake-token-tool. exited 1: .*\[REDACTED/)
+  expect(world.logs.some(l => l.startsWith('bqaa backfill:') && l.includes('[REDACTED'))).toBe(true)
+})
+
+test('BigQuery error text never puts credential text in a file, the status line, a log or a command', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  const refusal = { status: 403, text: JSON.stringify({ error: { code: 403, message: `Access Denied: ${LEAKY}`, errors: [{ reason: 'accessDenied' }] } }) }
+  const invalid = { status: 200, text: JSON.stringify({ insertErrors: [{ index: 0, errors: [{ reason: 'invalid', message: `bad value ${LEAKY}` }] }] }) }
+  const busy = { status: 503, text: JSON.stringify({ error: { code: 503, message: `backend busy ${LEAKY}` } }) }
+  world.replies = [refusal, invalid, busy]
+  await startSession($)
+  // Refused: the row is parked with BigQuery's reason, and the status line says so.
+  await world.clock.advance(5000)
+  // A backfill: insertAll reports the row invalid, so its reason is replaced.
+  const first = await $.command.run({ command: 'bqaa-backfill', args: '', ...COMMAND })
+  await world.clock.settle()
+  // Another: BigQuery is busy, and the backfill stops on that.
+  const second = await $.command.run({ command: 'bqaa-backfill', args: '', ...COMMAND })
+  await world.clock.settle()
+  for (const text of await everySink($, world, [first.text ?? '', second.text ?? ''])) expect(text.includes(SECRET)).toBe(false)
+  const [file] = deadLetterFiles(world)
+  expect(file?.[1] ?? '').toMatch(/"reason":"invalid: bad value \[REDACTED:google-oauth-token\] password=\[REDACTED\]"/)
+  expect(world.statusLines.some(l => (l ?? '').includes('refused'))).toBe(true)
+  expect(await statusText($)).toMatch(/stopped: HTTP 503: backend busy \[REDACTED:google-oauth-token\]/)
+  expect(world.logs.some(l => l.startsWith('bqaa backfill:') && l.includes('stopped: HTTP 503'))).toBe(true)
 })
 
 test('under queue pressure while BigQuery is down, rows go to disk instead of being dropped', { options: OPTIONS }, async ($, on) => {
@@ -285,7 +480,7 @@ test('under queue pressure while BigQuery is down, rows go to disk instead of be
   const status = await statusText($)
   expect(status).toMatch(/dropped 0/)
   expect(status).toMatch(/spilled [1-9]/)
-  expect(deadLetterFiles(world).some(([p]) => p.startsWith(`${DEAD_LETTER_DIR}/spill-`))).toBe(true)
+  expect(deadLetterFiles(world).some(([p]) => p.startsWith(`${PARTITION_DIR}/spill-`))).toBe(true)
 })
 
 test('a dead-letter write that fails is counted as dropped, not thrown', { options: OPTIONS }, async ($, on) => {

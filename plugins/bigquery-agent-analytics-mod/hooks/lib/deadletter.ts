@@ -2,11 +2,14 @@
 // the full insertAll row so a backfill can send it again unchanged.
 //
 // `$.fs` has no append and no delete, and reads and writes at most 4 MiB per
-// file. So every failure writes a new, immutable file (no read-modify-write
-// races between sessions), files are kept under that size, and a backfill
-// that delivered a file truncates it to zero bytes.
+// file, counted in UTF-8 bytes (the file on disk). So every failure writes a
+// new, immutable file (no read-modify-write races between sessions), files
+// are kept to 3 MiB of UTF-8, and a backfill that delivered a file truncates
+// it to zero bytes. Each table's files live in a subdirectory of their own
+// (config.ts `deadLetterPartition`).
 
-import type { BqaaRow } from './rows.ts'
+import { type BqaaRow, fitRow, utf8Length } from './rows.ts'
+import { redactDiagnostic } from './sanitize.ts'
 
 export type DeadLetterKind =
   // Queued rows written out at session end, or under queue pressure while
@@ -24,28 +27,52 @@ export type DeadLetterLine = {
   reason: string
   attempts: number
   failed_at: string
+  // The table the row was meant for, `project.dataset.table`: a replay sends
+  // a line only to that table.
   table: string
   row: BqaaRow
 }
 
-export const MAX_FILE_CHARS = 3 * 1024 * 1024
+// What `$.fs.read` and `$.fs.write` take, and what this mod writes: a file
+// a backfill rewrites (with longer reasons, say) still reads back.
+export const HOST_FILE_BYTES = 4 * 1024 * 1024
+export const MAX_FILE_BYTES = 3 * 1024 * 1024
+const REASON_CHARS = 1000
+
 export const FILE_PATTERN = /^(spill|retry|rejected)-[A-Za-z0-9._-]+\.jsonl$/
 
-export function encodeLines(lines: DeadLetterLine[]): string[] {
-  // Several files when the lines would pass MAX_FILE_CHARS.
+// One line of a dead-letter file: the reason redacted and held to
+// REASON_CHARS, and a row too large for a file on its own cut to fit.
+export function lineText(line: DeadLetterLine): string {
+  const clean: DeadLetterLine = { ...line, reason: redactDiagnostic(line.reason, REASON_CHARS) }
+  const text = JSON.stringify(clean)
+  if (utf8Length(text) < MAX_FILE_BYTES) return text
+  const overhead = utf8Length(JSON.stringify({ ...clean, row: null }))
+  return JSON.stringify({ ...clean, row: fitRow(clean.row, MAX_FILE_BYTES - overhead - 16) })
+}
+
+// Groups JSONL lines, each of which fits on its own, into file texts of at
+// most `maxBytes` of UTF-8.
+export function packLines(lines: readonly string[], maxBytes = MAX_FILE_BYTES): string[] {
   const files: string[] = []
-  let current = ''
+  let current: string[] = []
+  let bytes = 0
   for (const line of lines) {
-    const text = `${JSON.stringify(line)}\n`
-    if (current !== '' && current.length + text.length > MAX_FILE_CHARS) {
-      files.push(current)
-      current = ''
+    const size = utf8Length(line) + 1
+    if (current.length > 0 && bytes + size > maxBytes) {
+      files.push(`${current.join('\n')}\n`)
+      current = []
+      bytes = 0
     }
-    current += text
+    current.push(line)
+    bytes += size
   }
-  if (current !== '') files.push(current)
+  if (current.length > 0) files.push(`${current.join('\n')}\n`)
   return files
 }
+
+// Several files when the lines pass MAX_FILE_BYTES.
+export const encodeLines = (lines: readonly DeadLetterLine[]): string[] => packLines(lines.map(lineText))
 
 export const fileName = (kind: DeadLetterKind, atMs: number, session: string | null, seq: number): string => {
   const stamp = new Date(atMs).toISOString().replace(/[-:]/g, '').replace('.', '')
@@ -58,23 +85,27 @@ export const kindOf = (name: string): DeadLetterKind | null => {
   return m ? (m[1] as DeadLetterKind) : null
 }
 
-export type ParsedFile = { lines: DeadLetterLine[]; unreadable: string[] }
+// `raw[i]` is the text `lines[i]` was read from, so a line can be kept
+// exactly as written.
+export type ParsedFile = { lines: DeadLetterLine[]; raw: string[]; unreadable: string[] }
 
 export function parseFile(text: string): ParsedFile {
   const lines: DeadLetterLine[] = []
+  const raw: string[] = []
   const unreadable: string[] = []
-  for (const raw of text.split('\n')) {
-    if (raw.trim() === '') continue
+  for (const line of text.split('\n')) {
+    if (line.trim() === '') continue
     try {
-      const line = JSON.parse(raw) as DeadLetterLine
-      if (line && typeof line === 'object' && line.row && typeof line.row.event_type === 'string' && typeof line.row.timestamp === 'string') {
-        lines.push(line)
+      const parsed = JSON.parse(line) as DeadLetterLine
+      if (parsed && typeof parsed === 'object' && parsed.row && typeof parsed.row.event_type === 'string' && typeof parsed.row.timestamp === 'string') {
+        lines.push(parsed)
+        raw.push(line)
       } else {
-        unreadable.push(raw)
+        unreadable.push(line)
       }
     } catch {
-      unreadable.push(raw)
+      unreadable.push(line)
     }
   }
-  return { lines, unreadable }
+  return { lines, raw, unreadable }
 }

@@ -1,11 +1,12 @@
-// The hot path: hooks never wait on BigQuery, a process or the disk, the
-// queue stays bounded, and the mod never changes what it observes.
+// The hot path: hooks never wait on BigQuery or a process (session end's
+// bounded spill write is the one wait on the disk), the queue stays bounded,
+// and the mod never changes what it observes.
 
 import { expect, test } from 'claude-code/testing'
 
-import { COMMAND, OPTIONS, byType, runStep, setUp, startSession } from './helpers.ts'
+import { COMMAND, OPTIONS, SESSION_ID, byType, deadLetterRows, runStep, setUp, startSession } from './helpers.ts'
 
-test('hooks never call the network or a process themselves', { options: OPTIONS }, async ($, on) => {
+test('hooks never call the network or a process themselves, session end included', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on)
   world.steps.push({ result: { answer: 'ok', stopReason: 'end_turn' } })
   await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' })
@@ -23,6 +24,15 @@ test('hooks never call the network or a process themselves', { options: OPTIONS 
   expect(world.commands.length).toBe(1)
   await world.clock.advance(5000)
   expect(world.sentRows().length).toBe(9)
+  // A token is in hand, BigQuery answers and rows are queued: session end
+  // still starts no request and runs no process. The rows go to a spill file.
+  await $.tool.call({ tool: 'Read', file_path: 'b.ts' })
+  const fetches = world.fetches.length
+  const commands = world.commands.length
+  await $.session.end({ reason: 'prompt_input_exit', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+  expect(world.fetches.length).toBe(fetches)
+  expect(world.commands.length).toBe(commands)
+  expect(deadLetterRows(world).map(r => r.event_type)).toEqual(['TOOL_STARTING', 'TOOL_COMPLETED', 'STATE_DELTA'])
 })
 
 test('a request that hangs never holds up a hook, and times out on its own', { options: OPTIONS }, async ($, on) => {
@@ -138,6 +148,15 @@ test('an environment variable a policy refuses reads as unset; capture goes on',
   const world = setUp(on)
   await startSession($)
   await world.clock.advance(5000)
+  expect(world.acceptedRows().map(r => r.event_type)).toEqual(['STATE_DELTA'])
+})
+
+test('a refused BQAA_ACCESS_TOKEN read leaves the token command to supply the token', { options: OPTIONS }, async ($, on) => {
+  on('env.get', { name: 'BQAA_ACCESS_TOKEN' }, () => ({ deny: 'refused by policy' }))
+  const world = setUp(on)
+  await startSession($)
+  await world.clock.advance(5000)
+  expect(world.commands.length).toBe(1)
   expect(world.acceptedRows().map(r => r.event_type)).toEqual(['STATE_DELTA'])
 })
 

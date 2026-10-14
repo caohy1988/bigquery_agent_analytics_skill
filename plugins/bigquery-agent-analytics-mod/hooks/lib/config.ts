@@ -60,11 +60,12 @@ export type Config = {
   // `$.http.fetch` call at 30 seconds.
   requestTimeoutMs: number
   maxQueueRows: number
+  // Queue and batch bounds in bytes are UTF-8 bytes.
   maxQueueBytes: number
   maxBatchRows: number
   maxBatchBytes: number
   maxRetries: number
-  // How long session.end may spend sending before it spills to disk.
+  // How long session.end may wait for its spill file to be written.
   exitFlushMs: number
   deadLetterDir: string
   dryRunDir: string
@@ -178,7 +179,8 @@ export function resolveConfig(options: Options, env: EnvSnapshot): Config {
     maxQueueRows: clampInt(env.BQAA_MAX_QUEUE_ROWS, 5000, 10, 100_000),
     maxQueueBytes: 8 * 1024 * 1024,
     maxBatchRows: 500,
-    // `$.http.fetch` refuses a request body over 4 MiB; stay well under it.
+    // `$.http.fetch` refuses a request body over 4 MiB, counted in
+    // characters; UTF-8 bytes are never fewer, so this stays well under it.
     maxBatchBytes: 3 * 1024 * 1024,
     maxRetries: 3,
     exitFlushMs: clampInt(env.BQAA_EXIT_FLUSH_MS, 800, 0, 1200),
@@ -200,3 +202,13 @@ export const canDeliver = (config: Config): boolean =>
   config.enabled && (config.dryRun ? config.dryRunDir !== '' : config.project !== '' && config.dataset !== '')
 
 export const tableRef = (config: Config): string => `${config.project}.${config.dataset}.${config.table}`
+
+// The dead-letter subdirectory for a table: its `project.dataset.table`
+// reference percent-encoded, so each table has a safe directory name of its
+// own on any file system.
+export const destinationDir = (table: string): string =>
+  encodeURIComponent(table).replace(/[!'()*~]/g, ch => `%${ch.charCodeAt(0).toString(16).toUpperCase()}`)
+
+// Where this configuration's dead-letter files go, and the only place its
+// replays read: rows parked for another table are never sent here.
+export const deadLetterPartition = (config: Config): string => joinPath(config.deadLetterDir, destinationDir(tableRef(config)))

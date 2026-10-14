@@ -27,19 +27,28 @@ this repo ("Make tracing hooks non-blocking and fail-open", open as of this
 writing) reworks them because they could hang the CLI. A mod runs inside the
 host CLI, which lets this one keep a hard rule:
 
-* Every hook calls `next(e)` straight away, records what it saw into an
-  in-memory queue (synchronous, bounded work), and returns what `next` gave
-  it, unchanged.
-* No hook waits on the network, a process or the disk. A background writer
-  driven by `$.clock` timers does that.
+* Each capture hook (prompt, turn, model request, tool and subagent events)
+  calls `next(e)` straight away, records what it saw into an in-memory queue
+  (synchronous, bounded work), and returns what `next` gave it, unchanged.
+* No hook waits on the network or a process; a background writer driven by
+  `$.clock` timers does that. Two lifecycle hooks do bounded work of their own
+  before passing their event on: `session.start` sets the writer up and
+  registers the three commands, and `session.end` writes what is still queued
+  to a spill file, waiting at most `BQAA_EXIT_FLUSH_MS` (800 ms) inside the
+  host's end-of-session bound. That write is the only wait on the disk.
 * If the mod's own code throws, the event goes on as if the mod were not
-  installed (fail open), and each observing hook's `.catch` says so.
+  installed (fail open). The five observers the validator lists as gating
+  hooks (`classic.SessionStart`, `classic.SubagentStart`,
+  `classic.PermissionRequest`, `prompt.submit`, `tool.call`) carry a
+  `.catch(($, e, next) => next(e))`; the other hooks run their bookkeeping
+  inside `try` blocks, so it cannot throw into the event.
 
 The test suite holds the mod to that: a test makes BigQuery hang forever and
-then runs 25 tool calls through the mod, and a test checks that no hook calls
-`$.http.fetch` or `$.process.run`. Breaking the rule on purpose (awaiting the
-flush inside the `tool.call` hook) makes the hang test time out, which is what
-a person would have seen as the CLI hanging.
+then runs 25 tool calls through the mod, and a test checks that no hook,
+`session.end` included, calls `$.http.fetch` or `$.process.run`. Breaking the
+rule on purpose (awaiting the flush inside the `tool.call` hook, or a network
+flush in `session.end`) makes those tests fail; the hang test times out, which
+is what a person would have seen as the CLI hanging.
 
 ## How it works
 
@@ -58,7 +67,7 @@ a person would have seen as the CLI hanging.
                                                   └──────────────┬───────────────┘
  $.clock.every(flushIntervalMs) ─────────────────▶ Writer (background, one at a time)
                                                          │ token: $.process.run(gcloud …), cached
-                                                         │ batch <= 500 rows / 3 MiB
+                                                         │ batch <= 500 rows / 3 MiB (UTF-8)
                                                          ▼
                                        $.http.fetch POST …/tables/{t}/insertAll
                                        (insertId = event_id, client timeout,
@@ -71,15 +80,18 @@ a person would have seen as the CLI hanging.
                                                           │ 404 table: create it, retry
                                                           │ 400/403/invalid row: refused
                                                           ▼
-                                       $.fs.write  <deadLetterDir>/{spill,retry,rejected}-*.jsonl
+                     $.fs.write  <deadLetterDir>/<project.dataset.table>/{spill,retry,rejected}-*.jsonl
                                                           │
-                       /bqaa-backfill, next session start, or recovery ──▶ insertAll again
+       /bqaa-backfill, next session start, or recovery ──▶ insertAll again, to that table only
 ```
 
-At `session.end` (the process is exiting) the mod has a short budget inside
-the engine's own end-of-session bound: one insertAll of what is queued if a
-token is in hand, then anything not confirmed sent goes to a spill file that
-the next session replays. `/clear` and `/resume` keep sending as usual.
+At `session.end` (the process is exiting) the mod starts no request: the
+rows still queued, and any whose request has not answered yet, go to a spill
+file in the table's dead-letter subdirectory, and the hook waits at most
+`BQAA_EXIT_FLUSH_MS` for that write. The next session sends the file 15
+seconds after it starts (or `/bqaa-backfill` does). A row whose request was
+still in flight can arrive twice; `event_id` dedups it. `/clear` and
+`/resume` keep sending as usual.
 
 ## Install
 
@@ -135,7 +147,7 @@ the environment variable the tracing plugin already uses, then to a default.
 | `dryRun` | `BQAA_DRY_RUN=true` turns it on | `false` | Write rows as JSONL to `<deadLetterDir>/../dry-run/` instead of sending |
 | `maxPayloadChars` | | `16384` (1024 to 500000) | Cap per JSON payload column (`content`, `attributes`); past it the value is cut and `is_truncated` set |
 | `flushIntervalMs` | | `5000` (1000 to 300000) | How often the background writer sends |
-| `deadLetterDir` | `BQAA_DEAD_LETTER_DIR` | `~/.bqaa-mod/dead-letter` | Where unsent rows are kept |
+| `deadLetterDir` | `BQAA_DEAD_LETTER_DIR` | `~/.bqaa-mod/dead-letter` | Where unsent rows are kept, in one subdirectory per table (`project.dataset.table`) |
 | `agentName` | `BQAA_AGENT_NAME` | `coding-agent` | `agent` column for main-loop rows |
 | `accessTokenCommand` | `BQAA_ACCESS_TOKEN_COMMAND` | `gcloud auth application-default print-access-token` | Command (argv, no shell) that prints an access token |
 
@@ -146,10 +158,10 @@ Advanced, environment only:
 | `BQAA_ACCESS_TOKEN` | unset | Use this token as is (re-read every 5 minutes) instead of running the command |
 | `BQAA_USER_ID` | `$USER` / `$USERNAME` | `user_id` column |
 | `BQAA_REQUEST_TIMEOUT_MS` | `10000` (1000 to 30000) | Client-side timeout per insertAll request |
-| `BQAA_MAX_QUEUE_ROWS` | `5000` (10 to 100000) | Queue bound in rows (the byte bound is 8 MiB) |
-| `BQAA_EXIT_FLUSH_MS` | `800` (0 to 1200) | Time session end may spend sending; `0` means spill to disk only |
+| `BQAA_MAX_QUEUE_ROWS` | `5000` (10 to 100000) | Queue bound in rows (the byte bound is 8 MiB of UTF-8) |
+| `BQAA_EXIT_FLUSH_MS` | `800` (0 to 1200) | How long session end may wait for its spill file to be written; `0` starts the write without waiting |
 | `BQAA_AUTO_CREATE_TABLE` | `true` | Create the table (BQAA schema v2, partitioned and clustered) when insertAll answers 404 for it |
-| `BQAA_AUTO_BACKFILL` | `true` | Replay `spill` and `retry` files at session start and after BigQuery recovers |
+| `BQAA_AUTO_BACKFILL` | `true` | Replay the table's `spill` and `retry` files at session start and after BigQuery recovers |
 
 For a `--plugin-dir` session, options live in the host's user settings file under
 `pluginConfigs["bigquery-agent-analytics-mod@inline"].options`, or use the
@@ -243,7 +255,9 @@ JSON-typed values on `tabledata.insertAll` (its `_json_to_json` converter is
 [`examples/sample-rows.jsonl`](examples/sample-rows.jsonl) is the insertAll
 payload of a fixture session (`tests/sample-rows.test.ts`): a prompt, four
 model requests, Read, Agent (an Explore subagent), Edit and Bash (with a
-permission prompt), and session end. **Sample output from the test
+permission prompt), and session end. It holds the rows the stubbed insertAll
+took, then the session-end row, which session end writes to a spill file for
+the next session to send. **Sample output from the test
 fixture:** the model id `example-model`, the token counts and the turn's
 48,211 ms are fixture inputs; the model and tool `latency_ms` values are what
 the run measured, a few milliseconds, since nothing really ran. Regenerate with:
@@ -297,31 +311,38 @@ the analysis skill's `{PROJECT}.{DATASET}.{TABLE}` placeholders and `@start` /
 deduplicated, tokens and cache share per session and model, model latency
 (p50/p95 total, time to first token), tool failure rate and latency, one line
 per turn, the span tree of a trace, subagents by type, and the mod's own
-health. For example, tokens per model:
+health. `QUALIFY` is evaluated after `GROUP BY`, so a query that aggregates
+dedups on `event_id` in a CTE first and aggregates what it returns. For
+example, tokens per model:
 
 ```sql
+WITH responses AS (
+  SELECT *
+  FROM `{PROJECT}.{DATASET}.{TABLE}`
+  WHERE event_type = 'LLM_RESPONSE'
+    AND timestamp BETWEEN @start AND @end
+  QUALIFY event_id IS NULL OR ROW_NUMBER() OVER (PARTITION BY event_id ORDER BY timestamp) = 1
+)
 SELECT
   JSON_VALUE(attributes, '$.model') AS model,
   COUNT(*) AS model_requests,
   SUM(CAST(JSON_VALUE(attributes, '$.usage_metadata.input_tokens') AS INT64)) AS input_tokens,
   SUM(CAST(JSON_VALUE(attributes, '$.usage_metadata.cache_read_input_tokens') AS INT64)) AS cache_read_tokens,
   SUM(CAST(JSON_VALUE(attributes, '$.usage_metadata.output_tokens') AS INT64)) AS output_tokens
-FROM `{PROJECT}.{DATASET}.{TABLE}`
-WHERE event_type = 'LLM_RESPONSE'
-  AND timestamp BETWEEN @start AND @end
-QUALIFY event_id IS NULL OR ROW_NUMBER() OVER (PARTITION BY event_id ORDER BY timestamp) = 1
+FROM responses
 GROUP BY model
 ```
 
 ## Reliability
 
-* **Queue:** in memory, bounded by `BQAA_MAX_QUEUE_ROWS` rows and 8 MiB; when
+* **Queue:** in memory, bounded by `BQAA_MAX_QUEUE_ROWS` rows and 8 MiB of UTF-8; when
   full it drops its oldest rows and counts them. While BigQuery is failing and
   the queue passes 80%, the writer moves the oldest half to a `spill` file
   instead of letting rows drop.
 * **Flush:** every `flushIntervalMs`, and right after each main-loop turn; one
-  request at a time; batches of at most 500 rows and 3 MiB (`$.http.fetch`
-  refuses bodies over 4 MiB).
+  request at a time; batches of at most 500 rows and 3 MiB of UTF-8
+  (`$.http.fetch` refuses bodies over 4 MiB, counted in characters, and UTF-8
+  bytes are never fewer).
 * **Timeouts:** each insertAll is raced against `BQAA_REQUEST_TIMEOUT_MS`
   (a `$.clock.after` timer), under the host's own 30-second cap per
   `$.http.fetch`; the token command has 15 seconds.
@@ -332,18 +353,28 @@ GROUP BY model
   BigQuery or the configuration refuses (400, 403 access denied, missing
   dataset, an invalid row reported by insertAll) go to `rejected-*.jsonl`;
   rows queued at exit go to `spill-*.jsonl`. Each line keeps the full row,
-  the reason, the attempt count and the table it was meant for. Each failure
-  writes a new file (the mods file API has no append), at most 3 MiB.
-* **Backfill:** `/bqaa-backfill` resends every dead-letter file to the
-  *current* table; `spill` and `retry` files are also replayed 15 seconds
-  after a session starts and once BigQuery recovers in a session that parked
-  rows. A file whose rows all land is truncated to zero bytes (the API has no
-  delete; empty files are safe to remove). Rows that fail again stay, and a
-  per-file lease in `$.store` keeps two sessions from replaying the same file
-  at once (best effort; `event_id` dedups the rest).
-* **Fail open:** a hook's bookkeeping runs in `try`; the writer never throws
-  into a hook; every failure path ends in sent, on disk, or counted as
-  dropped.
+  the reason (redacted), the attempt count and the table it was meant for.
+  Files go to a subdirectory of `deadLetterDir` named after that table
+  (`project.dataset.table`, percent-encoded where a name needs it). Each
+  failure writes a new file (the mods file API has no append) of at most
+  3 MiB of UTF-8, under the 4 MiB the API reads or writes per file; a row too
+  large for a file on its own has its payload columns cut to fit and
+  `is_truncated` set.
+* **Backfill:** `/bqaa-backfill` resends the files in the configured table's
+  subdirectory to that table, and checks each line's recorded table first: a
+  line for another table stays in its file as written, and rows parked for
+  another table are sent only by a session configured for that table. `spill`
+  and `retry` files are also replayed 15 seconds after a session starts and
+  once BigQuery recovers in a session that parked rows. A file whose rows all
+  land is truncated to zero bytes (the API has no delete; empty files are safe
+  to remove). A file over 4 MiB, which the API cannot read, is reported by
+  `/bqaa-status` and the backfill instead of being passed over. Rows that fail
+  again stay, and a per-file lease in `$.store` keeps two sessions from
+  replaying the same file at once (best effort; `event_id` dedups the rest).
+* **Fail open:** a hook's bookkeeping runs behind `.catch` or inside `try`;
+  the writer never throws into a hook; every failure path ends in sent, on
+  disk, or counted as dropped. An environment variable a policy refuses reads
+  as unset, `BQAA_ACCESS_TOKEN` included (the token command takes over).
 
 ## Commands
 
@@ -352,10 +383,12 @@ never payloads or tokens (the agent reads a command's output too).
 
 * `/bqaa-status`: target table, queue depth, rows captured / sent /
   dead-lettered / refused / spilled / dropped this session, retries, backoff,
-  the last error (redacted), dead-letter files on disk, the last backfill.
+  the last error (redacted), the configured table's dead-letter files, how
+  many files elsewhere in the directory belong to other tables, any file too
+  large to read, the last backfill.
 * `/bqaa-flush`: send the queue now instead of at the next interval.
-* `/bqaa-backfill`: resend the dead-letter files in the background; a dim
-  transcript line reports the result.
+* `/bqaa-backfill`: resend the configured table's dead-letter files in the
+  background; a dim transcript line reports the result.
 
 When BigQuery refuses rows or retries run out, the mod also sets a status line
 under the prompt (`⚠ bigquery-agent-analytics-mod: …`) until the next
@@ -367,14 +400,26 @@ The table receives your prompts, the model's visible answers, tool arguments
 and tool results (the text the model read), cut to `maxPayloadChars` per
 column. Treat the dataset like the transcripts it mirrors.
 
-* **Redaction (best effort):** values under credential-like keys (`api_key`,
-  `authorization`, `password`, `secret`, `token`, `client_secret`, `cookie`,
-  `private_key`, ... and ADK's `temp:` prefix) become `[REDACTED]`; free text
-  is scrubbed of private-key blocks, provider-style `sk-` keys, AWS
-  access key ids, Google API keys and OAuth tokens, GitHub/GitLab/npm/Slack/
-  Stripe tokens, JWTs, `Bearer`/`Basic` credentials, passwords in URLs and
-  `KEY=value` / `"key": "value"` pairs whose key names a credential. Patterns
-  cannot catch every secret; do not rely on them alone.
+* **Redaction (best effort):** values under credential-like keys become
+  `[REDACTED]`. A key matches when its name, with case and punctuation
+  removed, contains `password`, `passwd`, `passphrase`, `secret`, `apikey`,
+  `accesskey`, `privatekey`, `signingkey`, `authorization`, `credential`,
+  `signature` or `cookie`, ends in `token`, is `auth`, `sig`, `jwt` or
+  `bearer`, or has ADK's `temp:` prefix: `my_api_key`, `X-Amz-Security-Token`
+  and `sessionCookie` all match, while token counts such as `max_tokens` are
+  numbers and stay. Free text is scrubbed of private-key blocks,
+  provider-style `sk-` keys, AWS access key ids, Google API keys and OAuth
+  tokens, GitHub/GitLab/npm/Slack/Stripe tokens, JWTs, `Bearer`/`Basic`
+  credentials, passwords in URLs, signed-link and token query parameters
+  (`X-Goog-Signature`, `X-Goog-Credential`, `X-Amz-Signature`,
+  `X-Amz-Credential`, `X-Amz-Security-Token`, `sig`, `access_token`, `key`,
+  ...) and `KEY=value` / `"key": "value"` pairs whose key names a credential.
+  Patterns cannot catch every secret; do not rely on them alone.
+* **Diagnostics:** error text from BigQuery, the token command or the file
+  system is redacted before it is cut, kept or shown: in dead-letter reasons,
+  the status line, `/bqaa-status`, backfill reports, the debug log and the
+  transcript. A failing token command is named by its program only, never its
+  arguments.
 * **Truncation:** each payload column is held to `maxPayloadChars`,
   error messages to 4,096 characters; the copy is built within that budget, so
   a multi-megabyte tool input costs the hot path milliseconds (a test checks
@@ -394,11 +439,16 @@ cd plugins/bigquery-agent-analytics-mod && claude plugin test
 The test command runs the `tests/*.test.ts` files against the host CLI's own
 test kit, with no session, sign-in, GCP or network: `$.http.fetch`,
 `$.process.run`, `$.fs` and `$.store` are stubbed, and `mock.clock` drives the
-timers. 55 tests cover the captured rows and their spans, the non-blocking
-rules, the queue bound, retries, timeouts, token refresh, table creation,
-partial inserts, dead-letter files, backfill, the exit spill, dry run,
-redaction, truncation (identifying fields survive a cut), refused
-environment reads, a re-fired `session.start`, and configuration.
+timers; the `$.fs` stubs measure files in UTF-8 bytes and refuse a file over
+4 MiB, as the host does. 67 tests cover the captured rows and their spans, the
+non-blocking rules (`session.end` included), the queue bound, retries,
+timeouts, token refresh, table creation, partial inserts, dead-letter files,
+replay that keeps two tables' rows apart, backfill, the exit spill and its
+time bound, multibyte rows held to the file limit in bytes, dry run,
+redaction (credential keys by stem, signed links, and every diagnostic sink),
+truncation (identifying fields survive a cut), refused environment reads
+(`BQAA_ACCESS_TOKEN` included), a re-fired `session.start`, and
+configuration.
 
 ## Limitations
 
@@ -425,6 +475,11 @@ environment reads, a re-fired `session.start`, and configuration.
 * Rows in the in-memory queue are lost if the hooks module reloads (a
   `--plugin-dir` edit, `/reload-plugins`) or the hooks worker crashes:
   at most one flush interval's worth, plus any batch in backoff.
+* Rows queued at exit reach BigQuery when a later session starts (15 seconds
+  in) or `/bqaa-backfill` runs; until then they wait in a spill file.
+* Rows parked for a table are sent only by a session configured for that
+  table: after switching tables, run with the old table's settings to send
+  what it left behind.
 * `$.fs` cannot append or delete: one file per failure, truncated rather than
   removed after backfill.
 * Timestamps have millisecond precision.
@@ -441,9 +496,9 @@ hooks/lib/tracer.ts          event -> BQAA row, ids and spans
 hooks/lib/rows.ts            row builder, BQAA schema
 hooks/lib/sanitize.ts        redaction, truncation
 hooks/lib/queue.ts           bounded queue
-hooks/lib/writer.ts          background writer, retries, dead letter, backfill, exit drain
+hooks/lib/writer.ts          background writer, retries, dead letter, backfill, exit spill
 hooks/lib/bigquery.ts        insertAll / tables.insert requests, answer classification
-hooks/lib/deadletter.ts      dead-letter file format
+hooks/lib/deadletter.ts      dead-letter file format, files sized in UTF-8 bytes
 hooks/lib/config.ts          options and environment
 hooks/lib/status.ts          /bqaa-status text
 sql/                         DDL and sample queries

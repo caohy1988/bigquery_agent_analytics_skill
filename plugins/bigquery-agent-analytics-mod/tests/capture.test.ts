@@ -3,7 +3,7 @@
 
 import { expect, test } from 'claude-code/testing'
 
-import { ACCESS_TOKEN, OPTIONS, SESSION_ID, USAGE, byType, json, runStep, setUp, startSession } from './helpers.ts'
+import { ACCESS_TOKEN, OPTIONS, SESSION_ID, USAGE, byType, deadLetterRows, json, runStep, setUp, startSession } from './helpers.ts'
 
 const HEX32 = /^[0-9a-f]{32}$/
 const HEX16 = /^[0-9a-f]{16}$/
@@ -257,9 +257,10 @@ test('session end is recorded with its reason, turn count and duration', { optio
   await $.turn.start({ turnId: 'turn-1', text: 'hi' })
   await $.turn.complete({ turnId: 'turn-1', answer: 'Hello.', durationMs: 800, isAborted: false, reason: 'answer' })
   await world.clock.advance(5000)
-  // A token is in hand, so session end sends the last rows itself.
+  // Session end starts no request: its row goes to a spill file the next
+  // session sends.
   await $.session.end({ reason: 'prompt_input_exit', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
-  const ends = byType(world.sentRows(), 'STATE_DELTA').filter(r => json(r.content).session_end === true)
+  const ends = byType(deadLetterRows(world), 'STATE_DELTA').filter(r => json(r.content).session_end === true)
   expect(ends.length).toBe(1)
   expect(json(ends[0]?.attributes ?? null)).toMatchObject({ state_delta: { source: 'coding_agent_session_end', reason: 'prompt_input_exit', trace_count: 1 } })
 })
