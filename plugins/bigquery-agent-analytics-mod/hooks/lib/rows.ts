@@ -2,7 +2,7 @@
 // (schema version 2, with `event_id`), and the table definition the mod
 // creates when the table is missing.
 
-import { type JsonValue, type Limits, type SanitizeStats, cutAt, limitsFor, newStats, sanitize, sanitizeAttributes, sanitizeContent, toJsonColumn } from './sanitize.ts'
+import { type JsonValue, type Limits, type SanitizeStats, cutAt, limitsFor, newStats, sanitize, toJsonColumn } from './sanitize.ts'
 
 export type ContentPart = {
   mime_type: string | null
@@ -58,15 +58,16 @@ export type BuiltRow = { row: BqaaRow; redactions: number }
 
 const ERROR_MESSAGE_CHARS = 4096
 
-// Builds one row: payloads copied within `maxPayloadChars`, secrets redacted,
+// Builds one row: payloads copied within `maxPayloadChars`, every value under
+// a key that is not on the allowlist redacted (allowlist.ts, sanitize.ts),
 // `is_truncated` set when anything was cut. `content` holds what the agent,
 // the model and the tools produced under the row's own field names;
-// `attributes` is the mod's own metadata (see sanitize.ts).
+// `attributes` is the mod's own metadata.
 export function buildRow(input: RowInput): BuiltRow {
   const stats: SanitizeStats = newStats()
   const limits: Limits = limitsFor(input.maxPayloadChars)
-  const content = input.content === undefined || input.content === null ? null : sanitizeContent(input.content, limits, stats)
-  const attributes = sanitizeAttributes(input.attributes, limits, stats)
+  const content = input.content === undefined || input.content === null ? null : sanitize(input.content, limits, stats)
+  const attributes = sanitize(input.attributes, limits, stats)
   let latency: string | null = null
   if (input.latencyMs) {
     const clean: Record<string, number> = {}

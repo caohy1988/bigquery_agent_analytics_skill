@@ -1,12 +1,15 @@
 // The local dead-letter files: JSONL, one row per line, each line keeping
-// the full insertAll row so a backfill can send it again unchanged.
+// the full insertAll row so a backfill can send it again unchanged, and a
+// last line, the completion record, written after every row.
 //
-// `$.fs` has no append and no delete, and reads and writes at most 4 MiB per
-// file, counted in UTF-8 bytes (the file on disk). So every failure writes a
-// new, immutable file (no read-modify-write races between sessions), files
-// are kept to 3 MiB of UTF-8, and a backfill that delivered a file truncates
-// it to zero bytes. Each table's files live in a subdirectory of their own
-// (config.ts `deadLetterPartition`).
+// `$.fs` has no append, no rename and no delete, its `write` is not atomic
+// (another process can read a file part-written), and it reads and writes at
+// most 4 MiB per file, counted in UTF-8 bytes (the file on disk). So every
+// failure writes a new, immutable file (no read-modify-write races between
+// sessions), files are kept to 3 MiB of UTF-8, a backfill reads only files
+// whose completion record matches every line above it, and one that
+// delivered a file truncates it to zero bytes. Each table's files live in a
+// subdirectory of their own (config.ts `deadLetterPartition`).
 
 import { type BqaaRow, fitRow, utf8Length } from './rows.ts'
 import { redactDiagnostic } from './sanitize.ts'
@@ -37,6 +40,9 @@ export type DeadLetterLine = {
 // a backfill rewrites (with longer reasons, say) still reads back.
 export const HOST_FILE_BYTES = 4 * 1024 * 1024
 export const MAX_FILE_BYTES = 3 * 1024 * 1024
+// Room for the completion record, under MAX_FILE_BYTES.
+const RECORD_BYTES = 128
+const BODY_BYTES = MAX_FILE_BYTES - RECORD_BYTES
 const REASON_CHARS = 1000
 
 export const FILE_PATTERN = /^(spill|retry|rejected)-[A-Za-z0-9._-]+\.jsonl$/
@@ -46,9 +52,9 @@ export const FILE_PATTERN = /^(spill|retry|rejected)-[A-Za-z0-9._-]+\.jsonl$/
 export function lineText(line: DeadLetterLine): string {
   const clean: DeadLetterLine = { ...line, reason: redactDiagnostic(line.reason, REASON_CHARS) }
   const text = JSON.stringify(clean)
-  if (utf8Length(text) < MAX_FILE_BYTES) return text
+  if (utf8Length(text) < BODY_BYTES) return text
   const overhead = utf8Length(JSON.stringify({ ...clean, row: null }))
-  return JSON.stringify({ ...clean, row: fitRow(clean.row, MAX_FILE_BYTES - overhead - 16) })
+  return JSON.stringify({ ...clean, row: fitRow(clean.row, BODY_BYTES - overhead - 16) })
 }
 
 // Groups JSONL lines, each of which fits on its own, into file texts of at
@@ -71,8 +77,31 @@ export function packLines(lines: readonly string[], maxBytes = MAX_FILE_BYTES): 
   return files
 }
 
+// FNV-1a, 32 bits, over UTF-16 code units: a checksum, not a secret.
+const fnv1a = (text: string): string => {
+  let hash = 0x811c9dc5
+  for (let i = 0; i < text.length; i += 1) {
+    hash ^= text.charCodeAt(i)
+    hash = Math.imul(hash, 0x01000193)
+  }
+  return (hash >>> 0).toString(16).padStart(8, '0')
+}
+
+const lineCount = (body: string): number => body.split('\n').length - 1
+
+// A file's text: its lines (`body`, each ending in a newline), then the
+// completion record, how many lines come before it and their checksum.
+export const sealFile = (body: string): string => `${body}${JSON.stringify({ v: 1, complete: true, lines: lineCount(body), fnv1a: fnv1a(body) })}\n`
+
+// Dead-letter file texts for JSONL lines: packed under MAX_FILE_BYTES with
+// room for each file's completion record, then sealed.
+export const packFiles = (lines: readonly string[]): string[] => packLines(lines, BODY_BYTES).map(sealFile)
+
 // Several files when the lines pass MAX_FILE_BYTES.
-export const encodeLines = (lines: readonly DeadLetterLine[]): string[] => packLines(lines.map(lineText))
+export const encodeLines = (lines: readonly DeadLetterLine[]): string[] => packFiles(lines.map(lineText))
+
+// The bodies `packFiles` seals, for a writer that counts each file's lines.
+export const packBodies = (lines: readonly string[]): string[] => packLines(lines, BODY_BYTES)
 
 export const fileName = (kind: DeadLetterKind, atMs: number, session: string | null, seq: number): string => {
   const stamp = new Date(atMs).toISOString().replace(/[-:]/g, '').replace('.', '')
@@ -86,14 +115,37 @@ export const kindOf = (name: string): DeadLetterKind | null => {
 }
 
 // `raw[i]` is the text `lines[i]` was read from, so a line can be kept
-// exactly as written.
-export type ParsedFile = { lines: DeadLetterLine[]; raw: string[]; unreadable: string[] }
+// exactly as written. `complete`: the file ends with a completion record that
+// matches every line above it. A file still being written, or left by a
+// writer that stopped part-way, is not complete.
+export type ParsedFile = { complete: boolean; lines: DeadLetterLine[]; raw: string[]; unreadable: string[] }
+
+const readRecord = (line: string): { lines: number; fnv1a: string } | null => {
+  try {
+    const parsed = JSON.parse(line) as { complete?: unknown; lines?: unknown; fnv1a?: unknown; row?: unknown } | null
+    if (parsed === null || typeof parsed !== 'object' || parsed.complete !== true || parsed.row !== undefined) return null
+    return typeof parsed.lines === 'number' && typeof parsed.fnv1a === 'string' ? { lines: parsed.lines, fnv1a: parsed.fnv1a } : null
+  } catch {
+    return null
+  }
+}
 
 export function parseFile(text: string): ParsedFile {
+  // The completion record is the last line, and the text ends with it.
+  let body = text
+  let complete = false
+  if (text.endsWith('\n')) {
+    const start = text.lastIndexOf('\n', text.length - 2) + 1
+    const record = readRecord(text.slice(start, -1))
+    if (record !== null) {
+      body = text.slice(0, start)
+      complete = record.lines === lineCount(body) && record.fnv1a === fnv1a(body)
+    }
+  }
   const lines: DeadLetterLine[] = []
   const raw: string[] = []
   const unreadable: string[] = []
-  for (const line of text.split('\n')) {
+  for (const line of body.split('\n')) {
     if (line.trim() === '') continue
     try {
       const parsed = JSON.parse(line) as DeadLetterLine
@@ -107,5 +159,5 @@ export function parseFile(text: string): ParsedFile {
       unreadable.push(line)
     }
   }
-  return { lines, raw, unreadable }
+  return { complete, lines, raw, unreadable }
 }

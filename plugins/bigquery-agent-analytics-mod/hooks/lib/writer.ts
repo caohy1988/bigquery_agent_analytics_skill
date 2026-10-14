@@ -10,7 +10,7 @@
 
 import { type Config, canDeliver, deadLetterPartition, destinationDir, joinPath, tableRef } from './config.ts'
 import { type HttpAnswer, classifyInsert, createTableBody, insertAllBody, insertAllUrl, isDatasetMissing, tablesUrl } from './bigquery.ts'
-import { type DeadLetterKind, type DeadLetterLine, HOST_FILE_BYTES, MAX_FILE_BYTES, encodeLines, fileName, kindOf, lineText, packLines, parseFile } from './deadletter.ts'
+import { type DeadLetterKind, type DeadLetterLine, HOST_FILE_BYTES, MAX_FILE_BYTES, type ParsedFile, fileName, kindOf, lineText, packBodies, packFiles, packLines, parseFile, sealFile } from './deadletter.ts'
 import { BoundedQueue, type Queued } from './queue.ts'
 import { type BqaaRow, fitRow, rowBytes } from './rows.ts'
 import { redactDiagnostic } from './sanitize.ts'
@@ -67,6 +67,9 @@ export type BackfillReport = {
   skippedFiles: number
   // Files over the 4 MiB `$.fs.read` limit, which cannot be read back.
   oversizedFiles: string[]
+  // Files with no completion record that matches them: still being written,
+  // or left by a writer that stopped part-way. Kept as they are, not read.
+  incompleteFiles: string[]
   error: string | null
   finishedAt: number | null
 }
@@ -463,12 +466,14 @@ export class Writer {
     const failedAt = new Date(at).toISOString()
     const dir = deadLetterPartition(c)
     const lines: DeadLetterLine[] = rows.map(q => ({ v: 1, kind, reason, attempts: q.attempts, failed_at: failedAt, table: tableRef(c), row: q.row }))
-    for (const text of encodeLines(lines)) {
-      const count = text.split('\n').length - 1
+    for (const body of packBodies(lines.map(lineText))) {
+      const count = body.split('\n').length - 1
       const path = joinPath(dir, fileName(kind, at, this.sessionId(), ++this.seq))
       try {
         if (c.deadLetterDir === '') throw new Error('no dead-letter directory')
-        await this.io.writeFile(path, text)
+        // The completion record goes last: a replay reads the file only once
+        // the record is there and matches every row above it.
+        await this.io.writeFile(path, sealFile(body))
         this.counters.deadLetterFiles += 1
         if (kind !== 'rejected') this.wroteRecoverable = true
       } catch (err) {
@@ -523,9 +528,12 @@ export class Writer {
 
   // ---- backfill ----------------------------------------------------------
 
-  // Sends the rows parked for this table. A file whose rows all land is
-  // truncated to zero bytes (`$.fs` has no delete); rows that fail again
-  // stay, and so does every line recorded for another table, as written.
+  // Sends the rows parked for this table. Only a file whose completion record
+  // matches it is read; any other file, still being written or left by a
+  // writer that stopped, is kept as it is and reported. A file whose rows all
+  // land is truncated to zero bytes (`$.fs` has no delete); rows that fail
+  // again stay, and so does every line recorded for another table, as
+  // written.
   backfill(kinds: DeadLetterKind[], trigger: BackfillReport['trigger']): Promise<BackfillReport> {
     if (this.backfilling) return this.backfilling
     const run = this.backfillRun(kinds, trigger).catch(err => {
@@ -537,6 +545,7 @@ export class Writer {
         otherTableRows: 0,
         skippedFiles: 0,
         oversizedFiles: [],
+        incompleteFiles: [],
         error: diagnostic(errorText(err)),
         finishedAt: this.io.now(),
       }
@@ -555,7 +564,7 @@ export class Writer {
 
   private async backfillRun(kinds: DeadLetterKind[], trigger: BackfillReport['trigger']): Promise<BackfillReport> {
     const c = this.config()
-    const report: BackfillReport = { trigger, files: 0, rowsSent: 0, rowsLeft: 0, otherTableRows: 0, skippedFiles: 0, oversizedFiles: [], error: null, finishedAt: null }
+    const report: BackfillReport = { trigger, files: 0, rowsSent: 0, rowsLeft: 0, otherTableRows: 0, skippedFiles: 0, oversizedFiles: [], incompleteFiles: [], error: null, finishedAt: null }
     const finish = (): BackfillReport => {
       report.finishedAt = this.io.now()
       this.backfillReport = report
@@ -601,8 +610,12 @@ export class Writer {
         // No store: go on without the lease; event_id still dedups in SQL.
       }
       try {
-        await this.backfillFile(dir, name, c, report)
-        report.files += 1
+        const parsed = parseFile(await this.io.readFile(joinPath(dir, name)))
+        if (!parsed.complete) report.incompleteFiles.push(name)
+        else {
+          await this.backfillFile(dir, name, parsed, c, report)
+          report.files += 1
+        }
       } finally {
         try {
           await this.io.storeDelete(leaseKey)
@@ -614,9 +627,9 @@ export class Writer {
     return finish()
   }
 
-  private async backfillFile(dir: string, name: string, c: Config, report: BackfillReport): Promise<void> {
+  private async backfillFile(dir: string, name: string, file: ParsedFile, c: Config, report: BackfillReport): Promise<void> {
     const path = joinPath(dir, name)
-    const { lines, raw, unreadable } = parseFile(await this.io.readFile(path))
+    const { lines, raw, unreadable } = file
     // A line is sent only to the table it records. Others stay as written.
     const table = tableRef(c)
     const mine: DeadLetterLine[] = []
@@ -686,12 +699,13 @@ export class Writer {
     // Nothing sent and nothing new to record: the file stays as it was.
     if (!changed) return
     // What is left goes to new files first (rewritten reasons can make it
-    // outgrow one), and only once every one is written is the source emptied:
-    // `$.fs` has no rename or delete. A write that fails leaves the source as
-    // it was, so an unsent row is never held only in memory; rows sent
-    // meanwhile may go again, and event_id dedups them.
+    // outgrow one), each ending with its completion record, and only once
+    // every one is written is the source emptied: `$.fs` has no rename or
+    // delete. A write that fails leaves the source as it was, so an unsent
+    // row is never held only in memory; rows sent meanwhile may go again,
+    // and event_id dedups them.
     const rest = [...left.map(lineText), ...others, ...unreadable]
-    for (const text of packLines(rest)) {
+    for (const text of packFiles(rest)) {
       await this.io.writeFile(joinPath(dir, fileName(kindOf(name) ?? 'retry', this.io.now(), this.sessionId(), ++this.seq)), text)
     }
     await this.io.writeFile(path, '')

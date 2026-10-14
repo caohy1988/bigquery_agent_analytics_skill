@@ -5,7 +5,7 @@
 import { type Engine, expect, test } from 'claude-code/testing'
 
 import { deadLetterPartition, resolveConfig } from '../hooks/lib/config.ts'
-import { type DeadLetterLine, encodeLines, parseFile } from '../hooks/lib/deadletter.ts'
+import { type DeadLetterLine, encodeLines, packFiles, parseFile } from '../hooks/lib/deadletter.ts'
 import { buildRow } from '../hooks/lib/rows.ts'
 import { type Io, Writer } from '../hooks/lib/writer.ts'
 
@@ -73,6 +73,10 @@ const parkedRow = (eventId: string, sessionId: string) => ({
 const parkedLine = (table: string, eventId: string, sessionId: string): string =>
   JSON.stringify({ v: 1, kind: 'spill', reason: 'session ended', attempts: 0, failed_at: '2026-10-13T20:01:02.003Z', table, row: parkedRow(eventId, sessionId) })
 
+// A dead-letter file as a writer that finished leaves it: its lines, then
+// the completion record a replay checks for.
+const parkedFile = (...lines: string[]): string => packFiles(lines)[0] as string
+
 const OTHER_TABLE = 'other-project.private_dataset.agent_events'
 const OTHER_OPTIONS = { project: 'other-project', dataset: 'private_dataset' }
 
@@ -86,10 +90,10 @@ function parkForTwoTables(world: World): { mine: string; theirs: string; mixed: 
     mixed: `${PARTITION_DIR}/retry-20261013T200102003Z-mixed-1.jsonl`,
     loose: `${DEAD_LETTER_DIR}/spill-20261013T200102003Z-loose-1.jsonl`,
   }
-  world.files.set(files.mine, `${parkedLine(TABLE_REF, 'a'.repeat(32), 'mine-session')}\n`)
-  world.files.set(files.theirs, `${parkedLine(OTHER_TABLE, 'b'.repeat(32), 'their-session')}\n`)
-  world.files.set(files.mixed, `${parkedLine(OTHER_TABLE, 'c'.repeat(32), 'their-session')}\n${parkedLine(TABLE_REF, 'd'.repeat(32), 'mine-session')}\n`)
-  world.files.set(files.loose, `${parkedLine(OTHER_TABLE, 'e'.repeat(32), 'their-session')}\n`)
+  world.files.set(files.mine, parkedFile(parkedLine(TABLE_REF, 'a'.repeat(32), 'mine-session')))
+  world.files.set(files.theirs, parkedFile(parkedLine(OTHER_TABLE, 'b'.repeat(32), 'their-session')))
+  world.files.set(files.mixed, parkedFile(parkedLine(OTHER_TABLE, 'c'.repeat(32), 'their-session'), parkedLine(TABLE_REF, 'd'.repeat(32), 'mine-session')))
+  world.files.set(files.loose, parkedFile(parkedLine(OTHER_TABLE, 'e'.repeat(32), 'their-session')))
   return files
 }
 
@@ -132,7 +136,14 @@ test('rows that exhaust their retries go to a dead-letter file, and are replayed
   expect(files.length).toBe(1)
   const [path, text] = files[0] as [string, string]
   expect(path.startsWith(`${PARTITION_DIR}/retry-`)).toBe(true)
-  const lines = text.trim().split('\n').map(l => JSON.parse(l) as { kind: string; attempts: number; table: string; reason: string; row: { event_type: string } })
+  // Every line but the last, the file's completion record, holds a row.
+  const lines = text
+    .trim()
+    .split('\n')
+    .map(l => JSON.parse(l) as { kind: string; attempts: number; table: string; reason: string; row?: { event_type: string } })
+    .filter(l => l.row !== undefined) as { kind: string; attempts: number; table: string; reason: string; row: { event_type: string } }[]
+  expect(lines.length).toBe(text.trim().split('\n').length - 1)
+  expect(parseFile(text).complete).toBe(true)
   expect(lines.map(l => l.row.event_type)).toEqual(['STATE_DELTA', 'TOOL_STARTING', 'TOOL_COMPLETED'])
   expect(lines[0]).toMatchObject({ kind: 'retry', attempts: 4, table: 'my-gcp-project.agent_analytics.agent_events' })
   expect(lines[0]?.reason ?? '').toMatch(/HTTP 503/)
@@ -264,7 +275,10 @@ test('rows BigQuery reports as invalid are parked; the rest land', { options: OP
   await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
   await world.clock.advance(5000)
   const [file] = deadLetterFiles(world)
-  const line = JSON.parse((file?.[1] ?? '').trim()) as { kind: string; reason: string; row: { event_type: string } }
+  // One row, then the file's completion record.
+  const [first = '', record = ''] = (file?.[1] ?? '').trim().split('\n')
+  const line = JSON.parse(first) as { kind: string; reason: string; row: { event_type: string } }
+  expect(JSON.parse(record)).toMatchObject({ complete: true, lines: 1 })
   expect(line.kind).toBe('rejected')
   expect(line.reason).toMatch(/invalid: no such field: foo/)
   expect(line.row.event_type).toBe('TOOL_STARTING')
@@ -341,14 +355,16 @@ test('with BQAA_EXIT_FLUSH_MS=0 session end does not wait for its spill write', 
 test('the next session replays spill files on its own', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on)
   const path = `${PARTITION_DIR}/spill-20261013T200102003Z-previoussess-1.jsonl`
-  world.files.set(path, `${parkedLine(TABLE_REF, 'a'.repeat(32), 'previous-session')}\nnot json\n`)
+  world.files.set(path, parkedFile(parkedLine(TABLE_REF, 'a'.repeat(32), 'previous-session'), 'not json'))
   await startSession($)
   await world.clock.advance(15_000)
   expect(world.acceptedRows().some(r => r.event_id === 'a'.repeat(32))).toBe(true)
-  // The unreadable line is kept for a person to look at, in a new file; the
-  // source is emptied once that file is written.
+  // The unreadable line is kept for a person to look at, in a new, complete
+  // file; the source is emptied once that file is written.
   expect(world.files.get(path)).toBe('')
-  expect(deadLetterFiles(world).map(([, text]) => text)).toEqual(['not json\n'])
+  const kept = deadLetterFiles(world)
+  expect(kept.map(([, text]) => text.split('\n')[0])).toEqual(['not json'])
+  expect(kept.map(([, text]) => parseFile(text).complete)).toEqual([true])
 })
 
 test('replay sends only rows recorded for the configured table; other tables keep theirs', { options: OPTIONS }, async ($, on) => {
@@ -372,7 +388,8 @@ test('replay sends only rows recorded for the configured table; other tables kee
   // in this table's directory before the mixed file was emptied.
   expect(world.files.get(files.mixed)).toBe('')
   const moved = deadLetterFiles(world).filter(([path]) => path.startsWith(`${PARTITION_DIR}/`))
-  expect(moved.map(([, text]) => text)).toEqual([`${parkedLine(OTHER_TABLE, 'c'.repeat(32), 'their-session')}\n`])
+  expect(moved.map(([, text]) => parseFile(text).raw)).toEqual([[parkedLine(OTHER_TABLE, 'c'.repeat(32), 'their-session')]])
+  expect(moved.map(([, text]) => parseFile(text).complete)).toEqual([true])
   const status = await statusText($)
   expect(status).toMatch(/2 rows sent, 1 left, 1 of them for another table/)
   expect(status).toMatch(/2 more file\(s\) in .* for other tables or an older layout/)
@@ -596,7 +613,7 @@ test('a credential across the cap on a row\'s insert error is removed whole, sen
   // Replayed: the same for a parked row, whose reason is rewritten in its file.
   const replayed = { status: 200, text: JSON.stringify({ insertErrors: [{ index: 0, errors: [{ reason: 'invalid', message: `${'e'.repeat(970)} ${CUT_TOKEN}` }] }] }) }
   const path = `${PARTITION_DIR}/retry-20261013T200102003Z-previoussess-1.jsonl`
-  world.files.set(path, `${parkedLine(TABLE_REF, 'a'.repeat(32), 'previous-session')}\n`)
+  world.files.set(path, parkedFile(parkedLine(TABLE_REF, 'a'.repeat(32), 'previous-session')))
   world.replies = [sent, replayed]
   await startSession($)
   await world.clock.advance(15_000)
@@ -614,8 +631,9 @@ test('a tool result sent as text keeps the redaction its keys get as structure',
   const [row] = world.sentRows().filter(r => r.event_type === 'TOOL_COMPLETED')
   const content = row?.content ?? ''
   for (const value of ['x'.repeat(12), 'y'.repeat(12), 'alpha', 'beta gamma', 'z'.repeat(12), 'w'.repeat(12)]) expect(content.includes(value)).toBe(false)
-  // Still the text the tool returned, with each value replaced.
-  expect((JSON.parse(content) as { result: string }).result).toBe('{"token":"[REDACTED]","sessionCookie":"[REDACTED]","password":"[REDACTED]","nested":{"api_key":"[REDACTED]","credentials":"[REDACTED]"}}')
+  // Still the text the tool returned, with each value under a key that is
+  // not listed replaced whole.
+  expect((JSON.parse(content) as { result: string }).result).toBe('{"token":"[REDACTED]","sessionCookie":"[REDACTED]","password":"[REDACTED]","nested":"[REDACTED]"}')
 })
 
 test('a 2xx answer that is not a valid insertAll response keeps the rows: retried, then parked', { options: OPTIONS }, async ($, on) => {
@@ -638,7 +656,7 @@ test('a 2xx answer that is not a valid insertAll response keeps the rows: retrie
 test('a replayed file whose answer is malformed stays as it was', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on)
   const path = `${PARTITION_DIR}/spill-20261013T200102003Z-previoussess-1.jsonl`
-  const text = `${parkedLine(TABLE_REF, 'a'.repeat(32), 'previous-session')}\n`
+  const text = parkedFile(parkedLine(TABLE_REF, 'a'.repeat(32), 'previous-session'))
   world.files.set(path, text)
   world.replies = [OK_INSERT, { status: 200, text: '{"insertErrors": {"index": 0}}' }]
   await startSession($)
@@ -692,19 +710,19 @@ for (const [label, payload, secret] of PROBES) {
   })
 }
 
-test('the same probes as tool input: every credential-named argument goes whole', { options: OPTIONS }, async ($, on) => {
+test('the same probes as tool input: every argument not listed goes whole', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on)
   world.replies = [REFUSED]
   await startSession($)
-  await $.tool.call({ tool: 'mcp__deploy__run', api_key: SECRET_NUM, env: { DB_PWD: CANARY, cookies: ['[REDACTED]', CANARY] }, note: JSON.stringify({ token: CANARY }), target: 'prod' })
+  await $.tool.call({ tool: 'mcp__deploy__run', api_key: SECRET_NUM, env: { DB_PWD: CANARY, cookies: ['[REDACTED]', CANARY] }, note: JSON.stringify({ token: CANARY }), target: 'prod', description: 'deploy the app' })
   await world.clock.advance(5000)
   const [sent] = world.sentRows().filter(r => r.event_type === 'TOOL_STARTING')
   const [parked] = deadLetterRows(world).filter(r => r.event_type === 'TOOL_STARTING')
   for (const row of [sent, parked]) {
     const text = JSON.stringify(row)
     expect(text.includes(CANARY) || text.includes(String(SECRET_NUM))).toBe(false)
-    // What is not a credential is kept.
-    expect((JSON.parse(row?.content ?? '{}') as { args: { target: string } }).args.target).toBe('prod')
+    // A listed key keeps its value; one that is not goes, credential or not.
+    expect((JSON.parse(row?.content ?? '{}') as { args: { description: string; target: string } }).args).toMatchObject({ description: 'deploy the app', target: '[REDACTED]' })
   }
 })
 
@@ -752,7 +770,7 @@ test('formatted JSON within the budget is still redacted by its structure', { op
   await world.clock.advance(5000)
   const [row] = world.sentRows().filter(r => r.event_type === 'TOOL_COMPLETED')
   expect(JSON.stringify(row).includes(CANARY)).toBe(false)
-  expect(JSON.parse((JSON.parse(row?.content ?? '{}') as { result: string }).result)).toEqual({ credentials: '[REDACTED]', padding: 'x'.repeat(100) })
+  expect(JSON.parse((JSON.parse(row?.content ?? '{}') as { result: string }).result)).toEqual({ credentials: '[REDACTED]', padding: '[REDACTED]' })
 })
 
 test('JSON text that does not parse is dropped, not scrubbed line by line', { options: OPTIONS }, async ($, on) => {
@@ -836,12 +854,15 @@ async function splitReplay(failNewFiles: boolean) {
   const writer = new Writer(io, () => config, () => 'replay-session')
   const report = await writer.backfill(['spill'], 'command')
   const ids = [...files.values()].flatMap(text => parseFile(text).lines.map(line => line.row.event_id))
-  return { files, source, report, ids }
+  const incomplete = [...files].filter(([path, text]) => path !== source && !parseFile(text).complete).map(([path]) => path)
+  return { files, source, report, ids, incomplete }
 }
 
 test('a replay that splits what is left writes every part before emptying its source', async () => {
-  const { files, source, report, ids } = await splitReplay(false)
+  const { files, source, report, ids, incomplete } = await splitReplay(false)
   expect(report.error).toBe(null)
+  // Each new file ends with its completion record.
+  expect(incomplete).toEqual([])
   // Lengths, not contents: a failure message holding megabytes of rows
   // would not reach the test report.
   expect(files.get(source)?.length).toBe(0)

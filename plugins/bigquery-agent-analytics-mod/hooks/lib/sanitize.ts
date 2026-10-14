@@ -1,15 +1,19 @@
 // Bounded, redacted copies of what the agent, the model and its tools
-// produced. Redaction is structural where structure exists: any value under a
-// credential-named key goes whole, JSON inside strings is parsed and redacted
-// the same way, URLs lose their user-info, credential-named parameters and,
-// for webhook URLs, everything. Free text is scrubbed of well-known credential
-// shapes and of whatever follows a credential name and a separator on its line
-// (best effort: text has no structure to go by).
+// produced. Structure is kept only where it is known safe: under a key that is
+// not on the allowlist (allowlist.ts) the value goes whole, whatever it holds.
+// Text that looks like JSON is parsed and held to the same list, or dropped
+// whole when it cannot be parsed within the budget; it is never scrubbed line
+// by line. Other text (prompts, answers, tool arguments and results, error
+// text) is scanned whole for well-known credential shapes, credential-named
+// values and URL credentials; that is best effort, as text has no structure
+// to go by.
 //
 // Runs on the hot path, so its work is bounded by the character budget rather
 // than by the size of what the host CLI passed in (a Write of a 2 MB file costs
 // the same as one of 20 KB). Text past a budget is dropped and marked, never
 // passed on unscanned.
+
+import { isListedKey, nameParts } from './allowlist.ts'
 
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue }
 
@@ -49,11 +53,12 @@ const MARKER = '[REDACTED]'
 // the cut is matched whole; the scanned text past the cut is dropped.
 const REDACT_MARGIN = 8192
 
-// ---- credential names --------------------------------------------------------
+// ---- credential names in text -------------------------------------------------
 
-// A key or name is a credential's when one of its parts, split on punctuation
-// and camelCase (`db_password`, `X-Api-Key`, `sessionCookie`, `MY_PWD`), is one
-// of these words...
+// In free text (a header, an assignment, a URL parameter) a name is a
+// credential's when one of its parts, split on punctuation and camelCase
+// (`db_password`, `X-Api-Key`, `sessionCookie`, `MY_PWD`), is one of these
+// words...
 const SENSITIVE_WORDS = new Set([
   'pass',
   'passwd',
@@ -106,20 +111,22 @@ const SENSITIVE_ENDINGS = [
 // `monkey`, `oauth` and `signal` are not credential names.
 const SENSITIVE_STEMS = ['password', 'passwd', 'apikey', 'accesskey', 'privatekey', 'secretkey', 'signingkey', 'credential']
 
-const nameParts = (name: string): string[] =>
-  name
-    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
-    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
-    .toLowerCase()
-    .split(/[^a-z0-9]+/)
-    .filter(part => part !== '')
+// A part also counts without trailing digits and a plural `s`: `token2`,
+// `api_keys`, `access_tokens` and `sessions` are credential names too.
+const forms = (part: string): string[] => {
+  const bare = part.replace(/\d+$/, '')
+  return bare.endsWith('s') ? [part, bare, bare.slice(0, -1)] : [part, bare]
+}
+
+const isCredentialWord = (word: string): boolean =>
+  word !== '' && (SENSITIVE_WORDS.has(word) || SENSITIVE_ENDINGS.some(end => word.endsWith(end)) || SENSITIVE_STEMS.some(stem => word.includes(stem)))
 
 export const isSensitiveKey = (name: string): boolean => {
   // ADK's per-invocation state.
   if (name.toLowerCase().startsWith('temp:')) return true
-  return nameParts(name).some(
-    part => SENSITIVE_WORDS.has(part) || SENSITIVE_ENDINGS.some(end => part.endsWith(end)) || SENSITIVE_STEMS.some(stem => part.includes(stem)),
-  )
+  // Listed names, such as the token counts, are not credentials.
+  if (isListedKey(name)) return false
+  return nameParts(name).some(part => forms(part).some(isCredentialWord))
 }
 
 // ---- free text ---------------------------------------------------------------
@@ -254,12 +261,6 @@ export function redactDiagnostic(text: string, maxChars: number): string {
 
 type WalkState = { remaining: number; seen: WeakSet<object> }
 
-// Whose keys the walk checks: `observed` checks every key (data the agent, the
-// model or a tool produced), `envelope` none of this object's own keys but
-// every key below them (a row's `content`), `schema` none at all (the row's
-// `attributes`, written by this mod; their text still gets the text rules).
-type Trust = 'observed' | 'envelope' | 'schema'
-
 // Length of the marker a cut string ends with.
 const MARKER_RESERVE = 40
 
@@ -305,13 +306,15 @@ function clipString(input: string, maxJson: number, stats: SanitizeStats): { tex
   return cutToFit(redacted, input.length, maxJson, stats)
 }
 
-// Text that is JSON (an object, a list, or a JSON-encoded string, which may
-// hold JSON in turn), when it is short enough to be scanned whole: parsed, so
-// that it is redacted by its structure.
-const JSON_START = /^\s*["[{]/
+// Text that looks like JSON: an object; a list that opens with a value (an
+// object, a list, a string, a number, true, false or null) or is empty; or a
+// JSON-encoded string whose text opens an object or a list. `[1/3] Building`,
+// `[INFO] ready` and `"Hi," she said.` do not.
+const JSON_LOOKING = /^\s*(?:\{|\[\s*(?:[{["\]]|(?:-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null)\s*[,\]])|"(?:\s|\\[nrt"\\/])*[{[])/
 
+// JSON text short enough to be scanned whole, parsed.
 function parseJsonText(text: string, limits: Limits): { value: unknown } | null {
-  if (text.length > limits.budgetChars + REDACT_MARGIN || !JSON_START.test(text)) return null
+  if (text.length > limits.budgetChars + REDACT_MARGIN) return null
   try {
     return { value: JSON.parse(text) as unknown }
   } catch {
@@ -319,22 +322,20 @@ function parseJsonText(text: string, limits: Limits): { value: unknown } | null 
   }
 }
 
-// Text that starts like a JSON object, or like a list that is laid out over
-// lines or opens with an object, a list or a string. When it is not parsed
-// whole (longer than the scan budget, or not valid JSON), its nested values
-// cannot be checked by name, and scrubbing it line by line would pass a
-// credential nested below its name's line: it is dropped and marked instead.
-const JSON_SHAPED = /^\s*(?:\{|\[[ \t]*(?:\r?\n|[{["]))/
-
+// JSON-looking text that cannot be parsed whole (longer than the scan budget,
+// or not valid JSON, such as a document cut short) cannot be checked key by
+// key, and scrubbing it line by line would pass a credential nested below
+// its name's line: it is dropped and marked instead.
 function dropJsonText(text: string, stats: SanitizeStats, state: WalkState): string {
   stats.truncated = true
+  stats.redactions += 1
   const marker = `[TRUNCATED: ${text.length} chars of JSON text that could not be parsed and checked]`
   state.remaining -= jsonLength(marker)
   return marker
 }
 
-// JSON found in a string: walked as observed data, then encoded again. Past
-// the depth budget it is dropped, not passed on unscanned.
+// JSON found in a string: walked under the same allowlist, then encoded
+// again. Past the depth budget it is dropped, not passed on unscanned.
 function walkJsonText(parsed: unknown, depth: number, allowed: number, limits: Limits, stats: SanitizeStats, state: WalkState): string {
   if (depth >= limits.maxDepth) {
     stats.truncated = true
@@ -343,14 +344,14 @@ function walkJsonText(parsed: unknown, depth: number, allowed: number, limits: L
     return text
   }
   // Encoding the result again escapes it: give the walk half the room.
-  const inner = walk(parsed, depth + 1, limits, stats, { remaining: Math.floor(allowed / 2), seen: state.seen }, 'observed')
+  const inner = walk(parsed, depth + 1, limits, stats, { remaining: Math.floor(allowed / 2), seen: state.seen })
   const encoded = JSON.stringify(inner === undefined ? null : inner)
   const fitted = jsonLength(encoded) <= allowed ? { text: encoded, cost: jsonLength(encoded) } : cutToFit(encoded, encoded.length, allowed, stats)
   state.remaining -= fitted.cost
   return fitted.text
 }
 
-function walk(value: unknown, depth: number, limits: Limits, stats: SanitizeStats, state: WalkState, trust: Trust): JsonValue | undefined {
+function walk(value: unknown, depth: number, limits: Limits, stats: SanitizeStats, state: WalkState): JsonValue | undefined {
   if (value === null) {
     state.remaining -= 4
     return null
@@ -358,12 +359,9 @@ function walk(value: unknown, depth: number, limits: Limits, stats: SanitizeStat
   switch (typeof value) {
     case 'string': {
       const allowed = Math.max(0, Math.min(limits.maxStringChars, state.remaining))
-      if (trust !== 'schema') {
+      if (JSON_LOOKING.test(value)) {
         const parsed = parseJsonText(value, limits)
-        if (parsed !== null && parsed.value !== null && (typeof parsed.value === 'object' || typeof parsed.value === 'string')) {
-          return walkJsonText(parsed.value, depth, allowed, limits, stats, state)
-        }
-        if (JSON_SHAPED.test(value)) return dropJsonText(value, stats, state)
+        return parsed === null ? dropJsonText(value, stats, state) : walkJsonText(parsed.value, depth, allowed, limits, stats, state)
       }
       const { text, cost } = clipString(value, allowed, stats)
       state.remaining -= cost
@@ -396,7 +394,6 @@ function walk(value: unknown, depth: number, limits: Limits, stats: SanitizeStat
   if (ArrayBuffer.isView(obj)) return `[binary ${obj.byteLength} bytes]`
   if (obj instanceof ArrayBuffer) return `[binary ${obj.byteLength} bytes]`
   if (obj instanceof Date) return Number.isNaN(obj.getTime()) ? null : obj.toISOString()
-  const below: Trust = trust === 'schema' ? 'schema' : 'observed'
   state.seen.add(obj)
   state.remaining -= 2
   try {
@@ -409,7 +406,7 @@ function walk(value: unknown, depth: number, limits: Limits, stats: SanitizeStat
           break
         }
         state.remaining -= 1
-        const item = walk(obj[i], depth + 1, limits, stats, state, below)
+        const item = walk(obj[i], depth + 1, limits, stats, state)
         out.push(item === undefined ? null : item)
       }
       return out
@@ -426,15 +423,20 @@ function walk(value: unknown, depth: number, limits: Limits, stats: SanitizeStat
       const raw = (obj as Record<string, unknown>)[key]
       if (raw === undefined || typeof raw === 'function' || typeof raw === 'symbol') continue
       state.remaining -= jsonLength(key) + 2
-      // Under a credential name the whole value goes, whatever its type;
-      // null has nothing to hide.
-      if (trust === 'observed' && raw !== null && isSensitiveKey(key)) {
-        stats.redactions += 1
-        state.remaining -= 12
-        out[key] = MARKER
+      // Under a key that is not listed the whole value goes, whatever its
+      // type; null has nothing to hide.
+      if (!isListedKey(key)) {
+        if (raw === null) {
+          state.remaining -= 4
+          out[key] = null
+        } else {
+          stats.redactions += 1
+          state.remaining -= 12
+          out[key] = MARKER
+        }
         continue
       }
-      const item = walk(raw, depth + 1, limits, stats, state, below)
+      const item = walk(raw, depth + 1, limits, stats, state)
       if (item !== undefined) out[key] = item
     }
     return out
@@ -443,23 +445,13 @@ function walk(value: unknown, depth: number, limits: Limits, stats: SanitizeStat
   }
 }
 
-const sanitizeAs = (trust: Trust) =>
-  (value: unknown, limits: Limits, stats: SanitizeStats): JsonValue => {
-    const out = walk(value, 0, limits, stats, { remaining: limits.budgetChars, seen: new WeakSet() }, trust)
-    return out === undefined ? null : out
-  }
-
-// A JSON-safe, bounded, redacted copy of observed data: every key is checked.
-export const sanitize = sanitizeAs('observed')
-
-// A row's `content`: its own top-level keys (`tool`, `args`, `result`,
-// `session_end`, ...) are the row's fields, so they are not checked; every
-// key in the observed data under them is.
-export const sanitizeContent = sanitizeAs('envelope')
-
-// A row's `attributes`, written by this mod (ids, model, token counts, session
-// metadata): no key is checked, text values still get the text rules.
-export const sanitizeAttributes = sanitizeAs('schema')
+// A JSON-safe, bounded, redacted copy of a row's `content`, its
+// `attributes` or its error text: every key is held to the allowlist, every
+// string to the text rules.
+export function sanitize(value: unknown, limits: Limits, stats: SanitizeStats): JsonValue {
+  const out = walk(value, 0, limits, stats, { remaining: limits.budgetChars, seen: new WeakSet() })
+  return out === undefined ? null : out
+}
 
 // Serializes a sanitized value as the text of a BigQuery JSON column, held to
 // `maxChars`. Past it the column becomes a valid JSON object holding a prefix

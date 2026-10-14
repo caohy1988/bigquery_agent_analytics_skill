@@ -60,8 +60,11 @@ export function formatStatus(args: {
   else if (args.backfill) {
     const b = args.backfill
     lines.push(
-      `last backfill (${b.trigger}, ${ago(now, b.finishedAt)}): ${b.files} file(s), ${b.rowsSent} rows sent, ${b.rowsLeft} left${b.otherTableRows ? `, ${b.otherTableRows} of them for another table` : ''}${b.skippedFiles ? `, ${b.skippedFiles} skipped` : ''}${b.oversizedFiles.length ? `, ${b.oversizedFiles.length} too large to read` : ''}${b.error ? `; stopped: ${b.error.slice(0, 200)}` : ''}`,
+      `last backfill (${b.trigger}, ${ago(now, b.finishedAt)}): ${b.files} file(s), ${b.rowsSent} rows sent, ${b.rowsLeft} left${b.otherTableRows ? `, ${b.otherTableRows} of them for another table` : ''}${b.skippedFiles ? `, ${b.skippedFiles} skipped` : ''}${b.oversizedFiles.length ? `, ${b.oversizedFiles.length} too large to read` : ''}${b.incompleteFiles.length ? `, ${b.incompleteFiles.length} incomplete` : ''}${b.error ? `; stopped: ${b.error.slice(0, 200)}` : ''}`,
     )
+    if (b.incompleteFiles.length > 0) {
+      lines.push(`dead-letter: ${b.incompleteFiles.length} file(s) without a completion record (still being written, or left by a writer that stopped), kept and not replayed: ${names(b.incompleteFiles)}`)
+    }
   }
   lines.push(`redactions ${k.redactions}, truncated rows ${k.truncatedRows}; session ${args.sessionId ?? 'unknown'}`)
   for (const problem of c.problems) lines.push(`problem: ${problem}`)

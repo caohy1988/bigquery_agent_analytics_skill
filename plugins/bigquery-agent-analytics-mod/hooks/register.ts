@@ -462,7 +462,8 @@ export const register: Register = (on, registered) => {
       .then(report => {
         const other = report.otherTableRows ? ` (${report.otherTableRows} for another table)` : ''
         const oversized = report.oversizedFiles.length ? `, ${report.oversizedFiles.length} file(s) too large to read` : ''
-        $.ui.log(clean(`bqaa backfill: ${report.files} file(s), ${report.rowsSent} row(s) sent, ${report.rowsLeft} left${other}${oversized}${report.error ? `; stopped: ${report.error}` : ''}`, 500))
+        const incomplete = report.incompleteFiles.length ? `, ${report.incompleteFiles.length} file(s) without a completion record kept` : ''
+        $.ui.log(clean(`bqaa backfill: ${report.files} file(s), ${report.rowsSent} row(s) sent, ${report.rowsLeft} left${other}${oversized}${incomplete}${report.error ? `; stopped: ${report.error}` : ''}`, 500))
       })
       .catch(() => {
         internalErrors += 1

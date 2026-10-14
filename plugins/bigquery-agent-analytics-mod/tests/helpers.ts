@@ -252,6 +252,7 @@ export function deadLetterFiles(world: World): [string, string][] {
 }
 
 // The rows parked in dead-letter files, file by file in name (time) order.
+// A file's last line is its completion record, which holds no row.
 export function deadLetterRows(world: World): Row[] {
   return deadLetterFiles(world)
     .sort(([a], [b]) => (a < b ? -1 : 1))
@@ -259,6 +260,7 @@ export function deadLetterRows(world: World): Row[] {
       text
         .trim()
         .split('\n')
-        .map(l => (JSON.parse(l) as { row: Row }).row),
+        .map(l => (JSON.parse(l) as { row?: Row }).row)
+        .filter((row): row is Row => row !== undefined),
     )
 }

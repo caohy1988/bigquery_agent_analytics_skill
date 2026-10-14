@@ -217,6 +217,10 @@ them (`input_tokens`, `output_tokens`, `cache_read_input_tokens`,
 `cache_creation_input_tokens`). Token counts come from the engine's
 `turn.step` and `turn.complete` results.
 
+In `content` and `attributes`, values under keys that are not on the
+allowlist are redacted, inside `args` and `result` too (see
+[Privacy and security](#privacy-and-security)).
+
 A failed tool is `TOOL_COMPLETED` with status `ERROR`, as in the tracing
 plugin and the analysis skill's failure-rate query (ADK itself uses
 `TOOL_ERROR`). Every row has `attributes.writer`
@@ -365,7 +369,8 @@ GROUP BY model
   dataset, an invalid row reported by insertAll) go to `rejected-*.jsonl`;
   rows queued at exit go to `spill-*.jsonl`. Each line keeps the full row,
   the reason (redacted), the attempt count and the table it was meant for.
-  Files go to a subdirectory of `deadLetterDir` named after that table
+  Each file ends with a completion record, written after its rows: how many
+  lines come before it and their checksum (FNV-1a). Files go to a subdirectory of `deadLetterDir` named after that table
   (`project.dataset.table`, percent-encoded where a name needs it). Each
   failure writes a new file (the mods file API has no append) of at most
   3 MiB of UTF-8, under the 4 MiB the API reads or writes per file; a row too
@@ -376,10 +381,16 @@ GROUP BY model
   line for another table is kept as written, and rows parked for another
   table are sent only by a session configured for that table. `spill` and
   `retry` files are also replayed 15 seconds after a session starts and once
-  BigQuery recovers in a session that parked rows. A file whose rows all land
-  is truncated to zero bytes (the API has no delete; empty files are safe to
-  remove). What a replay leaves (rows that fail again, other tables' lines,
-  lines it cannot parse) is written to new files first, and only then is the
+  BigQuery recovers in a session that parked rows. A replay reads a file
+  only when its completion record is there and matches every line above it:
+  the API's writes are not atomic, so another session can read a file
+  part-written, and the record is what marks a file whole. A file without a
+  matching record (still being written, or left by a writer that stopped
+  part-way) is kept as it is, never read or emptied, and `/bqaa-status`
+  lists it. A file whose rows all land is truncated to zero bytes (the API
+  has no delete; empty files are safe to remove). What a replay leaves (rows
+  that fail again, other tables' lines, lines it cannot parse) is written to
+  new files first, each with its completion record, and only then is the
   replayed file truncated: the API has no rename either, so a write that
   fails leaves that file as it was (rows sent meanwhile may go again;
   `event_id` dedups them). A file over 4 MiB, which the API cannot read, is
@@ -400,7 +411,7 @@ never payloads or tokens (the agent reads a command's output too).
   dead-lettered / refused / spilled / dropped this session, retries, backoff,
   the last error (redacted), the configured table's dead-letter files, how
   many files elsewhere in the directory belong to other tables, any file too
-  large to read, the last backfill.
+  large to read or without a completion record, the last backfill.
 * `/bqaa-flush`: send the queue now instead of at the next interval.
 * `/bqaa-backfill`: resend the configured table's dead-letter files in the
   background; a dim transcript line reports the result.
@@ -415,42 +426,77 @@ The table receives your prompts, the model's visible answers, tool arguments
 and tool results (the text the model read), cut to `maxPayloadChars` per
 column. Treat the dataset like the transcripts it mirrors.
 
-* **Redaction by structure:** in what the agent, the model and the tools
-  produced (tool arguments and results, prompts, answers, error text), the
-  whole value under a credential-named key becomes `[REDACTED]`, whatever it
-  is: a string, a number, a boolean, a list or an object (`null` stays).
-  A name is a credential's when one of its parts, split on punctuation and
-  camelCase and compared without case, is `pass`, `passwd`, `password`,
-  `passphrase`, `pwd`, `secret`, `token`, `auth`, `authorization`, `cookie`,
-  `session`, `key`, `apikey`, `credential(s)`, `private`, `bearer`, `jwt`,
-  `sig` or `signature`; when a part ends with one of the longer words
-  (`rootpwd`, `accesstoken`); or when it has ADK's `temp:` prefix. So
-  `MY_PWD`, `db_password`, `X-Api-Key`, `sessionCookie`, `Set-Cookie` and
-  `session_id` all match, while `max_tokens`, `author`, `oauth` and `monkey`
-  do not. A string that is JSON, including JSON encoded inside JSON, is
-  parsed, redacted the same way at every level and encoded again (compactly);
-  past the walk's depth or size budget, what is left is dropped and the row
-  marked truncated. A string that starts like a JSON object, or like a list
-  that opens with an object, a list, a string or a line break, but is not
-  parsed whole (longer than the 24,064 characters parsed at the default
-  `maxPayloadChars`, or not valid JSON, such as a document cut short) is
-  dropped and marked the same way, never scrubbed line by line. JSON that
-  follows other text in a string (a file view with line numbers, a log line)
-  gets the free-text rules below, which miss a value nested on a later line
-  than its credential name. In URLs, the user-info part and credential-named query or
-  fragment parameters lose their values, and incoming-webhook URLs (Slack,
-  Discord, Office) are replaced whole. The row's own field names (the top
-  level of `content`, and `attributes`, which the mod writes itself) are not
-  name-checked, so `session_end` and `session_metadata` keep their values.
-* **Free text (best effort):** text has no structure to go by. It is scrubbed
-  of private-key blocks, provider-style `sk-` keys, AWS access key ids, Google
-  API keys and OAuth tokens, GitHub/GitLab/npm/Slack/Stripe tokens, JWTs and
-  `Bearer`/`Basic` credentials; and after a credential name followed by `:`
-  or `=` (a header, a YAML or `.env` line, a JSON key in text, an assignment)
-  everything to the end of the line is removed, whatever it holds, including
-  a redaction marker (`?name=` / `&name=` only to the next `&`). Code can lose
-  a little more than the credential (`token: string` loses its type name).
-  Patterns cannot catch every secret; do not rely on them alone.
+* **Allowlist:** in `content` and `attributes`, at any depth, and in JSON
+  found in their text, a value is kept only under a key on the list in
+  [`hooks/lib/allowlist.ts`](hooks/lib/allowlist.ts); under any other key it
+  becomes `[REDACTED]`, whatever it is: a string, a number, a boolean, a list
+  or an object (`null` stays). Keys are compared by their words, so
+  `inputTokens` and `INPUT_TOKENS` are `input_tokens`. The list:
+  * structure and telemetry: `event_type`, `timestamp`, `status`,
+    `event_id`, `invocation_id`, `trace_id`, `span_id`, `parent_span_id`,
+    `agent`, `agent_id`, `agent_type`, `root_agent_name`, `subagent_type`,
+    `subagent_turn_id`, `source_turn_id`, `tool_use_id`, `tool`,
+    `tool_name`, `tool_origin`, `tool_uses`, `server_tool_uses`, `model`,
+    `model_version`, `llm_config`, `effort`, `usage_metadata`,
+    `prompt_tokens`, `completion_tokens`, `total_tokens`, `input_tokens`,
+    `output_tokens`, `cache_read_input_tokens`,
+    `cache_creation_input_tokens`, `max_tokens`, `latency_ms`, `total_ms`,
+    `time_to_first_token_ms`, `duration_ms`, `step_index`, `step_count`,
+    `message_count`, `turn_number`, `trace_count`, `session_start`,
+    `session_end`, `state_delta`, `source`, `start_source`,
+    `permission_mode`, `reason`, `finish_reason`, `is_aborted`, `is_error`,
+    `is_read_only`, `denied`, `inferred`, `permission_requested`,
+    `submitted_during_turn`, `wait`, `prompt_origin`, `attachments`, `role`,
+    `type`, `session_metadata`, `project_name`, `cwd`, `host_version`,
+    `writer`, `plugin`, `version`, `label`, `mode`, and the built-in tools'
+    `limit`, `offset`, `timeout`, `run_in_background`, `replace_all`,
+    `head_limit`, `multiline` and `output_mode`;
+  * free text: `text_summary`, `prompt`, `content`, `response`, `result`,
+    `args`, `text`, `message`, `error`, `error_message`, `stdout`, `stderr`,
+    `output`, and the built-in tools' `command`, `description`,
+    `file_path`, `path`, `notebook_path`, `pattern`, `glob`, `query`, `url`,
+    `old_string`, `new_string`, `new_source`, `plan`, `todos`, `edits` and
+    `active_form`.
+
+  So `api_keys`, `token2`, `headers`, `env` and most of an MCP tool's own
+  arguments lose their values, credential or not. A kept value is still
+  checked: its text goes through the two rules below.
+* **JSON in text:** text that looks like JSON (an object; a list that opens
+  with a value, whether an object, a list, a string, a number, `true`,
+  `false` or `null`, or is empty; or a JSON-encoded string whose text opens
+  an object or a list) is parsed and held to the same list, at any encoding
+  depth, then encoded again (compactly). Text that looks like JSON but
+  cannot be parsed whole (longer than the 24,064 characters parsed at the
+  default `maxPayloadChars`, or not valid JSON, such as a document cut short
+  or JSON lines) is dropped: it becomes `[TRUNCATED: N chars of JSON text
+  that could not be parsed and checked]`, the row is marked `is_truncated`,
+  and the drop counts as a redaction. It is never scrubbed line by line.
+  Text that only starts with a bracket or a quote (`[1/3] Building`,
+  `[INFO] ready`, `"Hi," she said.`) does not look like JSON; `[1] first`
+  does, and is dropped.
+* **Free text (best effort):** text has no structure to go by; every string
+  that is not JSON is scanned, all of what is kept (see Truncation). Removed: private-key blocks,
+  provider-style `sk-` keys, AWS access key ids, Google API keys and OAuth
+  tokens, GitHub/GitLab/npm/Slack/Stripe tokens, JWTs and `Bearer`/`Basic`
+  credentials; in URLs, the user-info part and credential-named query or
+  fragment parameters, and incoming-webhook URLs (Slack, Discord, Office)
+  whole; and after a credential name followed by `:` or `=` (a header, a
+  YAML or `.env` line, a JSON key in text, an assignment) everything to the
+  end of the line, whatever it holds, including a redaction marker
+  (`?name=` / `&name=` only to the next `&`). A name is a credential's when
+  one of its parts, split on punctuation and camelCase and compared without
+  case, is `pass`, `passwd`, `password`, `passphrase`, `pwd`, `secret`,
+  `token`, `auth`, `authorization`, `cookie`, `session`, `key`, `apikey`,
+  `credential(s)`, `private`, `bearer`, `jwt`, `sig` or `signature`, also
+  with trailing digits or a plural `s` (`api_keys`, `access_tokens`,
+  `sessions`, `token2`, `passphrase2`); when a part ends with one of the
+  longer words (`rootpwd`, `accesstoken`); or when it has ADK's `temp:`
+  prefix. Names on the allowlist, such as the token counts (`max_tokens`,
+  `input_tokens`), are not credential names. JSON that follows other text in
+  a string (a file view with line numbers, a log line) is free text, where a
+  value nested on a later line than its credential name is missed. Code can
+  lose a little more than the credential (`token: string` loses its type
+  name). Patterns cannot catch every secret; do not rely on them alone.
 * **Diagnostics:** error text from BigQuery, the token command or the file
   system goes through the same free-text rules before it is cut (including
   where BigQuery's error messages and per-row insert errors are first held to
@@ -479,17 +525,21 @@ The test command runs the `tests/*.test.ts` files against the host CLI's own
 test kit, with no session, sign-in, GCP or network: `$.http.fetch`,
 `$.process.run`, `$.fs` and `$.store` are stubbed, and `mock.clock` drives the
 timers; the `$.fs` stubs measure files in UTF-8 bytes and refuse a file over
-4 MiB, as the host does. 107 tests cover the captured rows and their spans,
+4 MiB, as the host does. 120 tests cover the captured rows and their spans,
 the session id after `/clear` and `/resume` with no classic hooks (a refused
 read included), the non-blocking rules (`session.end` included), the queue
 bound, retries, timeouts, token refresh, table creation, partial inserts, 2xx
 answers that are not valid insertAll responses, dead-letter files,
 replay that keeps two tables' rows apart and writes what it leaves before
-emptying a file (a failed write included), backfill, the exit spill and its
-time bound, multibyte rows held to the file limit in bytes, dry run,
-redaction (whole values under credential names of any type, name parts and
-endings, JSON nested in strings to any encoding depth, JSON text too long or
-broken to parse, URLs and webhook URLs,
+emptying a file (a failed write included), completion records (a file part
+written, cut short or changed is not complete; a writer and a replayer
+interleaved lose no row; a file without its record is kept and reported),
+backfill, the exit spill and its time bound, multibyte rows held to the
+file limit in bytes, dry run,
+redaction (the allowlist at any depth and in JSON inside text, whole values
+of any type, JSON nested in strings to any encoding depth, JSON-looking text
+too long or broken to parse however it opens, credential names in text with
+their parts, endings, plural and numbered forms, URLs and webhook URLs,
 credential-named lines whatever they hold, values past 5,000 characters and
 past the scanned window, credentials across a length cap, every diagnostic
 sink, and each review probe through capture, delivery and the dead-letter
@@ -501,7 +551,7 @@ configuration.
 ## Limitations
 
 * Mods are early access; the events and `$` methods can change between
-  host CLI releases. Tested with 2.1.296.
+  host CLI releases. Tested with 2.1.296 and 2.1.299.
 * Writes use `tabledata.insertAll` (the legacy streaming API) because the
   Storage Write API is gRPC only and `$.http.fetch` is HTTP with text bodies.
   insertAll's quotas and pricing apply, and its `insertId` dedup is best
@@ -528,8 +578,16 @@ configuration.
 * Rows parked for a table are sent only by a session configured for that
   table: after switching tables, run with the old table's settings to send
   what it left behind.
-* `$.fs` cannot append or delete: one file per failure, truncated rather than
-  removed after backfill.
+* `$.fs` cannot append, rename or delete: one file per failure, truncated
+  rather than removed after backfill.
+* A dead-letter file without a matching completion record is never replayed.
+  One left by a writer that stopped part-way, or written by an earlier
+  version of this mod, stays on disk, listed by `/bqaa-status`, for a person
+  to look at.
+* Redaction keeps a value only under a listed key: an MCP tool's own
+  arguments, structured results and JSON output, and anything else under a
+  key that is not on the list, are recorded as `[REDACTED]`. Free text is
+  scanned for credentials on a best-effort basis.
 * Timestamps have millisecond precision.
 * An organization's web-fetch policy or `allowManagedModsOnly` can stop the
   mod; `/bqaa-status` and the debug log (start the CLI with `--debug`) say why.
@@ -548,6 +606,7 @@ hooks/hooks.json             names the hooks module
 hooks/register.ts            hooks and $ wiring
 hooks/lib/tracer.ts          event -> BQAA row, ids and spans
 hooks/lib/rows.ts            row builder, BQAA schema
+hooks/lib/allowlist.ts       the keys whose values a row keeps
 hooks/lib/sanitize.ts        redaction, truncation
 hooks/lib/queue.ts           bounded queue
 hooks/lib/writer.ts          background writer, retries, dead letter, backfill, exit spill
