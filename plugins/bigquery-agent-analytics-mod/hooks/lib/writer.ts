@@ -15,7 +15,7 @@
 // send clears it.
 
 import { type Config, canDeliver, deadLetterPartition, destinationDir, joinPath, tableRef } from './config.ts'
-import { type HttpAnswer, TOKEN_INFO_URL, classifyInsert, createTableBody, insertAllBody, insertAllUrl, isDatasetMissing, tableCheckUrl, tablesUrl } from './bigquery.ts'
+import { type HttpAnswer, TOKEN_INFO_URL, classifyInsert, createTableBody, insertAllBody, insertAllUrl, isDatasetMissing, tablesUrl } from './bigquery.ts'
 import { type DeadLetterKind, type DeadLetterLine, HOST_FILE_BYTES, MAX_FILE_BYTES, type ParsedFile, fileName, kindOf, lineText, packBodies, packFiles, packLines, parseFile, sealFile } from './deadletter.ts'
 import { BoundedQueue, type Queued } from './queue.ts'
 import { type BqaaRow, fitRow, rowBytes } from './rows.ts'
@@ -241,7 +241,7 @@ export class Writer {
   }
 
   // Off a hook's dispatch: gets a token, so one is at hand for the first
-  // send and at a `block` mode prompt, and with it the account's identity.
+  // send, and with it the account's identity.
   prefetchToken(): void {
     const c = this.config()
     if (!canDeliver(c) || c.dryRun) return
@@ -550,51 +550,6 @@ export class Writer {
     } catch {
       // The status line and /bqaa-status still say it.
     }
-  }
-
-  // For `block` mode, before a prompt goes in: null when the credentials
-  // work as far as can be told within `withinMs`, else why the prompt must
-  // wait. A token at hand with no problem standing needs no request. A
-  // permission problem never blocks: one wrong grant must not stop every
-  // prompt. Fails closed: a check that cannot finish refuses.
-  async credentialsCheck(withinMs: number): Promise<string | null> {
-    const c = this.config()
-    if (this.problem?.kind !== 'credentials' && this.token !== null && this.io.now() < this.token.expiresAt) return null
-    const deadline = this.io.now() + withinMs
-    const refuse = (why: string): string => {
-      const { headline, fix } = this.problemText()
-      return diagnostic(`BQAA blocks prompts until rows can be written: ${headline}. To fix, ${fix}, then send the prompt again. (${why})`, 1000)
-    }
-    if (withinMs <= 0) return refuse('no time was left to check the credentials')
-    const got = await this.within(
-      this.getToken().then(
-        value => ({ value }),
-        err => ({ error: messageOf(err) }),
-      ),
-      deadline,
-    )
-    if (got === TIMED_OUT) return refuse(`no access token came within ${Math.ceil(withinMs / 1000)} s`)
-    if ('error' in got) return refuse(diagnostic(got.error, 300))
-    if (this.problem?.kind !== 'credentials') return null
-    // BigQuery refused a token before: ask it about this one first.
-    const answer = await this.request(tableCheckUrl(c), { method: 'GET', headers: { authorization: `Bearer ${got.value}` } }, Math.max(1, deadline - this.io.now()))
-    if ('error' in answer) return refuse(`BigQuery refused the credentials before, and checking them again failed: ${answer.error}`)
-    if (answer.status === 401) {
-      this.dropToken()
-      return refuse('BigQuery still refuses the credentials (HTTP 401)')
-    }
-    this.clearProblem()
-    this.setStatus(undefined)
-    return null
-  }
-
-  // `work`'s result, or TIMED_OUT at `until`.
-  private within<T>(work: Promise<T>, until: number): Promise<T | typeof TIMED_OUT> {
-    let timer: Timer | null = null
-    const timeout = new Promise<typeof TIMED_OUT>(resolve => {
-      timer = this.io.after(Math.max(0, until - this.io.now()), () => resolve(TIMED_OUT))
-    })
-    return Promise.race([work, timeout]).finally(() => (timer as Timer | null)?.cancel())
   }
 
   // ---- identity ----------------------------------------------------------

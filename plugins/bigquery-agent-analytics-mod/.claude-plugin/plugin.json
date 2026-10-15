@@ -86,16 +86,6 @@
       "description": "Command (no shell) that prints a Google OAuth access token. Empty: BQAA_ACCESS_TOKEN_COMMAND, then gcloud auth application-default print-access-token.",
       "default": ""
     },
-    "onAuthFailure": {
-      "type": "string",
-      "title": "If credentials fail",
-      "description": "warn: while rows cannot be written for lack of Google credentials or BigQuery permission, a line above the prompt says what to run. block: also refuse prompts while no credentials work (a missing permission only warns).",
-      "options": [
-        "warn",
-        "block"
-      ],
-      "default": "warn"
-    },
     "userIdFromCredentials": {
       "type": "boolean",
       "title": "User id from the token's account",

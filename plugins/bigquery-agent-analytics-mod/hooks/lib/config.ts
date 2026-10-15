@@ -74,9 +74,6 @@ export type Config = {
   tokenTtlMs: number
   autoCreateTable: boolean
   autoBackfill: boolean
-  // What a prompt meets while rows cannot be written for lack of working
-  // credentials: `warn` shows a notice; `block` also refuses the prompt.
-  onAuthFailure: AuthFailureMode
   // Opt-in identity: `user_id` from the credential's verified account, and
   // the machine's hostname in `session_metadata.host_name`. Both are
   // personal data, so both are off unless set.
@@ -85,8 +82,6 @@ export type Config = {
   // Why rows will not reach BigQuery, if anything stops them.
   problems: string[]
 }
-
-export type AuthFailureMode = 'warn' | 'block'
 
 const clampInt = (value: unknown, fallback: number, min: number, max: number): number => {
   const n = typeof value === 'number' ? value : Number(value)
@@ -202,10 +197,6 @@ export function resolveConfig(options: Options, env: EnvSnapshot): Config {
     tokenTtlMs: 45 * 60 * 1000,
     autoCreateTable: !isFalse(env.BQAA_AUTO_CREATE_TABLE),
     autoBackfill: !isFalse(env.BQAA_AUTO_BACKFILL),
-    // The manifest lists the two values, so the host hands over one of them
-    // (another value in a settings file reads as the default, and the host
-    // says so).
-    onAuthFailure: options.onAuthFailure === 'block' ? 'block' : 'warn',
     userIdFromCredentials: options.userIdFromCredentials === true,
     recordHostname: options.recordHostname === true,
     problems,

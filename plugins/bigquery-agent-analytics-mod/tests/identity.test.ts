@@ -436,13 +436,18 @@ test('an account a slow lookup finds for a token already let go is never used fo
   let answerFirst = (): void => undefined
   const lookups: string[] = []
   const sent: (string | null)[][] = []
+  const row = (eventId: string, userId: string) =>
+    buildRow({ eventType: 'STATE_DELTA', timestampMs: 0, eventId, agent: 'coding-agent', sessionId: 's', invocationId: null, userId, traceId: null, spanId: null, parentSpanId: null, content: {}, attributes: {}, maxPayloadChars: 16384 }).row
+  // A row an earlier session parked, for someone else, waiting to be replayed.
+  const dir = '/race/dead-letter/race-project.events.agent_events'
+  const parked = { v: 1, kind: 'spill', reason: 'session ended', attempts: 0, failed_at: '2026-10-13T20:01:02.003Z', table: 'race-project.events.agent_events', row: row('e'.repeat(32), 'someone-else') }
+  const files = new Map([[`${dir}/spill-20261013T200102003Z-earlier-1.jsonl`, packFiles([JSON.stringify(parked)])[0] as string]])
   const io: Io = {
     now: () => now,
     after: () => ({ cancel: () => undefined }),
     fetch: async (url, init) => {
       if (url !== TOKEN_INFO_URL) {
-        // tables.get for the credential check, or insertAll.
-        if (init.method === 'POST') sent.push(usersOf({ body: init.body ?? '' }))
+        sent.push(usersOf({ body: init.body ?? '' }))
         return OK_INSERT
       }
       const isFirst = (init.body ?? '').endsWith(encodeURIComponent(firstToken))
@@ -452,34 +457,34 @@ test('an account a slow lookup finds for a token already let go is never used fo
     },
     runCommand: async () => ({ exitCode: 0, stdout: `${commands.shift() ?? SECOND_TOKEN}\n`, stderr: '' }),
     envToken: async () => undefined,
-    readFile: async () => '',
-    writeFile: async () => undefined,
-    listDir: async () => [],
+    readFile: async path => files.get(path) ?? '',
+    writeFile: async (path, text) => {
+      files.set(path, text)
+    },
+    listDir: async path => [...files].filter(([name]) => name.startsWith(`${path}/`)).map(([name, text]) => ({ name: name.slice(path.length + 1), kind: 'file', size: utf8Bytes(text) })),
     storeGet: async () => undefined,
     storeSet: async () => undefined,
     storeDelete: async () => undefined,
     status: () => undefined,
     debug: () => undefined,
   }
-  const row = (eventId: string) =>
-    buildRow({ eventType: 'STATE_DELTA', timestampMs: 0, eventId, agent: 'coding-agent', sessionId: 's', invocationId: null, userId: 'dev', traceId: null, spanId: null, parentSpanId: null, content: {}, attributes: {}, maxPayloadChars: 16384 }).row
   const turns = async (until: () => boolean) => {
     for (let i = 0; i < 200 && !until(); i += 1) await Promise.resolve()
   }
   const writer = new Writer(io, () => config, () => 's')
   // The first token's account is being looked up when the token runs out,
-  // and a path that looks up no account (the block-mode check) fetches the
-  // next token.
+  // and a path that looks up no account (a replay) fetches the next token.
   writer.prefetchToken()
   await turns(() => lookups.length === 1)
   now += 46 * 60 * 1000
-  expect(await writer.credentialsCheck(5000)).toBe(null)
+  expect((await writer.backfill(['spill'], 'command')).rowsSent).toBe(1)
   // Only now does the first token's lookup answer.
   answerFirst()
   await turns(() => false)
-  writer.enqueue(row('a'.repeat(32)), 0)
+  writer.enqueue(row('a'.repeat(32), 'dev'), 0)
   await writer.flush()
-  expect(sent).toEqual([[SECOND]])
+  // The replayed row kept its own user; the new row has the new token's account.
+  expect(sent).toEqual([['someone-else'], [SECOND]])
   expect(lookups).toEqual(['first', 'second'])
 })
 

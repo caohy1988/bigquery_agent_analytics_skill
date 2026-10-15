@@ -12,11 +12,8 @@
 // the exit budget. If the mod's own code throws, the event goes on as if the
 // mod were not there (fail open): the observers through their `.catch`, the
 // other hooks because their bookkeeping runs inside `safely` or a `try`.
-//
-// One opt-in exception: with onAuthFailure `block`, prompt.submit checks the
-// credentials before a prompt goes in (within its hook budget) and refuses
-// the prompt while none work, failing closed. In the default `warn` mode the
-// band above the prompt says what is wrong and nothing waits.
+// While rows cannot be written for lack of credentials or permission, the
+// band above the prompt says what is wrong; no prompt ever waits on that.
 
 import type { EngineInterface, Register } from 'claude-code'
 
@@ -37,12 +34,6 @@ let internalErrors = 0
 // The host's timer, from session.start's `$`, for work that waits briefly
 // outside any hook (a finished tool call waiting for its decision).
 let clockAfter: ((ms: number, fn: () => void) => { cancel: () => void }) | null = null
-
-// With onAuthFailure `block`: the longest a prompt's credential check takes,
-// and the part of the hook's budget kept for passing the prompt on.
-const BLOCK_CHECK_MS = 8000
-const BLOCK_MARGIN_MS = 1500
-const BLOCK_CHECK_FAILED = 'BQAA blocks prompts until rows can be written, and its credential check failed; send the prompt again, or run /bqaa-status.'
 
 // Rows captured before session.start built the writer (an event the engine
 // raised first); handed over once it exists.
@@ -221,18 +212,6 @@ async function lookUpHostname($: EngineInterface): Promise<void> {
   }
 }
 
-// With onAuthFailure `block`: why a prompt may not go in, or null. Capture
-// turned off and a dry run need no credentials, so they block nothing; a
-// configuration that cannot send, or a writer that never started, blocks;
-// otherwise the writer checks the credentials in the time the hook has left.
-async function blockingProblem(remainingMs: number): Promise<string | null> {
-  if (!config.enabled || config.dryRun) return null
-  if (!canDeliver(config)) return `BQAA blocks prompts until rows can be written: ${config.problems.join('; ') || 'set project and dataset'}.`
-  if (!writer) return 'BQAA blocks prompts until rows can be written: the mod did not start; run /bqaa-status.'
-  const left = Number.isFinite(remainingMs) ? remainingMs : BLOCK_CHECK_MS + BLOCK_MARGIN_MS
-  return writer.credentialsCheck(Math.min(BLOCK_CHECK_MS, left - BLOCK_MARGIN_MS))
-}
-
 // This table's dead-letter files, those elsewhere in the dead-letter
 // directory (other tables' subdirectories, at most 50 of them, and files from
 // the older flat layout), and files too large to read back.
@@ -381,17 +360,12 @@ export const register: Register = (on, registered) => {
     return pending
   }).catch(($, e, next) => next(e))
 
-  // A prompt while rows cannot be written also starts a retry: the person
-  // may have just signed in. With onAuthFailure `block`, the credentials are
-  // checked first and the prompt refused while none work; a crash before
-  // the prompt was passed on refuses it too (fail closed). In `warn` mode
-  // the hook waits on nothing but the session id.
+  // Every prompt is passed on first, as it came; the hook then waits on
+  // nothing but the session id (no network, no process). A prompt while rows
+  // cannot be written also starts a retry, from a timer: the person may have
+  // just signed in.
   on('prompt.submit', async ($, e, next) => {
     const submittedAt = Date.now()
-    if (config.onAuthFailure === 'block') {
-      const refusal = await blockingProblem(next.budget.remainingMs)
-      if (refusal !== null) return { drop: clean(refusal, 1000) }
-    }
     const entered = await next(e)
     if (entered.drop === undefined) {
       await readSessionId($)
@@ -408,7 +382,7 @@ export const register: Register = (on, registered) => {
       safely(() => writer?.retrySoon())
     }
     return entered
-  }).catch(($, e, next) => (next.called || config.onAuthFailure !== 'block' ? next(e) : { drop: BLOCK_CHECK_FAILED }))
+  }).catch(($, e, next) => next(e))
 
   // The band above the prompt while rows cannot be written for lack of
   // credentials or permission: what is wrong, the fix, and how many rows
@@ -420,16 +394,14 @@ export const register: Register = (on, registered) => {
     const problem = current?.problem ?? null
     if (current === null || problem === null || e.props.hasSurvey) return theirs
     const { headline, fix } = current.problemText()
-    const blocking = config.onAuthFailure === 'block' && problem.kind === 'credentials'
     const { Box, Text } = $.ui.resolve(e)
     const line = Box({
       flexDirection: 'row',
       flexWrap: 'wrap',
       children: [
-        Text({ color: blocking ? 'error' : 'warning', bold: true, children: '⚠ BQAA: ' }),
+        Text({ color: 'warning', bold: true, children: '⚠ BQAA: ' }),
         Text({ children: clean(`rows are not being written: ${headline}. To fix, ${fix}.`, 500) }),
         Text({ dimColor: true, children: ` ${current.waitingRows()} row(s) waiting.` }),
-        blocking ? Text({ color: 'error', children: ' New prompts are refused until then.' }) : null,
       ],
     })
     return Box({ flexDirection: 'column', children: [line, theirs] })

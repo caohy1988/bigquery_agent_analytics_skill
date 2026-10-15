@@ -52,7 +52,7 @@ export function formatStatus(args: {
   // No credential word before a colon: the free-text rules would cut the
   // rest of the line.
   const identity = [c.userIdFromCredentials ? `user_id from the token's account (${s.identity})` : '', c.recordHostname ? 'host name recorded' : ''].filter(Boolean).join('; ')
-  lines.push(`on credential failure: ${c.onAuthFailure}${identity ? `; ${identity}` : ''}`)
+  if (identity) lines.push(`identity: ${identity}`)
   if (s.lastError) lines.push(`last error (${ago(now, s.lastError.at)}): ${s.lastError.message.slice(0, 300)}`)
   if ('error' in args.deadLetter) lines.push(`dead-letter: ${args.deadLetter.error}`)
   else {

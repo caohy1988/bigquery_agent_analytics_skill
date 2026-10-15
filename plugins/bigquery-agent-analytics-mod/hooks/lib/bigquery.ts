@@ -15,11 +15,6 @@ export const insertAllUrl = (c: Config): string =>
 
 export const tablesUrl = (c: Config): string => `${API}/projects/${seg(c.project)}/datasets/${seg(c.dataset)}/tables`
 
-// tables.get for the table's id alone: the credential check `block` mode
-// makes before it lets a prompt through. Any answer but a 401 shows that
-// BigQuery accepts the token (a 403 or a 404 is about the table, not it).
-export const tableCheckUrl = (c: Config): string => `${tablesUrl(c)}/${seg(c.table)}?fields=id`
-
 // Google's token information endpoint: names the account a token was issued
 // to. The token goes in a POST body, never in the URL.
 export const TOKEN_INFO_URL = 'https://oauth2.googleapis.com/tokeninfo'

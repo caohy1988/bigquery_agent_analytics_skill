@@ -15,9 +15,11 @@ so the [analysis skill](../../bigquery-agent-analytics-skill) and its queries
 work on what it writes.
 
 Status: early. Mods are an early-access feature of the host CLI (v2.1.287 or
-later); this mod was built and tested against **v2.1.296**. Its
-writer was tested against a scripted BigQuery API (no live BigQuery insert has
-been made from this change; see [Testing](#testing)).
+later); this mod was built against **v2.1.296** and is tested with 2.1.296
+and 2.1.299. Its writer is tested against a scripted BigQuery API (see
+[Testing](#testing)). It has also run live: a real session (host 2.1.299)
+wrote its 14 rows to a test dataset, the last of them through a spill file
+that the next session replayed, and the rows were read back with `bq`.
 
 ## Why a mod, and not settings hooks
 
@@ -45,11 +47,10 @@ host CLI, which lets this one keep a hard rule:
   `tool.call`) carry a `.catch(($, e, next) => next(e))`; the other hooks
   run their bookkeeping inside `try` blocks, so it cannot throw into the
   event.
-* One opt-in exception: with `onAuthFailure: block`, `prompt.submit` checks
-  the credentials before a prompt goes in, within its hook budget, and
-  refuses the prompt while none work (see
-  [If no credentials work](#if-no-credentials-work)). That check fails
-  closed, its `.catch` included. In the default `warn` mode nothing waits.
+* `prompt.submit` passes every prompt on, first and as it came, whatever
+  the credentials do: no prompt waits on a token or on BigQuery. While rows
+  cannot be written, a notice says so (see
+  [If no credentials work](#if-no-credentials-work)).
 
 The test suite holds the mod to that: a test makes BigQuery hang forever and
 then runs 25 tool calls through the mod, and a test checks that no hook,
@@ -174,7 +175,6 @@ the environment variable the tracing plugin already uses, then to a default.
 | `deadLetterDir` | `BQAA_DEAD_LETTER_DIR` | `~/.bqaa-mod/dead-letter` | Where unsent rows are kept, in one subdirectory per table (`project.dataset.table`) |
 | `agentName` | `BQAA_AGENT_NAME` | `coding-agent` | `agent` column for main-loop rows |
 | `accessTokenCommand` | `BQAA_ACCESS_TOKEN_COMMAND` | `gcloud auth application-default print-access-token` | Command (argv, no shell) that prints an access token |
-| `onAuthFailure` | | `warn` | `warn`: while rows cannot be written for lack of credentials or permission, the mod shows a notice above the prompt with the fix. `block`: also refuse prompts while no credentials work. See [If no credentials work](#if-no-credentials-work). |
 | `userIdFromCredentials` | | `false` | Off by default, since it is personal data. When on, `user_id` is the verified email of the access token's account. See [Identity](#identity). |
 | `recordHostname` | | `false` | Off by default, since it is personal data. When on, `session_metadata.host_name` holds the machine's host name. See [Identity](#identity). |
 
@@ -250,29 +250,8 @@ The next successful send clears the notice. Recovery is quick:
 * Rows refused for a missing permission wait for `/bqaa-backfill`, and the
   transcript says so when rows flow again.
 
-`onAuthFailure: block` adds enforcement. While no credentials work, each
-prompt is refused before it reaches the model, with the fix as the reason.
-How the check works:
-
-* **It is quick.** It needs no request while a token is at hand and no
-  credentials problem stands. Otherwise it gets a token. While a credentials
-  problem stands, it then asks BigQuery about that token with a `tables.get`
-  of the table's id. Any answer other than 401 counts as working
-  credentials, and clears the notice.
-* **It fits the hook's budget.** It takes at most 8 seconds of the hook's
-  10.
-* **It fails closed.** No token in time refuses, and so does a check that
-  cannot reach BigQuery while a credentials problem stands. If the hook
-  throws before passing the prompt on, its `.catch` refuses too.
-* **A permission problem never blocks**, so that one wrong grant cannot stop
-  every prompt.
-* **Capture off or a dry run blocks nothing.** Capture on with no project
-  or dataset blocks, and the reason says what to set.
-
-`block` is enforcement only where people cannot change the mod's options or
-remove it: install it through managed settings. `BQAA_TRACE_ENABLED=false`
-also turns capture, and so the check, off. The host reads a value other than
-`warn` or `block` in a settings file as `warn`, and says so.
+The notice never holds up a prompt: prompts go to the model as usual, and
+the rows wait.
 
 ### Identity
 
@@ -719,7 +698,7 @@ The test command runs the `tests/*.test.ts` files against the host CLI's own
 test kit, with no session, sign-in, GCP or network: `$.http.fetch`,
 `$.process.run`, `$.fs` and `$.store` are stubbed, and `mock.clock` drives the
 timers; the `$.fs` stubs measure files in UTF-8 bytes and refuse a file over
-4 MiB, as the host does. 183 tests cover the captured rows and their spans,
+4 MiB, as the host does. 176 tests cover the captured rows and their spans,
 subagent runs in the order the host raises them (one invocation and one
 trace for the turn, a span per run, a SubagentStart that comes late or never),
 the session-start row raised before or during `session.start`'s setup,
@@ -758,9 +737,11 @@ They also cover what happens when credentials fail:
 * a 401's immediate retry with a fresh token;
 * the role to ask for on a 403;
 * retries at least every 30 s, and a prompt's retry from a timer;
-* `block` refusing without credentials, after a failed re-check and past
-  its time bound, while letting prompts in with a token at hand, on a 403,
-  with capture off and in a dry run.
+* `prompt.submit` passing every prompt on with no request and no process
+  while it runs, with the token command failing, BigQuery refusing the
+  credentials, or either never answering. Each of those tests runs with a
+  leftover `onAuthFailure: block` from an earlier version's settings, which
+  nothing reads now.
 
 And the other additions:
 
@@ -877,7 +858,6 @@ examples/sample-rows.jsonl   fixture output
 tests/                       plugin-test suites, and setup.test.sh for setup.sh
 ```
 
-The credential notice, `onAuthFailure`, the identity options, the
-permission decisions, `setup.sh` and the views follow ideas from the
-upstream reference mod (Apache-2.0). They were reimplemented, and no code
-was copied.
+The credential notice, the identity options, the permission decisions,
+`setup.sh` and the views follow ideas from the upstream reference mod
+(Apache-2.0). They were reimplemented, and no code was copied.
