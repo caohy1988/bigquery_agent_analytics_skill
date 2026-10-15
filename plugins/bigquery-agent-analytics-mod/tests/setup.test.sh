@@ -51,6 +51,7 @@ check 'the table gets its event_id column' has 'ADD COLUMN IF NOT EXISTS event_i
 check 'the model view is made in the views dataset' has 'CREATE OR REPLACE VIEW `my-gcp-project.agent_analytics_reporting.daily_usage_by_model`' "$log"
 check 'the user view is made in the views dataset' has 'CREATE OR REPLACE VIEW `my-gcp-project.agent_analytics_reporting.daily_usage_by_user`' "$log"
 check 'the views read the events table' has 'FROM `my-gcp-project.agent_analytics.agent_events`' "$log"
+check "the views keep to this mod's rows" test "$(grep -cF "AND JSON_VALUE(attributes, '\$.writer.plugin') = 'bigquery-agent-analytics-mod'" "$log")" -eq 2
 check 'no placeholder is left' lacks '{' "$log"
 check 'queries are standard SQL in the location' has 'query --use_legacy_sql=false --location=US' "$log"
 check 'three queries in all: the table, then the two views' test "$(grep -c -- '--- sql' "$log")" -eq 3

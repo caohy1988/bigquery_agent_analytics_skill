@@ -183,10 +183,13 @@ export class Writer {
   private announced = new Set<ProblemKind>()
   // Where the last token came from: the fix differs.
   private tokenSource: 'environment' | 'command' = 'command'
-  // With userIdFromCredentials: the verified email of the credential's
-  // account, or null while a failed lookup waits to be tried again.
-  private identity: { email: string | null } | null = null
-  private identityPending: Promise<string | null> | null = null
+  // With userIdFromCredentials: the account of one access token, the token it
+  // describes, and the order its lookup started in (a lookup that answers
+  // late never replaces a newer one). `email` is null while a failed lookup
+  // waits to be tried again. The token stays in memory, like `token`.
+  private identity: { token: string; email: string | null; seq: number } | null = null
+  private identityPending: { token: string; answer: Promise<string | null> } | null = null
+  private identitySeq = 0
 
   constructor(io: Io, config: () => Config, sessionId: () => string | null) {
     this.io = io
@@ -292,10 +295,9 @@ export class Writer {
       await this.retryLater(batch, `authentication: ${messageOf(err)}`)
       return false
     }
-    // This process's rows carry the credential's account when asked to.
-    const email = await this.identityFor(token, c)
-    if (email !== null) for (const q of batch) this.stamp(q, email)
-    const body = insertAllBody(batch.map(q => q.row))
+    // This process's rows carry the account of the token they go out with.
+    await this.stampFor(batch, token, c)
+    let body = insertAllBody(batch.map(q => q.row))
     let answer = await this.post(insertAllUrl(c), body, token, c.requestTimeoutMs)
     if ('error' in answer) {
       await this.retryLater(batch, answer.error)
@@ -312,6 +314,9 @@ export class Writer {
         await this.retryLater(batch, `authentication: ${messageOf(err)}`)
         return false
       }
+      // The fresh token can be another account's: the rows go out under it.
+      await this.stampFor(batch, token, c)
+      body = insertAllBody(batch.map(q => q.row))
       answer = await this.post(insertAllUrl(c), body, token, c.requestTimeoutMs)
       if ('error' in answer) {
         await this.retryLater(batch, answer.error)
@@ -595,26 +600,44 @@ export class Writer {
   // ---- identity ----------------------------------------------------------
 
   // With userIdFromCredentials: the verified email of the account `token`
-  // was issued to, looked up once per writer (a failed lookup again after
-  // ten minutes, by a timer, so it follows the host's clock). Null when off,
-  // unknown or failed. Never throws.
+  // was issued to. Each token is looked up once: a new token (a refresh, the
+  // fresh one after a 401, another BQAA_ACCESS_TOKEN) is a new credential and
+  // is looked up again; a failed lookup is tried again after ten minutes, by
+  // a timer, so it follows the host's clock. Null when off, unknown or
+  // failed. Never throws.
   private identityFor(token: string, c: Config): Promise<string | null> {
     if (!c.userIdFromCredentials) return Promise.resolve(null)
-    if (this.identity !== null) return Promise.resolve(this.identity.email)
-    if (this.identityPending === null) {
-      const pending = this.lookUpIdentity(token, c).catch(() => null)
+    if (this.identity !== null && this.identity.token === token) return Promise.resolve(this.identity.email)
+    if (this.identityPending === null || this.identityPending.token !== token) {
+      const answer = this.lookUpIdentity(token, c, ++this.identitySeq).catch(() => null)
+      const pending = { token, answer }
       this.identityPending = pending
-      void pending.then(() => {
+      void answer.then(() => {
         if (this.identityPending === pending) this.identityPending = null
       })
     }
-    return this.identityPending
+    return this.identityPending.answer
+  }
+
+  // The account of the token in use now, if its lookup has answered.
+  private currentIdentity(): string | null {
+    const token = this.token
+    return token !== null && this.identity !== null && this.identity.token === token.value ? this.identity.email : null
+  }
+
+  // Gives each of this process's rows the account of `token`, or, while that
+  // account is unknown, the user_id it was built with: never an account
+  // looked up for another token.
+  private async stampFor(rows: Queued[], token: string, c: Config): Promise<void> {
+    if (!c.userIdFromCredentials) return
+    const email = await this.identityFor(token, c)
+    for (const q of rows) this.stamp(q, email)
   }
 
   // Google's token information endpoint names the account; the token goes
   // in the POST body, never in the URL or a header. The address is never
   // logged.
-  private async lookUpIdentity(token: string, c: Config): Promise<string | null> {
+  private async lookUpIdentity(token: string, c: Config, seq: number): Promise<string | null> {
     const answer = await this.request(TOKEN_INFO_URL, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: `access_token=${encodeURIComponent(token)}` }, c.requestTimeoutMs)
     let email: string | null = null
     let why = ''
@@ -631,21 +654,28 @@ export class Writer {
       else if (info.email_verified !== true && info.email_verified !== 'true') why = "the account's email is not verified"
       else email = info.email
     }
-    this.identity = { email }
-    if (email === null) {
-      const failed = this.identity
-      this.io.after(IDENTITY_RETRY_MS, () => {
-        if (this.identity === failed) this.identity = null
-      })
+    // A lookup that started earlier, for an older token, never replaces the
+    // answer of a later one.
+    if (this.identity === null || this.identity.seq < seq) {
+      const known = { token, email, seq }
+      this.identity = known
+      if (email === null) {
+        this.io.after(IDENTITY_RETRY_MS, () => {
+          if (this.identity === known) this.identity = null
+        })
+      }
     }
     if (email === null) this.io.debug(diagnostic(`bqaa: looking up the token's account for user_id failed (${why}); rows keep the configured user_id`))
     return email
   }
 
-  // This process's row, with the credential's account as its user_id.
-  private stamp(q: Queued, email: string): void {
-    if (q.row.user_id === email) return
-    q.row = { ...q.row, user_id: email }
+  // This process's row with `email` as its user_id, or with the user_id it
+  // was built with when `email` is null.
+  private stamp(q: Queued, email: string | null): void {
+    if (email !== null && q.configuredUserId === undefined) q.configuredUserId = q.row.user_id
+    const userId = email ?? (q.configuredUserId === undefined ? q.row.user_id : q.configuredUserId)
+    if (q.row.user_id === userId) return
+    q.row = { ...q.row, user_id: userId }
     q.bytes = rowBytes(q.row)
   }
 
@@ -742,9 +772,9 @@ export class Writer {
   private async deadLetter(kind: DeadLetterKind, rows: Queued[], reason: string): Promise<void> {
     if (rows.length === 0) return
     const c = this.config()
-    // The rows are this process's: they keep its credential's account.
-    const email = c.userIdFromCredentials ? (this.identity?.email ?? null) : null
-    if (email !== null) for (const q of rows) this.stamp(q, email)
+    // The rows are this process's: they are parked with the account of the
+    // token in use now, and keep it when they are replayed.
+    if (c.userIdFromCredentials) for (const q of rows) this.stamp(q, this.currentIdentity())
     const at = this.io.now()
     const failedAt = new Date(at).toISOString()
     const dir = deadLetterPartition(c)
@@ -1026,7 +1056,7 @@ export class Writer {
       hasToken: this.token !== null && this.io.now() < this.token.expiresAt,
       problem: this.problem,
       waiting: this.waitingRows(),
-      identity: !c.userIdFromCredentials ? 'off' : this.identity === null ? 'pending' : this.identity.email === null ? 'failed' : 'found',
+      identity: !c.userIdFromCredentials ? 'off' : this.token === null || this.identity?.token !== this.token.value ? 'pending' : this.identity.email === null ? 'failed' : 'found',
     }
   }
 }

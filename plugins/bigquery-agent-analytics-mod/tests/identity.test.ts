@@ -4,7 +4,10 @@
 
 import { type Engine, expect, test } from 'claude-code/testing'
 
+import { resolveConfig } from '../hooks/lib/config.ts'
 import { packFiles } from '../hooks/lib/deadletter.ts'
+import { buildRow } from '../hooks/lib/rows.ts'
+import { type Io, Writer } from '../hooks/lib/writer.ts'
 
 import {
   ACCESS_TOKEN,
@@ -26,6 +29,18 @@ import {
 const ADDRESS = 'dev.person@example.com'
 const VERIFIED = { status: 200, text: JSON.stringify({ email: ADDRESS, email_verified: 'true', scope: 'openid https://www.googleapis.com/auth/userinfo.email', expires_in: 3599 }) }
 const UNAVAILABLE = { status: 503, text: '{"error":{"code":503,"message":"The service is currently unavailable.","status":"UNAVAILABLE"}}' }
+const UNAUTHENTICATED = { status: 401, text: '{"error":{"code":401,"message":"Request had invalid authentication credentials.","status":"UNAUTHENTICATED"}}' }
+
+// Two accounts, and the token of the second; joined at run time, like every
+// credential-shaped test value (helpers.ts).
+const FIRST = 'first.person@example.com'
+const SECOND = 'second.person@example.com'
+const verified = (email: string) => ({ status: 200, text: JSON.stringify({ email, email_verified: 'true' }) })
+const SECOND_TOKEN = ['ya29', 'token-of-the-second-account-0123'].join('.')
+
+// The user_id of each row an insertAll request carried.
+const usersOf = (call: { body: string } | undefined): (string | null)[] =>
+  (JSON.parse(call?.body ?? '{"rows":[]}') as { rows: { json: { user_id: string | null } }[] }).rows.map(r => r.json.user_id)
 
 const statusText = async ($: Engine): Promise<string> => (await $.command.run({ command: 'bqaa-status', args: '', ...COMMAND })).text ?? ''
 
@@ -157,6 +172,154 @@ test("rows still queued at exit go to the spill file with this process's account
   const spilled = deadLetterRows(world)
   expect(spilled.map(r => r.event_type)).toEqual(['STATE_DELTA', 'TOOL_STARTING', 'TOOL_COMPLETED', 'STATE_DELTA'])
   expect(spilled.every(r => r.user_id === ADDRESS)).toBe(true)
+})
+
+test('a new credential after a session change: the rows sent with it carry its account, the 401 retry included', { options: { ...OPTIONS, userIdFromCredentials: true } }, async ($, on) => {
+  const world = setUp(on)
+  world.tokenInfo = verified(FIRST)
+  await startSession($)
+  await world.clock.advance(5000)
+  expect(world.acceptedRows().map(r => r.user_id)).toEqual([FIRST])
+  // The session changes; the process and its writer go on.
+  await $.session.end({ reason: 'clear', sessionId: SESSION_ID, resume: { id: SESSION_ID } })
+  world.sessionId = 'second-session'
+  // The person signed in as someone else: the token at hand has expired, and
+  // the token command now prints the other account's.
+  world.processReply = { exitCode: 0, stdout: `${SECOND_TOKEN}\n`, stderr: '' }
+  world.tokenInfo = verified(SECOND)
+  world.replies = [UNAUTHENTICATED, OK_INSERT]
+  await $.tool.call({ tool: 'Read', file_path: 'b.ts' })
+  await world.clock.advance(5000)
+  const [, refused, retried] = world.insertCalls()
+  // Tried with the old token as the old account; the 401's fresh token is
+  // the other account's, and the retry carries that account.
+  expect(refused?.answered).toBe(401)
+  expect(usersOf(refused)).toEqual([FIRST, FIRST, FIRST])
+  expect(retried?.headers.authorization).toBe(`Bearer ${SECOND_TOKEN}`)
+  expect(usersOf(retried)).toEqual([SECOND, SECOND, SECOND])
+  // Later rows carry it too, and each token was looked up once.
+  await $.tool.call({ tool: 'Read', file_path: 'c.ts' })
+  await world.clock.advance(5000)
+  const later = world.acceptedRows().slice(-2)
+  expect(later.map(r => r.session_id)).toEqual(['second-session', 'second-session'])
+  expect(later.map(r => r.user_id)).toEqual([SECOND, SECOND])
+  expect(world.fetches.filter(f => f.url === TOKEN_INFO_URL).map(f => f.body)).toEqual([`access_token=${encodeURIComponent(ACCESS_TOKEN)}`, `access_token=${encodeURIComponent(SECOND_TOKEN)}`])
+})
+
+test('rows parked under one account keep it when a later credential replays them', { options: { ...OPTIONS, userIdFromCredentials: true } }, async ($, on) => {
+  // No automatic replay: /bqaa-backfill below sends the file.
+  const world = setUp(on, { BQAA_AUTO_BACKFILL: 'false' })
+  world.tokenInfo = verified(FIRST)
+  world.replies = [UNAVAILABLE, UNAVAILABLE, UNAVAILABLE, UNAVAILABLE]
+  await startSession($)
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
+  // Four failed tries: the rows are parked, with the first account.
+  for (let t = 0; t < 4; t += 1) await world.clock.advance(5000)
+  expect(deadLetterRows(world).map(r => r.user_id)).toEqual([FIRST, FIRST, FIRST])
+  // Another account's credential takes over.
+  world.processReply = { exitCode: 0, stdout: `${SECOND_TOKEN}\n`, stderr: '' }
+  world.tokenInfo = verified(SECOND)
+  world.replies = [UNAUTHENTICATED, OK_INSERT]
+  await $.tool.call({ tool: 'Read', file_path: 'c.ts' })
+  await world.clock.advance(20_000)
+  await $.command.run({ command: 'bqaa-backfill', args: '', ...COMMAND })
+  await world.clock.settle()
+  const sent = world.acceptedRows()
+  const fileOf = (r: { content: string | null }) => (JSON.parse(r.content ?? '{}') as { args?: { file_path?: string } }).args?.file_path
+  expect(sent.filter(r => r.event_type === 'TOOL_STARTING').map(r => [fileOf(r), r.user_id])).toEqual([
+    ['c.ts', SECOND],
+    ['a.ts', FIRST],
+  ])
+})
+
+test("while a new token's account is unknown, rows carry the configured user_id, never the old account", { options: { ...OPTIONS, userIdFromCredentials: true } }, async ($, on) => {
+  const world = setUp(on)
+  world.tokenInfo = verified(FIRST)
+  await startSession($)
+  await world.clock.advance(5000)
+  world.processReply = { exitCode: 0, stdout: `${SECOND_TOKEN}\n`, stderr: '' }
+  world.tokenInfo = { status: 400, text: '{"error":"invalid_token"}' }
+  // Busy once, then the old token is refused: the rows are given the first
+  // account twice before the new token's account turns out unknown.
+  world.replies = [UNAVAILABLE, UNAUTHENTICATED, OK_INSERT]
+  await $.tool.call({ tool: 'Read', file_path: 'b.ts' })
+  await world.clock.advance(10_000)
+  const [, busy, refused, retried] = world.insertCalls()
+  expect([busy?.answered, refused?.answered, retried?.answered]).toEqual([503, 401, 200])
+  expect(usersOf(busy)).toEqual([FIRST, FIRST])
+  expect(usersOf(refused)).toEqual([FIRST, FIRST])
+  expect(usersOf(retried)).toEqual(['dev', 'dev'])
+})
+
+test('rows parked while no token works carry the configured user_id, not the last account', { options: { ...OPTIONS, userIdFromCredentials: true } }, async ($, on) => {
+  const world = setUp(on)
+  world.tokenInfo = verified(FIRST)
+  await startSession($)
+  await world.clock.advance(5000)
+  // BigQuery refuses the token, and no fresh one comes.
+  world.replies = [UNAUTHENTICATED]
+  world.processReply = { exitCode: 1, stdout: '', stderr: 'ERROR: (gcloud.auth.application-default.print-access-token) Your default credentials were not found.\n' }
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
+  // Tried with the first account's token once, then four failed tries.
+  for (let t = 0; t < 4; t += 1) await world.clock.advance(5000)
+  expect(usersOf(world.insertCalls()[1])).toEqual([FIRST, FIRST])
+  expect(deadLetterRows(world).map(r => r.user_id)).toEqual(['dev', 'dev'])
+})
+
+test('a lookup that answers late, for an older token, never replaces the account of the newer one', async () => {
+  const config = resolveConfig({ project: 'race-project', dataset: 'events', deadLetterDir: '/race/dead-letter', userIdFromCredentials: true }, {})
+  const firstToken = ['ya29', 'token-of-the-first-account-0123'].join('.')
+  const commands = [firstToken, SECOND_TOKEN]
+  let now = 0
+  let answerFirst = (): void => undefined
+  const lookups: string[] = []
+  const sent: (string | null)[][] = []
+  const io: Io = {
+    now: () => now,
+    after: () => ({ cancel: () => undefined }),
+    fetch: async (url, init) => {
+      if (url !== TOKEN_INFO_URL) {
+        sent.push(usersOf({ body: init.body ?? '' }))
+        return OK_INSERT
+      }
+      const isFirst = (init.body ?? '').endsWith(encodeURIComponent(firstToken))
+      lookups.push(isFirst ? 'first' : 'second')
+      // The first token's lookup answers only when the test says so.
+      if (isFirst) await new Promise<void>(resolve => (answerFirst = resolve))
+      return verified(isFirst ? FIRST : SECOND)
+    },
+    runCommand: async () => ({ exitCode: 0, stdout: `${commands.shift() ?? SECOND_TOKEN}\n`, stderr: '' }),
+    envToken: async () => undefined,
+    readFile: async () => '',
+    writeFile: async () => undefined,
+    listDir: async () => [],
+    storeGet: async () => undefined,
+    storeSet: async () => undefined,
+    storeDelete: async () => undefined,
+    status: () => undefined,
+    debug: () => undefined,
+  }
+  const row = (eventId: string) =>
+    buildRow({ eventType: 'STATE_DELTA', timestampMs: 0, eventId, agent: 'coding-agent', sessionId: 's', invocationId: null, userId: 'dev', traceId: null, spanId: null, parentSpanId: null, content: {}, attributes: {}, maxPayloadChars: 16384 }).row
+  const turns = async (until: () => boolean) => {
+    for (let i = 0; i < 200 && !until(); i += 1) await Promise.resolve()
+  }
+  const writer = new Writer(io, () => config, () => 's')
+  // The first token's account is being looked up...
+  writer.prefetchToken()
+  await turns(() => lookups.length === 1)
+  // ...when that token runs out (45 minutes) and a row goes out with the
+  // next one, whose account answers at once.
+  now += 46 * 60 * 1000
+  writer.enqueue(row('a'.repeat(32)), 0)
+  await writer.flush()
+  // The older lookup answers now; it must not replace the newer account.
+  answerFirst()
+  await turns(() => false)
+  writer.enqueue(row('b'.repeat(32)), 0)
+  await writer.flush()
+  expect(sent).toEqual([[SECOND], [SECOND]])
+  expect(lookups).toEqual(['first', 'second'])
 })
 
 test("recordHostname: the machine's name is in the session metadata of the turns after the lookup; off by default, hostname never runs", { options: { ...OPTIONS, recordHostname: true } }, async ($, on) => {

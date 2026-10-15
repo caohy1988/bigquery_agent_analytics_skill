@@ -278,16 +278,23 @@ also turns capture, and so the check, off. The host reads a value other than
 
 Both options are off by default, since each adds personal data to the rows.
 
-* **`userIdFromCredentials`** sets `user_id` to the account the access token
-  was issued to.
-  * The writer looks the account up once per session, at Google's token
-    information endpoint, with the token in a POST body.
+* **`userIdFromCredentials`** sets `user_id` to the account of the access
+  token each row is sent with.
+  * The writer looks up the account of each token it uses, at Google's
+    token information endpoint, with the token in a POST body. A new token
+    is a new credential and is looked up again: a refresh, the fresh token
+    after a 401 (the retry carries the new account), or another
+    `BQAA_ACCESS_TOKEN`.
+  * A lookup that answers late, for an older token, never replaces the
+    account of a newer one.
   * It takes the email only if the endpoint says it is verified. A token
     without the email scope gives none.
-  * A failed lookup is retried after ten minutes; until then rows keep the
-    configured `user_id`.
-  * Once the account is known, every row this process sends or parks
-    carries it. Rows parked by an earlier session are sent as they were.
+  * A failed lookup is retried after ten minutes. Until then, and while the
+    current token's account is not known, rows carry the configured
+    `user_id`, never an account looked up for another token.
+  * A row parked on disk carries the account of the token in use when it was
+    parked, and keeps it when replayed. Rows an earlier session parked are
+    sent as they were.
   * The address goes to the table, and to rows parked on disk. It never
     goes to a log line or a command's output.
 * **`recordHostname`** runs the `hostname` command once, from a timer.
@@ -446,20 +453,28 @@ One `LLM_RESPONSE` row from it, JSON columns expanded:
 ### Views
 
 `setup.sh` makes two views in the views dataset, from the `LLM_RESPONSE`
-rows (the main loop's and the subagents' model requests):
+rows this mod wrote (`attributes.writer.plugin` is
+`bigquery-agent-analytics-mod`): the main loop's and the subagents' model
+requests. The table can be shared with ADK agents and the settings-hook
+plugin. Other writers can name their token counts differently (ADK's
+`prompt_token_count`, for one), so their rows are left out. That way
+requests, sessions and tokens always count the same rows.
 
 * [`daily_usage_by_model`](sql/views/daily_usage_by_model.sql): per day and
   model, model requests, sessions and the token counts.
 * [`daily_usage_by_user`](sql/views/daily_usage_by_user.sql): per day and
   `user_id`, sessions, model requests and the token counts.
 
-Both details below were checked with BigQuery dry runs:
+The details below were checked on BigQuery itself:
 
 * Each view keeps one row per `(timestamp, event_id)`. A row sent twice has
   the same `event_id` and timestamp.
 * A filter on `day` still reaches the table's day partitions: a dry run with
   one day's filter reads 0 bytes of the other days. Deduplicating on
   `event_id` alone would read the whole table.
+* Over a fixture shared by several writers, both views count only this
+  mod's requests, sessions and tokens. That run read literal rows, with no
+  table, and so does [`tests/views.test.py`](tests/views.test.py) offline.
 
 The rows carry token counts, not prices, so the views report tokens. Keep
 the views in a dataset of their own, as `setup.sh` does, so the identities
@@ -693,13 +708,14 @@ column. Treat the dataset like the transcripts it mirrors.
 claude plugin validate plugins/bigquery-agent-analytics-mod
 cd plugins/bigquery-agent-analytics-mod && claude plugin test
 bash tests/setup.test.sh
+python3 tests/views.test.py   # needs DuckDB: python3 -m pip install duckdb
 ```
 
 The test command runs the `tests/*.test.ts` files against the host CLI's own
 test kit, with no session, sign-in, GCP or network: `$.http.fetch`,
 `$.process.run`, `$.fs` and `$.store` are stubbed, and `mock.clock` drives the
 timers; the `$.fs` stubs measure files in UTF-8 bytes and refuse a file over
-4 MiB, as the host does. 173 tests cover the captured rows and their spans,
+4 MiB, as the host does. 178 tests cover the captured rows and their spans,
 subagent runs in the order the host raises them (one invocation and one
 trace for the turn, a span per run, a SubagentStart that comes late or never),
 the session-start row raised before or during `session.start`'s setup,
@@ -749,7 +765,13 @@ And the other additions:
   odd values, a subagent's call;
 * the identity options: off by default, the lookup sent in a POST body only,
   an unverified or missing email, a retry after ten minutes, parked and
-  replayed rows, the host name.
+  replayed rows, the host name;
+* a credential change: after a session change, a 401's fresh token for
+  another account gives the retry and later rows that account; rows parked
+  under the first account keep it when replayed; a new token whose account
+  is unknown, or no working token, gives the configured `user_id`; and a
+  lookup that answers late, for an older token, does not replace the newer
+  account.
 
 `tests/setup.test.sh` runs `setup.sh` against a stand-in `bq` that logs its
 calls. It checks:
@@ -757,7 +779,15 @@ calls. It checks:
 * the datasets, table and views it makes, on a first run and on a second;
 * the fallback variables;
 * that a dry run calls nothing;
-* that names which are not plain ones are refused before any call.
+* that names which are not plain ones are refused before any call;
+* that the rendered views keep to this mod's rows.
+
+`tests/views.test.py` runs both views in DuckDB. It uses five dialect
+substitutions, and each must match. The fixture is a table shared by this
+mod, an ADK-style writer, the settings-hook plugin, a duplicate row, another
+event type and a row without `event_id`. The test checks requests, sessions
+and token totals together. It also checks that without the writer filter
+the same views count other producers' requests but not their tokens.
 
 ## Limitations
 

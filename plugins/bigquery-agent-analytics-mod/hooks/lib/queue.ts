@@ -3,7 +3,10 @@
 
 import { type BqaaRow, rowBytes } from './rows.ts'
 
-export type Queued = { row: BqaaRow; bytes: number; attempts: number }
+// `configuredUserId`: the user_id the row was built with, kept once the row
+// has been given the credential's account (userIdFromCredentials), so the
+// row can fall back to it when the current credential's account is unknown.
+export type Queued = { row: BqaaRow; bytes: number; attempts: number; configuredUserId?: string | null }
 
 export class BoundedQueue {
   private items: Queued[] = []

@@ -1,12 +1,14 @@
--- Model requests and tokens per day and model, from the mod's LLM_RESPONSE
--- rows: the main loop's and its subagents' requests, one row per event_id.
--- setup.sh fills in {PROJECT}, {DATASET}, {TABLE} and {VIEWS_DATASET}.
+-- Model requests and tokens per day and model, from the LLM_RESPONSE rows
+-- this mod wrote (attributes.writer.plugin): the main loop's and its
+-- subagents' requests, one row per event_id. Requests, sessions and tokens
+-- all count the same rows. setup.sh fills in {PROJECT}, {DATASET}, {TABLE}
+-- and {VIEWS_DATASET}.
 --
 -- The rows carry token counts, not prices: multiply by your own rates.
 -- Filter on `day`: duplicates are matched within one timestamp, so a filter
 -- on the date still reaches the table's day partitions.
 CREATE OR REPLACE VIEW `{PROJECT}.{VIEWS_DATASET}.daily_usage_by_model`
-OPTIONS (description = 'Model requests and tokens per day and model, from the agent_events LLM_RESPONSE rows, one per event_id.')
+OPTIONS (description = 'Model requests and tokens per day and model, from the LLM_RESPONSE rows the bigquery-agent-analytics-mod wrote, one per event_id.')
 AS
 WITH responses AS (
   SELECT
@@ -20,6 +22,11 @@ WITH responses AS (
     SAFE_CAST(JSON_VALUE(attributes, '$.usage_metadata.total_tokens') AS INT64) AS total_tokens
   FROM `{PROJECT}.{DATASET}.{TABLE}`
   WHERE event_type = 'LLM_RESPONSE'
+    -- This mod's rows only. The table can be shared (ADK agents, the
+    -- settings-hook plugin), and other writers can name their token counts
+    -- differently, so counting their requests here would not match the
+    -- token totals.
+    AND JSON_VALUE(attributes, '$.writer.plugin') = 'bigquery-agent-analytics-mod'
   -- A row sent twice (after an ambiguous timeout, or by a replay) has the
   -- same event_id and timestamp: keep one.
   QUALIFY event_id IS NULL OR ROW_NUMBER() OVER (PARTITION BY timestamp, event_id) = 1
