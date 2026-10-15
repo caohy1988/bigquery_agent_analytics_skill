@@ -307,7 +307,7 @@ export class Writer {
     if (outcome.kind === 'auth') {
       // The token may have run out early: one more try at once, with a fresh
       // one. A second 401 means BigQuery refuses the credentials themselves.
-      this.token = null
+      this.dropToken()
       try {
         token = await this.getToken()
       } catch (err) {
@@ -349,7 +349,7 @@ export class Writer {
         return true
       }
       case 'auth':
-        this.token = null
+        this.dropToken()
         await this.retryLater(batch, `authentication: ${outcome.message}`)
         return false
       case 'not-found': {
@@ -580,7 +580,7 @@ export class Writer {
     const answer = await this.request(tableCheckUrl(c), { method: 'GET', headers: { authorization: `Bearer ${got.value}` } }, Math.max(1, deadline - this.io.now()))
     if ('error' in answer) return refuse(`BigQuery refused the credentials before, and checking them again failed: ${answer.error}`)
     if (answer.status === 401) {
-      this.token = null
+      this.dropToken()
       return refuse('BigQuery still refuses the credentials (HTTP 401)')
     }
     this.clearProblem()
@@ -619,10 +619,21 @@ export class Writer {
     return this.identityPending.answer
   }
 
-  // The account of the token in use now, if its lookup has answered.
+  // The account of the token in use now, if its lookup has answered. An
+  // expired token is no longer in use, whether or not a fresh one came.
   private currentIdentity(): string | null {
     const token = this.token
-    return token !== null && this.identity !== null && this.identity.token === token.value ? this.identity.email : null
+    if (token === null || this.io.now() >= token.expiresAt) return null
+    return this.identity !== null && this.identity.token === token.value ? this.identity.email : null
+  }
+
+  // A token that expired or that BigQuery refused is let go, and so is the
+  // account looked up for it: while no fresh token comes, rows parked meanwhile
+  // carry the user_id they were built with, never that account.
+  private dropToken(): void {
+    const dropped = this.token
+    this.token = null
+    if (dropped !== null && this.identity !== null && this.identity.token === dropped.value) this.identity = null
   }
 
   // Gives each of this process's rows the account of `token`, or, while that
@@ -704,6 +715,8 @@ export class Writer {
   private getToken(): Promise<string> {
     const c = this.config()
     if (this.token && this.io.now() < this.token.expiresAt) return Promise.resolve(this.token.value)
+    // Expired: let it go now, so a refresh that fails leaves no token behind.
+    if (this.token) this.dropToken()
     if (this.tokenPending) return this.tokenPending
     const pending = (async (): Promise<string> => {
       const fromEnv = (await this.io.envToken())?.trim()
@@ -1005,7 +1018,7 @@ export class Writer {
         changed = true
         continue
       }
-      if (outcome.kind === 'auth') this.token = null
+      if (outcome.kind === 'auth') this.dropToken()
       report.error = diagnostic(outcome.message)
       left.push(...chunk)
     }

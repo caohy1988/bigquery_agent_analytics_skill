@@ -5,7 +5,7 @@
 import { type Engine, expect, test } from 'claude-code/testing'
 
 import { resolveConfig } from '../hooks/lib/config.ts'
-import { packFiles } from '../hooks/lib/deadletter.ts'
+import { packFiles, parseFile } from '../hooks/lib/deadletter.ts'
 import { buildRow } from '../hooks/lib/rows.ts'
 import { type Io, Writer } from '../hooks/lib/writer.ts'
 
@@ -23,6 +23,7 @@ import {
   json,
   setUp,
   startSession,
+  utf8Bytes,
 } from './helpers.ts'
 
 // A made-up address on a reserved domain.
@@ -264,6 +265,222 @@ test('rows parked while no token works carry the configured user_id, not the las
   for (let t = 0; t < 4; t += 1) await world.clock.advance(5000)
   expect(usersOf(world.insertCalls()[1])).toEqual([FIRST, FIRST])
   expect(deadLetterRows(world).map(r => r.user_id)).toEqual(['dev', 'dev'])
+})
+
+test('a token that expires and cannot be refreshed takes its account with it: rows parked then, at retry exhaustion or at exit, carry the configured user_id, and replay keeps it', async () => {
+  const config = resolveConfig({ project: 'expiry-project', dataset: 'events', deadLetterDir: '/expiry/dead-letter', userIdFromCredentials: true }, { BQAA_USER_ID: 'configured-user' })
+  const firstToken = ['ya29', 'token-that-runs-out-0123456789'].join('.')
+  const accounts = new Map([
+    [firstToken, FIRST],
+    [SECOND_TOKEN, SECOND],
+  ])
+  let now = 0
+  // What the token command prints; null: it fails.
+  let printed: string | null = firstToken
+  const files = new Map<string, string>()
+  // Each insertAll, by the credential it went out with.
+  const sent: { credential: string; users: (string | null)[] }[] = []
+  const labelOf = (bearer: string) => (bearer === `Bearer ${firstToken}` ? 'first' : bearer === `Bearer ${SECOND_TOKEN}` ? 'second' : 'other')
+  const io: Io = {
+    now: () => now,
+    after: () => ({ cancel: () => undefined }),
+    fetch: async (url, init) => {
+      if (url === TOKEN_INFO_URL) {
+        const email = accounts.get(decodeURIComponent((init.body ?? '').replace(/^access_token=/, '')))
+        return email === undefined ? { status: 400, text: '{"error":"invalid_token"}' } : verified(email)
+      }
+      sent.push({ credential: labelOf(init.headers.authorization ?? ''), users: usersOf({ body: init.body ?? '' }) })
+      return OK_INSERT
+    },
+    runCommand: async () =>
+      printed === null ? { exitCode: 1, stdout: '', stderr: 'ERROR: (gcloud.auth.application-default.print-access-token) Reauthentication failed.\n' } : { exitCode: 0, stdout: `${printed}\n`, stderr: '' },
+    envToken: async () => undefined,
+    writeFile: async (path, text) => {
+      files.set(path, text)
+    },
+    readFile: async path => files.get(path) ?? '',
+    listDir: async dir => [...files].filter(([path]) => path.startsWith(`${dir}/`)).map(([path, text]) => ({ name: path.slice(dir.length + 1), kind: 'file', size: utf8Bytes(text) })),
+    storeGet: async () => undefined,
+    storeSet: async () => undefined,
+    storeDelete: async () => undefined,
+    status: () => undefined,
+    debug: () => undefined,
+  }
+  const writer = new Writer(io, () => config, () => 'expiry-session')
+  const row = (id: string) =>
+    buildRow({ eventType: 'STATE_DELTA', timestampMs: now, eventId: id.repeat(32), agent: 'coding-agent', sessionId: 'expiry-session', invocationId: null, userId: config.userId, traceId: null, spanId: null, parentSpanId: null, content: {}, attributes: {}, maxPayloadChars: 16384 }).row
+  // The first account is looked up, and a row goes out with it.
+  writer.enqueue(row('a'), 0)
+  await writer.flush()
+  expect(sent).toEqual([{ credential: 'first', users: [FIRST] }])
+  // The token runs out (it is reused for 45 minutes) and no fresh one comes.
+  now += 46 * 60 * 1000
+  printed = null
+  writer.enqueue(row('b'), 0)
+  // Four failed tries, then the row is parked.
+  for (let i = 0; i < 4; i += 1) {
+    writer.retrySoon()
+    await writer.flush()
+  }
+  // A row still queued when the session ends is spilled.
+  writer.enqueue(row('c'), 0)
+  await writer.spillForExit(800)
+  const parked = [...files.values()].flatMap(text => parseFile(text).lines.map(line => [line.kind, line.row.event_id[0], line.row.user_id]))
+  expect(parked).toEqual([
+    ['retry', 'b', 'configured-user'],
+    ['spill', 'c', 'configured-user'],
+  ])
+  expect(writer.snapshot().identity).toBe('pending')
+  // Another account's credential replays them: they keep the user_id they
+  // were parked with.
+  printed = SECOND_TOKEN
+  await writer.backfill(['retry', 'spill'], 'command')
+  expect(sent.slice(1)).toEqual([
+    { credential: 'second', users: ['configured-user'] },
+    { credential: 'second', users: ['configured-user'] },
+  ])
+})
+
+test('a session that ends just after its token expired spills its rows with the configured user_id, though no send dropped the token yet', async () => {
+  const config = resolveConfig({ project: 'expiry-project', dataset: 'events', deadLetterDir: '/expiry/dead-letter', userIdFromCredentials: true }, { BQAA_USER_ID: 'configured-user' })
+  let now = 0
+  const files = new Map<string, string>()
+  const io: Io = {
+    now: () => now,
+    after: () => ({ cancel: () => undefined }),
+    fetch: async url => (url === TOKEN_INFO_URL ? verified(FIRST) : OK_INSERT),
+    runCommand: async () => ({ exitCode: 0, stdout: `${SECOND_TOKEN}\n`, stderr: '' }),
+    envToken: async () => undefined,
+    writeFile: async (path, text) => {
+      files.set(path, text)
+    },
+    readFile: async path => files.get(path) ?? '',
+    listDir: async () => [],
+    storeGet: async () => undefined,
+    storeSet: async () => undefined,
+    storeDelete: async () => undefined,
+    status: () => undefined,
+    debug: () => undefined,
+  }
+  const writer = new Writer(io, () => config, () => 'expiry-session')
+  const row = (id: string) =>
+    buildRow({ eventType: 'STATE_DELTA', timestampMs: now, eventId: id.repeat(32), agent: 'coding-agent', sessionId: 'expiry-session', invocationId: null, userId: config.userId, traceId: null, spanId: null, parentSpanId: null, content: {}, attributes: {}, maxPayloadChars: 16384 }).row
+  writer.enqueue(row('a'), 0)
+  await writer.flush()
+  // The token runs out; the session ends before any send asks for another.
+  now += 46 * 60 * 1000
+  writer.enqueue(row('c'), 0)
+  await writer.spillForExit(800)
+  const parked = [...files.values()].flatMap(text => parseFile(text).lines.map(line => line.row.user_id))
+  expect(parked).toEqual(['configured-user'])
+})
+
+test("once a token expires its looked-up account goes with it: the same token issued again is looked up again", async () => {
+  const config = resolveConfig({ project: 'expiry-project', dataset: 'events', deadLetterDir: '/expiry/dead-letter', userIdFromCredentials: true }, { BQAA_USER_ID: 'configured-user' })
+  let now = 0
+  let lookups = 0
+  const sent: (string | null)[][] = []
+  const io: Io = {
+    now: () => now,
+    after: () => ({ cancel: () => undefined }),
+    fetch: async (url, init) => {
+      if (url === TOKEN_INFO_URL) {
+        lookups += 1
+        return verified(FIRST)
+      }
+      sent.push(usersOf({ body: init.body ?? '' }))
+      return OK_INSERT
+    },
+    // The token command hands out the same token again after the expiry.
+    runCommand: async () => ({ exitCode: 0, stdout: `${SECOND_TOKEN}\n`, stderr: '' }),
+    envToken: async () => undefined,
+    writeFile: async () => undefined,
+    readFile: async () => '',
+    listDir: async () => [],
+    storeGet: async () => undefined,
+    storeSet: async () => undefined,
+    storeDelete: async () => undefined,
+    status: () => undefined,
+    debug: () => undefined,
+  }
+  const writer = new Writer(io, () => config, () => 'expiry-session')
+  const row = (id: string) =>
+    buildRow({ eventType: 'STATE_DELTA', timestampMs: now, eventId: id.repeat(32), agent: 'coding-agent', sessionId: 'expiry-session', invocationId: null, userId: config.userId, traceId: null, spanId: null, parentSpanId: null, content: {}, attributes: {}, maxPayloadChars: 16384 }).row
+  writer.enqueue(row('a'), 0)
+  await writer.flush()
+  now += 46 * 60 * 1000
+  writer.enqueue(row('b'), 0)
+  await writer.flush()
+  expect(sent).toEqual([[FIRST], [FIRST]])
+  expect(lookups).toBe(2)
+})
+
+test('a refused BQAA_ACCESS_TOKEN loses its looked-up account: read again, it is looked up again', { options: { ...OPTIONS, userIdFromCredentials: true } }, async ($, on) => {
+  const fromEnv = SECOND_TOKEN
+  const world = setUp(on, { BQAA_ACCESS_TOKEN: fromEnv })
+  world.tokenInfo = verified(SECOND)
+  world.replies = [UNAUTHENTICATED, OK_INSERT]
+  await startSession($)
+  await world.clock.advance(5000)
+  // Refused once, then sent again with the same token, read again.
+  expect(world.insertCalls().map(f => f.answered)).toEqual([401, 200])
+  expect(world.fetches.filter(f => f.url === TOKEN_INFO_URL).length).toBe(2)
+  expect(world.acceptedRows().map(r => r.user_id)).toEqual([SECOND])
+})
+
+test('an account a slow lookup finds for a token already let go is never used for the next token', async () => {
+  const config = resolveConfig({ project: 'race-project', dataset: 'events', deadLetterDir: '/race/dead-letter', userIdFromCredentials: true }, {})
+  const firstToken = ['ya29', 'token-let-go-while-looked-up-0123'].join('.')
+  const commands = [firstToken, SECOND_TOKEN]
+  let now = 0
+  let answerFirst = (): void => undefined
+  const lookups: string[] = []
+  const sent: (string | null)[][] = []
+  const io: Io = {
+    now: () => now,
+    after: () => ({ cancel: () => undefined }),
+    fetch: async (url, init) => {
+      if (url !== TOKEN_INFO_URL) {
+        // tables.get for the credential check, or insertAll.
+        if (init.method === 'POST') sent.push(usersOf({ body: init.body ?? '' }))
+        return OK_INSERT
+      }
+      const isFirst = (init.body ?? '').endsWith(encodeURIComponent(firstToken))
+      lookups.push(isFirst ? 'first' : 'second')
+      if (isFirst) await new Promise<void>(resolve => (answerFirst = resolve))
+      return verified(isFirst ? FIRST : SECOND)
+    },
+    runCommand: async () => ({ exitCode: 0, stdout: `${commands.shift() ?? SECOND_TOKEN}\n`, stderr: '' }),
+    envToken: async () => undefined,
+    readFile: async () => '',
+    writeFile: async () => undefined,
+    listDir: async () => [],
+    storeGet: async () => undefined,
+    storeSet: async () => undefined,
+    storeDelete: async () => undefined,
+    status: () => undefined,
+    debug: () => undefined,
+  }
+  const row = (eventId: string) =>
+    buildRow({ eventType: 'STATE_DELTA', timestampMs: 0, eventId, agent: 'coding-agent', sessionId: 's', invocationId: null, userId: 'dev', traceId: null, spanId: null, parentSpanId: null, content: {}, attributes: {}, maxPayloadChars: 16384 }).row
+  const turns = async (until: () => boolean) => {
+    for (let i = 0; i < 200 && !until(); i += 1) await Promise.resolve()
+  }
+  const writer = new Writer(io, () => config, () => 's')
+  // The first token's account is being looked up when the token runs out,
+  // and a path that looks up no account (the block-mode check) fetches the
+  // next token.
+  writer.prefetchToken()
+  await turns(() => lookups.length === 1)
+  now += 46 * 60 * 1000
+  expect(await writer.credentialsCheck(5000)).toBe(null)
+  // Only now does the first token's lookup answer.
+  answerFirst()
+  await turns(() => false)
+  writer.enqueue(row('a'.repeat(32)), 0)
+  await writer.flush()
+  expect(sent).toEqual([[SECOND]])
+  expect(lookups).toEqual(['first', 'second'])
 })
 
 test('a lookup that answers late, for an older token, never replaces the account of the newer one', async () => {

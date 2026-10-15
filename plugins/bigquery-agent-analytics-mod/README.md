@@ -295,6 +295,10 @@ Both options are off by default, since each adds personal data to the rows.
   * A row parked on disk carries the account of the token in use when it was
     parked, and keeps it when replayed. Rows an earlier session parked are
     sent as they were.
+  * A token that expires, or that BigQuery refuses, is dropped together with
+    the account looked up for it. Rows parked while no fresh token comes
+    (at retry exhaustion or at exit) carry the configured `user_id`, never
+    the expired token's account.
   * The address goes to the table, and to rows parked on disk. It never
     goes to a log line or a command's output.
 * **`recordHostname`** runs the `hostname` command once, from a timer.
@@ -715,7 +719,7 @@ The test command runs the `tests/*.test.ts` files against the host CLI's own
 test kit, with no session, sign-in, GCP or network: `$.http.fetch`,
 `$.process.run`, `$.fs` and `$.store` are stubbed, and `mock.clock` drives the
 timers; the `$.fs` stubs measure files in UTF-8 bytes and refuse a file over
-4 MiB, as the host does. 178 tests cover the captured rows and their spans,
+4 MiB, as the host does. 183 tests cover the captured rows and their spans,
 subagent runs in the order the host raises them (one invocation and one
 trace for the turn, a span per run, a SubagentStart that comes late or never),
 the session-start row raised before or during `session.start`'s setup,
@@ -769,9 +773,15 @@ And the other additions:
 * a credential change: after a session change, a 401's fresh token for
   another account gives the retry and later rows that account; rows parked
   under the first account keep it when replayed; a new token whose account
-  is unknown, or no working token, gives the configured `user_id`; and a
-  lookup that answers late, for an older token, does not replace the newer
-  account.
+  is unknown, or no working token, gives the configured `user_id`; a token
+  that expires with no fresh one to follow leaves rows parked then (at retry
+  exhaustion and at exit, also when the session ends before any send asked
+  for a fresh token) with the configured `user_id`, which replay under
+  another account keeps; a token that expires or is refused loses its
+  looked-up account, so the same token issued again is looked up again; an
+  account that a slow lookup finds after its token was let go is not used
+  for the next token; and a lookup that answers late, for an older token,
+  does not replace the newer account.
 
 `tests/setup.test.sh` runs `setup.sh` against a stand-in `bq` that logs its
 calls. It checks:
