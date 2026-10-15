@@ -12,7 +12,24 @@ export type TracerDeps = {
   ids: IdSource
   config: () => Config
   emit: (row: BqaaRow, redactions: number) => void
+  // A timer, once the host's clock is at hand (null before): how a finished
+  // tool call waits briefly for its permission decision.
+  after?: (ms: number, fn: () => void) => { cancel: () => void } | null
 }
+
+// How the permission check answered a tool call, from the host's
+// `tool_decision` record: `accept` or `reject`, and where the answer came
+// from (`config`, `hook`, `user_temporary`, `user_permanent`, `user_abort`,
+// `user_reject`).
+export type ToolDecision = { decision: string; source: string }
+
+// A rejection's record can come just after its call returned (an accept's
+// comes while the call runs): how long a finished call waits for its own.
+export const DECISION_WAIT_MS = 2000
+const DECISION_VALUE = /^[a-z][a-z0-9_]{0,31}$/
+
+// A finished call waiting for its decision, and its timer.
+type AwaitingDecision = { write: (decision: ToolDecision | undefined) => void; timer: { cancel: () => void } | null }
 
 // The token counts the engine reports (`ModelUsage` plus the model's id).
 export type Usage = {
@@ -172,15 +189,25 @@ export class Tracer {
   private others = new Map<string, TurnCtx>()
   private loops = new Map<string, LoopCtx>()
   private inflightTools = new Set<ToolCtx>()
+  // With recordHostname: the machine's name, once looked up.
+  private hostName: string | null = null
+  // Permission decisions by tool_use_id that came before their call ended,
+  // and calls that ended before theirs came. Once any collector record has
+  // come, the host sends decisions too, so a call that ends without its
+  // decision waits for it.
+  private decisions = new Map<string, ToolDecision>()
+  private awaitingDecision = new Map<string, AwaitingDecision>()
+  private recordsArrive = false
 
   constructor(deps: TracerDeps) {
     this.deps = deps
   }
 
-  setSession(info: { sessionId?: string | null; cwd?: string | null; engineVersion?: string | null }): void {
+  setSession(info: { sessionId?: string | null; cwd?: string | null; engineVersion?: string | null; hostName?: string | null }): void {
     if (info.sessionId) this.sessionId = info.sessionId
     if (info.cwd) this.cwd = info.cwd
     if (info.engineVersion) this.engineVersion = info.engineVersion
+    if (info.hostName) this.hostName = info.hostName
     if (this.sessionStartedAt === null) this.sessionStartedAt = this.deps.now()
   }
 
@@ -214,6 +241,8 @@ export class Tracer {
 
   sessionEnded(e: { reason: string; sessionId?: string }): void {
     if (e.sessionId) this.sessionId = e.sessionId
+    // Calls still waiting for their decision are written first, without it.
+    this.writeAwaiting()
     const now = this.deps.now()
     this.emit({
       eventType: 'STATE_DELTA',
@@ -232,6 +261,7 @@ export class Tracer {
     this.others.clear()
     this.loops.clear()
     this.inflightTools.clear()
+    this.decisions.clear()
     // After /clear, /resume or /branch the process goes on under another id:
     // until it is read, rows carry none rather than the old one.
     if (e.reason === 'clear' || e.reason === 'resume') this.sessionId = null
@@ -451,18 +481,85 @@ export class Tracer {
     return ctx
   }
 
+  // A tool call ended: its TOOL_COMPLETED row, with the permission decision
+  // when it is known. Once decisions arrive, a call whose decision has not
+  // come yet waits up to DECISION_WAIT_MS for it, keeping the time it ended.
   toolFinished(ctx: ToolCtx, outcome: ToolOutcome): void {
     this.inflightTools.delete(ctx)
-    const latencyMs = { total_ms: this.deps.now() - ctx.startedAt }
+    const endedAt = this.deps.now()
+    const id = ctx.toolUseId
+    const known = id === null ? undefined : this.decisions.get(id)
+    if (id !== null) this.decisions.delete(id)
+    const timer = known === undefined && id !== null && this.recordsArrive ? this.deps.after : undefined
+    if (id === null || timer === undefined) {
+      this.toolCompleted(ctx, outcome, endedAt, known)
+      return
+    }
+    const waiting: AwaitingDecision = { write: decision => this.toolCompleted(ctx, outcome, endedAt, decision), timer: null }
+    this.awaitingDecision.set(id, waiting)
+    // Past the bound, the oldest waiting call is written without its decision.
+    if (this.awaitingDecision.size > MAX_TRACKED) {
+      const [oldestId, oldest] = this.awaitingDecision.entries().next().value as [string, AwaitingDecision]
+      this.awaitingDecision.delete(oldestId)
+      oldest.timer?.cancel()
+      oldest.write(undefined)
+    }
+    waiting.timer = timer(DECISION_WAIT_MS, () => {
+      if (this.awaitingDecision.get(id) !== waiting) return
+      this.awaitingDecision.delete(id)
+      waiting.write(undefined)
+    })
+    // No clock yet: written now.
+    if (waiting.timer === null && this.awaitingDecision.get(id) === waiting) {
+      this.awaitingDecision.delete(id)
+      waiting.write(undefined)
+    }
+  }
+
+  // A collector record of the host's. Only `tool_decision` is used: matched
+  // to its call by tool_use_id, its values kept when they are short
+  // lowercase tokens. Any record shows that decisions will come.
+  recordSeen(event: string, attributes: Readonly<Record<string, unknown>>): void {
+    this.recordsArrive = true
+    if (event !== 'tool_decision') return
+    const id = attributes.tool_use_id
+    const decision = attributes.decision
+    const source = attributes.source
+    if (typeof id !== 'string' || id === '' || typeof decision !== 'string' || !DECISION_VALUE.test(decision)) return
+    const answer: ToolDecision = { decision, source: typeof source === 'string' && DECISION_VALUE.test(source) ? source : 'unknown' }
+    const waiting = this.awaitingDecision.get(id)
+    if (waiting) {
+      this.awaitingDecision.delete(id)
+      waiting.timer?.cancel()
+      waiting.write(answer)
+      return
+    }
+    remember(this.decisions, id, answer)
+  }
+
+  private writeAwaiting(): void {
+    const all = [...this.awaitingDecision.values()]
+    this.awaitingDecision.clear()
+    for (const waiting of all) {
+      waiting.timer?.cancel()
+      waiting.write(undefined)
+    }
+  }
+
+  private toolCompleted(ctx: ToolCtx, outcome: ToolOutcome, endedAt: number, decision: ToolDecision | undefined): void {
+    const latencyMs = { total_ms: endedAt - ctx.startedAt }
     const attributes: Record<string, unknown> = {
       tool_use_id: ctx.toolUseId,
       agent_id: ctx.agentId,
       permission_requested: ctx.permissionRequested || undefined,
+      permission_decision: decision?.decision,
+      permission_decision_source: decision?.source,
     }
     if ('deny' in outcome && typeof outcome.deny === 'string') {
       this.emit({
         eventType: 'TOOL_COMPLETED',
         agent: ctx.agent,
+        timestampMs: endedAt,
         ids: ctx,
         content: { tool: ctx.tool, tool_origin: ctx.origin, result: null },
         attributes: { ...attributes, denied: true },
@@ -476,6 +573,7 @@ export class Tracer {
       this.emit({
         eventType: 'TOOL_COMPLETED',
         agent: ctx.agent,
+        timestampMs: endedAt,
         ids: ctx,
         content: { tool: ctx.tool, tool_origin: ctx.origin, result: null },
         attributes,
@@ -489,6 +587,7 @@ export class Tracer {
     this.emit({
       eventType: 'TOOL_COMPLETED',
       agent: ctx.agent,
+      timestampMs: endedAt,
       ids: ctx,
       content: { tool: ctx.tool, tool_origin: ctx.origin, result: ok.text ?? ok.result ?? null },
       attributes: { ...attributes, is_read_only: ok.isReadOnly === true ? true : undefined },
@@ -674,6 +773,7 @@ export class Tracer {
       project_name: this.cwd ? baseName(this.cwd) : null,
       cwd: this.cwd,
       host_version: this.engineVersion,
+      host_name: this.hostName ?? undefined,
     }
   }
 

@@ -12,6 +12,11 @@
 // the exit budget. If the mod's own code throws, the event goes on as if the
 // mod were not there (fail open): the observers through their `.catch`, the
 // other hooks because their bookkeeping runs inside `safely` or a `try`.
+//
+// One opt-in exception: with onAuthFailure `block`, prompt.submit checks the
+// credentials before a prompt goes in (within its hook budget) and refuses
+// the prompt while none work, failing closed. In the default `warn` mode the
+// band above the prompt says what is wrong and nothing waits.
 
 import type { EngineInterface, Register } from 'claude-code'
 
@@ -29,6 +34,15 @@ let config: Config = resolveConfig({}, {})
 let writer: Writer | null = null
 let flushTimer: { cancel: () => void } | null = null
 let internalErrors = 0
+// The host's timer, from session.start's `$`, for work that waits briefly
+// outside any hook (a finished tool call waiting for its decision).
+let clockAfter: ((ms: number, fn: () => void) => { cancel: () => void }) | null = null
+
+// With onAuthFailure `block`: the longest a prompt's credential check takes,
+// and the part of the hook's budget kept for passing the prompt on.
+const BLOCK_CHECK_MS = 8000
+const BLOCK_MARGIN_MS = 1500
+const BLOCK_CHECK_FAILED = 'BQAA blocks prompts until rows can be written, and its credential check failed; send the prompt again, or run /bqaa-status.'
 
 // Rows captured before session.start built the writer (an event the engine
 // raised first); handed over once it exists.
@@ -61,6 +75,7 @@ const tracer = new Tracer({
     if (writer) writer.enqueue(row, redactions)
     else if (early.length < 1000) early.push({ row, redactions })
   },
+  after: (ms, fn) => (clockAfter ? clockAfter(ms, fn) : null),
 })
 
 // The mod's bookkeeping never breaks the event it watches.
@@ -193,6 +208,31 @@ async function readSessionId($: EngineInterface): Promise<void> {
   }
 }
 
+// With recordHostname: the machine's name, from the `hostname` command, run
+// from a timer (never in a hook). Rows built after it answers carry it.
+async function lookUpHostname($: EngineInterface): Promise<void> {
+  try {
+    const answer = await $.process.run(['hostname'], { timeoutMs: 5000 })
+    const printed = answer.stdout.trim()
+    if (answer.exitCode === 0 && /^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$/.test(printed)) tracer.setSession({ hostName: printed })
+    else $.ui.log(clean(`bqaa: recordHostname: the hostname command gave no usable name (exit ${answer.exitCode})`), { to: 'debug' })
+  } catch (err) {
+    $.ui.log(clean(`bqaa: recordHostname: ${errorText(err)}`), { to: 'debug' })
+  }
+}
+
+// With onAuthFailure `block`: why a prompt may not go in, or null. Capture
+// turned off and a dry run need no credentials, so they block nothing; a
+// configuration that cannot send, or a writer that never started, blocks;
+// otherwise the writer checks the credentials in the time the hook has left.
+async function blockingProblem(remainingMs: number): Promise<string | null> {
+  if (!config.enabled || config.dryRun) return null
+  if (!canDeliver(config)) return `BQAA blocks prompts until rows can be written: ${config.problems.join('; ') || 'set project and dataset'}.`
+  if (!writer) return 'BQAA blocks prompts until rows can be written: the mod did not start; run /bqaa-status.'
+  const left = Number.isFinite(remainingMs) ? remainingMs : BLOCK_CHECK_MS + BLOCK_MARGIN_MS
+  return writer.credentialsCheck(Math.min(BLOCK_CHECK_MS, left - BLOCK_MARGIN_MS))
+}
+
 // This table's dead-letter files, those elsewhere in the dead-letter
 // directory (other tables' subdirectories, at most 50 of them, and files from
 // the older flat layout), and files too large to read back.
@@ -238,6 +278,7 @@ export const register: Register = (on, registered) => {
   on('session.start', async ($, e, next) => {
     try {
       config = resolveConfig(options, await readEnv($))
+      clockAfter = (ms, fn) => $.clock.after(ms, fn)
       const io: Io = {
         now: () => Date.now(),
         after: (ms, fn) => $.clock.after(ms, fn),
@@ -262,6 +303,9 @@ export const register: Register = (on, registered) => {
         storeDelete: key => $.store.delete(key),
         status: text => $.ui.status(text === undefined ? undefined : clean(text, 300)),
         debug: text => $.ui.log(clean(text), { to: 'debug' }),
+        toast: text => $.ui.toast(clean(text, 500), { timeoutMs: 15_000 }),
+        notice: text => $.ui.log(clean(text)),
+        redraw: () => $.ui.invalidate('ui.render'),
       }
       const previous = writer
       writer = new Writer(io, () => config, () => tracer.sessionId)
@@ -275,6 +319,7 @@ export const register: Register = (on, registered) => {
       flushTimer = $.clock.every(config.flushIntervalMs, () => {
         void writer?.flush()
       })
+      if (config.enabled && config.recordHostname) $.clock.after(0, () => void lookUpHostname($))
       if (canDeliver(config) && !config.dryRun) {
         // Off this dispatch: the token command and the replay run later.
         $.clock.after(0, () => writer?.prefetchToken())
@@ -336,8 +381,17 @@ export const register: Register = (on, registered) => {
     return pending
   }).catch(($, e, next) => next(e))
 
+  // A prompt while rows cannot be written also starts a retry: the person
+  // may have just signed in. With onAuthFailure `block`, the credentials are
+  // checked first and the prompt refused while none work; a crash before
+  // the prompt was passed on refuses it too (fail closed). In `warn` mode
+  // the hook waits on nothing but the session id.
   on('prompt.submit', async ($, e, next) => {
     const submittedAt = Date.now()
+    if (config.onAuthFailure === 'block') {
+      const refusal = await blockingProblem(next.budget.remainingMs)
+      if (refusal !== null) return { drop: clean(refusal, 1000) }
+    }
     const entered = await next(e)
     if (entered.drop === undefined) {
       await readSessionId($)
@@ -351,8 +405,42 @@ export const register: Register = (on, registered) => {
           attachments: e.attachments,
         }),
       )
+      safely(() => writer?.retrySoon())
     }
     return entered
+  }).catch(($, e, next) => (next.called || config.onAuthFailure !== 'block' ? next(e) : { drop: BLOCK_CHECK_FAILED }))
+
+  // The band above the prompt while rows cannot be written for lack of
+  // credentials or permission: what is wrong, the fix, and how many rows
+  // wait. What the mods after this one draw there stays, under this line; a
+  // survey has the band to itself.
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    const theirs = await next(e)
+    const current = writer
+    const problem = current?.problem ?? null
+    if (current === null || problem === null || e.props.hasSurvey) return theirs
+    const { headline, fix } = current.problemText()
+    const blocking = config.onAuthFailure === 'block' && problem.kind === 'credentials'
+    const { Box, Text } = $.ui.resolve(e)
+    const line = Box({
+      flexDirection: 'row',
+      flexWrap: 'wrap',
+      children: [
+        Text({ color: blocking ? 'error' : 'warning', bold: true, children: '⚠ BQAA: ' }),
+        Text({ children: clean(`rows are not being written: ${headline}. To fix, ${fix}.`, 500) }),
+        Text({ dimColor: true, children: ` ${current.waitingRows()} row(s) waiting.` }),
+        blocking ? Text({ color: 'error', children: ' New prompts are refused until then.' }) : null,
+      ],
+    })
+    return Box({ flexDirection: 'column', children: [line, theirs] })
+  })
+
+  // Permission decisions, from the host's own collector records: each record
+  // goes on first, unchanged, and one a later hook refused is not used.
+  on('telemetry.log', { to: 'collector' }, async ($, e, next) => {
+    const logged = await next(e)
+    if (logged.deny === undefined) safely(() => tracer.recordSeen(e.event, e.attributes))
+    return logged
   }).catch(($, e, next) => next(e))
 
   on('turn.start', async ($, e, next) => {

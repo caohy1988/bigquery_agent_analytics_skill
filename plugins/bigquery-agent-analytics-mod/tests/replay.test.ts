@@ -52,7 +52,7 @@ test('a spill file still being written is left to its writer while a replay runs
     now: () => 100_000,
     after: () => ({ cancel: () => undefined }),
     fetch: async (_url, init) => {
-      const ids = (JSON.parse(init.body) as { rows: { json: { event_id: string } }[] }).rows.map(r => r.json.event_id)
+      const ids = (JSON.parse(init.body ?? '{}') as { rows: { json: { event_id: string } }[] }).rows.map(r => r.json.event_id)
       if (holdRequest) {
         holdRequest = false
         await new Promise<void>(resolve => {

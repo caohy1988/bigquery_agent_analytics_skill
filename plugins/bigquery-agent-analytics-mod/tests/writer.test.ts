@@ -104,7 +104,7 @@ const SECRET = ['canary', 'secret', 'x'.repeat(16)].join('-')
 const LEAKY = `${['ya29', SECRET].join('.')} password=${SECRET}`
 
 async function everySink($: Engine, world: World, extra: string[] = []): Promise<string[]> {
-  return [...world.files.values(), ...world.statusLines.map(l => l ?? ''), ...world.logs, await statusText($), ...extra]
+  return [...world.files.values(), ...world.statusLines.map(l => l ?? ''), ...world.logs, ...world.toasts, await statusText($), ...extra]
 }
 
 test('a failed request is retried with the same insertIds, then succeeds', { options: OPTIONS }, async ($, on) => {
@@ -217,7 +217,10 @@ test('a permission error parks rows as refused; /bqaa-backfill sends them once f
   expect(world.insertCalls().length).toBe(1)
   const [file] = deadLetterFiles(world)
   expect(file?.[0].startsWith(`${PARTITION_DIR}/rejected-`)).toBe(true)
-  expect(world.statusLines.at(-1) ?? '').toMatch(/refused/)
+  // The status line says what is wrong, and the fix, with the rows waiting.
+  expect(world.statusLines.at(-1) ?? '').toBe(
+    'BQAA: BigQuery denied the identity access to the dataset. To fix, ask for roles/bigquery.dataEditor on my-gcp-project:agent_analytics, then run /bqaa-backfill (3 row(s) waiting)',
+  )
   // Refused rows are not replayed automatically.
   await world.clock.advance(60_000)
   expect(world.acceptedRows().length).toBe(0)
@@ -470,7 +473,11 @@ test('a failing token command never puts credential text in a file, the status l
   const parked = deadLetterFiles(world)
   expect(parked.length > 0).toBe(true)
   for (const [, text] of parked) expect(text).toMatch(/"reason":"authentication: token command `fake-token-tool` exited 1: ERROR: refresh failed for \[REDACTED:google-oauth-token\] password=\[REDACTED\]"/)
-  expect(world.statusLines.some(l => (l ?? '').includes('parked after retries'))).toBe(true)
+  // While no credentials work, the status line names the fix, the command by
+  // its program only; the toast and the transcript line carry the reason.
+  expect(world.statusLines.some(l => (l ?? '').startsWith('BQAA: no working Google credentials. To fix, check the token command `fake-token-tool`'))).toBe(true)
+  expect(world.toasts.length).toBe(1)
+  expect(world.transcript.some(l => l.includes('exited 1: ERROR: refresh failed for [REDACTED:google-oauth-token] password=[REDACTED]'))).toBe(true)
   expect(await statusText($)).toMatch(/last backfill \(command, .*stopped: authentication: token command .fake-token-tool. exited 1: .*\[REDACTED/)
   expect(world.logs.some(l => l.startsWith('bqaa backfill:') && l.includes('[REDACTED'))).toBe(true)
 })
@@ -493,7 +500,8 @@ test('BigQuery error text never puts credential text in a file, the status line,
   for (const text of await everySink($, world, [first.text ?? '', second.text ?? ''])) expect(text.includes(SECRET)).toBe(false)
   const [file] = deadLetterFiles(world)
   expect(file?.[1] ?? '').toMatch(/"reason":"invalid: bad value \[REDACTED:google-oauth-token\] password=\[REDACTED\]"/)
-  expect(world.statusLines.some(l => (l ?? '').includes('refused'))).toBe(true)
+  expect(world.statusLines.some(l => (l ?? '').startsWith('BQAA: BigQuery denied the identity access to the dataset.'))).toBe(true)
+  expect(world.transcript.some(l => l.includes('Access Denied: [REDACTED:google-oauth-token] password=[REDACTED]'))).toBe(true)
   expect(await statusText($)).toMatch(/stopped: HTTP 503: backend busy \[REDACTED:google-oauth-token\]/)
   expect(world.logs.some(l => l.startsWith('bqaa backfill:') && l.includes('stopped: HTTP 503'))).toBe(true)
 })
@@ -836,7 +844,7 @@ async function splitReplay(failNewFiles: boolean) {
   const io: Io = {
     now: () => 0,
     after: () => ({ cancel: () => undefined }),
-    fetch: async (_url, init) => ({ status: 200, text: refusal((JSON.parse(init.body) as { rows: unknown[] }).rows.length) }),
+    fetch: async (_url, init) => ({ status: 200, text: refusal((JSON.parse(init.body ?? '{}') as { rows: unknown[] }).rows.length) }),
     runCommand: async () => ({ exitCode: 0, stdout: 'a'.repeat(24), stderr: '' }),
     envToken: async () => undefined,
     readFile: async path => files.get(path) ?? '',

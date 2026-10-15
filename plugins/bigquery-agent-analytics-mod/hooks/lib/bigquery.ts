@@ -15,6 +15,15 @@ export const insertAllUrl = (c: Config): string =>
 
 export const tablesUrl = (c: Config): string => `${API}/projects/${seg(c.project)}/datasets/${seg(c.dataset)}/tables`
 
+// tables.get for the table's id alone: the credential check `block` mode
+// makes before it lets a prompt through. Any answer but a 401 shows that
+// BigQuery accepts the token (a 403 or a 404 is about the table, not it).
+export const tableCheckUrl = (c: Config): string => `${tablesUrl(c)}/${seg(c.table)}?fields=id`
+
+// Google's token information endpoint: names the account a token was issued
+// to. The token goes in a POST body, never in the URL.
+export const TOKEN_INFO_URL = 'https://oauth2.googleapis.com/tokeninfo'
+
 // `insertId` is the row's event_id, so BigQuery can drop a retried row on a
 // best-effort basis; event_id stays in the row for exact dedup in SQL.
 // skipInvalidRows: a bad row is reported alone instead of failing the batch.
@@ -51,8 +60,9 @@ export type InsertOutcome =
   | { kind: 'auth'; message: string }
   // The table (or dataset) does not exist.
   | { kind: 'not-found'; message: string }
-  // Needs the person's action (permissions, bad request, billing).
-  | { kind: 'rejected'; message: string }
+  // Needs the person's action (permissions, bad request, billing);
+  // `permission` when BigQuery denied the identity access.
+  | { kind: 'rejected'; message: string; permission?: true }
 
 const RETRYABLE_REASONS = new Set(['rateLimitExceeded', 'quotaExceeded', 'userRateLimitExceeded', 'backendError', 'internalError', 'timeout', 'stopped'])
 
@@ -109,6 +119,7 @@ export function classifyInsert(answer: HttpAnswer, rowCount: number): InsertOutc
   if (status === 404) return { kind: 'not-found', message }
   if (status === 403 && RETRYABLE_REASONS.has(reason)) return { kind: 'retry', message }
   if (status === 408 || status === 429 || status >= 500) return { kind: 'retry', message }
+  if (status === 403 && (reason === 'accessDenied' || body?.error?.status === 'PERMISSION_DENIED')) return { kind: 'rejected', message, permission: true }
   if (status === 403 || status === 400) return { kind: 'rejected', message }
   return { kind: 'retry', message }
 }

@@ -85,6 +85,28 @@
       "title": "Access token command",
       "description": "Command (no shell) that prints a Google OAuth access token. Empty: BQAA_ACCESS_TOKEN_COMMAND, then gcloud auth application-default print-access-token.",
       "default": ""
+    },
+    "onAuthFailure": {
+      "type": "string",
+      "title": "If credentials fail",
+      "description": "warn: while rows cannot be written for lack of Google credentials or BigQuery permission, a line above the prompt says what to run. block: also refuse prompts while no credentials work (a missing permission only warns).",
+      "options": [
+        "warn",
+        "block"
+      ],
+      "default": "warn"
+    },
+    "userIdFromCredentials": {
+      "type": "boolean",
+      "title": "User id from the token's account",
+      "description": "Personal data, so off by default. On: user_id is the verified email of the account the access token was issued to (from Google's token information endpoint), instead of BQAA_USER_ID or the login name.",
+      "default": false
+    },
+    "recordHostname": {
+      "type": "boolean",
+      "title": "Record the host name",
+      "description": "Personal data, so off by default. On: session_metadata.host_name carries this machine's host name (from the hostname command).",
+      "default": false
     }
   }
 }

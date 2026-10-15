@@ -21,9 +21,22 @@ export type World = {
   commands: string[][]
   statusLines: (string | undefined)[]
   logs: string[]
+  // Of those, the lines meant for the transcript (not the debug log).
+  transcript: string[]
+  toasts: string[]
   steps: StepReply[]
-  // What `$.process.run` (the token command) answers.
+  // What `$.process.run` (the token command) answers, and after how long
+  // on the mock clock.
   processReply: { exitCode: number; stdout: string; stderr: string }
+  processDelayMs: number
+  // What the `hostname` command prints.
+  hostname: string
+  // What the token information endpoint answers (with userIdFromCredentials).
+  tokenInfo: FetchReply
+  // Collector records that reached the stub beneath the mod, as it got them,
+  // and whether that stub refuses them.
+  records: { event: string; attributes: Record<string, unknown> }[]
+  refuseRecords: boolean
   // What `$.session.id()` answers, and whether a policy refuses it.
   sessionId: string
   sessionIdRefused: boolean
@@ -69,6 +82,7 @@ export type Row = {
 }
 
 export const SESSION_ID = '5c4b1d2e-8f7a-4c3b-9d1e-2a6f0b7c8d9e'
+export const TOKEN_INFO_URL = 'https://oauth2.googleapis.com/tokeninfo'
 export const HOME = '/home/dev'
 export const DEAD_LETTER_DIR = `${HOME}/.bqaa-mod/dead-letter`
 // The table OPTIONS point at, and the dead-letter subdirectory its files go to.
@@ -110,8 +124,15 @@ export function setUp(on: On, env: Record<string, string> = {}, store: Record<st
     commands: [],
     statusLines: [],
     logs: [],
+    transcript: [],
+    toasts: [],
     steps: [],
     processReply: { exitCode: 0, stdout: `${ACCESS_TOKEN}\n`, stderr: '' },
+    processDelayMs: 0,
+    hostname: 'devbox-7',
+    tokenInfo: { status: 400, text: '{"error":"invalid_token"}' },
+    records: [],
+    refuseRecords: false,
     sessionId: SESSION_ID,
     sessionIdRefused: false,
     failWrites: false,
@@ -149,15 +170,27 @@ export function setUp(on: On, env: Record<string, string> = {}, store: Record<st
   })
   on('ui.log', ($, e) => {
     world.logs.push(e.text)
+    if (e.to !== 'debug') world.transcript.push(e.text)
     return { value: undefined }
   })
-  on('process.run', ($, e) => {
-    world.commands.push([...e.argv])
-    return { value: { ...world.processReply, isStdoutTruncated: false, isStderrTruncated: false } }
+  on('ui.toast', ($, e) => {
+    world.toasts.push(e.text)
+    return { value: undefined }
   })
+  // What the mods after this one draw in a site this one draws in too.
+  on('ui.render', () => ({ type: 'Text', props: {}, children: ['drawn beneath'] }))
+  on('process.run', async ($, e) => {
+    world.commands.push([...e.argv])
+    const isHostname = e.argv[0] === 'hostname'
+    const printed = isHostname ? { exitCode: 0, stdout: `${world.hostname}\n`, stderr: '' } : world.processReply
+    if (!isHostname && world.processDelayMs > 0) await clock.sleep(world.processDelayMs)
+    return { value: { ...printed, isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+  // The next scripted BigQuery answer; the last one repeats.
+  const nextReply = (): FetchReply => (world.replies.length > 1 ? world.replies.shift() : world.replies[0]) as FetchReply
   on('http.fetch', ($, e) => {
     const headers = { ...((e.init?.headers ?? {}) as Record<string, string>) }
-    const reply = (world.replies.length > 1 ? world.replies.shift() : world.replies[0]) as FetchReply
+    const reply = e.url === TOKEN_INFO_URL ? world.tokenInfo : nextReply()
     const answered = 'reject' in reply ? 'reject' : 'hang' in reply ? 'hang' : reply.status
     world.fetches.push({ url: e.url, method: e.init?.method ?? 'GET', headers, body: String(e.init?.body ?? ''), answered })
     if ('reject' in reply) return { deny: reply.reject }
@@ -196,6 +229,10 @@ export function setUp(on: On, env: Record<string, string> = {}, store: Record<st
   on('prompt.submit', async ($, e) => {
     if (world.promptEntered) await world.promptEntered(e.text)
     return { text: e.text }
+  })
+  on('telemetry.log', { to: 'collector' }, ($, e) => {
+    world.records.push({ event: e.event, attributes: { ...e.attributes } })
+    return world.refuseRecords ? { deny: 'not exported' } : { value: undefined }
   })
   on('classic.SessionStart', () => ({}))
   on('classic.SubagentStart', () => ({}))

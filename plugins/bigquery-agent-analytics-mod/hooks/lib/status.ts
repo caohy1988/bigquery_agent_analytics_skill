@@ -45,6 +45,14 @@ export function formatStatus(args: {
     `requests: ${k.batches} ok, ${k.retries} retried; last success ${ago(now, s.lastSuccessAt)}`,
   ]
   if (s.consecutiveFailures > 0) lines.push(`backing off: ${s.consecutiveFailures} failure(s) in a row, next try in about ${Math.max(0, Math.round((s.pausedUntil - now) / 1000))}s`)
+  if (s.problem) {
+    const { headline, fix } = writer.problemText()
+    lines.push(`notice (since ${ago(now, s.problem.since)}): rows are not being written: ${headline} (${s.problem.reason.slice(0, 200)}); to fix, ${fix}; ${s.waiting} row(s) waiting`)
+  }
+  // No credential word before a colon: the free-text rules would cut the
+  // rest of the line.
+  const identity = [c.userIdFromCredentials ? `user_id from the token's account (${s.identity})` : '', c.recordHostname ? 'host name recorded' : ''].filter(Boolean).join('; ')
+  lines.push(`on credential failure: ${c.onAuthFailure}${identity ? `; ${identity}` : ''}`)
   if (s.lastError) lines.push(`last error (${ago(now, s.lastError.at)}): ${s.lastError.message.slice(0, 300)}`)
   if ('error' in args.deadLetter) lines.push(`dead-letter: ${args.deadLetter.error}`)
   else {

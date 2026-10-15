@@ -39,11 +39,17 @@ host CLI, which lets this one keep a hard rule:
   to a spill file, waiting at most `BQAA_EXIT_FLUSH_MS` (800 ms) inside the
   host's end-of-session bound. That write is the only wait on the disk.
 * If the mod's own code throws, the event goes on as if the mod were not
-  installed (fail open). The five observers the validator lists as gating
+  installed (fail open). The six observers the validator lists as gating
   hooks (`classic.SessionStart`, `classic.SubagentStart`,
-  `classic.PermissionRequest`, `prompt.submit`, `tool.call`) carry a
-  `.catch(($, e, next) => next(e))`; the other hooks run their bookkeeping
-  inside `try` blocks, so it cannot throw into the event.
+  `classic.PermissionRequest`, `prompt.submit`, `telemetry.log`,
+  `tool.call`) carry a `.catch(($, e, next) => next(e))`; the other hooks
+  run their bookkeeping inside `try` blocks, so it cannot throw into the
+  event.
+* One opt-in exception: with `onAuthFailure: block`, `prompt.submit` checks
+  the credentials before a prompt goes in, within its hook budget, and
+  refuses the prompt while none work (see
+  [If no credentials work](#if-no-credentials-work)). That check fails
+  closed, its `.catch` included. In the default `warn` mode nothing waits.
 
 The test suite holds the mod to that: a test makes BigQuery hang forever and
 then runs 25 tool calls through the mod, and a test checks that no hook,
@@ -80,7 +86,7 @@ is what a person would have seen as the CLI hanging.
                                           ▼                ▼
                                        sent          retry with backoff (1 s … 60 s),
                                                      3 retries, then dead-letter
-                                                          │ 401: refresh token, retry
+                                                          │ 401: a fresh token, one retry at once
                                                           │ 404 table: create it, retry
                                                           │ 400/403/invalid row: refused
                                                           ▼
@@ -102,6 +108,20 @@ still in flight can arrive twice; `event_id` dedups it. `/clear` and
 You need the host CLI at v2.1.287 or later (its `--version` flag prints it),
 a BigQuery dataset, and a way to get a Google access token (below). The mod
 creates the table on first write if it is missing.
+
+[`setup.sh`](setup.sh) creates the rest with the `bq` CLI, and is safe to run
+again:
+
+* the dataset, if it is missing;
+* the table, from [`sql/agent_events_ddl.sql`](sql/agent_events_ddl.sql);
+* a views dataset (default `<dataset>_reporting`);
+* the usage views (see [Views](#views)).
+
+```bash
+BQAA_PROJECT_ID=my-gcp-project BQAA_DATASET=agent_analytics ./plugins/bigquery-agent-analytics-mod/setup.sh --dry-run
+```
+
+`--dry-run` prints the commands and the SQL. Without it, they run.
 
 **For one session, from a checkout** (development, or to try it):
 
@@ -154,13 +174,16 @@ the environment variable the tracing plugin already uses, then to a default.
 | `deadLetterDir` | `BQAA_DEAD_LETTER_DIR` | `~/.bqaa-mod/dead-letter` | Where unsent rows are kept, in one subdirectory per table (`project.dataset.table`) |
 | `agentName` | `BQAA_AGENT_NAME` | `coding-agent` | `agent` column for main-loop rows |
 | `accessTokenCommand` | `BQAA_ACCESS_TOKEN_COMMAND` | `gcloud auth application-default print-access-token` | Command (argv, no shell) that prints an access token |
+| `onAuthFailure` | | `warn` | `warn`: while rows cannot be written for lack of credentials or permission, the mod shows a notice above the prompt with the fix. `block`: also refuse prompts while no credentials work. See [If no credentials work](#if-no-credentials-work). |
+| `userIdFromCredentials` | | `false` | Off by default, since it is personal data. When on, `user_id` is the verified email of the access token's account. See [Identity](#identity). |
+| `recordHostname` | | `false` | Off by default, since it is personal data. When on, `session_metadata.host_name` holds the machine's host name. See [Identity](#identity). |
 
 Advanced, environment only:
 
 | Variable | Default | What it does |
 | --- | --- | --- |
 | `BQAA_ACCESS_TOKEN` | unset | Use this token as is (re-read every 5 minutes) instead of running the command |
-| `BQAA_USER_ID` | `$USER` / `$USERNAME` | `user_id` column |
+| `BQAA_USER_ID` | `$USER` / `$USERNAME` | `user_id` column (with `userIdFromCredentials` on, the token's account takes its place once known) |
 | `BQAA_REQUEST_TIMEOUT_MS` | `10000` (1000 to 30000) | Client-side timeout per insertAll request |
 | `BQAA_MAX_QUEUE_ROWS` | `5000` (10 to 100000) | Queue bound in rows (the byte bound is 8 MiB of UTF-8) |
 | `BQAA_EXIT_FLUSH_MS` | `800` (0 to 1200) | How long session end may wait for its spill file to be written; `0` starts the write without waiting |
@@ -178,10 +201,13 @@ cannot use a Google client library. The background writer, never a hook, gets
 one by running `accessTokenCommand` with `$.process.run` (default
 `gcloud auth application-default print-access-token`, so Application Default
 Credentials: run `gcloud auth application-default login` once, or set up
-service-account impersonation for it). The token is kept in memory only,
-reused for 45 minutes, refreshed on a 401, and sent only to
-`bigquery.googleapis.com` (`$.http.fetch` drops the `Authorization` header on
-a cross-origin redirect). `BQAA_ACCESS_TOKEN` skips the command. A
+service-account impersonation for it). The token is kept in memory only and
+reused for 45 minutes. On a 401 the writer gets a fresh token and retries
+once at once. The token goes only to `bigquery.googleapis.com`, and, with
+`userIdFromCredentials` on, to Google's token information endpoint
+(`oauth2.googleapis.com/tokeninfo`) in a POST body. `$.http.fetch` drops the
+`Authorization` header on a cross-origin redirect. `BQAA_ACCESS_TOKEN` skips
+the command. A
 service-account key file cannot be used directly: the mods environment has
 `crypto.subtle.digest` but no signing, so wrap it in a command that prints a
 token. The type declarations mark `$.process.run` as CLI only; where it is
@@ -189,6 +215,86 @@ not available, set `BQAA_ACCESS_TOKEN`.
 
 The identity needs `roles/bigquery.dataEditor` on the dataset (insert rows,
 create the table). The repo's `setup_gcp_prereqs.py` grants it.
+
+### If no credentials work
+
+Rows stop being written when no Google credentials work, or when the identity
+lacks permission on the dataset. That happens when:
+
+* the token command fails (never signed in, or a sign-in expired);
+* BigQuery answers 401 even to a fresh token;
+* BigQuery answers 403 access denied.
+
+While that lasts, the mod shows a notice:
+
+* **The band above the prompt** (terminal and desktop) says what is wrong
+  and the fix for the token source in use, for example `run: gcloud auth
+  application-default login`. For a missing permission it names the role to
+  ask for on which dataset. It also counts the rows waiting: queued, in
+  flight, or parked on disk since the problem began. It keeps what other
+  mods draw there below it, and gives the band up to a survey.
+* **A toast** comes once per kind of problem in a session.
+* **A dim transcript line** comes once per kind of problem, with the reason
+  (redacted). A `-p` or SDK host receives it as `ui_log`.
+* **The status line** shows the same notice.
+* **`/bqaa-status`** adds a `notice` line.
+
+The next successful send clears the notice. Recovery is quick:
+
+* While credentials are the problem, retries come at least every 30
+  seconds.
+* A prompt starts a retry at once, from a timer, so signing in from the
+  session (`! gcloud auth application-default login`) is enough.
+* Rows parked meanwhile follow on their own once BigQuery takes rows again
+  (`BQAA_AUTO_BACKFILL`).
+* Rows refused for a missing permission wait for `/bqaa-backfill`, and the
+  transcript says so when rows flow again.
+
+`onAuthFailure: block` adds enforcement. While no credentials work, each
+prompt is refused before it reaches the model, with the fix as the reason.
+How the check works:
+
+* **It is quick.** It needs no request while a token is at hand and no
+  credentials problem stands. Otherwise it gets a token. While a credentials
+  problem stands, it then asks BigQuery about that token with a `tables.get`
+  of the table's id. Any answer other than 401 counts as working
+  credentials, and clears the notice.
+* **It fits the hook's budget.** It takes at most 8 seconds of the hook's
+  10.
+* **It fails closed.** No token in time refuses, and so does a check that
+  cannot reach BigQuery while a credentials problem stands. If the hook
+  throws before passing the prompt on, its `.catch` refuses too.
+* **A permission problem never blocks**, so that one wrong grant cannot stop
+  every prompt.
+* **Capture off or a dry run blocks nothing.** Capture on with no project
+  or dataset blocks, and the reason says what to set.
+
+`block` is enforcement only where people cannot change the mod's options or
+remove it: install it through managed settings. `BQAA_TRACE_ENABLED=false`
+also turns capture, and so the check, off. The host reads a value other than
+`warn` or `block` in a settings file as `warn`, and says so.
+
+### Identity
+
+Both options are off by default, since each adds personal data to the rows.
+
+* **`userIdFromCredentials`** sets `user_id` to the account the access token
+  was issued to.
+  * The writer looks the account up once per session, at Google's token
+    information endpoint, with the token in a POST body.
+  * It takes the email only if the endpoint says it is verified. A token
+    without the email scope gives none.
+  * A failed lookup is retried after ten minutes; until then rows keep the
+    configured `user_id`.
+  * Once the account is known, every row this process sends or parks
+    carries it. Rows parked by an earlier session are sent as they were.
+  * The address goes to the table, and to rows parked on disk. It never
+    goes to a log line or a command's output.
+* **`recordHostname`** runs the `hostname` command once, from a timer.
+  * Rows built after it answers carry `session_metadata.host_name`, from
+    the first turn on (`INVOCATION_STARTING`).
+  * A name that is not a plain host name is left out.
+  * On macOS the default host name often includes the owner's name.
 
 ## What it writes
 
@@ -203,11 +309,12 @@ create the table). The repo's `setup_gcp_prereqs.py` grants it.
 | `turn.step`, response | `LLM_RESPONSE` | `{"tool_uses": [names], "response": text}` | `model`, `usage_metadata`, `finish_reason`; `latency_ms.total_ms`, `time_to_first_token_ms` |
 | `turn.step`, no response | `LLM_ERROR` (status `ERROR`) | `null` | `latency_ms.total_ms` |
 | `tool.call`, before | `TOOL_STARTING` | `{"tool", "tool_origin", "args"}` | `tool_use_id` |
-| `tool.call`, after | `TOOL_COMPLETED` | `{"tool", "tool_origin", "result"}` | `latency_ms.total_ms`; status `ERROR` with `error_message` for a tool error or a hook's deny (`denied: true`); `permission_requested` |
+| `tool.call`, after | `TOOL_COMPLETED` | `{"tool", "tool_origin", "result"}` | `latency_ms.total_ms`; status `ERROR` with `error_message` for a tool error or a hook's deny (`denied: true`); `permission_requested`; `permission_decision`, `permission_decision_source` |
 | `classic.SubagentStart` | `AGENT_STARTING` | `{"agent_type", "agent_id"}` | `agent` column = subagent type |
 | `turn.complete` (subagent) | `AGENT_COMPLETED` / `AGENT_ERROR` | `{}` | `usage_metadata` (the subagent's totals), `latency_ms.total_ms` |
 | `turn.complete` (main loop) | `AGENT_RESPONSE` (if it answered) and `INVOCATION_COMPLETED` / `INVOCATION_ERROR` | `{"response": answer}` / `{}` | `finish_reason`, `is_aborted`, `step_count`, turn `usage_metadata`, `latency_ms.total_ms` |
 | `classic.PermissionRequest` | (no row) | | sets `permission_requested` on the waiting tool's `TOOL_COMPLETED` |
+| `telemetry.log` (`tool_decision`, a collector record) | (no row) | | sets `permission_decision` (`accept`, `reject`) and `permission_decision_source` (`config`, `hook`, `user_temporary`, `user_permanent`, `user_abort`, `user_reject`) on that call's `TOOL_COMPLETED` |
 | `session.end` | `STATE_DELTA` | `{"session_end": true}` | `state_delta.reason`, `trace_count`, `duration_ms` |
 
 The host can raise `classic.SessionStart` before `session.start` has read
@@ -227,6 +334,19 @@ them (`input_tokens`, `output_tokens`, `cache_read_input_tokens`,
 In `content` and `attributes`, values under keys that are not on the
 allowlist are redacted, inside `args` and `result` too (see
 [Privacy and security](#privacy-and-security)).
+
+The permission decision comes from the host's own `tool_decision`
+collector record. That record reaches mods with no telemetry settings
+(checked live with host 2.1.299), and is matched to its call by
+`tool_use_id`. The mod passes every collector record on unchanged, and
+ignores one that a later hook refuses.
+
+* An accept arrives while its call runs.
+* A rejection arrives just after its call has returned. So once the host's
+  records are arriving, a call that ends without its decision waits up to
+  2 seconds for it. Its row keeps the time the call ended.
+* A call whose decision never comes is written without one. So is one
+  still waiting when the session ends.
 
 A failed tool is `TOOL_COMPLETED` with status `ERROR`, as in the tracing
 plugin and the analysis skill's failure-rate query (ADK itself uses
@@ -323,6 +443,35 @@ One `LLM_RESPONSE` row from it, JSON columns expanded:
 }
 ```
 
+### Views
+
+`setup.sh` makes two views in the views dataset, from the `LLM_RESPONSE`
+rows (the main loop's and the subagents' model requests):
+
+* [`daily_usage_by_model`](sql/views/daily_usage_by_model.sql): per day and
+  model, model requests, sessions and the token counts.
+* [`daily_usage_by_user`](sql/views/daily_usage_by_user.sql): per day and
+  `user_id`, sessions, model requests and the token counts.
+
+Both details below were checked with BigQuery dry runs:
+
+* Each view keeps one row per `(timestamp, event_id)`. A row sent twice has
+  the same `event_id` and timestamp.
+* A filter on `day` still reaches the table's day partitions: a dry run with
+  one day's filter reads 0 bytes of the other days. Deduplicating on
+  `event_id` alone would read the whole table.
+
+The rows carry token counts, not prices, so the views report tokens. Keep
+the views in a dataset of their own, as `setup.sh` does, so the identities
+that write rows need no access to them.
+
+```sql
+SELECT day, model, model_requests, input_tokens, cache_read_input_tokens, output_tokens
+FROM `my-gcp-project.agent_analytics_reporting.daily_usage_by_model`
+WHERE day >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+ORDER BY day, model
+```
+
 ### Queries
 
 [`sql/sample_queries.sql`](sql/sample_queries.sql) has eight, written with
@@ -367,8 +516,10 @@ GROUP BY model
   (a `$.clock.after` timer), under the host's own 30-second cap per
   `$.http.fetch`; the token command has 15 seconds.
 * **Retries:** 408, 429, 5xx, quota 403s, network errors and timeouts back off
-  exponentially (1 s doubling to 60 s, with jitter) and retry a batch up to 3
-  times with the same `insertId`s; a 401 refreshes the token first. A 2xx
+  exponentially (1 s doubling to 60 s, with jitter; at most 30 s while no
+  credentials work) and retry a batch up to 3 times with the same
+  `insertId`s. A 401 gets a fresh token and one retry at once, and only a
+  second 401 counts as a failure. A 2xx
   answer counts as delivered only when it is a valid insertAll response: a
   body cut off at the response limit, a non-JSON page or an `insertErrors`
   entry that names no row of the batch leaves the outcome unknown, so the rows
@@ -427,7 +578,9 @@ never payloads or tokens (the agent reads a command's output too).
 
 When BigQuery refuses rows or retries run out, the mod also sets a status line
 under the prompt (`⚠ bigquery-agent-analytics-mod: …`) until the next
-successful send.
+successful send. While no credentials work or a permission is missing, that
+line, the band above the prompt and `/bqaa-status` give the fix (see
+[If no credentials work](#if-no-credentials-work)).
 
 ## Privacy and security
 
@@ -455,9 +608,11 @@ column. Treat the dataset like the transcripts it mirrors.
     `session_end`, `state_delta`, `source`, `start_source`,
     `permission_mode`, `reason`, `finish_reason`, `is_aborted`, `is_error`,
     `is_read_only`, `denied`, `inferred`, `permission_requested`,
+    `permission_decision`, `permission_decision_source`,
     `submitted_during_turn`, `wait`, `prompt_origin`, `attachments`, `role`,
     `type`, `session_metadata`, `project_name`, `cwd`, `host_version`,
-    `writer`, `plugin`, `version`, `label`, `mode`, and the built-in tools'
+    `host_name`, `writer`, `plugin`, `version`, `label`, `mode`, and the
+    built-in tools'
     `limit`, `offset`, `timeout`, `run_in_background`, `replace_all`,
     `head_limit`, `multiline` and `output_mode`;
   * free text: `text_summary`, `prompt`, `content`, `response`, `result`,
@@ -513,9 +668,10 @@ column. Treat the dataset like the transcripts it mirrors.
 * **Diagnostics:** error text from BigQuery, the token command or the file
   system goes through the same free-text rules before it is cut (including
   where BigQuery's error messages and per-row insert errors are first held to
-  their length), kept or shown: in dead-letter reasons, the status line,
-  `/bqaa-status`, backfill reports, the debug log and the transcript. A
-  failing token command is named by its program only, never its arguments.
+  their length), kept or shown: in dead-letter reasons, the status line, the
+  band above the prompt, toasts, `/bqaa-status`, backfill reports, the debug
+  log and the transcript. A failing token command is named by its program
+  only, never its arguments.
 * **Truncation:** each payload column is held to `maxPayloadChars`,
   error messages to 4,096 characters; the copy is built within that budget, so
   a multi-megabyte tool input costs the hot path milliseconds (a test checks
@@ -526,19 +682,24 @@ column. Treat the dataset like the transcripts it mirrors.
 * **Local files:** dead-letter and dry-run files hold the same redacted rows
   as the table; they are written with your user's default permissions.
 * **Token:** memory only; never written to rows, files, logs or status text.
+* **Identity:** `userIdFromCredentials` and `recordHostname` are off by
+  default. When on, the rows carry the token's account email and the
+  machine's host name (see [Identity](#identity)). `cwd` and `user_id` (the
+  login name by default) are in the rows either way.
 
 ## Testing
 
 ```bash
 claude plugin validate plugins/bigquery-agent-analytics-mod
 cd plugins/bigquery-agent-analytics-mod && claude plugin test
+bash tests/setup.test.sh
 ```
 
 The test command runs the `tests/*.test.ts` files against the host CLI's own
 test kit, with no session, sign-in, GCP or network: `$.http.fetch`,
 `$.process.run`, `$.fs` and `$.store` are stubbed, and `mock.clock` drives the
 timers; the `$.fs` stubs measure files in UTF-8 bytes and refuse a file over
-4 MiB, as the host does. 135 tests cover the captured rows and their spans,
+4 MiB, as the host does. 173 tests cover the captured rows and their spans,
 subagent runs in the order the host raises them (one invocation and one
 trace for the turn, a span per run, a SubagentStart that comes late or never),
 the session-start row raised before or during `session.start`'s setup,
@@ -566,6 +727,38 @@ truncation (identifying fields survive a cut), refused environment reads
 (`BQAA_ACCESS_TOKEN` included), a re-fired `session.start`, and
 configuration.
 
+They also cover what happens when credentials fail:
+
+* the band, drawn through the test kit's `$.ui.mount` (its fix, its count of
+  waiting rows, what other mods draw kept, a survey left alone);
+* one toast and one transcript line, the status line and `/bqaa-status`;
+* the fix for each token source (the default command, gcloud's own account,
+  `BQAA_ACCESS_TOKEN`, another command named by its program only);
+* the notice clearing on the next send;
+* a 401's immediate retry with a fresh token;
+* the role to ask for on a 403;
+* retries at least every 30 s, and a prompt's retry from a timer;
+* `block` refusing without credentials, after a failed re-check and past
+  its time bound, while letting prompts in with a token at hand, on a 403,
+  with capture off and in a dry run.
+
+And the other additions:
+
+* permission decisions: an accept during the call, a rejection after it, a
+  decision that never comes, session end, a record a later hook refuses,
+  odd values, a subagent's call;
+* the identity options: off by default, the lookup sent in a POST body only,
+  an unverified or missing email, a retry after ten minutes, parked and
+  replayed rows, the host name.
+
+`tests/setup.test.sh` runs `setup.sh` against a stand-in `bq` that logs its
+calls. It checks:
+
+* the datasets, table and views it makes, on a first run and on a second;
+* the fallback variables;
+* that a dry run calls nothing;
+* that names which are not plain ones are refused before any call.
+
 ## Limitations
 
 * Mods are early access; the events and `$` methods can change between
@@ -589,9 +782,10 @@ configuration.
   text, thinking or tool chunk.
 * A subagent's span hangs under its turn, not under the `Agent` tool call that
   started it (the events carry no reliable link between the two).
-* No `HITL_*` rows: the host CLI exposes the permission prompt but not a
-  reliable answer to it, and a request row without a completion would read as
-  unanswered.
+* No `HITL_*` rows. The answer to a permission prompt is recorded on
+  `TOOL_COMPLETED` (`permission_decision`, `permission_decision_source`)
+  from the host's `tool_decision` record. A rejection arriving more than
+  2 seconds after its call returned is not recorded.
 * Rows in the in-memory queue are lost if the hooks module reloads (a
   `--plugin-dir` edit, `/reload-plugins`) or the hooks worker crashes:
   at most one flush interval's worth, plus any batch in backoff.
@@ -636,7 +830,14 @@ hooks/lib/bigquery.ts        insertAll / tables.insert requests, answer classifi
 hooks/lib/deadletter.ts      dead-letter file format, files sized in UTF-8 bytes
 hooks/lib/config.ts          options and environment
 hooks/lib/status.ts          /bqaa-status text
+setup.sh                     creates the dataset, table, views dataset and views (bq CLI)
 sql/                         DDL and sample queries
+sql/views/                   the usage views setup.sh makes
 examples/sample-rows.jsonl   fixture output
-tests/                       plugin-test suites
+tests/                       plugin-test suites, and setup.test.sh for setup.sh
 ```
+
+The credential notice, `onAuthFailure`, the identity options, the
+permission decisions, `setup.sh` and the views follow ideas from the
+upstream reference mod (Apache-2.0). They were reimplemented, and no code
+was copied.
