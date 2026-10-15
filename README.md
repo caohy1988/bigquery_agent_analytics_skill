@@ -30,6 +30,25 @@ Analytics `agent_events` format analyzed by this skill.
 See
 `plugins/bigquery-agent-analytics-tracing/README.md` for setup and SDK examples.
 
+## Tracing Mod (coding-agent CLI with mod support, v2.1.287+)
+
+`plugins/bigquery-agent-analytics-mod` writes the same `agent_events` rows from
+inside the host coding-agent CLI as a mod (a JavaScript/TypeScript hooks
+module) instead of settings-hook scripts. Its hooks never wait on BigQuery:
+they queue rows in memory and a background writer streams them with
+`insertAll`, with retries, a local dead-letter directory and `/bqaa-backfill`.
+It also records each model request with its token usage and latency, and
+subagents with their own spans. Use it or the tracing plugin against a table,
+not both.
+
+```bash
+claude plugin install bigquery-agent-analytics-mod@bigquery-agent-analytics-plugin \
+  --config project=my-gcp-project --config dataset=agent_analytics
+```
+
+See `plugins/bigquery-agent-analytics-mod/README.md` for configuration, the
+event mapping, sample rows and queries, and limitations.
+
 ### 2. Install in your AI assistant
 
 **Claude Code** — add to `CLAUDE.md` or copy to `.claude/skills/`:
