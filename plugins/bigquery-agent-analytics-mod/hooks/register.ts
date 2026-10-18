@@ -285,9 +285,18 @@ export const register: Register = (on, registered) => {
         toast: text => $.ui.toast(clean(text, 500), { timeoutMs: 15_000 }),
         notice: text => $.ui.log(clean(text)),
         redraw: () => $.ui.invalidate('ui.render'),
+        // Where setup.sh is, for the fix when BigQuery cannot find the dataset.
+        pluginRoot: $.plugin.root,
       }
       const previous = writer
       writer = new Writer(io, () => config, () => tracer.sessionId)
+      // The host keeps one status line per plugin until it is replaced, a
+      // reload included: this writer starts with none, as it holds no notice.
+      try {
+        $.ui.status(undefined)
+      } catch {
+        // No status line on this surface: nothing to clear.
+      }
       // session.start can fire again without a reload (the plugin was turned
       // off and on): keep what the previous writer still held.
       if (previous) writer.adopt(previous)
@@ -385,15 +394,17 @@ export const register: Register = (on, registered) => {
   }).catch(($, e, next) => next(e))
 
   // The band above the prompt while rows cannot be written for lack of
-  // credentials or permission: what is wrong, the fix, and how many rows
-  // wait. What the mods after this one draw there stays, under this line; a
-  // survey has the band to itself.
+  // credentials or permission, or because BigQuery cannot find the dataset:
+  // what is wrong, the fix (for a missing dataset, the setup.sh command on a
+  // line of its own), and how many rows wait. What the mods after this one
+  // draw there stays, under these lines; a survey has the band to itself.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const theirs = await next(e)
     const current = writer
     const problem = current?.problem ?? null
     if (current === null || problem === null || e.props.hasSurvey) return theirs
     const { headline, fix } = current.problemText()
+    const command = current.setupCommand()
     const { Box, Text } = $.ui.resolve(e)
     const line = Box({
       flexDirection: 'row',
@@ -404,7 +415,8 @@ export const register: Register = (on, registered) => {
         Text({ dimColor: true, children: ` ${current.waitingRows()} row(s) waiting.` }),
       ],
     })
-    return Box({ flexDirection: 'column', children: [line, theirs] })
+    const lines = command === null ? [line] : [line, Text({ dimColor: true, children: clean(`Run: ${command}`, 1000) })]
+    return Box({ flexDirection: 'column', children: [...lines, theirs] })
   })
 
   // Permission decisions, from the host's own collector records: each record

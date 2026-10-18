@@ -9,10 +9,10 @@
 // Every diagnostic is redacted before it is cut, kept, written or shown.
 //
 // While rows cannot be written for lack of working credentials or of
-// permission, the writer holds that problem and shows it: the band above the
-// prompt (drawn in register.ts), a toast and a transcript line once, and the
-// status line, each with the fix and how many rows wait. The next successful
-// send clears it.
+// permission, or because BigQuery cannot find the dataset or table, the
+// writer holds that problem and shows it: the band above the prompt (drawn in
+// register.ts), a toast and a transcript line once, and the status line, each
+// with the fix and how many rows wait. The next successful send clears it.
 
 import { type Config, canDeliver, deadLetterPartition, destinationDir, joinPath, tableRef } from './config.ts'
 import { type HttpAnswer, TOKEN_INFO_URL, classifyInsert, createTableBody, insertAllBody, insertAllUrl, isDatasetMissing, tablesUrl } from './bigquery.ts'
@@ -47,13 +47,19 @@ export type Io = {
   toast?: (text: string) => void
   notice?: (text: string) => void
   redraw?: () => void
+  // The mod's own directory, where setup.sh is: the fix for a dataset
+  // BigQuery cannot find names the script there. Absent, the fix is told
+  // without a command.
+  pluginRoot?: string
 }
 
 // Why rows cannot be written: no working credentials (the token source
-// fails, or BigQuery refuses even a fresh token), or the identity lacks
-// permission on the dataset.
-export type ProblemKind = 'credentials' | 'permission'
-export type Problem = { kind: ProblemKind; reason: string; since: number }
+// fails, or BigQuery refuses even a fresh token), the identity lacks
+// permission on the dataset, or BigQuery cannot find the dataset or table
+// (not made yet, or made so recently that streaming inserts do not see it).
+export type ProblemKind = 'credentials' | 'permission' | 'destination'
+// `missing` says which one BigQuery could not find, for a destination problem.
+export type Problem = { kind: ProblemKind; reason: string; since: number; missing?: 'dataset' | 'table' }
 
 export type Counters = {
   // Rows built and queued.
@@ -97,9 +103,10 @@ export type BackfillReport = {
 const TIMED_OUT = Symbol('timed out')
 const MAX_BATCHES_PER_TICK = 10
 const LEASE_MS = 10 * 60 * 1000
-// While credentials are the problem, a retry comes at least this often, so
-// rows flow again soon after the person signs in.
-const CREDENTIAL_RETRY_CAP_MS = 30_000
+// While credentials or a missing dataset are the problem, a retry comes at
+// least this often, so rows flow again soon after the person signs in or
+// makes the dataset.
+const QUICK_RETRY_CAP_MS = 30_000
 // How long a failed lookup of the credential's account is kept before it is
 // tried again.
 const IDENTITY_RETRY_MS = 10 * 60 * 1000
@@ -125,10 +132,20 @@ const errorLine = (text: string): string => {
 // credential (a key file, a header, a password).
 const programName = (argv: readonly string[]): string => (argv[0] ?? '').split(/[\\/]/).pop() || 'command'
 
-const HEADLINE: Record<ProblemKind, string> = {
+const HEADLINE: Record<Exclude<ProblemKind, 'destination'>, string> = {
   credentials: 'no working Google credentials',
   permission: 'BigQuery denied the identity access to the dataset',
 }
+
+// The names setup.sh takes (it checks them the same way before any call): a
+// command is offered only for these, so nothing in it is read by the shell
+// as anything but the name.
+const PLAIN_PROJECT = /^([a-z0-9.-]+:)?[a-z][-a-z0-9]{4,28}[a-z0-9]$/
+const PLAIN_NAME = /^[A-Za-z0-9_]{1,1024}$/
+const PLAIN_LOCATION = /^[A-Za-z0-9-]+$/
+// A path as one shell word: in single quotes, any single quote in it closed,
+// escaped and reopened.
+const shellQuote = (text: string): string => `'${text.replace(/'/g, `'\\''`)}'`
 
 export class Writer {
   readonly queue: BoundedQueue
@@ -179,6 +196,8 @@ export class Writer {
   problem: Problem | null = null
   // Rows parked on disk while the problem stood (sent once it clears).
   private parkedDuringProblem = 0
+  // Rows refused since rows last landed: the count the status line gives.
+  private refusedSinceSuccess = 0
   // Problem kinds already announced with a toast and a transcript line.
   private announced = new Set<ProblemKind>()
   // Where the last token came from: the fix differs.
@@ -261,6 +280,20 @@ export class Writer {
   private async flushLoop(): Promise<void> {
     // The band's count of waiting rows moves with every tick.
     if (this.problem !== null) this.showProblem()
+    // Nothing queued, and rows this session parked while credentials or a
+    // missing dataset stopped them: no send would tell when the problem is
+    // fixed, so a replay of them does, at the paced retries. Once it lands
+    // rows, the notice clears (`recovered`), in a session left idle too.
+    if (this.queue.length === 0 && this.parkedDuringProblem > 0 && (this.problem?.kind === 'credentials' || this.problem?.kind === 'destination')) {
+      const c = this.config()
+      if (this.pauseTimer !== null || this.closing || !c.autoBackfill || !canDeliver(c) || c.dryRun) return
+      const report = await this.backfill(['spill', 'retry'], 'recovery')
+      if (report.rowsSent === 0) {
+        this.consecutiveFailures += 1
+        this.pause()
+      }
+      return
+    }
     for (let i = 0; i < MAX_BATCHES_PER_TICK; i += 1) {
       const c = this.config()
       if (this.closing || this.queue.length === 0 || !canDeliver(c)) return
@@ -360,12 +393,15 @@ export class Writer {
             return true
           }
         }
-        if (this.tableCreatedAt !== null && this.io.now() - this.tableCreatedAt < 120_000) {
-          // A table created moments ago can take a little while to take rows.
-          await this.retryLater(batch, outcome.message)
-          return false
+        if (this.tableCreatedAt === null || this.io.now() - this.tableCreatedAt >= 120_000) {
+          // Not made yet, or made so recently that streaming inserts do not
+          // see it (minutes, after setup.sh): the person is told how to make
+          // it, and the rows wait as retries, sent on their own once it is
+          // found. A table this writer created moments ago gets the retries
+          // alone.
+          this.noteProblem('destination', outcome.message, isDatasetMissing(outcome.message) ? 'dataset' : 'table')
         }
-        await this.reject(batch, outcome.message)
+        await this.retryLater(batch, outcome.message)
         return false
       }
       case 'rejected':
@@ -382,6 +418,7 @@ export class Writer {
     this.batchOpen = false
     const hadFailures = this.consecutiveFailures > 0
     this.counters.sent += rows
+    if (rows > 0) this.refusedSinceSuccess = 0
     this.counters.batches += 1
     this.consecutiveFailures = 0
     this.resume()
@@ -403,7 +440,8 @@ export class Writer {
   }
 
   private pause(): void {
-    const ms = this.problem?.kind === 'credentials' ? Math.min(CREDENTIAL_RETRY_CAP_MS, this.backoffMs()) : this.backoffMs()
+    const quick = this.problem?.kind === 'credentials' || this.problem?.kind === 'destination'
+    const ms = quick ? Math.min(QUICK_RETRY_CAP_MS, this.backoffMs()) : this.backoffMs()
     this.pauseTimer?.cancel()
     this.pausedUntil = this.io.now() + ms
     this.pauseTimer = this.io.after(ms, () => {
@@ -449,10 +487,11 @@ export class Writer {
     this.pause()
     this.counters.failed += batch.length
     this.counters.rejected += batch.length
+    this.refusedSinceSuccess += batch.length
     this.recordError(reason)
     await this.deadLetter('rejected', batch, reason)
     if (this.problem !== null) this.showProblem()
-    else this.setStatus(`BQAA: ${batch.length} row(s) refused (${reason.slice(0, 80)}); fix, then /bqaa-backfill`)
+    else this.setStatus(`BQAA: ${this.refusedSinceSuccess} row(s) refused (${reason.slice(0, 80)}); fix, then /bqaa-backfill`)
   }
 
   // While BigQuery is unreachable, rows past 80% of the queue go to disk
@@ -484,18 +523,22 @@ export class Writer {
   // Records why rows cannot be written and shows it: the status line and the
   // band now, and the first time each kind comes up, a toast and a
   // transcript line with the reason. Never throws.
-  private noteProblem(kind: ProblemKind, reason: string): void {
+  private noteProblem(kind: ProblemKind, reason: string, missing?: Problem['missing']): void {
     const clean = diagnostic(reason, 300)
     if (this.problem === null || this.problem.kind !== kind) {
-      this.problem = { kind, reason: clean, since: this.io.now() }
+      this.problem = { kind, reason: clean, since: this.io.now(), missing }
       this.parkedDuringProblem = 0
-    } else this.problem.reason = clean
+    } else {
+      this.problem.reason = clean
+      this.problem.missing = missing
+    }
     this.showProblem()
     if (this.announced.has(kind)) return
     this.announced.add(kind)
     const { headline, fix } = this.problemText()
+    const command = this.setupCommand()
     this.call(() => this.io.toast?.(diagnostic(`BQAA: rows are not being written: ${headline}. To fix, ${fix}.`, 500)))
-    this.call(() => this.io.notice?.(diagnostic(`bqaa: rows are not being written: ${headline} (${clean}). To fix, ${fix}; this clears after the next successful send.`, 1000)))
+    this.call(() => this.io.notice?.(diagnostic(`bqaa: rows are not being written: ${headline} (${clean}). To fix, ${fix}${command ? `. Run: ${command}` : ''}; this clears after the next successful send.`, 1000)))
   }
 
   // The next successful send: the problem is gone. Rows refused while
@@ -527,6 +570,11 @@ export class Writer {
     const c = this.config()
     const kind = this.problem?.kind ?? 'credentials'
     if (kind === 'permission') return { headline: HEADLINE.permission, fix: `ask for roles/bigquery.dataEditor on ${c.project}:${c.dataset}, then run /bqaa-backfill` }
+    if (kind === 'destination') {
+      const what = this.problem?.missing === 'table' ? `the table ${c.project}:${c.dataset}.${c.table}` : `the dataset ${c.project}:${c.dataset}`
+      const make = this.setupCommand() === null ? 'create it, or correct the project and dataset options' : "create it with the mod's setup.sh"
+      return { headline: `BigQuery cannot find ${what}`, fix: `${make}; rows wait, and are sent once BigQuery finds it (a few minutes after it is made)` }
+    }
     if (this.tokenSource === 'environment') return { headline: HEADLINE.credentials, fix: 'set a fresh BQAA_ACCESS_TOKEN, or unset it to use the token command' }
     const argv = c.accessTokenCommand
     const program = programName(argv)
@@ -535,6 +583,22 @@ export class Writer {
       return { headline: HEADLINE.credentials, fix: argv.includes('application-default') ? 'run: gcloud auth application-default login' : 'run: gcloud auth login' }
     }
     return { headline: HEADLINE.credentials, fix: `check the token command \`${program}\`` }
+  }
+
+  // For a dataset or table BigQuery cannot find: the command that makes it,
+  // the mod's setup.sh with every name this configuration writes to (so none
+  // falls back to a variable set in the person's shell), or null when the
+  // mod's directory is unknown or not a POSIX path, or a name is one setup.sh
+  // would refuse.
+  setupCommand(): string | null {
+    if (this.problem?.kind !== 'destination') return null
+    const c = this.config()
+    const root = this.io.pluginRoot
+    if (root === undefined || !root.startsWith('/')) return null
+    // setup.sh also makes `<dataset>_reporting` for its views, held to the same rule.
+    const names = [c.dataset, `${c.dataset}_reporting`, c.table]
+    if (!PLAIN_PROJECT.test(c.project) || !names.every(name => PLAIN_NAME.test(name)) || !PLAIN_LOCATION.test(c.location)) return null
+    return `BQAA_PROJECT_ID=${c.project} BQAA_DATASET=${c.dataset} BQAA_TABLE=${c.table} BQAA_LOCATION=${c.location} ${shellQuote(joinPath(root, 'setup.sh'))}`
   }
 
   // Rows that wait for the problem to clear: queued, in flight, and parked
@@ -906,7 +970,20 @@ export class Writer {
         }
       }
     }
+    if (report.rowsSent > 0) this.recovered(trigger)
     return finish()
+  }
+
+  // A replay landed rows: what stopped rows is gone, as after a send. The
+  // command's replay sent the refused rows too, so none is left to name.
+  private recovered(trigger: BackfillReport['trigger']): void {
+    this.consecutiveFailures = 0
+    this.refusedSinceSuccess = 0
+    this.resume()
+    this.lastSuccessAt = this.io.now()
+    if (trigger === 'command') this.parkedDuringProblem = 0
+    this.clearProblem()
+    this.setStatus(undefined)
   }
 
   private async backfillFile(dir: string, name: string, file: ParsedFile, c: Config, report: BackfillReport): Promise<void> {

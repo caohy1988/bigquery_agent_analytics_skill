@@ -48,6 +48,8 @@ export function formatStatus(args: {
   if (s.problem) {
     const { headline, fix } = writer.problemText()
     lines.push(`notice (since ${ago(now, s.problem.since)}): rows are not being written: ${headline} (${s.problem.reason.slice(0, 200)}); to fix, ${fix}; ${s.waiting} row(s) waiting`)
+    const command = writer.setupCommand()
+    if (command !== null) lines.push(`setup: ${command}`)
   }
   // No credential word before a colon: the free-text rules would cut the
   // rest of the line.

@@ -15,11 +15,15 @@ so the [analysis skill](../../bigquery-agent-analytics-skill) and its queries
 work on what it writes.
 
 Status: early. Mods are an early-access feature of the host CLI (v2.1.287 or
-later); this mod was built against **v2.1.296** and is tested with 2.1.296
-and 2.1.299. Its writer is tested against a scripted BigQuery API (see
+later); this mod was built against **v2.1.296** and is tested with 2.1.296,
+2.1.299 and 2.1.302. Its writer is tested against a scripted BigQuery API (see
 [Testing](#testing)). It has also run live: a real session (host 2.1.299)
 wrote its 14 rows to a test dataset, the last of them through a spill file
-that the next session replayed, and the rows were read back with `bq`.
+that the next session replayed, and the rows were read back with `bq`. On
+2.1.302, installed from GitHub, sessions with tool calls, a subagent and a
+permission prompt were read back the same way, as was a session started
+before its dataset existed: its rows waited, then landed on their own once
+`setup.sh` had made the dataset.
 
 ## Why a mod, and not settings hooks
 
@@ -50,7 +54,7 @@ host CLI, which lets this one keep a hard rule:
 * `prompt.submit` passes every prompt on, first and as it came, whatever
   the credentials do: no prompt waits on a token or on BigQuery. While rows
   cannot be written, a notice says so (see
-  [If no credentials work](#if-no-credentials-work)).
+  [If rows cannot be written](#if-rows-cannot-be-written)).
 
 The test suite holds the mod to that: a test makes BigQuery hang forever and
 then runs 25 tool calls through the mod, and a test checks that no hook,
@@ -89,6 +93,8 @@ is what a person would have seen as the CLI hanging.
                                                      3 retries, then dead-letter
                                                           │ 401: a fresh token, one retry at once
                                                           │ 404 table: create it, retry
+                                                          │ 404 still (no dataset, or too new):
+                                                          │   notice with the setup.sh command, retry
                                                           │ 400/403/invalid row: refused
                                                           ▼
                      $.fs.write  <deadLetterDir>/<project.dataset.table>/{spill,retry,rejected}-*.jsonl
@@ -107,8 +113,46 @@ still in flight can arrive twice; `event_id` dedups it. `/clear` and
 ## Install
 
 You need the host CLI at v2.1.287 or later (its `--version` flag prints it),
-a BigQuery dataset, and a way to get a Google access token (below). The mod
-creates the table on first write if it is missing.
+a BigQuery dataset (below), and a way to get a Google access token (see
+[Authentication](#authentication)). The mod creates the table on first write
+if it is missing.
+
+From GitHub (`--marketplace` needs v2.1.292 or later):
+
+```bash
+claude plugin install bigquery-agent-analytics-mod \
+  --marketplace haiyuan-eng-google/bigquery_agent_analytics_skill \
+  --config project=my-gcp-project --config dataset=agent_analytics
+```
+
+If this repository's marketplace was added from a clone before (the
+settings-hook tracing plugin's guide adds it that way), that command stops:
+the marketplace's "source doesn't match its extraKnownMarketplaces entry".
+Install from the clone instead, once it is up to date:
+
+```bash
+git -C path/to/your/clone pull
+claude plugin marketplace update bigquery-agent-analytics-plugin
+claude plugin install bigquery-agent-analytics-mod@bigquery-agent-analytics-plugin \
+  --config project=my-gcp-project --config dataset=agent_analytics
+```
+
+Inside a session, `/plugin install bigquery-agent-analytics-mod@bigquery-agent-analytics-plugin`
+does the same and opens the configuration dialog. If you install or update it
+from your shell while a session is open, run `/reload-plugins` there. Run
+`/plugin` and look for `1 mod active · bigquery-agent-analytics-mod` under the tabs.
+
+**For one session, from a checkout** (development, or to try it):
+
+```bash
+export BQAA_PROJECT_ID=my-gcp-project BQAA_DATASET=agent_analytics
+claude --plugin-dir ./plugins/bigquery-agent-analytics-mod
+```
+
+Use this mod **or** the settings-hook tracing plugin against a table, not both:
+with both enabled every event is written twice.
+
+### The dataset
 
 [`setup.sh`](setup.sh) creates the rest with the `bq` CLI, and is safe to run
 again:
@@ -124,37 +168,14 @@ BQAA_PROJECT_ID=my-gcp-project BQAA_DATASET=agent_analytics ./plugins/bigquery-a
 
 `--dry-run` prints the commands and the SQL. Without it, they run.
 
-**For one session, from a checkout** (development, or to try it):
-
-```bash
-export BQAA_PROJECT_ID=my-gcp-project BQAA_DATASET=agent_analytics
-claude --plugin-dir ./plugins/bigquery-agent-analytics-mod
-```
-
-**From this repository's marketplace.** The mod is on the `coding-agent-mod`
-branch until its PR merges; from a clone of that branch:
-
-```bash
-claude plugin marketplace add ./
-claude plugin install bigquery-agent-analytics-mod@bigquery-agent-analytics-plugin \
-  --config project=my-gcp-project --config dataset=agent_analytics
-```
-
-Once merged, from GitHub (`--marketplace` needs v2.1.292 or later):
-
-```bash
-claude plugin install bigquery-agent-analytics-mod \
-  --marketplace haiyuan-eng-google/bigquery_agent_analytics_skill \
-  --config project=my-gcp-project --config dataset=agent_analytics
-```
-
-Inside a session, `/plugin install bigquery-agent-analytics-mod@bigquery-agent-analytics-plugin`
-does the same and opens the configuration dialog. If you install or update it
-from your shell while a session is open, run `/reload-plugins` there. Run
-`/plugin` and look for `1 mod active · bigquery-agent-analytics-mod` under the tabs.
-
-Use this mod **or** the settings-hook tracing plugin against a table, not both:
-with both enabled every event is written twice.
+`setup.sh` ships with the mod. Installed from a marketplace, it is in the
+mod's own directory, not a checkout: start a session, and while BigQuery
+cannot find the dataset the mod prints the whole command, with your project,
+dataset, table and location and the script's path (see
+[If rows cannot be written](#if-rows-cannot-be-written)). The rows of that
+session wait for it. A dataset or table made moments ago can still answer
+"Not found" to streaming inserts for a few minutes; rows wait through that
+too, and land on their own.
 
 ## Configure
 
@@ -216,37 +237,52 @@ not available, set `BQAA_ACCESS_TOKEN`.
 The identity needs `roles/bigquery.dataEditor` on the dataset (insert rows,
 create the table). The repo's `setup_gcp_prereqs.py` grants it.
 
-### If no credentials work
+### If rows cannot be written
 
-Rows stop being written when no Google credentials work, or when the identity
-lacks permission on the dataset. That happens when:
+Rows stop being written when no Google credentials work, when the identity
+lacks permission on the dataset, or when BigQuery cannot find the dataset or
+table. That happens when:
 
 * the token command fails (never signed in, or a sign-in expired);
 * BigQuery answers 401 even to a fresh token;
-* BigQuery answers 403 access denied.
+* BigQuery answers 403 access denied;
+* insertAll answers 404 for the dataset (not made yet, say the mod was
+  installed before `setup.sh` ran, or a name is wrong), or for a table the
+  mod may not create (`BQAA_AUTO_CREATE_TABLE=false`) or still does not see
+  two minutes after creating it. Streaming inserts can miss a dataset or
+  table made minutes ago, so this also comes up just after `setup.sh`.
 
 While that lasts, the mod shows a notice:
 
 * **The band above the prompt** (terminal and desktop) says what is wrong
   and the fix for the token source in use, for example `run: gcloud auth
   application-default login`. For a missing permission it names the role to
-  ask for on which dataset. It also counts the rows waiting: queued, in
-  flight, or parked on disk since the problem began. It keeps what other
-  mods draw there below it, and gives the band up to a survey.
+  ask for on which dataset. For a dataset or table BigQuery cannot find, a
+  second line gives the `setup.sh` command: your project, dataset, table and
+  location, then the script in the mod's directory, quoted as one shell word.
+  It is offered only for names `setup.sh` takes and a POSIX path; otherwise
+  the fix says to create it or correct the options. The band also counts the
+  rows waiting: queued, in flight, or parked on disk since the problem began.
+  It keeps what other mods draw there below it, and gives the band up to a
+  survey.
 * **A toast** comes once per kind of problem in a session.
 * **A dim transcript line** comes once per kind of problem, with the reason
-  (redacted). A `-p` or SDK host receives it as `ui_log`.
+  (redacted) and, for a missing dataset, the command. A `-p` or SDK host
+  receives it as `ui_log`.
 * **The status line** shows the same notice.
-* **`/bqaa-status`** adds a `notice` line.
+* **`/bqaa-status`** adds a `notice` line, and for a missing dataset a
+  `setup` line with the command.
 
 The next successful send clears the notice. Recovery is quick:
 
-* While credentials are the problem, retries come at least every 30
-  seconds.
+* While credentials or a missing dataset are the problem, retries come at
+  least every 30 seconds.
 * A prompt starts a retry at once, from a timer, so signing in from the
   session (`! gcloud auth application-default login`) is enough.
 * Rows parked meanwhile follow on their own once BigQuery takes rows again
-  (`BQAA_AUTO_BACKFILL`).
+  (`BQAA_AUTO_BACKFILL`). With nothing new queued (a session left idle),
+  the retries replay the rows this session parked, so they land and the
+  notice clears without a prompt.
 * Rows refused for a missing permission wait for `/bqaa-backfill`, and the
   transcript says so when rows flow again.
 
@@ -448,6 +484,9 @@ requests, sessions and tokens always count the same rows.
 * [`daily_usage_by_user`](sql/views/daily_usage_by_user.sql): per day and
   `user_id`, sessions, model requests and the token counts.
 
+`day` is the UTC date of each request (`DATE(timestamp)`): in the evening
+west of Greenwich, today's requests are under tomorrow's date.
+
 The details below were checked on BigQuery itself:
 
 * Each view keeps one row per `(timestamp, event_id)`. A row sent twice has
@@ -513,18 +552,20 @@ GROUP BY model
 * **Timeouts:** each insertAll is raced against `BQAA_REQUEST_TIMEOUT_MS`
   (a `$.clock.after` timer), under the host's own 30-second cap per
   `$.http.fetch`; the token command has 15 seconds.
-* **Retries:** 408, 429, 5xx, quota 403s, network errors and timeouts back off
-  exponentially (1 s doubling to 60 s, with jitter; at most 30 s while no
-  credentials work) and retry a batch up to 3 times with the same
+* **Retries:** 408, 429, 5xx, quota 403s, network errors, timeouts and a 404
+  for a dataset or table BigQuery cannot find back off exponentially (1 s
+  doubling to 60 s, with jitter; at most 30 s while no credentials work or
+  the dataset cannot be found) and retry a batch up to 3 times with the same
   `insertId`s. A 401 gets a fresh token and one retry at once, and only a
   second 401 counts as a failure. A 2xx
   answer counts as delivered only when it is a valid insertAll response: a
   body cut off at the response limit, a non-JSON page or an `insertErrors`
   entry that names no row of the batch leaves the outcome unknown, so the rows
   are retried the same way and parked if the retries run out.
-* **Dead letter:** rows that exhaust retries go to `retry-*.jsonl`; rows
-  BigQuery or the configuration refuses (400, 403 access denied, missing
-  dataset, an invalid row reported by insertAll) go to `rejected-*.jsonl`;
+* **Dead letter:** rows that exhaust retries go to `retry-*.jsonl`, rows
+  waiting for a dataset or table BigQuery cannot find included; rows
+  BigQuery or the configuration refuses (400, 403 access denied, an invalid
+  row reported by insertAll) go to `rejected-*.jsonl`;
   rows queued at exit go to `spill-*.jsonl`. Each line keeps the full row,
   the reason (redacted), the attempt count and the table it was meant for.
   Each file ends with a completion record, written after its rows: how many
@@ -539,7 +580,9 @@ GROUP BY model
   line for another table is kept as written, and rows parked for another
   table are sent only by a session configured for that table. `spill` and
   `retry` files are also replayed 15 seconds after a session starts and once
-  BigQuery recovers in a session that parked rows. A replay reads a file
+  BigQuery recovers in a session that parked rows, and at the paced retries
+  while credentials or a missing dataset stop rows and none is queued. A
+  replay that lands rows clears the notice, as a send does. A replay reads a file
   only when its completion record is there and matches every line above it:
   the API's writes are not atomic, so another session can read a file
   part-written, and the record is what marks a file whole. A file without a
@@ -567,6 +610,8 @@ never payloads or tokens (the agent reads a command's output too).
 
 * `/bqaa-status`: target table, queue depth, rows captured / sent /
   dead-lettered / refused / spilled / dropped this session, retries, backoff,
+  the notice if rows cannot be written (with the `setup.sh` command when
+  BigQuery cannot find the dataset),
   the last error (redacted), the configured table's dead-letter files, how
   many files elsewhere in the directory belong to other tables, any file too
   large to read or without a completion record, the last backfill.
@@ -576,9 +621,12 @@ never payloads or tokens (the agent reads a command's output too).
 
 When BigQuery refuses rows or retries run out, the mod also sets a status line
 under the prompt (`⚠ bigquery-agent-analytics-mod: …`) until the next
-successful send. While no credentials work or a permission is missing, that
-line, the band above the prompt and `/bqaa-status` give the fix (see
-[If no credentials work](#if-no-credentials-work)).
+successful send; its count of refused rows covers every row refused since
+rows last landed. While no credentials work, a permission is missing or
+BigQuery cannot find the dataset, that line, the band above the prompt and
+`/bqaa-status` give the fix (see
+[If rows cannot be written](#if-rows-cannot-be-written)). The host keeps a
+status line across a reload of the mod; the reloaded mod clears it.
 
 ## Privacy and security
 
@@ -698,7 +746,7 @@ The test command runs the `tests/*.test.ts` files against the host CLI's own
 test kit, with no session, sign-in, GCP or network: `$.http.fetch`,
 `$.process.run`, `$.fs` and `$.store` are stubbed, and `mock.clock` drives the
 timers; the `$.fs` stubs measure files in UTF-8 bytes and refuse a file over
-4 MiB, as the host does. 176 tests cover the captured rows and their spans,
+4 MiB, as the host does. 189 tests cover the captured rows and their spans,
 subagent runs in the order the host raises them (one invocation and one
 trace for the turn, a span per run, a SubagentStart that comes late or never),
 the session-start row raised before or during `session.start`'s setup,
@@ -733,7 +781,8 @@ They also cover what happens when credentials fail:
 * one toast and one transcript line, the status line and `/bqaa-status`;
 * the fix for each token source (the default command, gcloud's own account,
   `BQAA_ACCESS_TOKEN`, another command named by its program only);
-* the notice clearing on the next send;
+* the notice clearing on the next send, and, with nothing new queued, the
+  rows parked meanwhile replayed by the retries once a sign-in works;
 * a 401's immediate retry with a fresh token;
 * the role to ask for on a 403;
 * retries at least every 30 s, and a prompt's retry from a timer;
@@ -742,6 +791,22 @@ They also cover what happens when credentials fail:
   credentials, or either never answering. Each of those tests runs with a
   leftover `onAuthFailure: block` from an earlier version's settings, which
   nothing reads now.
+
+And when BigQuery cannot find the dataset or table:
+
+* the band, toast, transcript line, status line and `/bqaa-status`, with the
+  `setup.sh` command;
+* the command's path as one shell word (a quote in it included), and no
+  command for a name `setup.sh` would refuse (its views dataset too) or a
+  directory that is not a POSIX path;
+* rows retried, and parked as retries, never refused;
+* every row landing once it is found, with new rows or with none (a session
+  left idle), and a prompt's retry from a timer;
+* retries at least every 30 s;
+* a table the mod made that BigQuery still cannot find after two minutes,
+  and table creation turned off;
+* a reload clearing the status line the previous load set, and the refused
+  count on the status line covering every row since rows last landed.
 
 And the other additions:
 
@@ -783,7 +848,7 @@ the same views count other producers' requests but not their tokens.
 ## Limitations
 
 * Mods are early access; the events and `$` methods can change between
-  host CLI releases. Tested with 2.1.296 and 2.1.299.
+  host CLI releases. Tested with 2.1.296, 2.1.299 and 2.1.302.
 * A subagent's run is told from a main-loop turn by the loop id its
   `turn.start` carries (`agentId`, in the host's type declarations from
   2.1.299). A host that raised `turn.start` for a subagent without it would

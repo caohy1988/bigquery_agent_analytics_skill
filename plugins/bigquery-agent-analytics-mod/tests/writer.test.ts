@@ -197,15 +197,17 @@ test('a missing table is created with the BQAA schema, then written', { options:
   expect(world.acceptedRows().length).toBe(1)
 })
 
-test('a missing dataset is not created: the rows are refused and parked', { options: OPTIONS }, async ($, on) => {
+// The notice and the replay once it is found: destination.test.ts.
+test('a missing dataset is not created: the rows wait as retries, none refused', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on)
   world.replies = [DATASET_MISSING]
   await startSession($)
   await world.clock.advance(5000)
   expect(world.fetches.length).toBe(1)
-  const [file] = deadLetterFiles(world)
-  expect(file?.[0].startsWith(`${PARTITION_DIR}/rejected-`)).toBe(true)
-  expect(await statusText($)).toMatch(/1 refused/)
+  expect(deadLetterFiles(world).length).toBe(0)
+  const status = await statusText($)
+  expect(status).toMatch(/queue: 1 rows/)
+  expect(status).toMatch(/\(0 refused\)/)
 })
 
 test('a permission error parks rows as refused; /bqaa-backfill sends them once fixed', { options: OPTIONS }, async ($, on) => {

@@ -97,6 +97,24 @@ test('the notice clears on the next successful send, and the rows go out', { opt
   expect(await statusText($)).not.toMatch(/notice/)
 })
 
+test('signed in again with nothing new to send, the rows parked meanwhile go out on their own, and the notice clears', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  const working = world.processReply
+  world.processReply = GCLOUD_FAILS
+  await startSession($)
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
+  // Until every row is parked and none is queued: a session left idle.
+  for (let t = 0; t < 30 && !/queue: 0 rows/.test(await statusText($)); t += 1) await world.clock.advance(5000)
+  expect(await statusText($)).toMatch(/queue: 0 rows/)
+  expect((await band($)).waiting).toBe(' 3 row(s) waiting.')
+  // Signed in from another terminal; no prompt follows.
+  world.processReply = working
+  for (let t = 0; t < 8; t += 1) await world.clock.advance(5000)
+  expect(world.acceptedRows().length).toBe(3)
+  expect((await band($)).line).toBeUndefined()
+  expect(world.statusLines.at(-1)).toBeUndefined()
+})
+
 test('the band yields to a survey, and keeps what the mods after it draw', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on)
   world.processReply = GCLOUD_FAILS
