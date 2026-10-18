@@ -39,9 +39,10 @@ const INVALID = { status: 400, text: '{"error":{"code":400,"message":"Invalid va
 const HEADLINE = 'BigQuery cannot find the dataset my-gcp-project:agent_analytics'
 const FIX = "create it with the mod's setup.sh; rows wait, and are sent once BigQuery finds it (a few minutes after it is made)"
 const LINE = `rows are not being written: ${HEADLINE}. To fix, ${FIX}.`
-// Every setting setup.sh reads, then the script in the mod's own directory,
+// Every name setup.sh reads, the views dataset included, so none comes from
+// the shell it runs in; then bash and the script in the mod's own directory,
 // quoted as one shell word.
-const SETUP = /^BQAA_PROJECT_ID=my-gcp-project BQAA_DATASET=agent_analytics BQAA_TABLE=agent_events BQAA_LOCATION=US '\/[^']*\/setup\.sh'$/
+const SETUP = /^BQAA_PROJECT_ID=my-gcp-project BQAA_DATASET=agent_analytics BQAA_TABLE=agent_events BQAA_VIEWS_DATASET=agent_analytics_reporting BQAA_LOCATION=US bash '\/[^']*\/setup\.sh'$/
 const PROMPT = { text: 'hi', wait: false, origin: { kind: 'composer' } } as const
 
 const statusText = async ($: Engine): Promise<string> => (await $.command.run({ command: 'bqaa-status', args: '', ...COMMAND })).text ?? ''
@@ -79,7 +80,7 @@ test('a dataset BigQuery cannot find is a notice with the setup.sh command, not 
   expect(world.statusLines.at(-1)).toBe(`BQAA: ${HEADLINE}. To fix, ${FIX} (3 row(s) waiting)`)
   const [notice = ''] = noticeLines(world)
   expect(notice).toContain(`${HEADLINE} (HTTP 404: Not found: Dataset my-gcp-project:agent_analytics). To fix, ${FIX}. Run: BQAA_PROJECT_ID=my-gcp-project `)
-  expect(notice.endsWith("/setup.sh'; this clears after the next successful send.")).toBe(true)
+  expect(notice.endsWith("/setup.sh'; this clears once rows are written again.")).toBe(true)
   const status = await statusText($)
   expect(status).toContain(`rows are not being written: ${HEADLINE} (HTTP 404: Not found: Dataset my-gcp-project:agent_analytics); to fix, ${FIX}; 3 row(s) waiting`)
   expect((status.split('\n').find(l => l.startsWith('setup: ')) ?? '').replace(/^setup: /, '')).toMatch(SETUP)
@@ -274,7 +275,7 @@ test('a table the mod made that BigQuery still cannot find after two minutes is 
   await w.writer.flush()
   expect(w.writer.problem).toMatchObject({ kind: 'destination', missing: 'table' })
   expect(w.writer.problemText().headline).toBe('BigQuery cannot find the table my-gcp-project:agent_analytics.agent_events')
-  expect(w.writer.setupCommand()).toBe("BQAA_PROJECT_ID=my-gcp-project BQAA_DATASET=agent_analytics BQAA_TABLE=agent_events BQAA_LOCATION=US '/opt/mods/bigquery-agent-analytics-mod/setup.sh'")
+  expect(w.writer.setupCommand()).toBe("BQAA_PROJECT_ID=my-gcp-project BQAA_DATASET=agent_analytics BQAA_TABLE=agent_events BQAA_VIEWS_DATASET=agent_analytics_reporting BQAA_LOCATION=US bash '/opt/mods/bigquery-agent-analytics-mod/setup.sh'")
   // Rows past their retries are parked as retries; the table is made once.
   for (let i = 0; i < 4; i += 1) {
     w.advance(31_000)
@@ -285,11 +286,43 @@ test('a table the mod made that BigQuery still cannot find after two minutes is 
   expect(w.urls.filter(u => u.endsWith('/tables')).length).toBe(1)
 })
 
-test("the setup.sh path is one shell word, a quote in it included; a directory that is not a POSIX path gets no command", async () => {
+test('a table the mod made that a replay still cannot find after two minutes is the notice too, with nothing new queued; its rows go once it is found', async () => {
+  const answers = [TABLE_MISSING, TABLE_CREATED, TABLE_MISSING]
+  const w = handBuilt(answers, '/opt/mods/bigquery-agent-analytics-mod')
+  w.enqueue()
+  // The row's retries run out while the table is new: parked, no notice.
+  for (let i = 0; i < 8; i += 1) {
+    w.advance(5000)
+    await w.writer.flush()
+  }
+  expect(w.writer.queue.length).toBe(0)
+  expect(w.parkedKinds()).toEqual(['retry'])
+  expect(w.writer.problem).toBeNull()
+  // Two minutes on, the paced replay still gets a 404.
+  for (let i = 0; i < 4; i += 1) {
+    w.advance(31_000)
+    await w.writer.flush()
+  }
+  expect(w.writer.problem).toMatchObject({ kind: 'destination', missing: 'table' })
+  answers.splice(0, answers.length, OK_INSERT)
+  for (let i = 0; i < 4; i += 1) {
+    w.advance(31_000)
+    await w.writer.flush()
+  }
+  expect(w.parkedKinds()).toEqual([])
+  expect(w.writer.problem).toBeNull()
+})
+
+test("the setup.sh path is one shell word, a quote or a closing backslash in it included; a directory that is not a POSIX path gets no command", async () => {
   const quoted = handBuilt([DATASET_MISSING], "/home/o'brien/my mods/bigquery-agent-analytics-mod")
   quoted.enqueue()
   await quoted.writer.flush()
-  expect(quoted.writer.setupCommand()).toBe("BQAA_PROJECT_ID=my-gcp-project BQAA_DATASET=agent_analytics BQAA_TABLE=agent_events BQAA_LOCATION=US '/home/o'\\''brien/my mods/bigquery-agent-analytics-mod/setup.sh'")
+  expect(quoted.writer.setupCommand()).toBe("BQAA_PROJECT_ID=my-gcp-project BQAA_DATASET=agent_analytics BQAA_TABLE=agent_events BQAA_VIEWS_DATASET=agent_analytics_reporting BQAA_LOCATION=US bash '/home/o'\\''brien/my mods/bigquery-agent-analytics-mod/setup.sh'")
+  // On a POSIX path a backslash is part of the directory's name, not a separator.
+  const backslash = handBuilt([DATASET_MISSING], '/opt/mods\\')
+  backslash.enqueue()
+  await backslash.writer.flush()
+  expect(backslash.writer.setupCommand()).toBe("BQAA_PROJECT_ID=my-gcp-project BQAA_DATASET=agent_analytics BQAA_TABLE=agent_events BQAA_VIEWS_DATASET=agent_analytics_reporting BQAA_LOCATION=US bash '/opt/mods\\/setup.sh'")
   const windows = handBuilt([DATASET_MISSING], 'C:\\mods\\bigquery-agent-analytics-mod')
   windows.enqueue()
   await windows.writer.flush()
@@ -318,8 +351,25 @@ test("a dataset whose views dataset setup.sh would refuse gets no command", { op
   world.replies = [DATASET_MISSING]
   await startSession($)
   await world.clock.advance(5000)
-  expect((await band($)).run).toBeUndefined()
+  const shown = await band($)
+  expect((shown.line ?? '').startsWith(`rows are not being written: BigQuery cannot find the dataset my-gcp-project:${'d'.repeat(100)}`)).toBe(true)
+  expect(shown.run).toBeUndefined()
   expect(await statusText($)).not.toMatch(/setup:/)
+})
+
+test('a dataset that turns up with a table that refuses the rows: the notice clears, and the status line says they were refused', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  world.replies = [DATASET_MISSING]
+  await startSession($)
+  await world.clock.advance(5000)
+  expect((await band($)).line).toBe(LINE)
+  // BigQuery answers 400 now: it found the table, and the rows are refused
+  // for a reason of their own.
+  world.replies = [INVALID]
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
+  for (let t = 0; t < 6; t += 1) await world.clock.advance(5000)
+  expect((await band($)).line).toBeUndefined()
+  expect(world.statusLines.at(-1) ?? '').toMatch(/^BQAA: \d+ row\(s\) refused \(HTTP 400: Invalid value for the table schema\); fix, then \/bqaa-backfill$/)
 })
 
 test('the status line counts every row refused since rows last landed', { options: OPTIONS }, async ($, on) => {

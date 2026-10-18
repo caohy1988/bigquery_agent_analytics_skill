@@ -114,6 +114,9 @@ export const kindOf = (name: string): DeadLetterKind | null => {
   return m ? (m[1] as DeadLetterKind) : null
 }
 
+// Whether a line's own `kind` names one.
+export const isDeadLetterKind = (value: unknown): value is DeadLetterKind => value === 'spill' || value === 'retry' || value === 'rejected'
+
 // `raw[i]` is the text `lines[i]` was read from, so a line can be kept
 // exactly as written. `complete`: the file ends with a completion record that
 // matches every line above it. A file still being written, or left by a

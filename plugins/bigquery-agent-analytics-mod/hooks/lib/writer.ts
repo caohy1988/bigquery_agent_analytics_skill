@@ -12,11 +12,12 @@
 // permission, or because BigQuery cannot find the dataset or table, the
 // writer holds that problem and shows it: the band above the prompt (drawn in
 // register.ts), a toast and a transcript line once, and the status line, each
-// with the fix and how many rows wait. The next successful send clears it.
+// with the fix and how many rows wait. The next send or replay BigQuery
+// takes clears it.
 
 import { type Config, canDeliver, deadLetterPartition, destinationDir, joinPath, tableRef } from './config.ts'
 import { type HttpAnswer, TOKEN_INFO_URL, classifyInsert, createTableBody, insertAllBody, insertAllUrl, isDatasetMissing, tablesUrl } from './bigquery.ts'
-import { type DeadLetterKind, type DeadLetterLine, HOST_FILE_BYTES, MAX_FILE_BYTES, type ParsedFile, fileName, kindOf, lineText, packBodies, packFiles, packLines, parseFile, sealFile } from './deadletter.ts'
+import { type DeadLetterKind, type DeadLetterLine, HOST_FILE_BYTES, MAX_FILE_BYTES, type ParsedFile, fileName, isDeadLetterKind, kindOf, lineText, packBodies, packFiles, packLines, parseFile, sealFile } from './deadletter.ts'
 import { BoundedQueue, type Queued } from './queue.ts'
 import { type BqaaRow, fitRow, rowBytes } from './rows.ts'
 import { redactDiagnostic } from './sanitize.ts'
@@ -88,6 +89,9 @@ export type BackfillReport = {
   files: number
   rowsSent: number
   rowsLeft: number
+  // Of rowsLeft, rows BigQuery refused on this replay: moved to `rejected`
+  // files, which only /bqaa-backfill sends.
+  rowsRefused: number
   // Of rowsLeft, lines recorded for another table: kept as they were.
   otherTableRows: number
   skippedFiles: number
@@ -100,9 +104,18 @@ export type BackfillReport = {
   finishedAt: number | null
 }
 
+// What a replay learns as it goes: how many of its rows still wait for a
+// replay that runs by itself (lines, and files it did not read), whether
+// BigQuery took a request (so the table is there and the credentials work),
+// and why it last refused a row.
+type ReplayTally = { waiting: number; reached: boolean; refusal: string }
+
 const TIMED_OUT = Symbol('timed out')
 const MAX_BATCHES_PER_TICK = 10
 const LEASE_MS = 10 * 60 * 1000
+// A table this writer made gets this long before a 404 for it is the notice:
+// streaming inserts may not see a new table for a while.
+const NEW_TABLE_MS = 120_000
 // While credentials or a missing dataset are the problem, a retry comes at
 // least this often, so rows flow again soon after the person signs in or
 // makes the dataset.
@@ -189,6 +202,14 @@ export class Writer {
   private soon: Timer | null = null
   private backfilling: Promise<BackfillReport> | null = null
   private wroteRecoverable = false
+  // The dead-letter directories (one per table) whose rows wait for a replay
+  // that runs by itself: this writer parked them as retries or spills, or a
+  // replay left them unsent. While nothing is queued, the paced retries
+  // replay the configured table's until one sends every such row.
+  private replayDue = new Set<string>()
+  // Counts those parkings: a replay that began before the latest one may not
+  // have read its rows.
+  private parkedSeq = 0
   private statusText: string | undefined = undefined
   // Set once the session is ending: no new batch starts after that.
   private closing = false
@@ -280,15 +301,15 @@ export class Writer {
   private async flushLoop(): Promise<void> {
     // The band's count of waiting rows moves with every tick.
     if (this.problem !== null) this.showProblem()
-    // Nothing queued, and rows this session parked while credentials or a
-    // missing dataset stopped them: no send would tell when the problem is
-    // fixed, so a replay of them does, at the paced retries. Once it lands
-    // rows, the notice clears (`recovered`), in a session left idle too.
-    if (this.queue.length === 0 && this.parkedDuringProblem > 0 && (this.problem?.kind === 'credentials' || this.problem?.kind === 'destination')) {
-      const c = this.config()
-      if (this.pauseTimer !== null || this.closing || !c.autoBackfill || !canDeliver(c) || c.dryRun) return
-      const report = await this.backfill(['spill', 'retry'], 'recovery')
-      if (report.rowsSent === 0) {
+    // Nothing queued, and rows wait for a replay (`replayDue`): no send would
+    // tell when what stopped them is fixed, so a replay does, at the paced
+    // retries, in a session left idle too, until one sends them all. A
+    // replay BigQuery takes clears the notice (`recovered`).
+    const current = this.config()
+    if (this.queue.length === 0 && this.replayDue.has(deadLetterPartition(current))) {
+      if (this.pauseTimer !== null || this.closing || !current.autoBackfill || !canDeliver(current) || current.dryRun) return
+      await this.backfill(['spill', 'retry'], 'recovery')
+      if (this.replayDue.has(deadLetterPartition(this.config()))) {
         this.consecutiveFailures += 1
         this.pause()
       }
@@ -393,19 +414,18 @@ export class Writer {
             return true
           }
         }
-        if (this.tableCreatedAt === null || this.io.now() - this.tableCreatedAt >= 120_000) {
-          // Not made yet, or made so recently that streaming inserts do not
-          // see it (minutes, after setup.sh): the person is told how to make
-          // it, and the rows wait as retries, sent on their own once it is
-          // found. A table this writer created moments ago gets the retries
-          // alone.
-          this.noteProblem('destination', outcome.message, isDatasetMissing(outcome.message) ? 'dataset' : 'table')
-        }
+        // Not made yet, or made so recently that streaming inserts do not
+        // see it (minutes, after setup.sh): the person is told how to make
+        // it, and the rows wait as retries, sent on their own once it is
+        // found. A table this writer created moments ago gets the retries
+        // alone.
+        this.missingDestination(outcome.message)
         await this.retryLater(batch, outcome.message)
         return false
       }
       case 'rejected':
         if (outcome.permission) this.noteProblem('permission', outcome.message)
+        else this.tableAnswered()
         await this.reject(batch, outcome.message)
         return false
       case 'retry':
@@ -538,7 +558,20 @@ export class Writer {
     const { headline, fix } = this.problemText()
     const command = this.setupCommand()
     this.call(() => this.io.toast?.(diagnostic(`BQAA: rows are not being written: ${headline}. To fix, ${fix}.`, 500)))
-    this.call(() => this.io.notice?.(diagnostic(`bqaa: rows are not being written: ${headline} (${clean}). To fix, ${fix}${command ? `. Run: ${command}` : ''}; this clears after the next successful send.`, 1000)))
+    this.call(() => this.io.notice?.(diagnostic(`bqaa: rows are not being written: ${headline} (${clean}). To fix, ${fix}${command ? `. Run: ${command}` : ''}; this clears once rows are written again.`, 1000)))
+  }
+
+  // BigQuery refused rows for a reason of their own (a 400, say): it found
+  // the table and took the credentials, so a notice about either is stale.
+  private tableAnswered(): void {
+    if (this.problem?.kind === 'credentials' || this.problem?.kind === 'destination') this.clearProblem()
+  }
+
+  // A 404 from insertAll, sent or replayed: the notice for the dataset or
+  // table, unless this writer made the table in the last two minutes.
+  private missingDestination(message: string): void {
+    if (this.tableCreatedAt !== null && this.io.now() - this.tableCreatedAt < NEW_TABLE_MS) return
+    this.noteProblem('destination', message, isDatasetMissing(message) ? 'dataset' : 'table')
   }
 
   // The next successful send: the problem is gone. Rows refused while
@@ -586,19 +619,21 @@ export class Writer {
   }
 
   // For a dataset or table BigQuery cannot find: the command that makes it,
-  // the mod's setup.sh with every name this configuration writes to (so none
-  // falls back to a variable set in the person's shell), or null when the
-  // mod's directory is unknown or not a POSIX path, or a name is one setup.sh
-  // would refuse.
+  // the mod's setup.sh run by bash with every name it reads set on the line,
+  // the views dataset included (so none comes from a variable set in the
+  // person's shell), or null when the mod's directory is unknown or not a
+  // POSIX path, or a name is one setup.sh would refuse.
   setupCommand(): string | null {
     if (this.problem?.kind !== 'destination') return null
     const c = this.config()
     const root = this.io.pluginRoot
     if (root === undefined || !root.startsWith('/')) return null
-    // setup.sh also makes `<dataset>_reporting` for its views, held to the same rule.
-    const names = [c.dataset, `${c.dataset}_reporting`, c.table]
-    if (!PLAIN_PROJECT.test(c.project) || !names.every(name => PLAIN_NAME.test(name)) || !PLAIN_LOCATION.test(c.location)) return null
-    return `BQAA_PROJECT_ID=${c.project} BQAA_DATASET=${c.dataset} BQAA_TABLE=${c.table} BQAA_LOCATION=${c.location} ${shellQuote(joinPath(root, 'setup.sh'))}`
+    // The views go to `<dataset>_reporting`, held to the same rule.
+    const views = `${c.dataset}_reporting`
+    if (!PLAIN_PROJECT.test(c.project) || ![c.dataset, views, c.table].every(name => PLAIN_NAME.test(name)) || !PLAIN_LOCATION.test(c.location)) return null
+    // A POSIX path: a backslash in it is part of a name, not a separator.
+    const script = root.endsWith('/') ? `${root}setup.sh` : `${root}/setup.sh`
+    return `BQAA_PROJECT_ID=${c.project} BQAA_DATASET=${c.dataset} BQAA_TABLE=${c.table} BQAA_VIEWS_DATASET=${views} BQAA_LOCATION=${c.location} bash ${shellQuote(script)}`
   }
 
   // Rows that wait for the problem to clear: queued, in flight, and parked
@@ -820,7 +855,11 @@ export class Writer {
         // the record is there and matches every row above it.
         await this.io.writeFile(path, sealFile(body))
         this.counters.deadLetterFiles += 1
-        if (kind !== 'rejected') this.wroteRecoverable = true
+        if (kind !== 'rejected') {
+          this.wroteRecoverable = true
+          this.replayDue.add(dir)
+          this.parkedSeq += 1
+        }
         if (this.problem !== null) this.parkedDuringProblem += count
       } catch (err) {
         this.counters.dropped += count
@@ -882,12 +921,18 @@ export class Writer {
   // written.
   backfill(kinds: DeadLetterKind[], trigger: BackfillReport['trigger']): Promise<BackfillReport> {
     if (this.backfilling) return this.backfilling
-    const run = this.backfillRun(kinds, trigger).catch(err => {
+    const parked = this.parkedSeq
+    const dir = deadLetterPartition(this.config())
+    const run = this.backfillRun(kinds, trigger, dir, parked).catch(err => {
+      // A file that cannot be read or written: no replay follows by itself
+      // until more rows are parked, so the same rows are not sent over and over.
+      if (this.parkedSeq === parked) this.replayDue.delete(dir)
       const report: BackfillReport = {
         trigger,
         files: 0,
         rowsSent: 0,
         rowsLeft: 0,
+        rowsRefused: 0,
         otherTableRows: 0,
         skippedFiles: 0,
         oversizedFiles: [],
@@ -908,9 +953,10 @@ export class Writer {
     return this.backfilling !== null
   }
 
-  private async backfillRun(kinds: DeadLetterKind[], trigger: BackfillReport['trigger']): Promise<BackfillReport> {
+  private async backfillRun(kinds: DeadLetterKind[], trigger: BackfillReport['trigger'], dir: string, parked: number): Promise<BackfillReport> {
     const c = this.config()
-    const report: BackfillReport = { trigger, files: 0, rowsSent: 0, rowsLeft: 0, otherTableRows: 0, skippedFiles: 0, oversizedFiles: [], incompleteFiles: [], error: null, finishedAt: null }
+    const report: BackfillReport = { trigger, files: 0, rowsSent: 0, rowsLeft: 0, rowsRefused: 0, otherTableRows: 0, skippedFiles: 0, oversizedFiles: [], incompleteFiles: [], error: null, finishedAt: null }
+    const tally: ReplayTally = { waiting: 0, reached: false, refusal: '' }
     const finish = (): BackfillReport => {
       report.finishedAt = this.io.now()
       this.backfillReport = report
@@ -920,13 +966,13 @@ export class Writer {
       report.error = c.dryRun ? 'dry run: nothing is sent to BigQuery' : 'not configured: set project and dataset'
       return finish()
     }
-    // Only this table's subdirectory: rows parked for another table wait for
-    // a session configured with that table.
-    const dir = deadLetterPartition(c)
+    // Only this table's subdirectory (`dir`): rows parked for another table
+    // wait for a session configured with that table.
     let entries: readonly { name: string; kind: string; size: number }[] = []
     try {
       entries = await this.io.listDir(dir)
     } catch {
+      if (this.parkedSeq === parked) this.replayDue.delete(dir)
       return finish()
     }
     const files: string[] = []
@@ -942,6 +988,8 @@ export class Writer {
     for (const name of files) {
       if (report.error) {
         report.skippedFiles += 1
+        // Not read: its rows wait for the next replay.
+        if (kindOf(name) !== 'rejected') tally.waiting += 1
         continue
       }
       const leaseKey = `lease:${destinationDir(tableRef(c))}/${name}`
@@ -959,7 +1007,7 @@ export class Writer {
         const parsed = parseFile(await this.io.readFile(joinPath(dir, name)))
         if (!parsed.complete) report.incompleteFiles.push(name)
         else {
-          await this.backfillFile(dir, name, parsed, c, report)
+          await this.backfillFile(dir, name, parsed, c, kinds, trigger, report, tally)
           report.files += 1
         }
       } finally {
@@ -970,12 +1018,18 @@ export class Writer {
         }
       }
     }
-    if (report.rowsSent > 0) this.recovered(trigger)
+    if (report.rowsRefused > 0) this.refusedOnReplay(report.rowsRefused, tally.refusal)
+    // Another replay of this table follows by itself while rows wait: rows
+    // this one left, files it did not read, or rows parked once it had begun.
+    // Rows refused here, and files it cannot read, never keep it going.
+    if (tally.waiting > 0 || this.parkedSeq !== parked) this.replayDue.add(dir)
+    else this.replayDue.delete(dir)
     return finish()
   }
 
-  // A replay landed rows: what stopped rows is gone, as after a send. The
-  // command's replay sent the refused rows too, so none is left to name.
+  // BigQuery took a replay's request: what stopped rows is gone, as after a
+  // send. The command's replay sends the refused rows too, so its count of
+  // rows parked meanwhile starts over.
   private recovered(trigger: BackfillReport['trigger']): void {
     this.consecutiveFailures = 0
     this.refusedSinceSuccess = 0
@@ -986,18 +1040,39 @@ export class Writer {
     this.setStatus(undefined)
   }
 
-  private async backfillFile(dir: string, name: string, file: ParsedFile, c: Config, report: BackfillReport): Promise<void> {
+  // Rows a replay found refused: on the status line, and among the rows the
+  // access-denied notice counts, as a send's refused rows are.
+  private refusedOnReplay(rows: number, reason: string): void {
+    this.refusedSinceSuccess += rows
+    if (this.problem?.kind === 'permission') this.parkedDuringProblem += rows
+    if (this.problem !== null) this.showProblem()
+    else this.setStatus(`BQAA: ${this.refusedSinceSuccess} row(s) refused (${diagnostic(reason).slice(0, 80)}); fix, then /bqaa-backfill`)
+  }
+
+  private async backfillFile(dir: string, name: string, file: ParsedFile, c: Config, kinds: readonly DeadLetterKind[], trigger: BackfillReport['trigger'], report: BackfillReport, tally: ReplayTally): Promise<void> {
     const path = joinPath(dir, name)
     const { lines, raw, unreadable } = file
-    // A line is sent only to the table it records. Others stay as written.
+    const fileKind = kindOf(name) ?? 'retry'
+    // A line is sent only to the table it records, and only by a replay that
+    // sends its kind: one that runs by itself never sends a refused row,
+    // whatever file holds it. The others stay as written.
     const table = tableRef(c)
     const mine: DeadLetterLine[] = []
-    const others: string[] = []
+    const kept: { kind: DeadLetterKind; text: string }[] = []
     lines.forEach((line, i) => {
-      if (line.table === table) mine.push(line)
-      else others.push(raw[i] as string)
+      const kind = isDeadLetterKind(line.kind) ? line.kind : fileKind
+      if (line.table === table && kinds.includes(kind)) mine.push({ ...line, kind })
+      else {
+        kept.push({ kind, text: raw[i] as string })
+        if (line.table !== table) report.otherTableRows += 1
+      }
     })
-    report.otherTableRows += others.length
+    // A row BigQuery refused: kept, with the reason, for /bqaa-backfill.
+    const refuse = (line: DeadLetterLine, reason: string): DeadLetterLine => {
+      report.rowsRefused += 1
+      tally.refusal = reason
+      return { ...line, kind: 'rejected', reason: diagnostic(reason), attempts: line.attempts + 1 }
+    }
     const left: DeadLetterLine[] = []
     let changed = false
     let index = 0
@@ -1031,6 +1106,12 @@ export class Writer {
         continue
       }
       const outcome = classifyInsert(answer, chunk.length)
+      // BigQuery took the request: the table is there and the credentials
+      // work, whatever it made of each row.
+      if ((outcome.kind === 'ok' || outcome.kind === 'partial') && !tally.reached) {
+        tally.reached = true
+        this.recovered(trigger)
+      }
       if (outcome.kind === 'ok') {
         report.rowsSent += chunk.length
         this.counters.sent += chunk.length
@@ -1040,32 +1121,54 @@ export class Writer {
       if (outcome.kind === 'partial') {
         chunk.forEach((line, i) => {
           const reason = outcome.rejected.get(i)
-          if (reason !== undefined) left.push({ ...line, kind: 'rejected', reason: diagnostic(reason), attempts: line.attempts + 1 })
+          if (reason !== undefined) left.push(refuse(line, reason))
           else if (outcome.retry.has(i)) left.push(line)
           else {
             report.rowsSent += 1
             this.counters.sent += 1
           }
         })
+        // Rows asked for again, and nothing else, leave the file as it was.
+        if (outcome.retry.size < chunk.length) changed = true
+        continue
+      }
+      if (outcome.kind === 'rejected') {
+        // Refused whole, as a send would be: parked for /bqaa-backfill, and
+        // access denied is the notice. The rest waits for the next replay.
+        if (outcome.permission) this.noteProblem('permission', outcome.message)
+        else this.tableAnswered()
+        for (const line of chunk) left.push(refuse(line, outcome.message))
         changed = true
+        report.error = diagnostic(outcome.message)
         continue
       }
       if (outcome.kind === 'auth') this.dropToken()
+      if (outcome.kind === 'not-found') this.missingDestination(outcome.message)
       report.error = diagnostic(outcome.message)
       left.push(...chunk)
     }
-    report.rowsLeft += left.length + others.length
+    for (const line of left) if (line.kind !== 'rejected') tally.waiting += 1
+    report.rowsLeft += left.length + kept.length
     // Nothing sent and nothing new to record: the file stays as it was.
     if (!changed) return
-    // What is left goes to new files first (rewritten reasons can make it
-    // outgrow one), each ending with its completion record, and only once
+    // What is left goes to new files first, each kind to files of its own (a
+    // row refused here to a `rejected` file, which no replay that runs by
+    // itself reads), each file ending with its completion record; only once
     // every one is written is the source emptied: `$.fs` has no rename or
     // delete. A write that fails leaves the source as it was, so an unsent
     // row is never held only in memory; rows sent meanwhile may go again,
     // and event_id dedups them.
-    const rest = [...left.map(lineText), ...others, ...unreadable]
-    for (const text of packFiles(rest)) {
-      await this.io.writeFile(joinPath(dir, fileName(kindOf(name) ?? 'retry', this.io.now(), this.sessionId(), ++this.seq)), text)
+    const rest = new Map<DeadLetterKind, string[]>()
+    const keep = (kind: DeadLetterKind, text: string): void => {
+      const texts = rest.get(kind)
+      if (texts) texts.push(text)
+      else rest.set(kind, [text])
+    }
+    for (const line of left) keep(line.kind, lineText(line))
+    for (const line of kept) keep(line.kind, line.text)
+    for (const text of unreadable) keep(fileKind, text)
+    for (const [kind, texts] of rest) {
+      for (const text of packFiles(texts)) await this.io.writeFile(joinPath(dir, fileName(kind, this.io.now(), this.sessionId(), ++this.seq)), text)
     }
     await this.io.writeFile(path, '')
   }

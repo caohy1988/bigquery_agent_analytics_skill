@@ -1,0 +1,268 @@
+// The replay that runs by itself at the paced retries while nothing is
+// queued (a session left idle). It goes on until every row waiting for it
+// has landed, a replay that lands only some included, and it starts for rows
+// parked while a table the mod just made was not visible yet. Rows BigQuery
+// refuses on it move to `rejected` files, as a send's refused rows do, and
+// wait for /bqaa-backfill: no replay that runs by itself sends them again,
+// and no request or file follows for them.
+
+import { type Engine, expect, test } from 'claude-code/testing'
+
+import { resolveConfig } from '../hooks/lib/config.ts'
+import { parseFile, packFiles } from '../hooks/lib/deadletter.ts'
+import { buildRow } from '../hooks/lib/rows.ts'
+import { type Io, Writer } from '../hooks/lib/writer.ts'
+
+import { COMMAND, OK_INSERT, OPTIONS, PARTITION_DIR, TABLE_REF, type World, deadLetterRows, setUp, startSession } from './helpers.ts'
+
+const PLUGIN = 'bigquery-agent-analytics-mod'
+
+const BAND = {
+  component: 'AbovePrompt',
+  requestId: 'above-prompt',
+  viewport: { columns: 120, rows: 40 },
+  props: { hasSurvey: false, isWorking: false, maxRows: 10, bodyColumns: 115, scroll: { offset: 0, bodyRows: 10 }, view: {} },
+} as const
+
+const DATASET_MISSING = {
+  status: 404,
+  text: '{"error":{"code":404,"message":"Not found: Dataset my-gcp-project:agent_analytics","errors":[{"reason":"notFound"}],"status":"NOT_FOUND"}}',
+}
+const TABLE_MISSING = {
+  status: 404,
+  text: '{"error":{"code":404,"message":"Not found: Table my-gcp-project:agent_analytics.agent_events","errors":[{"reason":"notFound"}],"status":"NOT_FOUND"}}',
+}
+const TABLE_CREATED = { status: 200, text: '{"kind":"bigquery#table"}' }
+// insertAll took every row of the request but the first, which it asks for
+// again; and insertAll refused the first row.
+const FIRST_AGAIN = { status: 200, text: JSON.stringify({ insertErrors: [{ index: 0, errors: [{ reason: 'backendError', message: 'try again' }] }] }) }
+const FIRST_REFUSED = { status: 200, text: JSON.stringify({ insertErrors: [{ index: 0, errors: [{ reason: 'invalid', message: 'no such field: extra' }] }] }) }
+const DENIED = {
+  status: 403,
+  text: '{"error":{"code":403,"message":"Access Denied: Table my-gcp-project:agent_analytics.agent_events: Permission bigquery.tables.updateData denied","errors":[{"reason":"accessDenied"}],"status":"PERMISSION_DENIED"}}',
+}
+const INVALID = { status: 400, text: '{"error":{"code":400,"message":"Invalid value for the table schema","errors":[{"reason":"invalid"}],"status":"INVALID_ARGUMENT"}}' }
+
+const statusText = async ($: Engine): Promise<string> => (await $.command.run({ command: 'bqaa-status', args: '', ...COMMAND })).text ?? ''
+
+async function band($: Engine): Promise<{ line?: string; waiting?: string }> {
+  const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...BAND })
+  const line = (await ui.find({ type: 'Text', text: /^rows are not being written/ }))?.text
+  const waiting = (await ui.find({ type: 'Text', text: /row\(s\) waiting/ }))?.text
+  await ui.unmount()
+  return { line, waiting }
+}
+
+// The event ids parked in this table's files of one kind.
+const parkedIn = (world: World, kind: 'spill' | 'retry' | 'rejected'): string[] =>
+  [...world.files]
+    .filter(([path, text]) => path.startsWith(`${PARTITION_DIR}/${kind}-`) && text.length > 0)
+    .flatMap(([, text]) => parseFile(text).lines.map(line => line.row.event_id))
+
+const idsOf = (body: string): string[] => (JSON.parse(body) as { rows: { json: { event_id: string } }[] }).rows.map(r => r.json.event_id)
+
+// Until no row is queued and the rows are parked: a session left idle.
+async function leaveIdle($: Engine, world: World): Promise<void> {
+  for (let t = 0; t < 30 && !(/queue: 0 rows/.test(await statusText($)) && deadLetterRows(world).length > 0); t += 1) await world.clock.advance(5000)
+}
+
+async function idleFor(world: World, minutes: number): Promise<void> {
+  for (let t = 0; t < minutes * 12; t += 1) await world.clock.advance(5000)
+}
+
+test('an idle replay that lands only some rows goes on by itself until the rest land, rewriting no file for a row asked for again', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  world.replies = [DATASET_MISSING]
+  await startSession($)
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
+  await leaveIdle($, world)
+  const parked = parkedIn(world, 'retry')
+  expect(parked.length).toBe(3)
+  // The dataset is made. BigQuery takes two of the rows, asks for the first
+  // again, and goes on asking for it.
+  world.replies = [FIRST_AGAIN]
+  for (let t = 0; t < 4; t += 1) await world.clock.advance(5000)
+  expect(parkedIn(world, 'retry')).toEqual([parked[0]])
+  // BigQuery found the dataset: no notice, and the row still waits.
+  expect((await band($)).line).toBeUndefined()
+  const requests = world.insertCalls().length
+  const files = world.files.size
+  await idleFor(world, 1)
+  expect(world.insertCalls().length > requests).toBe(true)
+  expect(world.files.size).toBe(files)
+  world.replies = [OK_INSERT]
+  await idleFor(world, 3)
+  expect(deadLetterRows(world).length).toBe(0)
+  expect(idsOf(world.insertCalls().at(-1)?.body ?? '{"rows":[]}')).toEqual([parked[0]])
+})
+
+test('a row BigQuery refuses on an idle replay moves to a rejected file: no replay by itself sends it again, and no request or file follows', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  world.replies = [DATASET_MISSING]
+  await startSession($)
+  await leaveIdle($, world)
+  const parked = parkedIn(world, 'retry')
+  expect(parked.length).toBe(1)
+  world.replies = [FIRST_REFUSED]
+  for (let t = 0; t < 4; t += 1) await world.clock.advance(5000)
+  expect(parkedIn(world, 'retry')).toEqual([])
+  expect(parkedIn(world, 'rejected')).toEqual(parked)
+  const requests = world.insertCalls().length
+  const files = world.files.size
+  await idleFor(world, 10)
+  expect(world.insertCalls().length).toBe(requests)
+  expect(world.files.size).toBe(files)
+  // BigQuery found the dataset: no notice; the refusal is on the status line
+  // and in /bqaa-status, as a send's is.
+  expect((await band($)).line).toBeUndefined()
+  expect(world.statusLines.at(-1)).toBe('BQAA: 1 row(s) refused (invalid: no such field: extra); fix, then /bqaa-backfill')
+  expect(await statusText($)).toMatch(/last backfill \(recovery, [^)]*\): 1 file\(s\), 0 rows sent, 1 left, 1 of them refused/)
+  // Once the cause is fixed, /bqaa-backfill sends it.
+  world.replies = [OK_INSERT]
+  await $.command.run({ command: 'bqaa-backfill', args: '', ...COMMAND })
+  await world.clock.advance(1000)
+  expect(idsOf(world.insertCalls().at(-1)?.body ?? '{"rows":[]}')).toEqual(parked)
+  expect(deadLetterRows(world).length).toBe(0)
+})
+
+test('a request BigQuery refuses whole on an idle replay parks its rows for /bqaa-backfill; access denied is the notice', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  world.replies = [DATASET_MISSING]
+  await startSession($)
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
+  await leaveIdle($, world)
+  const parked = parkedIn(world, 'retry')
+  expect(parked.length).toBe(3)
+  world.replies = [DENIED]
+  for (let t = 0; t < 4; t += 1) await world.clock.advance(5000)
+  expect(parkedIn(world, 'retry')).toEqual([])
+  expect(parkedIn(world, 'rejected').sort()).toEqual([...parked].sort())
+  const shown = await band($)
+  expect(shown.line).toBe('rows are not being written: BigQuery denied the identity access to the dataset. To fix, ask for roles/bigquery.dataEditor on my-gcp-project:agent_analytics, then run /bqaa-backfill.')
+  expect(shown.waiting).toBe(' 3 row(s) waiting.')
+  const requests = world.insertCalls().length
+  const files = world.files.size
+  await idleFor(world, 10)
+  expect(world.insertCalls().length).toBe(requests)
+  expect(world.files.size).toBe(files)
+})
+
+test('a request BigQuery refuses whole as invalid on an idle replay parks its rows for /bqaa-backfill, and nothing follows', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  world.replies = [DATASET_MISSING]
+  await startSession($)
+  await leaveIdle($, world)
+  const parked = parkedIn(world, 'retry')
+  world.replies = [INVALID]
+  for (let t = 0; t < 4; t += 1) await world.clock.advance(5000)
+  expect(parkedIn(world, 'rejected')).toEqual(parked)
+  expect(world.statusLines.at(-1) ?? '').toMatch(/1 row\(s\) refused \(HTTP 400: Invalid value for the table schema\); fix, then \/bqaa-backfill/)
+  const requests = world.insertCalls().length
+  await idleFor(world, 10)
+  expect(world.insertCalls().length).toBe(requests)
+})
+
+test('rows parked while a table the mod just made is not visible yet go out once it is, with nothing new queued', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  world.replies = [TABLE_MISSING, TABLE_CREATED, TABLE_MISSING]
+  await startSession($)
+  await idleFor(world, 2)
+  // Made once; the row's retries ran out while the table was new.
+  expect(world.fetches.filter(f => f.url.endsWith('/tables')).length).toBe(1)
+  const parked = parkedIn(world, 'retry')
+  expect(parked.length).toBe(1)
+  world.replies = [OK_INSERT]
+  await idleFor(world, 3)
+  expect(deadLetterRows(world).length).toBe(0)
+  expect(idsOf(world.insertCalls().at(-1)?.body ?? '{"rows":[]}')).toEqual(parked)
+})
+
+// A dead-letter line for this table, of `kind`.
+const line = (eventId: string, kind: 'spill' | 'retry' | 'rejected'): string =>
+  JSON.stringify({
+    v: 1,
+    kind,
+    reason: kind === 'rejected' ? 'invalid: no such field: extra' : 'retries ran out',
+    attempts: 4,
+    failed_at: '2026-10-13T20:01:02.003Z',
+    table: TABLE_REF,
+    row: buildRow({ eventType: 'STATE_DELTA', timestampMs: 0, eventId, agent: 'coding-agent', sessionId: 'earlier', invocationId: null, userId: 'dev', traceId: null, spanId: null, parentSpanId: null, content: {}, attributes: {}, maxPayloadChars: 16384 }).row,
+  })
+
+test('a refused row in a retry file, as earlier versions rewrote them, is never sent by a replay that runs by itself; /bqaa-backfill sends it', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  const refused = 'a'.repeat(32)
+  const waiting = 'b'.repeat(32)
+  world.files.set(`${PARTITION_DIR}/retry-20261013T200102003Z-earlier-1.jsonl`, packFiles([line(refused, 'rejected'), line(waiting, 'retry')])[0] as string)
+  await startSession($)
+  // The replay 15 s after the start sends the waiting row; the refused one
+  // stays, now in a rejected file.
+  await world.clock.advance(20_000)
+  const sent = () => world.sentRows().map(r => r.event_id)
+  expect(sent()).toContain(waiting)
+  expect(sent()).not.toContain(refused)
+  expect(parkedIn(world, 'rejected')).toEqual([refused])
+  expect(parkedIn(world, 'retry')).toEqual([])
+  await idleFor(world, 10)
+  expect(sent()).not.toContain(refused)
+  await $.command.run({ command: 'bqaa-backfill', args: '', ...COMMAND })
+  await world.clock.advance(1000)
+  expect(sent()).toContain(refused)
+  expect(deadLetterRows(world).length).toBe(0)
+})
+
+test('rows parked for one table stay due while another table is configured, and go out once theirs is again', async () => {
+  // A writer built by hand, whose configuration the test changes in place.
+  let config = resolveConfig({ project: 'my-gcp-project', dataset: 'agent_analytics', deadLetterDir: '/dl' }, {})
+  let now = 0
+  let answer = DATASET_MISSING
+  const timers: { at: number; fn: () => void; live: boolean }[] = []
+  const files = new Map<string, string>()
+  const urls: string[] = []
+  const io: Io = {
+    now: () => now,
+    after: (ms, fn) => {
+      const timer = { at: now + ms, fn, live: true }
+      timers.push(timer)
+      return { cancel: () => (timer.live = false) }
+    },
+    fetch: async url => {
+      urls.push(url)
+      return answer
+    },
+    runCommand: async () => ({ exitCode: 0, stdout: `${'a'.repeat(24)}\n`, stderr: '' }),
+    envToken: async () => undefined,
+    writeFile: async (path, text) => {
+      files.set(path, text)
+    },
+    readFile: async path => files.get(path) ?? '',
+    listDir: async dir => [...files].filter(([path]) => path.startsWith(`${dir}/`)).map(([path, text]) => ({ name: path.slice(dir.length + 1), kind: 'file', size: text.length })),
+    storeGet: async () => undefined,
+    storeSet: async () => undefined,
+    storeDelete: async () => undefined,
+    status: () => undefined,
+    debug: () => undefined,
+  }
+  const writer = new Writer(io, () => config, () => 'hand-built-session')
+  const tick = async (): Promise<void> => {
+    now += 5000
+    for (const timer of timers.filter(t => t.live && t.at <= now).sort((a, b) => a.at - b.at)) {
+      timer.live = false
+      timer.fn()
+    }
+    await writer.flush()
+  }
+  const waiting = (): number => [...files.values()].reduce((rows, text) => rows + parseFile(text).lines.length, 0)
+  writer.enqueue(buildRow({ eventType: 'STATE_DELTA', timestampMs: 0, eventId: 'c'.repeat(32), agent: 'coding-agent', sessionId: 'hand-built-session', invocationId: null, userId: 'dev', traceId: null, spanId: null, parentSpanId: null, content: {}, attributes: {}, maxPayloadChars: 16384 }).row, 0)
+  for (let t = 0; t < 12 && writer.queue.length > 0; t += 1) await tick()
+  expect(waiting()).toBe(1)
+  // Another table, where nothing is parked: its empty replays leave the row due.
+  config = resolveConfig({ project: 'my-gcp-project', dataset: 'another_dataset', deadLetterDir: '/dl' }, {})
+  answer = OK_INSERT
+  for (let t = 0; t < 24; t += 1) await tick()
+  expect(urls.some(u => u.includes('another_dataset'))).toBe(false)
+  expect(waiting()).toBe(1)
+  config = resolveConfig({ project: 'my-gcp-project', dataset: 'agent_analytics', deadLetterDir: '/dl' }, {})
+  for (let t = 0; t < 24; t += 1) await tick()
+  expect(waiting()).toBe(0)
+})

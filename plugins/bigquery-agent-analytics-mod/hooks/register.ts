@@ -559,10 +559,11 @@ export const register: Register = (on, registered) => {
     void current
       .backfill(['spill', 'retry', 'rejected'], 'command')
       .then(report => {
+        const refused = report.rowsRefused ? `, ${report.rowsRefused} of them refused` : ''
         const other = report.otherTableRows ? ` (${report.otherTableRows} for another table)` : ''
         const oversized = report.oversizedFiles.length ? `, ${report.oversizedFiles.length} file(s) too large to read` : ''
         const incomplete = report.incompleteFiles.length ? `, ${report.incompleteFiles.length} file(s) without a completion record kept` : ''
-        $.ui.log(clean(`bqaa backfill: ${report.files} file(s), ${report.rowsSent} row(s) sent, ${report.rowsLeft} left${other}${oversized}${incomplete}${report.error ? `; stopped: ${report.error}` : ''}`, 500))
+        $.ui.log(clean(`bqaa backfill: ${report.files} file(s), ${report.rowsSent} row(s) sent, ${report.rowsLeft} left${refused}${other}${oversized}${incomplete}${report.error ? `; stopped: ${report.error}` : ''}`, 500))
       })
       .catch(() => {
         internalErrors += 1

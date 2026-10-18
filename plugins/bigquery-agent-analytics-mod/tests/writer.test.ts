@@ -672,7 +672,8 @@ test('a replayed file whose answer is malformed stays as it was', { options: OPT
   await startSession($)
   await world.clock.advance(15_000)
   expect(world.files.get(path)).toBe(text)
-  expect(await statusText($)).toMatch(/last backfill \(auto, .*\): 1 file\(s\), 0 rows sent, 1 left; stopped: HTTP 200 with a response that is not a valid insertAll answer/)
+  // The replay 15 s in, or the one the paced retries run after it.
+  expect(await statusText($)).toMatch(/last backfill \((auto|recovery), .*\): 1 file\(s\), 0 rows sent, 1 left; stopped: HTTP 200 with a response that is not a valid insertAll answer/)
 })
 
 // The round-three probes, end to end: each payload reaches the mod as a tool

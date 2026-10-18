@@ -258,10 +258,13 @@ While that lasts, the mod shows a notice:
   and the fix for the token source in use, for example `run: gcloud auth
   application-default login`. For a missing permission it names the role to
   ask for on which dataset. For a dataset or table BigQuery cannot find, a
-  second line gives the `setup.sh` command: your project, dataset, table and
-  location, then the script in the mod's directory, quoted as one shell word.
-  It is offered only for names `setup.sh` takes and a POSIX path; otherwise
-  the fix says to create it or correct the options. The band also counts the
+  second line gives the `setup.sh` command. It sets every name the script
+  reads (your project, dataset, table, views dataset `<dataset>_reporting`
+  and location), so none comes from a variable already set in your shell,
+  then runs the script in the mod's directory with `bash`, its path quoted
+  as one shell word. It is offered only for names `setup.sh` takes and a
+  POSIX path; otherwise the fix says to create it or correct the options.
+  The band also counts the
   rows waiting: queued, in flight, or parked on disk since the problem began.
   It keeps what other mods draw there below it, and gives the band up to a
   survey.
@@ -273,18 +276,25 @@ While that lasts, the mod shows a notice:
 * **`/bqaa-status`** adds a `notice` line, and for a missing dataset a
   `setup` line with the command.
 
-The next successful send clears the notice. Recovery is quick:
+The next send or replay that BigQuery takes clears the notice. So does a
+400 refusing the rows themselves, which shows that BigQuery found the table
+and took the credentials. Recovery is quick:
 
-* While credentials or a missing dataset are the problem, retries come at
-  least every 30 seconds.
+* While credentials or a missing dataset are the problem, the wait before
+  the next retry is at most 30 seconds. The retry then goes at the next
+  flush, so add up to `flushIntervalMs` (5 seconds by default).
 * A prompt starts a retry at once, from a timer, so signing in from the
   session (`! gcloud auth application-default login`) is enough.
 * Rows parked meanwhile follow on their own once BigQuery takes rows again
   (`BQAA_AUTO_BACKFILL`). With nothing new queued (a session left idle),
-  the retries replay the rows this session parked, so they land and the
-  notice clears without a prompt.
+  the retries replay the parked rows until every one has landed, a replay
+  that lands only some included, so they land and the notice clears
+  without a prompt. That covers rows parked while a table the mod just
+  made was not visible yet.
 * Rows refused for a missing permission wait for `/bqaa-backfill`, and the
-  transcript says so when rows flow again.
+  transcript says so when rows flow again. So do rows BigQuery refuses on a
+  replay: they move to a `rejected` file, and no replay that runs by itself
+  sends them again.
 
 The notice never holds up a prompt: prompts go to the model as usual, and
 the rows wait.
@@ -580,9 +590,16 @@ GROUP BY model
   line for another table is kept as written, and rows parked for another
   table are sent only by a session configured for that table. `spill` and
   `retry` files are also replayed 15 seconds after a session starts and once
-  BigQuery recovers in a session that parked rows, and at the paced retries
-  while credentials or a missing dataset stop rows and none is queued. A
-  replay that lands rows clears the notice, as a send does. A replay reads a file
+  BigQuery recovers in a session that parked rows. While none is queued,
+  the paced retries replay them too, until every row parked for the
+  configured table (by this session, or left by a replay) has landed. A
+  replay that runs by itself sends `spill` and `retry` rows only, whatever
+  file holds them. Rows BigQuery refuses on any replay (an invalid row, a
+  400, 403 access denied) move to `rejected-*.jsonl` and wait for
+  `/bqaa-backfill`, as a send's refused rows do. Access denied is the
+  notice; the other refusals are on the status line, and `/bqaa-status`
+  counts them in its last-backfill line. A replay that BigQuery takes clears
+  the notice, as a send does. A replay reads a file
   only when its completion record is there and matches every line above it:
   the API's writes are not atomic, so another session can read a file
   part-written, and the record is what marks a file whole. A file without a
@@ -591,8 +608,10 @@ GROUP BY model
   lists it. A file whose rows all land is truncated to zero bytes (the API
   has no delete; empty files are safe to remove). What a replay leaves (rows
   that fail again, other tables' lines, lines it cannot parse) is written to
-  new files first, each with its completion record, and only then is the
-  replayed file truncated: the API has no rename either, so a write that
+  new files first, each kind to files of its own and each file with its
+  completion record, and only then is the replayed file truncated. A replay
+  whose rows BigQuery only asks for again rewrites nothing. The API has no
+  rename either, so a write that
   fails leaves that file as it was (rows sent meanwhile may go again;
   `event_id` dedups them). A file over 4 MiB, which the API cannot read, is
   reported by `/bqaa-status` and the backfill instead of being passed over. A
@@ -746,7 +765,7 @@ The test command runs the `tests/*.test.ts` files against the host CLI's own
 test kit, with no session, sign-in, GCP or network: `$.http.fetch`,
 `$.process.run`, `$.fs` and `$.store` are stubbed, and `mock.clock` drives the
 timers; the `$.fs` stubs measure files in UTF-8 bytes and refuse a file over
-4 MiB, as the host does. 189 tests cover the captured rows and their spans,
+4 MiB, as the host does. 198 tests cover the captured rows and their spans,
 subagent runs in the order the host raises them (one invocation and one
 trace for the turn, a span per run, a SubagentStart that comes late or never),
 the session-start row raised before or during `session.start`'s setup,
@@ -795,18 +814,32 @@ They also cover what happens when credentials fail:
 And when BigQuery cannot find the dataset or table:
 
 * the band, toast, transcript line, status line and `/bqaa-status`, with the
-  `setup.sh` command;
-* the command's path as one shell word (a quote in it included), and no
-  command for a name `setup.sh` would refuse (its views dataset too) or a
-  directory that is not a POSIX path;
+  `setup.sh` command, which sets the views dataset too;
+* the command's path as one shell word (a quote or a closing backslash in it
+  included), and no command for a name `setup.sh` would refuse (its views
+  dataset too) or a directory that is not a POSIX path;
 * rows retried, and parked as retries, never refused;
 * every row landing once it is found, with new rows or with none (a session
   left idle), and a prompt's retry from a timer;
 * retries at least every 30 s;
 * a table the mod made that BigQuery still cannot find after two minutes,
-  and table creation turned off;
+  on a send or on a replay with nothing queued, and table creation turned
+  off;
+* a 400 after the notice: the notice clears, and the rows are refused;
 * a reload clearing the status line the previous load set, and the refused
   count on the status line covering every row since rows last landed.
+
+And the replay that runs by itself while nothing is queued:
+
+* it goes on until every parked row lands, a replay that lands only some
+  included, and rewrites no file while BigQuery only asks for a row again;
+* rows parked while a table the mod just made was not visible yet;
+* rows parked for one table stay due while another table is configured;
+* a row refused on it (insertAll's row error, a 400, 403 access denied,
+  which is the notice) moves to a `rejected` file, with no further request
+  or file, and `/bqaa-backfill` still sends it;
+* a refused row in a `retry` file, as earlier versions rewrote them, is
+  never sent by it.
 
 And the other additions:
 
@@ -836,7 +869,10 @@ calls. It checks:
 * the fallback variables;
 * that a dry run calls nothing;
 * that names which are not plain ones are refused before any call;
-* that the rendered views keep to this mod's rows.
+* that the rendered views keep to this mod's rows;
+* that the command the mod prints for a missing dataset makes the views in
+  `<dataset>_reporting` even when the shell already sets `BQAA_VIEWS_DATASET`
+  (valid or not), or another project, dataset or table.
 
 `tests/views.test.py` runs both views in DuckDB. It uses five dialect
 substitutions, and each must match. The fixture is a table shared by this
