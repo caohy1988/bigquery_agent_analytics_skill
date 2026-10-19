@@ -666,9 +666,10 @@ GROUP BY model
   sending) sends none of the file, `/bqaa-backfill` included: its rows may
   have been refused, and that writer may yet record what became of them.
   `/bqaa-backfill force` replays it afresh, for a session that stopped
-  mid-replay; run while that session is in fact still replaying the file,
-  it can send a refused row once more, as two replays of one file each
-  keep what they learned. The writer that takes over when the
+  mid-replay, once no other session's lease on the file stands (a lease
+  lasts ten minutes; force passes the mark, not the lease); run while that
+  session is in fact still replaying the file, it can send a refused row
+  once more, as two replays of one file each keep what they learned. The writer that takes over when the
   mod reloads in a session holds the outcomes the one before it held, an
   outcome that one's replay comes to after the reload included, but not
   its marks: a mark of the one before whose outcome it does not hold keeps
@@ -735,7 +736,11 @@ GROUP BY model
   of being passed over. A file read before its completion record was
   written keeps its table due, so the paced replays read it again and send
   it once it is whole; one never finished costs those reads and nothing
-  more. A per-file lease in `$.store` keeps two sessions from replaying the
+  more. So does an empty one (a write can show a file empty before any of
+  it lands) with nothing beside it to say a replay emptied it, for a
+  lease's time from its last write (or, where the listing gives no times,
+  from when the writer first saw it so), and one listed with its rows and
+  read empty with no done mark beside it. A per-file lease in `$.store` keeps two sessions from replaying the
   same file at once (best effort: of two that read the lease at the same
   moment, one that reads the other's mark back beside its own sends none of
   the file, so at most one sends it, and if each reads the other's,
@@ -771,7 +776,8 @@ never payloads or tokens (the agent reads a command's output too).
   background; a dim transcript line reports the result, and why any file
   was left waiting. It leaves a file another session's replay holds (its
   mark, or its record cut off part-way); `/bqaa-backfill force` replays
-  such a file afresh, for a session that stopped mid-replay.
+  such a file afresh, for a session that stopped mid-replay, once that
+  session's lease on it (ten minutes) has run out.
 
 When BigQuery refuses rows or retries run out, the mod also sets a status line
 under the prompt (`⚠ bigquery-agent-analytics-mod: …`) until rows land
@@ -910,7 +916,7 @@ test kit, with no session, sign-in, GCP or network: `$.http.fetch`,
 `$.process.run`, `$.fs` and `$.store` are stubbed, and `mock.clock` drives the
 timers; the `$.fs` stubs measure files in UTF-8 bytes and refuse a file over
 4 MiB, and the `$.store` stub a store over 4 MiB of JSON in all, as the host
-does. 297 tests cover the captured rows and their spans,
+does. 300 tests cover the captured rows and their spans,
 subagent runs in the order the host raises them (one invocation and one
 trace for the turn, a span per run, a SubagentStart that comes late or never),
 the session-start row raised before or during `session.start`'s setup,
@@ -1091,7 +1097,10 @@ And the replay that runs by itself while nothing is queued:
   with no backoff, and then goes on;
 * a retry file it read before its completion record was written is sent
   once it is whole, and one never finished makes no request or file over
-  ten minutes of paced reads;
+  ten minutes of paced reads; one listed empty before its write landed, or
+  listed with its rows and read empty, is sent once whole, with or without
+  times in the listing, and one left empty long ago, or emptied by its
+  replay, keeps nothing going;
 * rows refused on a send and then on a replay all counted on the status
   line, which a replay whose rows are only asked for again leaves as it
   was, and a later request of the same replay that lands rows ends; a

@@ -93,6 +93,123 @@ test('/bqaa-backfill leaves a file another session\'s replay holds and says so i
   expect(await statusText($)).toMatch(/last backfill \(force, .*\): 1 file\(s\), 1 rows sent, 0 left/)
 })
 
+test('a retry file listed empty, before its write put anything in it, is replayed by the idle session once whole; one left empty long ago keeps nothing going', { options: OPTIONS }, async ($, on) => {
+  let lists = 0
+  on('fs.list', { path: PARTITION_DIR }, ($, e, next) => {
+    lists += 1
+    return next(e)
+  })
+  const world = setUp(on)
+  await startSession($)
+  await world.clock.advance(5000)
+  const old = `${PARTITION_DIR}/retry-20261013T200102002Z-earlier-0.jsonl`
+  const source = `${PARTITION_DIR}/retry-20261013T200102003Z-earlier-1.jsonl`
+  const a = 'a'.repeat(32)
+  const whole = packFiles([line(a, 'retry')])[0] as string
+  // One left empty long ago, as a replay leaves a file, and one just made,
+  // its write still to put anything in it, at the replay after session.start.
+  world.files.set(old, '')
+  world.mtimes.set(old, Date.now() - 11 * 60 * 1000)
+  world.files.set(source, '')
+  world.mtimes.set(source, Date.now())
+  await world.clock.advance(15_000)
+  expect(world.sentRows().filter(r => r.event_id === a).length).toBe(0)
+  world.files.set(source, whole)
+  await idleFor(world, 10)
+  expect([world.sentRows().filter(r => r.event_id === a).length, world.files.get(source)]).toEqual([1, ''])
+  // The session starts again: its replay lists the file, emptied by its
+  // replay with its done mark beside it, and the one left empty long ago:
+  // neither keeps the table due.
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' })
+  await world.clock.advance(15_000)
+  const before = lists
+  await idleFor(world, 10)
+  expect(lists - before).toBe(0)
+})
+
+test('a retry file listed with its rows and read empty, no done mark beside it, keeps its table due: the idle session replays it once it is whole again', { options: OPTIONS }, async ($, on) => {
+  const source = `${PARTITION_DIR}/retry-20261013T200102003Z-earlier-1.jsonl`
+  // A write that starts the file over is under way at the first read.
+  let emptyReads = 1
+  on('fs.read', { path: source }, ($, e, next) => (emptyReads-- > 0 ? { value: '' } : next(e)))
+  const world = setUp(on)
+  await startSession($)
+  await world.clock.advance(5000)
+  const a = 'a'.repeat(32)
+  world.files.set(source, packFiles([line(a, 'retry')])[0] as string)
+  await idleFor(world, 10)
+  expect([emptyReads < 0, world.sentRows().filter(r => r.event_id === a).length, world.files.get(source)]).toEqual([true, 1, ''])
+})
+
+test('where the listing gives no times, an empty file a write may still fill is watched for a lease\'s time from when the writer first saw it: sent once whole, and then nothing keeps the table due', async () => {
+  const config = resolveConfig({ project: 'my-gcp-project', dataset: 'agent_analytics', deadLetterDir: '/dl' }, {})
+  const dir = `/dl/${TABLE_REF}`
+  const source = `${dir}/retry-20261019T000000000Z-producer-1.jsonl`
+  const stuck = `${dir}/retry-20261019T000000000Z-producer-2.jsonl`
+  const files = new Map<string, string>([
+    [source, ''],
+    [stuck, ''],
+  ])
+  const store = new Map<string, unknown>()
+  const sent: string[] = []
+  const timers: { at: number; fn: () => void; live: boolean }[] = []
+  // A day into the clock: no time read as 0 passes for recent.
+  let now = 24 * 60 * 60 * 1000
+  let lists = 0
+  const io: Io = {
+    now: () => now,
+    after: (ms, fn) => {
+      const timer = { at: now + ms, fn, live: true }
+      timers.push(timer)
+      return { cancel: () => void (timer.live = false) }
+    },
+    fetch: async (url, init) => {
+      sent.push(...idsOf(init.body ?? '{"rows":[]}'))
+      return OK_INSERT
+    },
+    runCommand: async () => ({ exitCode: 0, stdout: `${'a'.repeat(24)}\n`, stderr: '' }),
+    envToken: async () => undefined,
+    writeFile: async (path, text) => void files.set(path, text),
+    readFile: async path => files.get(path) ?? '',
+    exists: async path => files.has(path),
+    listDir: async d => {
+      lists += 1
+      return [...files].filter(([path]) => path.startsWith(`${d}/`)).map(([path, text]) => ({ name: path.slice(d.length + 1), kind: 'file', size: new TextEncoder().encode(text).length }))
+    },
+    storeGet: async key => store.get(key),
+    storeSet: async (key, value) => void store.set(key, JSON.parse(JSON.stringify(value)) as unknown),
+    storeDelete: async key => void store.delete(key),
+    status: () => undefined,
+    debug: () => undefined,
+  }
+  const writer = new Writer(io, () => config, () => 'idle-session')
+  const idle = async (minutes: number): Promise<void> => {
+    for (let i = 0; i < minutes * 12; i += 1) {
+      now += 5000
+      for (const timer of timers) {
+        if (timer.live && timer.at <= now) {
+          timer.live = false
+          timer.fn()
+        }
+      }
+      await writer.flush()
+    }
+  }
+  const first = await writer.backfill(['spill', 'retry'], 'auto')
+  expect(first.held ?? '').toMatch(/is empty, perhaps still being written; it waits for the next replay/)
+  // The first file's write lands; the second's never does.
+  const a = 'a'.repeat(32)
+  files.set(source, packFiles([line(a, 'retry')])[0] as string)
+  await idle(5)
+  expect([sent.filter(id => id === a).length, files.get(source)]).toEqual([1, ''])
+  // A lease's time after the writer first saw it, the empty one keeps the
+  // table due no longer.
+  await idle(10)
+  const before = lists
+  await idle(10)
+  expect(lists - before).toBe(0)
+})
+
 test('a retry file read before its completion record was written is replayed by the idle session once it is whole, and one never finished makes no request or file', { options: OPTIONS }, async ($, on) => {
   let lists = 0
   on('fs.list', { path: PARTITION_DIR }, ($, e, next) => {

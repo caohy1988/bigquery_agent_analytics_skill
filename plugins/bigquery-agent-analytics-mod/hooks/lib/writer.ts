@@ -163,6 +163,10 @@ type Journal = Outcome & { size: number; files: string[]; written: boolean[]; wa
 const TIMED_OUT = Symbol('timed out')
 const MAX_BATCHES_PER_TICK = 10
 const LEASE_MS = 10 * 60 * 1000
+// How long an empty dead-letter file, with nothing beside it to say a
+// replay emptied it, may be one whose write is still under way (a write is
+// not atomic, and can show the file empty first): a lease's time.
+const WRITE_PENDING_MS = LEASE_MS
 // A table this writer made gets this long before a 404 for it is the notice:
 // streaming inserts may not see a new table for a while.
 const NEW_TABLE_MS = 120_000
@@ -438,6 +442,9 @@ export class Writer {
   // characters: a mark of its own is one whose outcome it would hold, if it
   // had one.
   private readonly mark = Math.random().toString(36).slice(2, 12).padEnd(10, '0')
+  // When this writer first saw each empty dead-letter file, by path: how old
+  // one is where the listing gives no `mtimeMs`.
+  private emptySince = new Map<string, number>()
   // Problem kinds already announced with a toast and a transcript line.
   private announced = new Set<ProblemKind>()
   // Where the last token came from: the fix differs.
@@ -1268,9 +1275,27 @@ export class Writer {
     }
     const files: string[] = []
     const sizes = new Map<string, number>()
+    // Empty files a write still under way may fill (said last, below).
+    const emptyWaiting: string[] = []
     for (const e of entries) {
       const kind = kindOf(e.name)
-      if (e.kind !== 'file' || e.size === 0 || kind === null || !kinds.includes(kind)) continue
+      if (e.kind !== 'file' || kind === null || !kinds.includes(kind)) continue
+      const path = joinPath(dir, e.name)
+      if (e.size === 0) {
+        // Emptied after its replay (its done mark, or a record file, beside
+        // it says so), or left empty long ago (by its time, or, where the
+        // listing gives none, since this writer first saw it so): nothing
+        // to do. Else a write still under way may yet fill it: its table
+        // stays due, so the paced replays look again.
+        const since = e.mtimeMs ?? this.emptySince.get(path) ?? this.io.now()
+        if (e.mtimeMs === undefined && !this.emptySince.has(path)) this.emptySince.set(path, since)
+        if (kind !== 'rejected' && this.io.now() - since < WRITE_PENDING_MS && !entries.some(x => x.size > 0 && (doneMarkerOf(x.name, e.name) !== null || x.name === `outcome-${e.name}` || x.name === `outcome-b-${e.name}`))) {
+          emptyWaiting.push(e.name)
+          tally.waiting += 1
+        }
+        continue
+      }
+      this.emptySince.delete(path)
       // `$.fs.read` refuses a file over 4 MiB: say so rather than pass it by.
       if (e.size > HOST_FILE_BYTES) report.oversizedFiles.push(e.name)
       else {
@@ -1398,7 +1423,12 @@ export class Writer {
             report.held ??= diagnostic(`${name} changed while it was read; it waits for the next replay`)
             report.skippedFiles += 1
             if (kindOf(name) !== 'rejected') tally.waiting += 1
-          } else if (text !== '') {
+          } else if (text === '') {
+            // Emptied since it was listed: by another writer, which writes
+            // its done mark first, or by a write that starts it over, still
+            // under way. With no done mark beside it, it waits.
+            if (kindOf(name) !== 'rejected' && !(await this.io.listDir(dir)).some(x => x.size > 0 && doneMarkerOf(x.name, name) !== null)) tally.waiting += 1
+          } else {
             const fate = parsed.parent === null ? 'go' : await this.parentFate(dir, parsed.parent, path, listed.get(parsed.parent) ?? 0, c)
             if (fate === 'wait') {
               // Written by a replay of another file whose record does not have
@@ -1432,10 +1462,12 @@ export class Writer {
         }
       }
     }
+    if (emptyWaiting.length > 0) report.held ??= diagnostic(`${emptyWaiting[0]} is empty, perhaps still being written; it waits for the next replay`)
     // Another replay of this table follows by itself while rows wait: rows
     // this one left, files it did not read (another session's lease on them
-    // included), or rows parked once it had begun. Rows refused here, and
-    // files too large to read or not whole, never keep it going.
+    // included), files not whole or empty that a write still under way may
+    // finish, or rows parked once it had begun. Rows refused here, and files
+    // too large to read, never keep it going.
     if (tally.waiting > 0 || this.parkedSeq !== parked) this.replayDue.add(dir)
     else this.replayDue.delete(dir)
     return finish()

@@ -44,6 +44,8 @@ export type World = {
   // Makes `$.fs.write` refuse every write, or the writes this picks.
   failWrites: boolean
   refuseWrite: ((path: string, text: string) => boolean) | null
+  // When files were last written, as the listing says (none: 0).
+  mtimes: Map<string, number>
   // Makes `$.fs.write` wait until `releaseWrites` is called.
   hangWrites: boolean
   releaseWrites: () => void
@@ -141,6 +143,7 @@ export function setUp(on: On, env: Record<string, string> = {}, store: Record<st
     sessionIdRefused: false,
     failWrites: false,
     refuseWrite: null,
+    mtimes: new Map(),
     hangWrites: false,
     releaseWrites: () => {
       for (const held of heldWrites.splice(0)) {
@@ -238,7 +241,7 @@ export function setUp(on: On, env: Record<string, string> = {}, store: Record<st
       if (!p.startsWith(prefix)) continue
       const rest = p.slice(prefix.length)
       const slash = rest.indexOf('/')
-      if (slash === -1) entries.set(rest, { name: rest, kind: 'file', size: utf8Bytes(text), mtimeMs: 0, isLink: false })
+      if (slash === -1) entries.set(rest, { name: rest, kind: 'file', size: utf8Bytes(text), mtimeMs: world.mtimes.get(p) ?? 0, isLink: false })
       else entries.set(rest.slice(0, slash), { name: rest.slice(0, slash), kind: 'dir', size: 0, mtimeMs: 0, isLink: false })
     }
     return { value: [...entries.values()] }
