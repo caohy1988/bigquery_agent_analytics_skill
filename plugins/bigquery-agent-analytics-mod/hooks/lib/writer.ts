@@ -1208,6 +1208,10 @@ export class Writer {
       }
     }
     files.sort()
+    // Outcomes this writer holds for files since emptied (by another writer,
+    // say) are let go.
+    const there = new Set(entries.filter(e => e.size > 0).map(e => joinPath(dir, e.name)))
+    for (const path of this.rewrites.keys()) if (path.startsWith(`${dir}/`) && !there.has(path)) this.rewrites.delete(path)
     const me = this.sessionId() ?? 'unknown'
     for (const name of files) {
       if (report.error || this.replayStops(trigger, tally)) {
@@ -1363,18 +1367,21 @@ export class Writer {
   // the files beside it when the store did not take it (or it was too large
   // for the store), the later of the two whole ones. When the store and the
   // file hold the same outcome, a file of what is left counts as written if
-  // either says so. None when no record is there; `torn` when only one cut
-  // off part-way is. A record that cannot be read throws, and is never taken
-  // for none.
+  // either says so. None when no record of the file's size is there; `torn`
+  // when only one cut off part-way is. A record that cannot be read throws,
+  // and is never taken for none.
   private async readJournal(source: Source): Promise<Found | 'torn' | undefined> {
-    const stored = ((await this.io.storeGet(source.recordKey)) ?? undefined) as Partial<Journal> | undefined
+    // A record of another size is not this file's (`size` -1: any size).
+    const fits = (journal: Partial<Journal> | undefined): journal is Partial<Journal> => journal !== undefined && (source.size < 0 || journal.size === source.size)
+    const read = ((await this.io.storeGet(source.recordKey)) ?? undefined) as Partial<Journal> | undefined
+    const stored = fits(read) ? read : undefined
     let filed: Partial<Journal> | undefined
     let torn = false
     for (const file of source.recordFiles) {
       if (this.io.exists !== undefined && !(await this.io.exists(file))) continue
-      const read = journalOf(await this.io.readFile(file))
-      if (read === 'torn') torn = true
-      else if (read !== undefined && (filed === undefined || seqOf(read) > seqOf(filed))) filed = read
+      const kept = journalOf(await this.io.readFile(file))
+      if (kept === 'torn') torn = true
+      else if (fits(kept) && (filed === undefined || seqOf(kept) > seqOf(filed))) filed = kept
     }
     if (stored === undefined) return filed !== undefined ? { journal: filed, filed: true } : torn ? 'torn' : undefined
     if (filed === undefined) return { journal: stored, filed: torn }
@@ -1437,7 +1444,7 @@ export class Writer {
   // file, what this writer holds, if anything; a record that no longer fits
   // the file is let go.
   private async resumeRewrite(path: string, source: Source, fileKind: DeadLetterKind, held: Rewrite | undefined, found: Found | undefined): Promise<Rewrite | undefined> {
-    if (found === undefined || found.journal.size !== source.size) return held
+    if (found === undefined) return held
     if (held !== undefined && Writer.catchUp(held, found)) return held
     const { journal } = found
     const paths = Array.isArray(journal.files) ? journal.files : []
@@ -1684,20 +1691,23 @@ export class Writer {
     const files = rest.map(({ kind, text }) => ({ path: joinPath(dir, fileName(kind, this.io.now(), this.sessionId(), ++this.seq)), text }))
     const ours: Rewrite = { ...source, ...outcome, files, waits: rest.some(f => f.kind !== 'rejected'), filed: false, seq: 0 }
     // Another writer that replayed the file at the same time may have
-    // recorded its outcome meanwhile: that one goes on, not this one, so no
-    // row is written out twice. A record that cannot be read keeps this
-    // outcome here until it can be.
+    // recorded its outcome meanwhile, or finished it and emptied the file:
+    // that one goes on, not this one, so no row is written out twice. A
+    // record (or the file) that cannot be read keeps this outcome here until
+    // it can be.
     let found: Found | 'torn' | undefined
+    let now: string
     try {
       found = await this.readJournal(source)
+      now = found === undefined || found === 'torn' ? await this.io.readFile(path) : ''
     } catch (err) {
       this.rewrites.set(path, ours)
       throw err
     }
-    if (found !== undefined && found !== 'torn' && found.journal.size === source.size) {
+    if (found !== undefined && found !== 'torn') {
       const theirs = await this.resumeRewrite(path, source, fileKind, undefined, found)
       if (theirs !== undefined) return this.writeOut(path, theirs)
-    }
+    } else if (now === '') return true
     return this.writeOut(path, ours)
   }
 

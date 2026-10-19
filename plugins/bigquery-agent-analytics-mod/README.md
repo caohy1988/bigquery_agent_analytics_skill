@@ -680,10 +680,11 @@ GROUP BY model
   of being passed over. A per-file lease in `$.store` keeps two sessions
   from replaying the same file at once (best effort: two that read the
   lease at the same moment both send the file, and `event_id` dedups it;
-  the one whose answer comes second finds the other's record and writes
-  out that outcome, not its own, so what is left is written once, unless
-  both record theirs at the same moment); a session that finds a file
-  leased tries it again at its next replay.
+  the one whose answer comes second finds the other's record, and writes
+  out that outcome, not its own, or finds the file already emptied, and
+  writes nothing, so what is left is written once, unless both record
+  theirs at the same moment); a session that finds a file leased tries it
+  again at its next replay.
 * **Fail open:** a hook's bookkeeping runs behind `.catch` or inside `try`;
   the writer never throws into a hook; every failure path ends in sent, on
   disk, or counted as dropped. An environment variable a policy refuses reads
@@ -842,7 +843,7 @@ test kit, with no session, sign-in, GCP or network: `$.http.fetch`,
 `$.process.run`, `$.fs` and `$.store` are stubbed, and `mock.clock` drives the
 timers; the `$.fs` stubs measure files in UTF-8 bytes and refuse a file over
 4 MiB, and the `$.store` stub a store over 4 MiB of JSON in all, as the host
-does. 250 tests cover the captured rows and their spans,
+does. 251 tests cover the captured rows and their spans,
 subagent runs in the order the host raises them (one invocation and one
 trace for the turn, a span per run, a SubagentStart that comes late or never),
 the session-start row raised before or during `session.start`'s setup,
@@ -962,7 +963,8 @@ And the replay that runs by itself while nothing is queued:
   record is cut off or cannot be read; while the source cannot be emptied,
   one the later record has as written replayed; a replay whose answer
   comes after another session wrote out its outcome going on with that
-  one, also when that record cannot be read at first;
+  one, also when that record cannot be read at first, and writing nothing
+  of its own once that session has emptied the file;
 * it stops between requests for a row queued meanwhile, which goes first,
   with no backoff, and then goes on;
 * rows refused on a send and then on a replay all counted on the status

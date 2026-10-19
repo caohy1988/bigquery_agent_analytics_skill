@@ -1119,9 +1119,12 @@ test('a first record cut off part-way, with none whole, its writer gone: replays
   const report = await w.writer('second-session').backfill(['spill', 'retry'], 'auto')
   expect([w.sentOf(a), w.copiesOf(a)]).toEqual([1, 0])
   expect(report.error ?? '').toMatch(/cut off part-way; \/bqaa-backfill replays the file afresh/)
+  // The store takes records again: the one cut off goes with the file.
+  w.failStore({})
   await w.writer('third-session').backfill(['spill', 'retry', 'rejected'], 'command')
   expect([w.sentOf(a), w.copiesOf(a)]).toEqual([2, 1])
   expect(w.files.get(source)).toBe('')
+  expect([...w.files].filter(([path, text]) => path.includes('/outcome-') && text !== '')).toEqual([])
 })
 
 test('a file of what is left, written while its record could not be updated, is not replayed until the record has it: then its rows go once', async () => {
@@ -1184,6 +1187,23 @@ test('a file of what is left is replayed once its parent\'s record names other f
   await w.writer('a-session').backfill(['spill', 'retry'], 'auto')
   expect(w.sent).toEqual(['d'.repeat(32)])
   expect(w.files.get(child)).toBe('')
+})
+
+test('a replay whose answer comes after another session finished the file and emptied it writes nothing of its own', async () => {
+  const w = twoWriters(() => FIRST_REFUSED)
+  const source = `/dl/${TABLE_REF}/retry-20261013T200102003Z-earlier-1.jsonl`
+  const a = 'a'.repeat(32)
+  w.files.set(source, packFiles([line(a, 'retry')])[0] as string)
+  let release = (): void => undefined
+  w.hold(session => (session === 'first-session' ? new Promise<void>(resolve => (release = resolve)) : undefined))
+  const first = w.writer('first-session').backfill(['spill', 'retry'], 'auto')
+  // The other session writes the rejected file, empties the source and lets
+  // its record go, all before the first session's answer comes.
+  await w.writer('second-session').backfill(['spill', 'retry'], 'auto')
+  expect([w.files.get(source), [...w.store.keys()]]).toEqual(['', []])
+  release()
+  await first
+  expect([w.sentOf(a), w.copiesOf(a)]).toEqual([2, 1])
 })
 
 test('a replay whose answer comes late, while the record it would adopt cannot be read, keeps its outcome until it can: what is left is still written once', async () => {
