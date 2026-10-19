@@ -158,7 +158,7 @@ type Rewrite = Outcome & Source & { files: { path: string; text: string | null }
 // another session's, or this one after another writer moved it on) writes
 // what is still missing, from the source and the outcome, and sends none of
 // the file's rows again.
-type Journal = Outcome & { size: number; files: string[]; written: boolean[]; waits: boolean; seq: number; retired?: boolean }
+type Journal = Outcome & { size: number; files: string[]; written: boolean[]; waits: boolean; seq: number; retired?: boolean; retiredAt?: number }
 
 const TIMED_OUT = Symbol('timed out')
 const MAX_BATCHES_PER_TICK = 10
@@ -442,9 +442,10 @@ export class Writer {
   // characters: a mark of its own is one whose outcome it would hold, if it
   // had one.
   private readonly mark = Math.random().toString(36).slice(2, 12).padEnd(10, '0')
-  // When this writer first saw each empty dead-letter file, by path: how old
-  // one is where the listing gives no `mtimeMs`.
-  private emptySince = new Map<string, number>()
+  // When this writer first saw each dead-letter file empty or not whole, by
+  // path: how long a write may still be under way where the listing gives no
+  // time (`writtenSince`).
+  private seenSince = new Map<string, number>()
   // Problem kinds already announced with a toast and a transcript line.
   private announced = new Set<ProblemKind>()
   // Where the last token came from: the fix differs.
@@ -1275,6 +1276,17 @@ export class Writer {
     }
     const files: string[] = []
     const sizes = new Map<string, number>()
+    const stamps = new Map<string, number | undefined>()
+    // Files a replay emptied: its done mark, or a record file, beside it.
+    const replayed = new Set<string>()
+    for (const x of entries) {
+      if (x.size === 0 || x.name.startsWith('outcome-sending-')) continue
+      const of = recordOf(x.name)
+      if (of !== null) replayed.add(of)
+    }
+    // First sights of files no longer there go.
+    const listedPaths = new Set(entries.map(x => joinPath(dir, x.name)))
+    for (const seen of this.seenSince.keys()) if (seen.startsWith(`${dir}/`) && !listedPaths.has(seen)) this.seenSince.delete(seen)
     // Empty files a write still under way may fill, files another session's
     // lease holds, and files of what is left whose parent's record does not
     // have them yet: why each waits, said last (below), after any reason of
@@ -1288,19 +1300,17 @@ export class Writer {
       const path = joinPath(dir, e.name)
       if (e.size === 0) {
         // Emptied after its replay (its done mark, or a record file, beside
-        // it says so), or left empty long ago (by its time, or, where the
-        // listing gives none, since this writer first saw it so): nothing
-        // to do. Else a write still under way may yet fill it: its table
-        // stays due, so the paced replays look again.
-        const since = e.mtimeMs ?? this.emptySince.get(path) ?? this.io.now()
-        if (e.mtimeMs === undefined && !this.emptySince.has(path)) this.emptySince.set(path, since)
-        if (kind !== 'rejected' && this.io.now() - since < WRITE_PENDING_MS && !entries.some(x => x.size > 0 && (doneMarkerOf(x.name, e.name) !== null || x.name === `outcome-${e.name}` || x.name === `outcome-b-${e.name}`))) {
+        // it says so), or left empty long ago (`writtenSince`): nothing to
+        // do. Else a write still under way may yet fill it: its table stays
+        // due, so the paced replays look again.
+        if (kind !== 'rejected' && !replayed.has(e.name) && this.io.now() - this.writtenSince(path, e.mtimeMs) < WRITE_PENDING_MS) {
           emptyWaiting.push(e.name)
+          report.skippedFiles += 1
           tally.waiting += 1
         }
         continue
       }
-      this.emptySince.delete(path)
+      stamps.set(e.name, e.mtimeMs)
       // `$.fs.read` refuses a file over 4 MiB: say so rather than pass it by.
       if (e.size > HOST_FILE_BYTES) report.oversizedFiles.push(e.name)
       else {
@@ -1317,10 +1327,31 @@ export class Writer {
     const there = new Set(entries.filter(e => e.size > 0).map(e => joinPath(dir, e.name)))
     for (const path of this.rewrites.keys()) if (path.startsWith(`${dir}/`) && !there.has(path)) this.rewrites.delete(path)
     // The records of files emptied more than a day ago go: no late copy of
-    // another session's comes that long after.
+    // another session's comes that long after. How long ago: by the record
+    // file's time in the listing, or, where the listing gives none, by when
+    // the file's done mark says it was done (none: kept).
+    const doneAt = new Map<string, number | null>()
+    const retiredAt = async (of: string): Promise<number | null> => {
+      const known = doneAt.get(of)
+      if (known !== undefined) return known
+      let at: number | null = null
+      for (const x of entries) {
+        if (doneMarkerOf(x.name, of) === null || x.size === 0) continue
+        try {
+          const kept = journalOf(await this.io.readFile(joinPath(dir, x.name)))
+          if (kept !== undefined && kept !== 'torn' && typeof kept.retiredAt === 'number') at = Math.max(at ?? kept.retiredAt, kept.retiredAt)
+        } catch {
+          // Not read: no time from it.
+        }
+      }
+      doneAt.set(of, at)
+      return at
+    }
     for (const e of entries) {
       const of = recordOf(e.name)
-      if (of === null || e.size === 0 || e.mtimeMs === undefined || (listed.get(of) ?? 0) > 0 || this.io.now() - e.mtimeMs < RETIRED_MS) continue
+      if (of === null || e.size === 0 || (listed.get(of) ?? 0) > 0) continue
+      const at = e.mtimeMs ? e.mtimeMs : await retiredAt(of)
+      if (at === null || this.io.now() - at < RETIRED_MS) continue
       try {
         await this.io.writeFile(joinPath(dir, e.name), '')
       } catch {
@@ -1419,10 +1450,11 @@ export class Writer {
           const parsed = parseFile(text)
           if (text !== '' && !parsed.complete) {
             // Still being written, or left part-written: none of it is read,
-            // and its table stays due, so the paced replays read it again
-            // and send it once its completion record is there.
+            // and, for a lease's time from its last write (`writtenSince`),
+            // its table stays due, so the paced replays read it again and
+            // send it once its completion record is there.
             report.incompleteFiles.push(name)
-            if (kindOf(name) !== 'rejected') tally.waiting += 1
+            if (kindOf(name) !== 'rejected' && this.io.now() - this.writtenSince(path, stamps.get(name)) < WRITE_PENDING_MS) tally.waiting += 1
           } else if (text !== '' && utf8Length(text) !== source.size) {
             // Written further since it was listed (a write that had not
             // finished then): its record, and every mark, go by the size the
@@ -1436,6 +1468,7 @@ export class Writer {
             // under way. With no done mark beside it, it waits.
             if (kindOf(name) !== 'rejected' && !(await this.io.listDir(dir)).some(x => x.size > 0 && doneMarkerOf(x.name, name) !== null)) tally.waiting += 1
           } else {
+            this.seenSince.delete(path)
             const fate = parsed.parent === null ? 'go' : await this.parentFate(dir, parsed.parent, path, listed.get(parsed.parent) ?? 0, c)
             if (fate === 'wait') {
               // Written by a replay of another file whose record does not have
@@ -1481,6 +1514,18 @@ export class Writer {
     if (tally.waiting > 0 || this.parkedSeq !== parked) this.replayDue.add(dir)
     else this.replayDue.delete(dir)
     return finish()
+  }
+
+  // When the file `path` was last written, as far as a replay can tell: its
+  // time in the listing (0, or none, gives no time), else when this writer
+  // first saw it empty or not whole.
+  private writtenSince(path: string, listedAt: number | undefined): number {
+    if (listedAt) return listedAt
+    const seen = this.seenSince.get(path)
+    if (seen !== undefined) return seen
+    const now = this.io.now()
+    this.seenSince.set(path, now)
+    return now
   }
 
   // A replay that runs by itself stops between requests, once it has sent
@@ -1552,16 +1597,21 @@ export class Writer {
     // /bqaa-backfill force.
     // Of two whole ones (two outcomes recorded at the same moment), the later
     // by number, then by name: every writer reads the same one.
-    const entries = await this.io.listDir(source.dir)
-    let doneTorn = false
-    let done: Partial<Journal> | undefined
-    for (const entry of [...entries].sort((x, y) => (x.name < y.name ? -1 : x.name > y.name ? 1 : 0))) {
-      if (doneMarkerOf(entry.name, source.name) === null || entry.size === 0) continue
-      const kept = journalOf(await this.io.readFile(joinPath(source.dir, entry.name)))
-      if (kept === 'torn') doneTorn = true
-      else if (fits(kept) && kept.retired === true && (done === undefined || seqOf(kept) > seqOf(done))) done = kept
+    const doneIn = async (entries: readonly { name: string; size: number }[]): Promise<{ done: Partial<Journal> | undefined; torn: boolean }> => {
+      let torn = false
+      let done: Partial<Journal> | undefined
+      const marks = entries.filter(entry => entry.size > 0 && doneMarkerOf(entry.name, source.name) !== null)
+      for (const entry of marks.sort((x, y) => (x.name < y.name ? -1 : x.name > y.name ? 1 : 0))) {
+        const kept = journalOf(await this.io.readFile(joinPath(source.dir, entry.name)))
+        if (kept === 'torn') torn = true
+        else if (fits(kept) && kept.retired === true && (done === undefined || seqOf(kept) >= seqOf(done))) done = kept
+      }
+      return { done, torn }
     }
-    if (done !== undefined) return { journal: done, filed: true }
+    let entries = await this.io.listDir(source.dir)
+    const first = await doneIn(entries)
+    if (first.done !== undefined) return { journal: first.done, filed: true }
+    let doneTorn = first.torn
     const read = ((await this.io.storeGet(source.recordKey)) ?? undefined) as Partial<Journal> | undefined
     const stored = fits(read) ? read : undefined
     let filed: Partial<Journal> | undefined
@@ -1578,7 +1628,14 @@ export class Writer {
     }
     if (stored === undefined) {
       if (filed !== undefined) return { journal: filed, filed: true }
-      if (torn || doneTorn) return 'torn'
+      // No record whole in the store or beside the file: a writer may have
+      // finished the file while those were read, and it writes its done mark
+      // before it lets the store's record go. The done marks are listed
+      // again, and the marks with them, before none is taken for an answer.
+      entries = await this.io.listDir(source.dir)
+      const again = await doneIn(entries)
+      if (again.done !== undefined) return { journal: again.done, filed: true }
+      if (torn || doneTorn || again.torn) return 'torn'
       const by = await this.marksOn(source, entries)
       return by.length === 0 ? undefined : { pending: by }
     }
@@ -1822,7 +1879,7 @@ export class Writer {
     rewrite.seq += 1
     const { size, waits, seq } = rewrite
     const { fates, reasons, refusals } = rewrite
-    const journal: Journal = { fates, reasons, refusals, size, waits, seq, files: rewrite.files.map(f => f.path), written: rewrite.files.map(() => true), retired: true }
+    const journal: Journal = { fates, reasons, refusals, size, waits, seq, files: rewrite.files.map(f => f.path), written: rewrite.files.map(() => true), retired: true, retiredAt: this.io.now() }
     try {
       await this.io.writeFile(doneFileOf(rewrite.dir, rewrite.name, this.mark), journalText(journal))
       return true

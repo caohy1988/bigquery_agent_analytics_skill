@@ -699,14 +699,20 @@ GROUP BY model
   a late copy of a finished file is emptied with the marks left as they
   were. One cut off part-way, with no other record whole, counts as a
   record cut off (the file may have been done): the file waits, and
-  `/bqaa-backfill force` replays it afresh. The
-  mark is read before any other record: a late write of another session's copy of
+  `/bqaa-backfill force` replays it afresh. Of two whole ones, every
+  writer goes by the later, by number, then by name. The
+  mark is read before any other record, and read again before a writer
+  takes no record found for an answer (another writer may have finished
+  the file while the record was read, its done mark written before it let
+  the store's copy go): a late write of another session's copy of
   a file it left is then emptied unsent, another session's late outcome
   for it stops there, and a file of what is left that the mark does not
   name is a late copy of another session's outcome, emptied unsent too, as
   it is where the mark could not be written and the record of the emptied
   file has every file it names written. These files, of files emptied more
-  than a day ago, are emptied at the next replay. Nothing of what is left
+  than a day ago, are emptied at the next replay: how long ago, by the
+  listing's time, or, where it gives none (or 0), by when the done mark
+  says the file was done. Nothing of what is left
   is written until the record is: when neither the store nor those files
   take it, the replayed file stays as it was, this session tries again at
   each replay, and its mark keeps every other session from sending the
@@ -736,12 +742,12 @@ GROUP BY model
   API cannot read, is reported by `/bqaa-status` and the backfill instead
   of being passed over. A file read before its completion record was
   written keeps its table due, so the paced replays read it again and send
-  it once it is whole; one never finished costs those reads and nothing
-  more. So does an empty one (a write can show a file empty before any of
-  it lands) with nothing beside it to say a replay emptied it, for a
-  lease's time from its last write (or, where the listing gives no times,
-  from when the writer first saw it so), and one listed with its rows and
-  read empty with no done mark beside it. A per-file lease in `$.store` keeps two sessions from replaying the
+  it once it is whole, and so does an empty one (a write can show a file
+  empty before any of it lands) with nothing beside it to say a replay
+  emptied it, each for a lease's time from its last write (or, where the
+  listing gives no time, or 0, from when the writer first saw it so): one
+  never finished costs those reads and nothing more. So does one listed
+  with its rows and read empty with no done mark beside it. A per-file lease in `$.store` keeps two sessions from replaying the
   same file at once (best effort: of two that read the lease at the same
   moment, one that reads the other's mark back beside its own sends none of
   the file, so at most one sends it, and if each reads the other's,
@@ -917,7 +923,7 @@ test kit, with no session, sign-in, GCP or network: `$.http.fetch`,
 `$.process.run`, `$.fs` and `$.store` are stubbed, and `mock.clock` drives the
 timers; the `$.fs` stubs measure files in UTF-8 bytes and refuse a file over
 4 MiB, and the `$.store` stub a store over 4 MiB of JSON in all, as the host
-does. 302 tests cover the captured rows and their spans,
+does. 306 tests cover the captured rows and their spans,
 subagent runs in the order the host raises them (one invocation and one
 trace for the turn, a span per run, a SubagentStart that comes late or never),
 the session-start row raised before or during `session.start`'s setup,
@@ -1088,7 +1094,11 @@ And the replay that runs by itself while nothing is queued:
   line, and `/bqaa-backfill force` replaying such a file afresh; a file
   another session's lease holds, and one of what is left waiting on its
   parent's record, each saying why; of two whole done marks for one file,
-  every writer going by the later; two writers of one session never giving
+  every writer going by the later, by number and then by name; a writer
+  whose read of the record answers after another finished the file, put
+  back by a late write, sending none of it; where the listing gives no
+  times, the records of a file done more than a day ago emptied by its done
+  mark's time, and a listing time of 0 taken for none; two writers of one session never giving
   two files one name; a done
   mark cut off part-way, with no other record, leaving the file waiting,
   for `/bqaa-backfill` too, and `/bqaa-backfill force` replaying it
@@ -1103,8 +1113,8 @@ And the replay that runs by itself while nothing is queued:
   once it is whole, and one never finished makes no request or file over
   ten minutes of paced reads; one listed empty before its write landed, or
   listed with its rows and read empty, is sent once whole, with or without
-  times in the listing, and one left empty long ago, or emptied by its
-  replay, keeps nothing going;
+  times in the listing, and one left empty or part-written long ago, or
+  emptied by its replay, keeps nothing going;
 * rows refused on a send and then on a replay all counted on the status
   line, which a replay whose rows are only asked for again leaves as it
   was, and a later request of the same replay that lands rows ends; a

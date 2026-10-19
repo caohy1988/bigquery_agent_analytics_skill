@@ -127,6 +127,20 @@ test('a retry file listed empty, before its write put anything in it, is replaye
   expect(lists - before).toBe(0)
 })
 
+test('a listing that gives 0 for a file\'s time gives no time: an empty file is watched from when the writer first saw it, and sent once whole', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  await startSession($)
+  await world.clock.advance(5000)
+  const source = `${PARTITION_DIR}/retry-20261013T200102003Z-earlier-1.jsonl`
+  const a = 'a'.repeat(32)
+  // No time set: the listing says 0.
+  world.files.set(source, '')
+  await world.clock.advance(15_000)
+  world.files.set(source, packFiles([line(a, 'retry')])[0] as string)
+  await idleFor(world, 10)
+  expect([world.sentRows().filter(r => r.event_id === a).length, world.files.get(source)]).toEqual([1, ''])
+})
+
 test('a retry file listed with its rows and read empty, no done mark beside it, keeps its table due: the idle session replays it once it is whole again', { options: OPTIONS }, async ($, on) => {
   const source = `${PARTITION_DIR}/retry-20261013T200102003Z-earlier-1.jsonl`
   // A write that starts the file over is under way at the first read.
@@ -146,9 +160,12 @@ test('where the listing gives no times, an empty file a write may still fill is 
   const dir = `/dl/${TABLE_REF}`
   const source = `${dir}/retry-20261019T000000000Z-producer-1.jsonl`
   const stuck = `${dir}/retry-20261019T000000000Z-producer-2.jsonl`
+  const partial = `${dir}/retry-20261019T000000000Z-producer-3.jsonl`
+  const whole = packFiles([line('f'.repeat(32), 'retry')])[0] as string
   const files = new Map<string, string>([
     [source, ''],
     [stuck, ''],
+    [partial, whole.slice(0, whole.indexOf('\n') + 1)],
   ])
   const store = new Map<string, unknown>()
   const sent: string[] = []
@@ -197,13 +214,14 @@ test('where the listing gives no times, an empty file a write may still fill is 
   }
   const first = await writer.backfill(['spill', 'retry'], 'auto')
   expect(first.held ?? '').toMatch(/is empty, perhaps still being written; it waits for the next replay/)
-  // The first file's write lands; the second's never does.
+  expect([first.skippedFiles, first.incompleteFiles]).toEqual([2, ['retry-20261019T000000000Z-producer-3.jsonl']])
+  // The first file's write lands; the second's, and the third's end, never do.
   const a = 'a'.repeat(32)
   files.set(source, packFiles([line(a, 'retry')])[0] as string)
   await idle(5)
   expect([sent.filter(id => id === a).length, files.get(source)]).toEqual([1, ''])
-  // A lease's time after the writer first saw it, the empty one keeps the
-  // table due no longer.
+  // A lease's time after the writer first saw them, the empty one and the
+  // part-written one keep the table due no longer.
   await idle(10)
   const before = lists
   await idle(10)
@@ -233,7 +251,9 @@ test('a retry file read before its completion record was written is replayed by 
   const before = lists
   await idleFor(world, 10)
   expect([world.insertCalls().length, world.files.size]).toEqual([requests, files])
-  expect(lists - before > 2 && lists - before < 30).toBe(true)
+  // Paced: a replay lists the directory, and the file's record check lists
+  // it twice more where it finds none, about a dozen replays in ten minutes.
+  expect(lists - before > 2 && lists - before < 60).toBe(true)
   // Finished now: the idle session sends it once, and empties it.
   world.files.set(source, whole)
   await idleFor(world, 10)
@@ -1669,6 +1689,42 @@ test('a record the store takes after another session finished the file with an o
   expect([w.store.has(key), w.sentOf(a), w.copiesOf(a)]).toEqual([false, 2, 1])
 })
 
+test('where the listing gives no times, the records of a file done more than a day ago are emptied by when its done mark says it was done', async () => {
+  const config = resolveConfig({ project: 'my-gcp-project', dataset: 'agent_analytics', deadLetterDir: '/dl' }, {})
+  const dir = `/dl/${TABLE_REF}`
+  const source = `${dir}/retry-20261013T200102003Z-earlier-1.jsonl`
+  const files = new Map<string, string>([[source, packFiles([line('a'.repeat(32), 'retry')])[0] as string]])
+  const store = new Map<string, unknown>()
+  let now = 0
+  const io: Io = {
+    now: () => now,
+    after: () => ({ cancel: () => undefined }),
+    fetch: async () => OK_INSERT,
+    runCommand: async () => ({ exitCode: 0, stdout: `${'a'.repeat(24)}\n`, stderr: '' }),
+    envToken: async () => undefined,
+    writeFile: async (path, text) => void files.set(path, text),
+    readFile: async path => files.get(path) ?? '',
+    exists: async path => files.has(path),
+    listDir: async d => [...files].filter(([path]) => path.startsWith(`${d}/`)).map(([path, text]) => ({ name: path.slice(d.length + 1), kind: 'file', size: new TextEncoder().encode(text).length })),
+    storeGet: async key => store.get(key),
+    storeSet: async (key, value) => void store.set(key, JSON.parse(JSON.stringify(value)) as unknown),
+    storeDelete: async key => void store.delete(key),
+    status: () => undefined,
+    debug: () => undefined,
+  }
+  const writer = new Writer(io, () => config, () => 'a-session')
+  const kept = (): string[] => [...files].filter(([path, text]) => path.includes('/outcome-') && text !== '').map(([path]) => path)
+  await writer.backfill(['spill', 'retry'], 'auto')
+  expect([files.get(source), kept().length]).toEqual(['', 1])
+  // Half a day on: kept. Two days on: emptied.
+  now = 12 * 60 * 60 * 1000
+  await writer.backfill(['spill', 'retry'], 'auto')
+  expect(kept().length).toBe(1)
+  now = 2 * 24 * 60 * 60 * 1000
+  await writer.backfill(['spill', 'retry'], 'auto')
+  expect(kept()).toEqual([])
+})
+
 test('the records of files emptied more than a day ago are emptied; newer ones, and those of files still there, stay', async () => {
   const w = twoWriters(() => OK_INSERT)
   const dir = `/dl/${TABLE_REF}`
@@ -2178,6 +2234,105 @@ test('of two whole done marks for one file, every writer goes by the later: what
   w.files.set(unnamed, packFiles([line(e, 'retry')], parent)[0] as string)
   await w.writer('a-session').backfill(['spill', 'retry'], 'auto')
   expect([w.sentOf(d), w.sentOf(e), w.files.get(named), w.files.get(unnamed)]).toEqual([1, 0, '', ''])
+})
+
+test('a writer whose read of the record answers after another writer finished the file, which a late write then puts back, sends none of it: the done marks are read again before it goes by no record', async () => {
+  const w = twoWriters(() => FIRST_REFUSED)
+  const parentName = 'retry-20261013T200102002Z-parent-1.jsonl'
+  const parent = `/dl/${TABLE_REF}/${parentName}`
+  const name = 'retry-20261013T200102003Z-child-1.jsonl'
+  const source = `/dl/${TABLE_REF}/${name}`
+  const a = 'a'.repeat(32)
+  const text = packFiles([line(a, 'retry'), line('c'.repeat(32), 'retry')])[0] as string
+  w.files.set(parent, text)
+  // The parent's outcome is recorded: its first row waits, in the child, and
+  // its second landed.
+  w.store.set(`replayed:${TABLE_REF}/${parentName}`, { size: new TextEncoder().encode(text).length, fates: 'WL', reasons: [], refusals: [], files: [source], written: [false], waits: true, seq: 1 })
+  // A writer's write of the child waits; its lease runs out, and another
+  // writer finishes the parent.
+  let outputReached = (): void => undefined
+  let releaseOutput = (): void => undefined
+  const atOutput = new Promise<void>(resolve => (outputReached = resolve))
+  const output = new Promise<void>(resolve => (releaseOutput = resolve))
+  let outputHeld = false
+  w.holdWrites((session, path, value) => {
+    if (session !== 'delayed-parent' || path !== source || value === '' || outputHeld) return undefined
+    outputHeld = true
+    outputReached()
+    return output
+  })
+  const delayed = w.writer('delayed-parent').backfill(['spill', 'retry'], 'auto')
+  await atOutput
+  w.store.delete(`lease:${TABLE_REF}/${parentName}`)
+  await w.writer('finishing-parent').backfill(['spill', 'retry'], 'auto')
+  expect([w.files.get(parent), parseFile(w.files.get(source) ?? '').lines.length]).toEqual(['', 1])
+  // A checker's read of the child waits; its lease runs out, and a sender
+  // sends the child, its answer held.
+  let readReached = (): void => undefined
+  let releaseRead = (): void => undefined
+  const atRead = new Promise<void>(resolve => (readReached = resolve))
+  const read = new Promise<void>(resolve => (releaseRead = resolve))
+  let readHeld = false
+  w.holdReads((session, path) => {
+    if (session !== 'checking-child' || path !== source || readHeld) return undefined
+    readHeld = true
+    readReached()
+    return read
+  })
+  const checking = w.writer('checking-child').backfill(['spill', 'retry'], 'auto')
+  await atRead
+  w.store.delete(`lease:${TABLE_REF}/${name}`)
+  let asked = (): void => undefined
+  let answer = (): void => undefined
+  const atRequest = new Promise<void>(resolve => (asked = resolve))
+  const answered = new Promise<void>(resolve => (answer = resolve))
+  w.hold(session => {
+    if (session !== 'sending-child') return undefined
+    asked()
+    return answered
+  })
+  const sending = w.writer('sending-child').backfill(['spill', 'retry'], 'auto')
+  await atRequest
+  // The checker goes on to its mark; its read of the child's record waits.
+  let getReached = (): void => undefined
+  let releaseGet = (): void => undefined
+  const atGet = new Promise<void>(resolve => (getReached = resolve))
+  const got = new Promise<void>(resolve => (releaseGet = resolve))
+  let getHeld = false
+  w.holdGets((session, key) => {
+    if (session !== 'checking-child' || key !== `replayed:${TABLE_REF}/${name}` || getHeld) return undefined
+    getHeld = true
+    getReached()
+    return got
+  })
+  releaseRead()
+  await atGet
+  // The sender's row is refused: it records, copies, marks the child done,
+  // empties it and lets its record go; the late write puts the child back.
+  answer()
+  await sending
+  expect([w.sentOf(a), w.copiesOf(a), w.files.get(source), doneMark(w.files, name)]).toEqual([1, 1, '', true])
+  releaseOutput()
+  await delayed
+  expect(parseFile(w.files.get(source) ?? '').lines.length).toBe(1)
+  releaseGet()
+  await checking
+  expect([w.sentOf(a), w.copiesOf(a)]).toEqual([1, 1])
+})
+
+test('of two whole done marks of one number, every writer goes by the later name', async () => {
+  const w = twoWriters(() => OK_INSERT)
+  const parent = 'retry-20261013T200102003Z-earlier-1.jsonl'
+  const [first, second] = [`/dl/${TABLE_REF}/retry-20261013T200103003Z-child-1.jsonl`, `/dl/${TABLE_REF}/retry-20261013T200103004Z-child-2.jsonl`]
+  const [d, e] = ['d'.repeat(32), 'e'.repeat(32)]
+  w.files.set(`/dl/${TABLE_REF}/${parent}`, '')
+  const mark = (files: string[]): string => sealFile(`${JSON.stringify({ size: 900, fates: 'W', reasons: [], refusals: [], files, written: [true], waits: true, seq: 5, retired: true })}\n`)
+  w.files.set(`/dl/${TABLE_REF}/outcome-done-aaaaaaaaaa-${parent}`, mark([first]))
+  w.files.set(`/dl/${TABLE_REF}/outcome-done-zzzzzzzzzz-${parent}`, mark([second]))
+  w.files.set(first, packFiles([line(d, 'retry')], parent)[0] as string)
+  w.files.set(second, packFiles([line(e, 'retry')], parent)[0] as string)
+  await w.writer('a-session').backfill(['spill', 'retry'], 'auto')
+  expect([w.sentOf(d), w.sentOf(e)]).toEqual([0, 1])
 })
 
 test('two writers of one session, one taking over from the other, never give two files one name: neither writes over what the other left', async () => {
