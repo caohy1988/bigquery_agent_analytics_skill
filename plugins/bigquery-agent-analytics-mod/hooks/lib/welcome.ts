@@ -11,14 +11,16 @@ export const WELCOME_KEY = 'welcome'
 
 // The version greeted, the version greeted before it (null on a fresh
 // install), the session that showed the card, when rows first landed while
-// it showed, and whether it was closed. A reload in that session
-// (/reload-plugins, an option changed in /config) shows the card again as it
-// was; no later session shows it.
+// it showed and where they went (`destinationKey`), and whether it was
+// closed. A reload in that session (/reload-plugins, an option changed in
+// /config) shows the card again as it was, waiting again if rows now go
+// elsewhere; no later session shows it.
 export type Welcome = {
   version: string
   previous: string | null
   sessionId: string | null
   landedAt: number | null
+  landedTo: string | null
   closed: boolean
 }
 
@@ -39,19 +41,29 @@ const NOT_SET_UP = 'the project and dataset options are set in /config, or BQAA_
 
 const isObject = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value)
 
+// Where rows go under this configuration: the dry-run directory, or the
+// table and its location. Rows that landed somewhere else (in a dry run
+// before a reload, in another table) say nothing about it.
+export const destinationKey = (c: Config): string => (c.dryRun ? `dry run: ${c.dryRunDir}` : `${tableRef(c)} (${c.location})`)
+
+// Whether the store still holds this card's own record, not one another
+// session wrote since (a newer version it greeted, say).
+export const isOwnRecord = (stored: unknown, w: Welcome): boolean => isObject(stored) && stored.version === w.version && stored.sessionId === w.sessionId
+
 // At session start, from what the store holds: a new card for a version not
 // greeted yet, the same card after a reload in the session that showed it
-// (unless it was closed), else none.
-export function openWelcome(stored: unknown, sessionId: string | null): { welcome: Welcome; isNew: boolean } | null {
+// (unless it was closed; waiting again if rows now go elsewhere, so `key` is
+// this configuration's `destinationKey`), else none.
+export function openWelcome(stored: unknown, sessionId: string | null, key: string): { welcome: Welcome; isNew: boolean } | null {
   const seen = isObject(stored) ? stored : {}
   const version = typeof seen.version === 'string' ? seen.version : null
   if (version !== PLUGIN_VERSION) {
-    return { welcome: { version: PLUGIN_VERSION, previous: version, sessionId, landedAt: null, closed: false }, isNew: true }
+    return { welcome: { version: PLUGIN_VERSION, previous: version, sessionId, landedAt: null, landedTo: null, closed: false }, isNew: true }
   }
   if (sessionId === null || seen.sessionId !== sessionId || seen.closed !== false) return null
   const previous = typeof seen.previous === 'string' ? seen.previous : null
-  const landedAt = typeof seen.landedAt === 'number' ? seen.landedAt : null
-  return { welcome: { version, previous, sessionId, landedAt, closed: false }, isNew: false }
+  const here = typeof seen.landedAt === 'number' && seen.landedTo === key
+  return { welcome: { version, previous, sessionId, landedAt: here ? (seen.landedAt as number) : null, landedTo: here ? key : null, closed: false }, isNew: false }
 }
 
 const arrival = (w: Welcome): string => (w.previous === null ? 'installed' : `updated to ${w.version}`)

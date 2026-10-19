@@ -27,7 +27,7 @@ import type { BqaaRow } from './lib/rows.ts'
 import { redactDiagnostic } from './lib/sanitize.ts'
 import { type DeadLetterSummary, formatStatus } from './lib/status.ts'
 import { type StepCtx, type StepResult, type ToolCtx, type ToolOutcome, Tracer, errorText } from './lib/tracer.ts'
-import { WELCOME_KEY, type Welcome, landedToast, openWelcome, welcomeCard, welcomeNotice } from './lib/welcome.ts'
+import { WELCOME_KEY, type Welcome, destinationKey, isOwnRecord, landedToast, openWelcome, welcomeCard, welcomeNotice } from './lib/welcome.ts'
 import { COMMAND_LINE_CHARS, type Io, Writer } from './lib/writer.ts'
 
 let options: Options = {}
@@ -42,6 +42,9 @@ let clockAfter: ((ms: number, fn: () => void) => { cancel: () => void }) | null 
 // The welcome card (lib/welcome.ts) in the first session after the mod is
 // installed or updated; null in any other session, and once it is closed.
 let welcome: Welcome | null = null
+// Counts the starts of the card: a store read that answers after a later
+// session.start began is not used.
+let welcomeStarts = 0
 
 // Rows captured before session.start built the writer (an event the engine
 // raised first); handed over once it exists.
@@ -222,8 +225,10 @@ async function lookUpHostname($: EngineInterface): Promise<void> {
 
 // In a session a person sees (a `-p` run draws no band): the welcome card
 // for a version not greeted yet, recorded at once so that no later session
-// shows it, or the card a reload in its own session left open.
+// shows it, or the card a reload in its own session left open. Runs in the
+// background: nothing waits on the store for it.
 async function startWelcome($: EngineInterface, e: SessionStartInput, sessionId: string | null): Promise<void> {
+  const start = ++welcomeStarts
   welcome = null
   if (!e.isInteractive || e.surface === null) return
   let stored: unknown
@@ -233,14 +238,19 @@ async function startWelcome($: EngineInterface, e: SessionStartInput, sessionId:
     // Unable to tell whether it showed before: never a card each session.
     return
   }
-  const opened = openWelcome(stored, sessionId)
+  // session.start ran again meanwhile: the card is that start's to show.
+  if (start !== welcomeStarts) return
+  const opened = openWelcome(stored, sessionId, destinationKey(config))
   if (opened === null) return
   welcome = opened.welcome
   // The band may be drawn already, from before this session started.
   redrawBand($)
-  if (!opened.isNew) return
-  await saveWelcome($, opened.welcome)
-  $.ui.log(clean(welcomeNotice(opened.welcome, config)))
+  if (opened.isNew) {
+    void saveWelcome($, opened.welcome)
+    $.ui.log(clean(welcomeNotice(opened.welcome, config)))
+  }
+  // Rows that landed while the store was read: the card says so now.
+  if (writer !== null && writer.counters.sent > 0) rowsLanded($)
 }
 
 // A surface that draws no band may refuse the redraw: nothing to draw then.
@@ -260,14 +270,24 @@ async function saveWelcome($: EngineInterface, shown: Welcome): Promise<void> {
   }
 }
 
+// What happened to the card since: written only over its own record, so that
+// a session left open never undoes a newer version another one greeted.
+async function updateWelcome($: EngineInterface, shown: Welcome): Promise<void> {
+  try {
+    if (isOwnRecord(await $.store.get(WELCOME_KEY), shown)) await $.store.set(WELCOME_KEY, shown)
+  } catch {
+    // Not recorded: a reload shows the card as it was before.
+  }
+}
+
 // Rows landed: the card's count moves, and the first time, it says they
 // landed, with a toast as well, as the band may be collapsed.
 function rowsLanded($: EngineInterface): void {
   const shown = welcome
   if (shown === null) return
   if (shown.landedAt === null) {
-    welcome = { ...shown, landedAt: Date.now() }
-    void saveWelcome($, welcome)
+    welcome = { ...shown, landedAt: Date.now(), landedTo: destinationKey(config) }
+    void updateWelcome($, welcome)
     $.ui.toast(clean(landedToast(config), 500), { timeoutMs: 15_000 })
   }
   redrawBand($)
@@ -278,7 +298,7 @@ function closeWelcome($: EngineInterface): void {
   const shown = welcome
   if (shown === null) return
   welcome = null
-  void saveWelcome($, { ...shown, closed: true })
+  void updateWelcome($, { ...shown, closed: true })
   redrawBand($)
 }
 
@@ -408,12 +428,11 @@ export const register: Register = (on, registered) => {
     } catch {
       internalErrors += 1
     }
-    // Last, and in its own try: nothing above waits on the welcome card.
-    try {
-      await startWelcome($, e, tracer.sessionId)
-    } catch {
+    // In the background: neither the first prompt nor anything above waits
+    // on the store for the welcome card.
+    void startWelcome($, e, tracer.sessionId).catch(() => {
       internalErrors += 1
-    }
+    })
     return next(e)
   })
 

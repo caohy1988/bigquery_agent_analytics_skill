@@ -213,8 +213,19 @@ not read, keeps what it said.
 The mod notes the version it greeted in its own store (`$.store`, key
 `welcome`), so no later session shows the card. A reload in the same session
 (`/reload-plugins`, or an option changed in `/config`) shows it again as it
-was.
+was. If rows now go somewhere else (another table, or BigQuery after a dry
+run), the card waits again until rows land there.
 A `-p` run draws no band: it shows nothing and leaves the store alone.
+Nothing waits on the store for the card, the session's start included; the
+card shows once the store answers. The store makes "once" a best effort:
+
+* if the record cannot be written, the next session shows the card again;
+* if it cannot be read, no card shows;
+* two sessions started at the same moment can both show it;
+* a session left open never writes over a newer version another session
+  greeted;
+* reinstalling the same version shows no card while the store keeps the
+  record.
 
 ## Configure
 
@@ -997,7 +1008,7 @@ test kit, with no session, sign-in, GCP or network: `$.http.fetch`,
 `$.process.run`, `$.fs` and `$.store` are stubbed, and `mock.clock` drives the
 timers; the `$.fs` stubs measure files in UTF-8 bytes and refuse a file over
 4 MiB, and the `$.store` stub a store over 4 MiB of JSON in all, as the host
-does. 350 tests cover the captured rows and their spans,
+does. 356 tests cover the captured rows and their spans,
 subagent runs in the order the host raises them (one invocation and one
 trace for the turn, a span per run, a SubagentStart that comes late or never),
 the session-start row raised before or during `session.start`'s setup,
@@ -1243,7 +1254,11 @@ And the welcome card:
   keeps later sessions from showing it; a reload in its session showing it
   again as it was; no card, line or record in a run with no one at the
   prompt;
-* a store that never answers holding up neither the rows nor the commands;
+* a store read or write that never answers holding up nothing, the session's
+  start included; rows that land while the store is read; a read that
+  answers after `session.start` ran again;
+* a reload to another table, or out of a dry run, waiting for rows to land
+  there, and a session left open never writing over a newer version's record;
 * its border only where the band has the rows for one, and a survey left
   alone.
 

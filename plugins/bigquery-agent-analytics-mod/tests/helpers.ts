@@ -69,8 +69,6 @@ export type World = {
   releaseHung: (status: number, text: string) => void
   // The mod's `$.store`, each value read back as JSON, as the host keeps it.
   store: Map<string, unknown>
-  // Makes `$.store.get` never answer.
-  hangStore: boolean
   // The slash commands the mod registered.
   registered: string[]
 }
@@ -179,11 +177,10 @@ export function setUp(on: On, env: Record<string, string> = {}, store: Record<st
       for (const resolve of hung.splice(0)) resolve({ value: { status, ok: status >= 200 && status < 300, headers: {}, text } })
     },
     store: new Map(Object.entries(store).map(([key, value]) => [key, asJson(value)])),
-    hangStore: false,
     registered: [],
   }
 
-  on('store.get', ($, e) => (world.hangStore ? new Promise<never>(() => {}) : { value: world.store.get(e.key) }))
+  on('store.get', ($, e) => ({ value: world.store.get(e.key) }))
   // As the host, a store of no more than 4 MiB of JSON in all.
   on('store.set', ($, e) => {
     const value = asJson(e.value)
