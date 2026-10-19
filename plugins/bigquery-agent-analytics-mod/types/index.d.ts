@@ -27,6 +27,18 @@ export type WelcomeState = {
   // The rank of that load's run (`loads` when it ran), so a load whose reads
   // answered late never takes the card from a later one.
   rank: number
+  // The session's delivery generation the card opened at (`delivered`): a
+  // delivery that began at an earlier one never counts on it.
+  generation?: number
+}
+
+// The session's deliveries: each writer's rows landed so far, keyed as
+// `counted`, whatever the card shows (none, closed, or counting elsewhere),
+// and the generation, which a card that opens moves on, at the version
+// read, taking its start from the totals it moved on from.
+export type DeliveredState = {
+  generation: number
+  totals: Record<string, number>
 }
 
 declare module 'claude-code' {
@@ -36,10 +48,13 @@ declare module 'claude-code' {
       // How many session.start runs, of every load of the code, the session
       // has seen: each run's rank (register.ts `nextLoad`).
       loads: number
-      // Each writer's rows landed so far in the session, keyed as `counted`,
-      // whatever the card shows (none, closed, or counting elsewhere): where
-      // a card that opens starts its count.
-      delivered: Record<string, number>
+      // Each writer's rows landed so far in the session, and the generation
+      // a card that opens moves on (DeliveredState).
+      delivered: DeliveredState
+      // Written by each delivery before it reads the generation: a dispatch
+      // reads one moment of the session's state until a write of its own
+      // brings it up to date, and a flush runs on through an update.
+      refresh: number
     }
   }
 }

@@ -60,8 +60,10 @@ function host({ hold = () => false, holdState = () => false, refuseState = () =>
     if (!hold(key)) return Promise.resolve(land())
     return new Promise(resolve => held.push({ key, release: () => resolve(land()) }))
   }
-  // One sequence of versions for the session's values, as the host's test
-  // runtime keeps: a write that lands takes the next one.
+  // A new version for each write that lands, from one sequence for the
+  // session's values. The code compares a value's version only with that
+  // value's own; the host's test runtime numbers writes of different values
+  // alike at times, so nothing here asks more of the numbers than that.
   let stamp = 0
   const stateSet = (ref, value, options) => {
     if (refuseState(value)) return Promise.reject(new Error('refused by policy'))
@@ -171,6 +173,14 @@ async function load(h, options = {}, version = null) {
       const b = await button()
       assert.ok(b, 'the card is up')
       dispatch.run({ moment: null }, () => b.props.onPress())
+      await settle()
+    },
+    // Rows queued (`count` session-start rows), and the next flush of them.
+    queue: async count => {
+      for (let i = 0; i < count; i += 1) await fire('classic.SessionStart', { source: 'startup', session_id: SESSION, model: 'example-model', cwd: '/work' })
+    },
+    flush: async () => {
+      timers.at(-1)()
       await settle()
     },
     // The session's first row, written by the next flush (a dry run).
@@ -920,6 +930,70 @@ const tests = {
     await b.start()
     assert.deepEqual([h.card().version, h.card().sent], [NEXT, 0])
     writes.splice(0).forEach(go => go())
+    await settle()
+    assert.equal(h.card().sent, 1)
+  },
+  async 'a delivery of the version before an update that lands after the updated version\'s card opened counts on it'() {
+    const h = host()
+    const a = await load(h)
+    await a.start()
+    await a.land()
+    await a.close()
+    const writes = []
+    h.writeFile = () => new Promise(resolve => writes.push(resolve))
+    await a.land()
+    const b = await load(h, {}, NEXT)
+    await b.start()
+    writes.shift()()
+    await settle()
+    assert.equal(h.card().sent, 1)
+  },
+  async 'a delivery that landed before an update, recorded only after the updated version\'s card opened, never counts on it'() {
+    let holding = false
+    // The write that records the second row's total waits.
+    const h = host({ holdState: value => holding && typeof value === 'object' && value !== null && 'totals' in value && Object.values(value.totals).some(total => total >= 2) })
+    const a = await load(h)
+    await a.start()
+    await a.land()
+    await a.close()
+    holding = true
+    await a.land()
+    assert.equal(h.held.length, 1)
+    holding = false
+    const b = await load(h, {}, NEXT)
+    await b.start()
+    assert.equal(h.card().sent, 0)
+    h.release('state')
+    await settle()
+    assert.deepEqual([h.card().sent, h.card().landedAt], [0, null])
+  },
+  async 'rows the version before an update lands while the updated version reads the store are in the card\'s start: only a later row counts'() {
+    const h = host()
+    h.store.set(`welcome:${PLUGIN_VERSION}`, { version: PLUGIN_VERSION, sessionId: 'another-session', previous: null })
+    const a = await load(h)
+    await a.start()
+    await a.land()
+    assert.equal(await a.shown(), false)
+    // 501 rows queued: the first batch's write waits, then the last row's.
+    const writes = []
+    h.writeFile = () => new Promise(resolve => writes.push(resolve))
+    await a.queue(501)
+    await a.flush()
+    assert.equal(writes.length, 1)
+    let holding = true
+    const reads = heldReads(h, () => holding)
+    const b = await load(h, {}, NEXT)
+    await b.start()
+    assert.ok(reads.count() > 0)
+    writes.shift()()
+    await settle()
+    assert.equal(writes.length, 1)
+    assert.equal(Object.values(h.state.get('delivered').value.totals)[0], 501)
+    holding = false
+    reads.answer()
+    await settle()
+    assert.equal(h.card().sent, 0)
+    writes.shift()()
     await settle()
     assert.equal(h.card().sent, 1)
   },

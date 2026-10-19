@@ -66,10 +66,14 @@ const WELCOME_STATE = { plugin: 'bigquery-agent-analytics-mod', key: 'welcome' }
 // replaced before its number came back), whatever the clock says.
 const LOADS_STATE = { plugin: 'bigquery-agent-analytics-mod', key: 'loads' } as const
 // Each writer's rows landed so far in the session, by writer and destination
-// (`countKey`), whatever the card shows: a card that opens starts its count
-// there (`startWelcome`), so rows landed before it, while no card showed or
-// the card was closed included, never count on it.
+// (`countKey`), whatever the card shows, and the generation, which a card
+// that opens moves on at the version read, taking its start from the totals
+// it moved on from (`startWelcome`): a delivery that began at an earlier
+// generation never counts on it, however late it is recorded.
 const DELIVERED_STATE = { plugin: 'bigquery-agent-analytics-mod', key: 'delivered' } as const
+// Written only to bring a dispatch's view of the session's state up to date
+// (`deliveryGeneration`), a key no other write goes to.
+const REFRESH_STATE = { plugin: 'bigquery-agent-analytics-mod', key: 'refresh' } as const
 // A writer's rows landed in one destination: the key of `counted` and of
 // `delivered`.
 const countKey = (by: string, to: string): string => `${by}@${to}`
@@ -341,24 +345,16 @@ async function startWelcome($: EngineInterface, e: SessionStartInput, sessionId:
   // its own; a card a later load or run showed, left to it; or an earlier
   // one's of another version (an update in the session), which this run's
   // card replaces, tried again at the state as it stands now. Its count
-  // starts from the rows every other writer has landed so far (the
-  // session's `delivered`, and what the card it replaces had counted), so
-  // an earlier load's rows landed before this card count once, as rows
-  // landed while it shows, only from here; this run's own rows, landed while
-  // the records were read, it counts at once.
+  // starts where the session's deliveries stand as it moves their generation
+  // on (`openGeneration`): an earlier load's rows landed before, or in a
+  // delivery that began before, never count on it; this run's own rows,
+  // landed while the records were read, it counts at once.
+  const opening = await openGeneration($)
+  const others = Object.fromEntries(Object.entries(opening.totals).filter(([id]) => !id.startsWith(`${me}@`)))
   let version = held.version
-  let replaced = held.value
   let isSet = false
-  let card = shown
+  const card: Welcome = { ...shown, counted: others, generation: opening.generation }
   for (let i = 0; i < 8 && !isSet; i += 1) {
-    let delivered: Record<string, number> = {}
-    try {
-      delivered = (await $.state.get(DELIVERED_STATE)).value ?? {}
-    } catch {
-      // None known: what the card it replaces had counted.
-    }
-    const others = Object.fromEntries(Object.entries(delivered).filter(([id]) => !id.startsWith(`${me}@`)))
-    card = { ...shown, counted: baselines(others, replaced?.counted ?? {}) }
     try {
       isSet = (await $.state.set(WELCOME_STATE, card, { ifVersion: version })).isSet
     } catch {
@@ -375,7 +371,6 @@ async function startWelcome($: EngineInterface, e: SessionStartInput, sessionId:
     }
     if (isOurs(now.value)) return takeOver($, sessionId as string, start, rank)
     if (now.value !== null && (now.value.rank ?? 0) > rank) return
-    replaced = now.value
     version = now.version
   }
   if (!isSet) return
@@ -522,15 +517,23 @@ function redrawBand($: EngineInterface): void {
 function rowsLanded($: EngineInterface, id: string, total: number, to: string | null): void {
   if (to === null || total <= 0) return
   let first = false
-  void noteDelivered($, id, total)
-    .then(() =>
-      changeCard($, card => {
-        const had = card.counted?.[id] ?? 0
-        if (card.closed || card.destination !== to || total <= had) return null
-        first = card.landedAt === null
-        return { ...card, counted: { ...card.counted, [id]: total }, sent: card.sent + total - had, ...(first ? { landedAt: Date.now(), landedTo: to } : {}) }
-      }),
-    )
+  void (async () => {
+    // The generation this delivery began at, read up to date, before it is
+    // recorded: one recorded late still counts only where it began.
+    const began = await deliveryGeneration($)
+    await noteDelivered($, id, total)
+    return changeCard($, card => {
+      const had = card.counted?.[id] ?? 0
+      if (card.closed || card.destination !== to || total <= had) return null
+      // Begun before the card opened: taken into its start, never counted
+      // on it. (The rows of the run that showed it, landed as it read the
+      // store, count at once: it says so once the card shows, a delivery
+      // begun then.)
+      if ((card.generation ?? 0) > began) return { ...card, counted: { ...card.counted, [id]: total } }
+      first = card.landedAt === null
+      return { ...card, counted: { ...card.counted, [id]: total }, sent: card.sent + total - had, ...(first ? { landedAt: Date.now(), landedTo: to } : {}) }
+    })
+  })()
     .then(card => {
       if (card === null) return
       // At every change: a landing whose write failed goes again.
@@ -556,20 +559,47 @@ async function noteDelivered($: EngineInterface, id: string, total: number): Pro
   try {
     for (let i = 0; i < 8; i += 1) {
       const held = await $.state.get(DELIVERED_STATE)
-      const now = held.value ?? {}
-      if ((now[id] ?? 0) >= total) return
-      if ((await $.state.set(DELIVERED_STATE, { ...now, [id]: total }, { ifVersion: held.version })).isSet) return
+      const now = held.value ?? { generation: 0, totals: {} }
+      if ((now.totals[id] ?? 0) >= total) return
+      if ((await $.state.set(DELIVERED_STATE, { generation: now.generation, totals: { ...now.totals, [id]: total } }, { ifVersion: held.version })).isSet) return
     }
   } catch {
     // No session state here, or refused: no card counts from it.
   }
 }
 
-// Each key's highest total of the maps given: what a card opening counts from.
-function baselines(...maps: Record<string, number>[]): Record<string, number> {
-  const out: Record<string, number> = {}
-  for (const map of maps) for (const [key, total] of Object.entries(map)) if (typeof total === 'number' && total > (out[key] ?? 0)) out[key] = total
-  return out
+// The session's delivery generation now. A dispatch reads one moment of the
+// session's state until a write of its own brings it up to date: one to a
+// key of its own (`refresh`) does, so a flush that runs on through an update
+// reads where things stand, and no write of the deliveries' record, early
+// or late, comes before the read.
+async function deliveryGeneration($: EngineInterface): Promise<number> {
+  if (!cardSession) return 0
+  try {
+    await $.state.set(REFRESH_STATE, 0)
+    return (await $.state.get(DELIVERED_STATE)).value?.generation ?? 0
+  } catch {
+    return 0
+  }
+}
+
+// A card opens: the session's delivery generation moves on, at the version
+// read (read again on a miss), and the card starts from the totals it moved
+// on from, so every delivery recorded before is in its start and every one
+// that begins after is counted on it. Where the state cannot be written,
+// generation 0 and no totals: a delivery of any generation counts.
+async function openGeneration($: EngineInterface): Promise<{ generation: number; totals: Record<string, number> }> {
+  try {
+    for (let i = 0; i < 8; i += 1) {
+      const held = await $.state.get(DELIVERED_STATE)
+      const now = held.value ?? { generation: 0, totals: {} }
+      const next = { generation: now.generation + 1, totals: now.totals }
+      if ((await $.state.set(DELIVERED_STATE, next, { ifVersion: held.version })).isSet) return next
+    }
+  } catch {
+    // No session state here, or refused.
+  }
+  return { generation: 0, totals: {} }
 }
 
 // Got it was pressed, or (`landedOnly`) a prompt came after rows landed

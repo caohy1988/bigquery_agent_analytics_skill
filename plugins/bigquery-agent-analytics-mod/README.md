@@ -260,9 +260,13 @@ version's, with its own greeting. Each
 writer's rows count once, however often or late it says so, counted apart
 for each place they land. The session's state also keeps each writer's
 rows landed so far, whatever the card shows (none, closed, or counting
-elsewhere), and a new card counts from there: rows an earlier load landed
-before it opened never count on it, while rows its own session start landed
-as it read the store do. If rows now go
+elsewhere), with a generation that a card opening moves on, at the version
+read, taking its start from the totals it moved on from: each delivery
+reads the generation it began at before it is recorded (after a write of
+its own to a key of its own, `refresh`, brings its view of the state up to
+date), and one that began before the card opened never counts on it,
+however late it is recorded, while one that began after counts. Rows its
+own session start landed as it read the store count at once. If rows now go
 somewhere else (another table or location, or BigQuery after a dry run), the card waits
 again until rows land there, and a prompt closes it only once they have,
 hiding it and writing the store's close at once, as Got it does; rows sent
@@ -1413,8 +1417,9 @@ does, which the test kit cannot, under node 24 with a small stand-in for
 writes and reads held and let go in any order). Its `$.state` keeps a
 version for each value and lands a conditional write only at it, and every
 `$.state.get` of one event reads one moment until a write of its own, landed
-or missed, brings the whole moment up to date, and the versions of all its
-values come from one sequence, as the host's test runtime does; its writes can be held or
+or missed, brings the whole moment up to date (a new version for each
+write that lands; the code compares a value's version only with that
+value's own, as the host's test runtime gives no more); its writes can be held or
 refused, its reads held. Its `$.clock.sleep` answers only in the newest
 load: a hot reload cancels the waits of the load it replaces. A load may be
 of another version of the code, its config naming that version, as after
@@ -1463,7 +1468,9 @@ event, brought up to date whole by a conditional write of its own, landed
 or missed; that rows the version before an update lands after the updated
 version showed its card count once there, and so do its rows landed after
 its own card was closed, or while the session showed no card, before the
-update: none of those count; that where no session id is
+update: none of those count, nor a delivery that landed before the update
+and was recorded after the card opened, nor rows an earlier load landed
+while the update read the store, while a later row of that load counts; that where no session id is
 known no card shows and no one is greeted, after a reload too;
 that a Got it, a takeover's stored close or a
 prompt in a load of the
