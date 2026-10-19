@@ -61,8 +61,9 @@ let cardReady: string | null = null
 const cardId = (version: string, sessionId: string | null): string => `${version}:${sessionId}`
 const WELCOME_STATE = { plugin: 'bigquery-agent-analytics-mod', key: 'welcome' } as const
 // How many session.start runs, of every load of this code, the session has
-// seen: each takes the next number, its rank, so a later load or run always
-// ranks above an earlier one, whatever the clock says.
+// seen: each takes the next number, its rank, so a later load or run ranks
+// above every earlier one that shows the card (`startWelcome` stops a load
+// replaced before its number came back), whatever the clock says.
 const LOADS_STATE = { plugin: 'bigquery-agent-analytics-mod', key: 'loads' } as const
 
 // Rows captured before session.start built the writer (an event the engine
@@ -271,6 +272,16 @@ async function startWelcome($: EngineInterface, e: SessionStartInput, sessionId:
   // Where the session keeps no state, there is no card: the band draws from it.
   const rank = await ranked
   if (rank === null) return
+  // Then only while the host still runs this load: a hot reload cancels the
+  // waits of the load it replaces, so this one never answers in a load
+  // replaced before its rank came back (its read or write answered late). A
+  // run that gets past it took its rank while still the current load, before
+  // any later load took one: every later run ranks above it.
+  try {
+    await $.clock.sleep(0)
+  } catch {
+    return
+  }
   let held: { value: Welcome | null; version: number }
   try {
     const read = await $.state.get(WELCOME_STATE)
@@ -399,6 +410,28 @@ async function stillOpen($: EngineInterface, sessionId: string): Promise<boolean
   closedCard = cardId(PLUGIN_VERSION, sessionId)
   redrawBand($)
   return false
+}
+
+// The store's close for the card the band draws, read again in the
+// background each time it draws it, one read at a time: Got it in an earlier
+// load, its state write refused and its store write late, hides the card
+// here once that write lands, with no reload and no press.
+let closeRead: Promise<void> | null = null
+function checkClosed($: EngineInterface, version: string, sessionId: string): void {
+  if (closeRead !== null) return
+  closeRead = $.store
+    .get(closedKey(version, sessionId))
+    .then(closed => {
+      if (closed !== true) return
+      closedCard = cardId(version, sessionId)
+      redrawBand($)
+    })
+    .catch(() => {
+      internalErrors += 1
+    })
+    .finally(() => {
+      closeRead = null
+    })
 }
 
 // Changes the card in `$.state`: reads it, applies `change`, and writes it
@@ -541,7 +574,8 @@ export const register: Register = (on, registered) => {
     // here on.
     const start = ++welcomeStarts
     cardReady = null
-    const ranked = nextLoad($).catch(() => null)
+    // Its rank, in a session a person sees (a `-p` run draws no card).
+    const ranked = e.isInteractive && e.surface !== null ? nextLoad($).catch(() => null) : Promise.resolve(null)
     try {
       config = resolveConfig(options, await readEnv($))
       clockAfter = (ms, fn) => $.clock.after(ms, fn)
@@ -710,6 +744,9 @@ export const register: Register = (on, registered) => {
       if (shown === null || shown.closed || shown.version !== PLUGIN_VERSION || shown.sessionId !== tracer.sessionId) return theirs
       const id = cardId(shown.version, shown.sessionId)
       if (id === closedCard || id !== cardReady) return theirs
+      // A close another load wrote late hides it at a later draw.
+      const { version, sessionId } = shown
+      if (sessionId !== null) safely(() => checkClosed($, version, sessionId))
       // Rows that landed elsewhere than this configuration sends them say
       // nothing here: the card waits.
       const here = shown.destination === destinationKey(config)

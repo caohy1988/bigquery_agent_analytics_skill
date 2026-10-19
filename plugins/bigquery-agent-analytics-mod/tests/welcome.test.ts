@@ -8,7 +8,9 @@
 // store for the card, session.start included. The greeting record names
 // the version greeted and the session; the card's own record, which only
 // that card writes, what became of it, written in order, so that a write
-// that answers late never undoes a close.
+// that answers late never undoes a close. The card shows one tick of the
+// clock after session.start (the check that this load is still the one the
+// host runs), so a test settles the clock before it looks.
 
 import { type Engine, expect, test } from 'claude-code/testing'
 
@@ -76,10 +78,10 @@ const statusText = async ($: Engine): Promise<string> => (await $.command.run({ 
 test('a fresh install shows the welcome card, then that the first rows landed, and the next prompt closes it', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on, {}, {})
   await startSession($)
+  await world.clock.settle()
   expect(await band($)).toEqual({ texts: [...INSTALLED, RECORDS, WAITING, 'drawn beneath'], boxed: true, button: 'Got it' })
   expect(welcomeLines(world.transcript)).toEqual([`bqaa: BigQuery Agent Analytics mod installed (${PLUGIN_VERSION}): records ${WHAT} to ${TABLE} (US); /bqaa-status shows what was sent.`])
   // Recorded at once: no later session shows it.
-  await world.clock.settle()
   expect(greeted(world)).toEqual(GREETED_HERE)
   expect(stored(world)).toBeUndefined()
   expect(own(world)).toBeUndefined()
@@ -111,6 +113,7 @@ test('a band drawn before the session started shows the card at once, before any
   const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...BAND })
   expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toEqual(['drawn beneath'])
   await startSession($)
+  await world.clock.settle()
   expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toEqual([...INSTALLED, RECORDS, WAITING, 'drawn beneath'])
   await ui.unmount()
   expect(world.acceptedRows().length).toBe(0)
@@ -138,6 +141,7 @@ for (const [name, records] of SHOWN_BEFORE) {
 test('a reload in the session that showed the card shows it again as it was, with no second line or toast', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on, {}, { welcome: GREETING, [GREETED_KEY]: GREETED_HERE, [OWN]: { landedAt: 1, landedTo: HERE } })
   await startSession($)
+  await world.clock.settle()
   // Rebuilt from the store's records alone (no `$.state`), which keep no
   // count: none until rows land again.
   expect((await band($)).texts).toEqual([...INSTALLED, RECORDS, '✓ First rows landed in BigQuery · /bqaa-status shows the counts', 'drawn beneath'])
@@ -150,30 +154,33 @@ test('a reload in the session that showed the card shows it again as it was, wit
 test('an update greets the new version and names the one it replaced', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on, {}, { welcome: { version: '0.0.9', previous: null, sessionId: 'an-earlier-session' } })
   await startSession($)
+  await world.clock.settle()
   expect((await band($)).texts).toEqual(['✓ ', `BigQuery Agent Analytics mod updated to ${PLUGIN_VERSION}`, ' was 0.0.9', RECORDS, WAITING, 'drawn beneath'])
   expect(welcomeLines(world.transcript)).toEqual([`bqaa: BigQuery Agent Analytics mod updated to ${PLUGIN_VERSION} (from 0.0.9): records ${WHAT} to ${TABLE} (US); /bqaa-status shows what was sent.`])
-  await world.clock.settle()
   expect(greeted(world)).toEqual({ sessionId: SESSION_ID, previous: '0.0.9' })
   // The record an earlier version kept is read, never written.
   expect(stored(world)).toEqual({ version: '0.0.9', previous: null, sessionId: 'an-earlier-session' })
 })
 
 test('pre-releases are ordered part by part: rc.10 comes after rc.2', { options: OPTIONS }, async ($, on) => {
-  setUp(on, {}, { 'welcome:0.1.0-rc.2': { sessionId: 'an-older-session', previous: null }, 'welcome:0.1.0-rc.10': { sessionId: 'an-earlier-session', previous: '0.1.0-rc.2' } })
+  const world = setUp(on, {}, { 'welcome:0.1.0-rc.2': { sessionId: 'an-older-session', previous: null }, 'welcome:0.1.0-rc.10': { sessionId: 'an-earlier-session', previous: '0.1.0-rc.2' } })
   await startSession($)
+  await world.clock.settle()
   expect((await band($)).texts.slice(1, 3)).toEqual([`BigQuery Agent Analytics mod updated to ${PLUGIN_VERSION}`, ' was 0.1.0-rc.10'])
 })
 
 test('the card names, as the version it replaced, the newest one greeted before', { options: OPTIONS }, async ($, on) => {
-  setUp(on, {}, { 'welcome:0.0.8': { sessionId: 'an-older-session', previous: null }, 'welcome:0.0.9': { sessionId: 'an-earlier-session', previous: '0.0.8' }, [`welcome:0.0.9:an-earlier-session`]: { landedAt: 1, landedTo: HERE } })
+  const world = setUp(on, {}, { 'welcome:0.0.8': { sessionId: 'an-older-session', previous: null }, 'welcome:0.0.9': { sessionId: 'an-earlier-session', previous: '0.0.8' }, [`welcome:0.0.9:an-earlier-session`]: { landedAt: 1, landedTo: HERE } })
   await startSession($)
+  await world.clock.settle()
   expect((await band($)).texts.slice(1, 3)).toEqual([`BigQuery Agent Analytics mod updated to ${PLUGIN_VERSION}`, ' was 0.0.9'])
 })
 
 for (const [previous, word] of [['0.1.0-rc.1', 'updated'], ['nightly', 'changed']] as const) {
   test(`after ${previous}, the card says ${word}: updated only to a version known to be newer`, { options: OPTIONS }, async ($, on) => {
-    setUp(on, {}, { welcome: { version: previous, previous: null, sessionId: 'an-earlier-session' } })
+    const world = setUp(on, {}, { welcome: { version: previous, previous: null, sessionId: 'an-earlier-session' } })
     await startSession($)
+    await world.clock.settle()
     expect((await band($)).texts.slice(1, 3)).toEqual([`BigQuery Agent Analytics mod ${word} to ${PLUGIN_VERSION}`, ` was ${previous}`])
   })
 }
@@ -181,6 +188,7 @@ for (const [previous, word] of [['0.1.0-rc.1', 'updated'], ['nightly', 'changed'
 test('a change back to an older version is greeted as a change, not an update', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on, {}, { welcome: { version: '99.0.0', previous: PLUGIN_VERSION, sessionId: 'an-earlier-session' } })
   await startSession($)
+  await world.clock.settle()
   expect((await band($)).texts.slice(0, 3)).toEqual(['✓ ', `BigQuery Agent Analytics mod changed to ${PLUGIN_VERSION}`, ' was 99.0.0'])
   expect(welcomeLines(world.transcript)).toEqual([`bqaa: BigQuery Agent Analytics mod changed to ${PLUGIN_VERSION} (from 99.0.0): records ${WHAT} to ${TABLE} (US); /bqaa-status shows what was sent.`])
 })
@@ -188,6 +196,7 @@ test('a change back to an older version is greeted as a change, not an update', 
 test('not set up: the card says what to set, stays after a prompt, and Got it closes it for good', { options: {} }, async ($, on) => {
   const world = setUp(on, {}, {})
   await startSession($)
+  await world.clock.settle()
   const card = ['◇ ', 'BigQuery Agent Analytics mod installed, not set up yet', ` ${PLUGIN_VERSION}`, `Nothing is recorded until ${NOT_SET_UP}.`, "Then make the dataset with the mod's setup.sh; its README shows how."]
   expect(await band($)).toEqual({ texts: [...card, 'drawn beneath'], boxed: true, button: 'Got it' })
   expect(welcomeLines(world.transcript)).toEqual([`bqaa: BigQuery Agent Analytics mod installed (${PLUGIN_VERSION}), not set up yet: nothing is recorded until ${NOT_SET_UP}.`])
@@ -239,7 +248,12 @@ test('rows parked while the dataset was missing land by replay in an idle sessio
   expect(world.toasts.at(-1)).toBe(`BQAA: first rows landed in ${TABLE}`)
 })
 
-test('a run with no one at the prompt shows no card and leaves the store alone', { options: OPTIONS }, async ($, on) => {
+test('a run with no one at the prompt shows no card and leaves the store and the session state alone', { options: OPTIONS }, async ($, on) => {
+  const written: string[] = []
+  on('state.set', ($, e, next) => {
+    written.push(e.key)
+    return next(e)
+  })
   const world = setUp(on, {}, {})
   await $.classic.SessionStart({ source: 'startup', session_id: SESSION_ID, model: 'example-model', cwd: '/work/my-repo' })
   await $.session.start({ surface: null, isInteractive: false, cwd: '/work/my-repo' })
@@ -248,8 +262,10 @@ test('a run with no one at the prompt shows no card and leaves the store alone',
   expect(welcomeLines(world.transcript)).toEqual([])
   expect(world.toasts).toEqual([])
   expect(stored(world)).toBeUndefined()
+  expect(written).toEqual([])
   // The first interactive session after it still has the card.
   await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' })
+  await world.clock.settle()
   expect((await band($)).texts.slice(0, 3)).toEqual(INSTALLED)
 })
 
@@ -321,7 +337,9 @@ test('a store read that answers after session.start ran again is not used: one c
   on('store.get', { key: 'welcome' }, () => new Promise<{ value: undefined }>(resolve => answers.push(resolve)))
   const world = setUp(on, {}, {})
   await startSession($)
+  await world.clock.settle()
   await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' })
+  await world.clock.settle()
   expect(answers.length).toBe(2)
   // The later start's read answers first; the earlier one's after it.
   answers[1]?.({ value: undefined })
@@ -376,6 +394,7 @@ test('a reload to another table waits for rows to land in that table', { options
 test('dry run: the card says where rows are written, then that the first were', { options: { dryRun: true } }, async ($, on) => {
   const world = setUp(on, {}, {})
   await startSession($)
+  await world.clock.settle()
   const head = ['✓ ', 'BigQuery Agent Analytics mod installed, dry run', ` ${PLUGIN_VERSION}`, `Writes ${WHAT} as JSONL files to ${DRY_RUN_DIR}, not to BigQuery.`]
   expect((await band($)).texts).toEqual([...head, '◌ Waiting for the first rows, written every 5 s while you work · /bqaa-status shows the counts', 'drawn beneath'])
   expect(welcomeLines(world.transcript)).toEqual([`bqaa: BigQuery Agent Analytics mod installed (${PLUGIN_VERSION}), dry run: writes ${WHAT} as JSONL files to ${DRY_RUN_DIR}, not to BigQuery.`])
@@ -387,6 +406,7 @@ test('dry run: the card says where rows are written, then that the first were', 
 test('capture off: the card says nothing is recorded, and how to turn it on', { options: { ...OPTIONS, enabled: false } }, async ($, on) => {
   const world = setUp(on, {}, {})
   await startSession($)
+  await world.clock.settle()
   expect((await band($)).texts).toEqual([
     '○ ',
     'BigQuery Agent Analytics mod installed, capture off',
@@ -398,8 +418,9 @@ test('capture off: the card says nothing is recorded, and how to turn it on', { 
 })
 
 test('the card is boxed where the band has the rows for a border, lines alone where not, and yields to a survey', { options: OPTIONS }, async ($, on) => {
-  setUp(on, {}, {})
+  const world = setUp(on, {}, {})
   await startSession($)
+  await world.clock.settle()
   expect(await band($, { maxRows: 5 })).toEqual({ texts: [...INSTALLED, RECORDS, WAITING, 'drawn beneath'], boxed: true, button: 'Got it' })
   expect(await band($, { maxRows: 4 })).toEqual({ texts: [...INSTALLED, RECORDS, WAITING, 'drawn beneath'], boxed: false, button: 'Got it' })
   expect(await band($, { hasSurvey: true })).toEqual({ texts: ['drawn beneath'], boxed: false, button: undefined })
@@ -433,6 +454,7 @@ test('a close made while the greeting is still being written is written at once,
   on('store.set', { key: GREETED_KEY }, ($, e) => writes.hold(e, world))
   const world = setUp(on, {}, {})
   await startSession($)
+  await world.clock.settle()
   await pressGotIt($)
   await world.clock.settle()
   // The close is in the store while the greeting is still being written.
@@ -554,6 +576,7 @@ test('a store read from an earlier session.start that answers while a later one 
   on('store.get', { key: 'welcome' }, () => (answer === undefined ? new Promise<{ value: unknown }>(resolve => (answer = resolve)) : { value: world.store.get('welcome') }))
   const world = setUp(on, {}, {})
   await startSession($)
+  await world.clock.settle()
   slow = true
   let started = false
   void $.session.start(START).then(() => {

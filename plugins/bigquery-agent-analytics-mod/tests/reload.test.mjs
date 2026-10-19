@@ -57,13 +57,20 @@ function heldReads(h, holding) {
 }
 
 let loads = 0
-// One load of the code against `h`, with `options` over the usual ones.
+// One load of the code against `h`, with `options` over the usual ones. The
+// newest load is the one the host runs: a hot reload cancels the waits of the
+// load it replaces, so `$.clock.sleep` never answers there once a later load
+// is in, or (`h.refuseWaits`) is refused; its other calls may still answer,
+// late.
 async function load(h, options = {}) {
-  const { register } = await import(`${REGISTER}?load=${++loads}`)
+  const index = ++loads
+  const { register } = await import(`${REGISTER}?load=${index}`)
+  h.current = index
   const hooks = new Map()
   const timers = []
   const lines = []
   const toasts = []
+  let redraws = 0
   const on = (name, ...args) => {
     hooks.set(name, args.at(-1))
     return { catch: () => undefined }
@@ -81,14 +88,18 @@ async function load(h, options = {}) {
       set: h.stateSet,
     },
     session: { id: async () => SESSION, version: async () => ({ version: 'test' }) },
-    clock: { every: (ms, fn) => (timers.push(fn), { cancel() {} }), after: () => ({ cancel() {} }) },
+    clock: {
+      every: (ms, fn) => (timers.push(fn), { cancel() {} }),
+      after: () => ({ cancel() {} }),
+      sleep: () => new Promise((resolve, reject) => queueMicrotask(() => (h.current === index ? resolve() : h.refuseWaits && reject(new Error('cancelled by a reload'))))),
+    },
     command: { register: async () => undefined },
     plugin: { root: '/opt/mods/bigquery-agent-analytics-mod' },
     ui: {
       log: text => void lines.push(text),
       toast: text => void toasts.push(text),
       status: () => undefined,
-      invalidate: () => undefined,
+      invalidate: () => void (redraws += 1),
       resolve: () => Object.fromEntries(['Box', 'Text', 'Button'].map(type => [type, props => ({ type, props })])),
     },
     fs: { write: (...args) => (h.writeFile ? h.writeFile(...args) : Promise.resolve()), read: async () => '', list: async () => [], exists: async () => false },
@@ -103,6 +114,8 @@ async function load(h, options = {}) {
     texts: async () => (await band()).filter(n => n.type === 'Text').map(n => n.props.children),
     greetings: () => lines.filter(line => line.startsWith('bqaa: BigQuery Agent Analytics mod')).length,
     toasts: () => toasts.length,
+    // The redraws this load asked for.
+    redraws: () => redraws,
     start: async () => {
       await fire('session.start', START)
       await settle()
@@ -559,6 +572,80 @@ const tests = {
     } finally {
       Date.now = realNow
     }
+  },
+  ...Object.fromEntries(
+    ['write', 'read'].map(step => [
+      `a load replaced while its rank ${step} is still out takes nothing over: the later load keeps its destination, counts its rows, and a prompt closes the card`,
+      async () => {
+        const A = { deadLetterDir: '/home/dev/a/dead-letter' }
+        const B = { deadLetterDir: '/home/dev/b/dead-letter' }
+        // B's cancelled wait never answers, or is refused.
+        for (const refuseWaits of [false, true]) {
+          let holding = false
+          const h = host({ holdState: value => holding && typeof value === 'number' })
+          h.refuseWaits = refuseWaits
+          const a = await load(h, A)
+          await a.start()
+          const reads = []
+          if (step === 'write') holding = true
+          else h.stateRead = key => (key === 'loads' ? new Promise(resolve => reads.push(resolve)) : undefined)
+          const b = await load(h, A)
+          await b.start()
+          assert.equal(step === 'write' ? h.held.length : reads.length, 1)
+          holding = false
+          h.stateRead = undefined
+          const c = await load(h, B)
+          await c.start()
+          // B's rank comes back now, above C's: B is no longer the load the host runs.
+          if (step === 'write') h.release('state')
+          else reads[0]()
+          await settle()
+          assert.equal(h.state.get('loads').value, 3)
+          assert.equal(h.card().destination, 'dry run: /home/dev/b/dry-run')
+          assert.equal(await b.shown(), false)
+          await c.land()
+          assert.equal(h.card().sent, 1)
+          assert.equal(h.card().landedTo, 'dry run: /home/dev/b/dry-run')
+          assert.ok((await c.texts()).some(text => text.startsWith('✓ First rows written · 1 so far')))
+          await c.prompt()
+          assert.equal(await c.shown(), false)
+          assert.equal(h.store.get(CLOSED), true)
+          assert.equal(a.greetings() + b.greetings() + c.greetings(), 1)
+        }
+      },
+    ]),
+  ),
+  async 'a close an earlier load writes late, its session-state close refused, hides the card a later load took over once it lands, with no reload and no press'() {
+    const h = host({ hold: key => key === CLOSED, refuseState: value => value?.closed === true })
+    const a = await load(h)
+    await a.start()
+    await a.close()
+    const b = await load(h)
+    await b.start()
+    // Not in the store yet: nothing says the card was closed.
+    assert.equal(await b.shown(), true)
+    h.release(CLOSED)
+    await settle()
+    const asked = b.redraws()
+    // A draw reads the close again, and asks for the next, which has no card.
+    await b.shown()
+    await settle()
+    assert.ok(b.redraws() > asked)
+    assert.equal(await b.shown(), false)
+    assert.equal(h.card().closed, false)
+  },
+  async 'draws of the card while its read of the close waits start no other read of it'() {
+    const h = host()
+    const a = await load(h)
+    await a.start()
+    let holding = true
+    const reads = heldReads(h, key => holding && key === CLOSED)
+    for (let i = 0; i < 3; i += 1) assert.equal(await a.shown(), true)
+    assert.equal(reads.count(), 1)
+    holding = false
+    reads.answer()
+    await settle()
+    assert.equal(await a.shown(), true)
   },
 }
 
