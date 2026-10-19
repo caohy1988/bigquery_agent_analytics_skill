@@ -35,6 +35,9 @@ export type DeadLetterLine = {
   // a line only to that table.
   table: string
   row: BqaaRow
+  // For a row with no event_id (from a file another writer made): how the
+  // refused and parked counts know it, kept as a replay rewrites the line.
+  key?: string
 }
 
 // What `$.fs.read` and `$.fs.write` take, and what this mod writes: a file
@@ -91,12 +94,14 @@ const fnv1a = (text: string): string => {
 const lineCount = (body: string): number => body.split('\n').length - 1
 
 // A file's text: its lines (`body`, each ending in a newline), then the
-// completion record, how many lines come before it and their checksum.
-export const sealFile = (body: string): string => `${body}${JSON.stringify({ v: 1, complete: true, lines: lineCount(body), fnv1a: fnv1a(body) })}\n`
+// completion record, how many lines come before it and their checksum, and,
+// for a file of what a replay left, the file it came from (`parent`).
+export const sealFile = (body: string, parent?: string): string =>
+  `${body}${JSON.stringify({ v: 1, complete: true, lines: lineCount(body), fnv1a: fnv1a(body), ...(parent === undefined ? {} : { parent }) })}\n`
 
 // Dead-letter file texts for JSONL lines: packed under MAX_FILE_BYTES with
 // room for each file's completion record, then sealed.
-export const packFiles = (lines: readonly string[]): string[] => packLines(lines, BODY_BYTES).map(sealFile)
+export const packFiles = (lines: readonly string[], parent?: string): string[] => packLines(lines, BODY_BYTES).map(body => sealFile(body, parent))
 
 // Several files when the lines pass MAX_FILE_BYTES.
 export const encodeLines = (lines: readonly DeadLetterLine[]): string[] => packFiles(lines.map(lineText))
@@ -121,14 +126,16 @@ export const isDeadLetterKind = (value: unknown): value is DeadLetterKind => val
 // `raw[i]` is the text `lines[i]` was read from, so a line can be kept
 // exactly as written. `complete`: the file ends with a completion record that
 // matches every line above it. A file still being written, or left by a
-// writer that stopped part-way, is not complete.
-export type ParsedFile = { complete: boolean; lines: DeadLetterLine[]; raw: string[]; unreadable: string[] }
+// writer that stopped part-way, is not complete. `parent`: the file a
+// replay wrote this one from, as its completion record names it.
+export type ParsedFile = { complete: boolean; lines: DeadLetterLine[]; raw: string[]; unreadable: string[]; parent: string | null }
 
-const readRecord = (line: string): { lines: number; fnv1a: string } | null => {
+const readRecord = (line: string): { lines: number; fnv1a: string; parent: string | null } | null => {
   try {
-    const parsed = JSON.parse(line) as { complete?: unknown; lines?: unknown; fnv1a?: unknown; row?: unknown } | null
+    const parsed = JSON.parse(line) as { complete?: unknown; lines?: unknown; fnv1a?: unknown; row?: unknown; parent?: unknown } | null
     if (parsed === null || typeof parsed !== 'object' || parsed.complete !== true || parsed.row !== undefined) return null
-    return typeof parsed.lines === 'number' && typeof parsed.fnv1a === 'string' ? { lines: parsed.lines, fnv1a: parsed.fnv1a } : null
+    const parent = typeof parsed.parent === 'string' ? parsed.parent : null
+    return typeof parsed.lines === 'number' && typeof parsed.fnv1a === 'string' ? { lines: parsed.lines, fnv1a: parsed.fnv1a, parent } : null
   } catch {
     return null
   }
@@ -138,12 +145,14 @@ export function parseFile(text: string): ParsedFile {
   // The completion record is the last line, and the text ends with it.
   let body = text
   let complete = false
+  let parent: string | null = null
   if (text.endsWith('\n')) {
     const start = text.lastIndexOf('\n', text.length - 2) + 1
     const record = readRecord(text.slice(start, -1))
     if (record !== null) {
       body = text.slice(0, start)
       complete = record.lines === lineCount(body) && record.fnv1a === fnv1a(body)
+      parent = record.parent
     }
   }
   const lines: DeadLetterLine[] = []
@@ -163,5 +172,5 @@ export function parseFile(text: string): ParsedFile {
       unreadable.push(line)
     }
   }
-  return { complete, lines, raw, unreadable }
+  return { complete, lines, raw, unreadable, parent }
 }
