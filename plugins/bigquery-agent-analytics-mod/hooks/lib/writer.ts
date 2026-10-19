@@ -105,10 +105,10 @@ export type BackfillReport = {
 }
 
 // What a replay learns as it goes: how many of its rows still wait for a
-// replay that runs by itself (lines, and files it did not read), whether
-// BigQuery took a request (so the table is there and the credentials work),
-// and why it last refused a row.
-type ReplayTally = { waiting: number; reached: boolean; refusal: string }
+// replay that runs by itself (lines, and files it did not read), how many
+// requests it sent, how many rows it refused that no replay had refused
+// before, and why it last refused a row.
+type ReplayTally = { waiting: number; requests: number; newlyRefused: number; refusal: string }
 
 const TIMED_OUT = Symbol('timed out')
 const MAX_BATCHES_PER_TICK = 10
@@ -126,6 +126,11 @@ const IDENTITY_RETRY_MS = 10 * 60 * 1000
 const EMAIL = /^[^\s@]{1,64}@[^\s@]{1,255}$/
 // Longest diagnostic kept: the last error, a report's error, a line's reason.
 const DIAGNOSTIC_CHARS = 1000
+// Longest `Run: <command>` line the band (register.ts) and the transcript
+// show whole; a longer command is shown whole by /bqaa-status alone.
+export const COMMAND_LINE_CHARS = 1000
+// Longest setup command offered at all.
+const SETUP_COMMAND_CHARS = 4000
 
 const diagnostic = (text: string, maxChars = DIAGNOSTIC_CHARS): string => redactDiagnostic(text, maxChars)
 // An error's own message, without the `Error: ` errorText puts first.
@@ -304,12 +309,15 @@ export class Writer {
     // Nothing queued, and rows wait for a replay (`replayDue`): no send would
     // tell when what stopped them is fixed, so a replay does, at the paced
     // retries, in a session left idle too, until one sends them all. A
-    // replay BigQuery takes clears the notice (`recovered`).
+    // replay BigQuery takes clears the notice (`tookRequest`).
     const current = this.config()
     if (this.queue.length === 0 && this.replayDue.has(deadLetterPartition(current))) {
       if (this.pauseTimer !== null || this.closing || !current.autoBackfill || !canDeliver(current) || current.dryRun) return
       await this.backfill(['spill', 'retry'], 'recovery')
-      if (this.replayDue.has(deadLetterPartition(this.config()))) {
+      // Rows still wait: the next replay comes after the backoff. Rows
+      // queued meanwhile (the replay stops for them) go first, at the next
+      // flush, and their send sets its own backoff.
+      if (this.replayDue.has(deadLetterPartition(this.config())) && this.queue.length === 0) {
         this.consecutiveFailures += 1
         this.pause()
       }
@@ -438,13 +446,8 @@ export class Writer {
     this.batchOpen = false
     const hadFailures = this.consecutiveFailures > 0
     this.counters.sent += rows
-    if (rows > 0) this.refusedSinceSuccess = 0
     this.counters.batches += 1
-    this.consecutiveFailures = 0
-    this.resume()
-    this.lastSuccessAt = this.io.now()
-    this.clearProblem()
-    this.setStatus(undefined)
+    this.tookRequest(rows)
     // BigQuery is reachable again: replay what this session parked on disk.
     if (hadFailures && this.wroteRecoverable && this.config().autoBackfill) {
       this.wroteRecoverable = false
@@ -452,6 +455,20 @@ export class Writer {
         void this.backfill(['spill', 'retry'], 'recovery')
       })
     }
+  }
+
+  // BigQuery took a request, sent or replayed: the table is there and the
+  // credentials work, so the backoff ends and so does a notice. Rows that
+  // landed also end the status line and its count of refused rows; a request
+  // whose rows were all refused or asked for again leaves both.
+  private tookRequest(landed: number): void {
+    this.consecutiveFailures = 0
+    this.resume()
+    this.lastSuccessAt = this.io.now()
+    const stood = this.problem !== null
+    this.clearProblem()
+    if (landed > 0) this.refusedSinceSuccess = 0
+    if (landed > 0 || stood) this.setStatus(undefined)
   }
 
   private backoffMs(): number {
@@ -495,7 +512,7 @@ export class Writer {
     if (exhausted.length > 0) {
       this.counters.failed += exhausted.length
       await this.deadLetter('retry', exhausted, reason)
-      if (this.problem === null) this.setStatus(`BQAA: ${exhausted.length} row(s) parked after retries (${reason.slice(0, 80)}); /bqaa-backfill sends them`)
+      if (this.problem === null) this.setStatus(`BQAA: ${exhausted.length} row(s) parked after retries (${reason.slice(0, 80)}); ${c.autoBackfill ? 'they are replayed on their own' : '/bqaa-backfill sends them'}`)
     }
     if (this.problem !== null) this.showProblem()
   }
@@ -556,9 +573,11 @@ export class Writer {
     if (this.announced.has(kind)) return
     this.announced.add(kind)
     const { headline, fix } = this.problemText()
-    const command = this.setupCommand()
+    const run = this.commandLine()
     this.call(() => this.io.toast?.(diagnostic(`BQAA: rows are not being written: ${headline}. To fix, ${fix}.`, 500)))
-    this.call(() => this.io.notice?.(diagnostic(`bqaa: rows are not being written: ${headline} (${clean}). To fix, ${fix}${command ? `. Run: ${command}` : ''}; this clears once rows are written again.`, 1000)))
+    // The command line goes whole, after the rest is cut.
+    const told = diagnostic(`bqaa: rows are not being written: ${headline} (${clean}). To fix, ${fix}`, 900)
+    this.call(() => this.io.notice?.(`${told}${run ? `. ${run}` : ''}; this clears once rows are written again.`))
   }
 
   // BigQuery refused rows for a reason of their own (a 400, say): it found
@@ -622,7 +641,8 @@ export class Writer {
   // the mod's setup.sh run by bash with every name it reads set on the line,
   // the views dataset included (so none comes from a variable set in the
   // person's shell), or null when the mod's directory is unknown or not a
-  // POSIX path, or a name is one setup.sh would refuse.
+  // POSIX path, a name is one setup.sh would refuse, or the command is too
+  // long, or holds text redaction would change, to be shown as it is.
   setupCommand(): string | null {
     if (this.problem?.kind !== 'destination') return null
     const c = this.config()
@@ -633,7 +653,20 @@ export class Writer {
     if (!PLAIN_PROJECT.test(c.project) || ![c.dataset, views, c.table].every(name => PLAIN_NAME.test(name)) || !PLAIN_LOCATION.test(c.location)) return null
     // A POSIX path: a backslash in it is part of a name, not a separator.
     const script = root.endsWith('/') ? `${root}setup.sh` : `${root}/setup.sh`
-    return `BQAA_PROJECT_ID=${c.project} BQAA_DATASET=${c.dataset} BQAA_TABLE=${c.table} BQAA_VIEWS_DATASET=${views} BQAA_LOCATION=${c.location} bash ${shellQuote(script)}`
+    const command = `BQAA_PROJECT_ID=${c.project} BQAA_DATASET=${c.dataset} BQAA_TABLE=${c.table} BQAA_VIEWS_DATASET=${views} BQAA_LOCATION=${c.location} bash ${shellQuote(script)}`
+    // Redaction also cuts a text past its limit, so a longer command fails
+    // the same check.
+    return diagnostic(`Run: ${command}`, SETUP_COMMAND_CHARS + 5) === `Run: ${command}` ? command : null
+  }
+
+  // The band's and the transcript's line for the setup command: the command
+  // itself when the line holds it whole, else where to find it (a command
+  // cut short would not run). Null when no command is offered.
+  commandLine(): string | null {
+    const command = this.setupCommand()
+    if (command === null) return null
+    const line = `Run: ${command}`
+    return line.length <= COMMAND_LINE_CHARS ? line : 'Run the setup command /bqaa-status shows (too long for this line)'
   }
 
   // Rows that wait for the problem to clear: queued, in flight, and parked
@@ -924,9 +957,10 @@ export class Writer {
     const parked = this.parkedSeq
     const dir = deadLetterPartition(this.config())
     const run = this.backfillRun(kinds, trigger, dir, parked).catch(err => {
-      // A file that cannot be read or written: no replay follows by itself
-      // until more rows are parked, so the same rows are not sent over and over.
-      if (this.parkedSeq === parked) this.replayDue.delete(dir)
+      // A file that could not be read or written: its rows are still in it,
+      // so they stay due and the paced retries replay them (rows sent before
+      // a rewrite failed go again; event_id dedups them).
+      this.replayDue.add(dir)
       const report: BackfillReport = {
         trigger,
         files: 0,
@@ -956,7 +990,7 @@ export class Writer {
   private async backfillRun(kinds: DeadLetterKind[], trigger: BackfillReport['trigger'], dir: string, parked: number): Promise<BackfillReport> {
     const c = this.config()
     const report: BackfillReport = { trigger, files: 0, rowsSent: 0, rowsLeft: 0, rowsRefused: 0, otherTableRows: 0, skippedFiles: 0, oversizedFiles: [], incompleteFiles: [], error: null, finishedAt: null }
-    const tally: ReplayTally = { waiting: 0, reached: false, refusal: '' }
+    const tally: ReplayTally = { waiting: 0, requests: 0, newlyRefused: 0, refusal: '' }
     const finish = (): BackfillReport => {
       report.finishedAt = this.io.now()
       this.backfillReport = report
@@ -971,8 +1005,14 @@ export class Writer {
     let entries: readonly { name: string; kind: string; size: number }[] = []
     try {
       entries = await this.io.listDir(dir)
-    } catch {
-      if (this.parkedSeq === parked) this.replayDue.delete(dir)
+    } catch (err) {
+      // No such directory: no row waits in it. Any other failure leaves the
+      // rows due, and the next replay lists it again.
+      const message = errorText(err)
+      if (!/ENOENT|no such file|not found/i.test(message)) {
+        this.replayDue.add(dir)
+        report.error = diagnostic(`cannot list ${dir}: ${message}`)
+      } else if (this.parkedSeq === parked) this.replayDue.delete(dir)
       return finish()
     }
     const files: string[] = []
@@ -986,7 +1026,7 @@ export class Writer {
     files.sort()
     const me = this.sessionId() ?? 'unknown'
     for (const name of files) {
-      if (report.error) {
+      if (report.error || this.replayStops(trigger, tally)) {
         report.skippedFiles += 1
         // Not read: its rows wait for the next replay.
         if (kindOf(name) !== 'rejected') tally.waiting += 1
@@ -996,7 +1036,10 @@ export class Writer {
       try {
         const lease = (await this.io.storeGet(leaseKey)) as { by?: string; until?: number } | undefined
         if (lease && typeof lease.until === 'number' && lease.until > this.io.now() && lease.by !== me) {
+          // Another session replays it. Should that one stop part-way, the
+          // rows still wait, so a replay here tries the file again.
           report.skippedFiles += 1
+          if (kindOf(name) !== 'rejected') tally.waiting += 1
           continue
         }
         await this.io.storeSet(leaseKey, { by: me, until: this.io.now() + LEASE_MS })
@@ -1018,35 +1061,32 @@ export class Writer {
         }
       }
     }
-    if (report.rowsRefused > 0) this.refusedOnReplay(report.rowsRefused, tally.refusal)
+    if (report.rowsRefused > 0) this.refusedOnReplay(tally.newlyRefused, tally.refusal)
     // Another replay of this table follows by itself while rows wait: rows
-    // this one left, files it did not read, or rows parked once it had begun.
-    // Rows refused here, and files it cannot read, never keep it going.
+    // this one left, files it did not read (another session's lease on them
+    // included), or rows parked once it had begun. Rows refused here, and
+    // files too large to read or not whole, never keep it going.
     if (tally.waiting > 0 || this.parkedSeq !== parked) this.replayDue.add(dir)
     else this.replayDue.delete(dir)
     return finish()
   }
 
-  // BigQuery took a replay's request: what stopped rows is gone, as after a
-  // send. The command's replay sends the refused rows too, so its count of
-  // rows parked meanwhile starts over.
-  private recovered(trigger: BackfillReport['trigger']): void {
-    this.consecutiveFailures = 0
-    this.refusedSinceSuccess = 0
-    this.resume()
-    this.lastSuccessAt = this.io.now()
-    if (trigger === 'command') this.parkedDuringProblem = 0
-    this.clearProblem()
-    this.setStatus(undefined)
+  // A replay that runs by itself stops between requests, once it has sent
+  // one, for rows queued meanwhile (the flush it holds sends them first) or
+  // for the session ending. What it did not send stays due.
+  private replayStops(trigger: BackfillReport['trigger'], tally: ReplayTally): boolean {
+    return trigger === 'recovery' && (this.closing || (tally.requests > 0 && this.queue.length > 0))
   }
 
-  // Rows a replay found refused: on the status line, and among the rows the
-  // access-denied notice counts, as a send's refused rows are.
+  // Rows a replay refused that no replay had refused before: on the status
+  // line, and among the rows the access-denied notice counts, as a send's
+  // refused rows are. A row /bqaa-backfill sends from a `rejected` file
+  // again, and BigQuery refuses again, is not counted twice.
   private refusedOnReplay(rows: number, reason: string): void {
     this.refusedSinceSuccess += rows
     if (this.problem?.kind === 'permission') this.parkedDuringProblem += rows
     if (this.problem !== null) this.showProblem()
-    else this.setStatus(`BQAA: ${this.refusedSinceSuccess} row(s) refused (${diagnostic(reason).slice(0, 80)}); fix, then /bqaa-backfill`)
+    else if (this.refusedSinceSuccess > 0) this.setStatus(`BQAA: ${this.refusedSinceSuccess} row(s) refused (${diagnostic(reason).slice(0, 80)}); fix, then /bqaa-backfill`)
   }
 
   private async backfillFile(dir: string, name: string, file: ParsedFile, c: Config, kinds: readonly DeadLetterKind[], trigger: BackfillReport['trigger'], report: BackfillReport, tally: ReplayTally): Promise<void> {
@@ -1070,6 +1110,7 @@ export class Writer {
     // A row BigQuery refused: kept, with the reason, for /bqaa-backfill.
     const refuse = (line: DeadLetterLine, reason: string): DeadLetterLine => {
       report.rowsRefused += 1
+      if (line.kind !== 'rejected') tally.newlyRefused += 1
       tally.refusal = reason
       return { ...line, kind: 'rejected', reason: diagnostic(reason), attempts: line.attempts + 1 }
     }
@@ -1077,7 +1118,7 @@ export class Writer {
     let changed = false
     let index = 0
     while (index < mine.length) {
-      if (report.error) {
+      if (report.error || this.replayStops(trigger, tally)) {
         left.push(...mine.slice(index))
         break
       }
@@ -1099,37 +1140,58 @@ export class Writer {
         left.push(...chunk)
         continue
       }
-      const answer = await this.post(insertAllUrl(c), insertAllBody(chunk.map(l => l.row)), token, c.requestTimeoutMs)
+      const body = insertAllBody(chunk.map(l => l.row))
+      tally.requests += 1
+      let answer = await this.post(insertAllUrl(c), body, token, c.requestTimeoutMs)
       if ('error' in answer) {
         report.error = diagnostic(answer.error)
         left.push(...chunk)
         continue
       }
-      const outcome = classifyInsert(answer, chunk.length)
-      // BigQuery took the request: the table is there and the credentials
-      // work, whatever it made of each row.
-      if ((outcome.kind === 'ok' || outcome.kind === 'partial') && !tally.reached) {
-        tally.reached = true
-        this.recovered(trigger)
+      let outcome = classifyInsert(answer, chunk.length)
+      if (outcome.kind === 'auth') {
+        // As for a send: one more try at once with a fresh token, and a
+        // second 401 is the credentials notice. The rows keep the user_id
+        // they were parked with.
+        this.dropToken()
+        try {
+          token = await this.getToken()
+        } catch (err) {
+          report.error = diagnostic(`authentication: ${messageOf(err)}`)
+          left.push(...chunk)
+          continue
+        }
+        answer = await this.post(insertAllUrl(c), body, token, c.requestTimeoutMs)
+        if ('error' in answer) {
+          report.error = diagnostic(answer.error)
+          left.push(...chunk)
+          continue
+        }
+        outcome = classifyInsert(answer, chunk.length)
+        if (outcome.kind === 'auth') this.noteProblem('credentials', `BigQuery refused a fresh token too: ${outcome.message}`)
       }
-      if (outcome.kind === 'ok') {
-        report.rowsSent += chunk.length
-        this.counters.sent += chunk.length
-        changed = true
-        continue
-      }
-      if (outcome.kind === 'partial') {
-        chunk.forEach((line, i) => {
-          const reason = outcome.rejected.get(i)
-          if (reason !== undefined) left.push(refuse(line, reason))
-          else if (outcome.retry.has(i)) left.push(line)
-          else {
-            report.rowsSent += 1
-            this.counters.sent += 1
-          }
-        })
+      if (outcome.kind === 'ok' || outcome.kind === 'partial') {
+        // BigQuery took the request: the table is there and the credentials
+        // work, whatever it made of each row. The command's replay sends
+        // the refused rows too, so its count of rows parked meanwhile starts
+        // over.
+        if (trigger === 'command') this.parkedDuringProblem = 0
+        let landed = chunk.length
+        if (outcome.kind === 'partial') {
+          const { rejected, retry } = outcome
+          landed = 0
+          chunk.forEach((line, i) => {
+            const reason = rejected.get(i)
+            if (reason !== undefined) left.push(refuse(line, reason))
+            else if (retry.has(i)) left.push(line)
+            else landed += 1
+          })
+        }
+        report.rowsSent += landed
+        this.counters.sent += landed
+        this.tookRequest(landed)
         // Rows asked for again, and nothing else, leave the file as it was.
-        if (outcome.retry.size < chunk.length) changed = true
+        if (outcome.kind === 'ok' || outcome.retry.size < chunk.length) changed = true
         continue
       }
       if (outcome.kind === 'rejected') {

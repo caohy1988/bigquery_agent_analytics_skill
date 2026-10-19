@@ -1,8 +1,9 @@
 // Stubs for the parts of the host CLI the mod reaches through `$`, so every
 // test runs with no session, no GCP and no network: `$.http.fetch` answers
 // from a script the test controls, `$.fs` is a Map held to the host's limits
-// (UTF-8 bytes, 4 MiB a file), `$.process.run` prints a fake token, and
-// `mock.clock` drives the flush timer.
+// (UTF-8 bytes, 4 MiB a file), `$.store` is a Map the test can read,
+// `$.process.run` prints a fake token, and `mock.clock` drives the flush
+// timer.
 
 import { type Engine, type MockClock, mock } from 'claude-code/testing'
 import type { On, TurnStepChunk, TurnStepResult } from 'claude-code'
@@ -59,6 +60,8 @@ export type World = {
   insertCalls: () => FetchCall[]
   // Lets every `{ hang: true }` request answer now.
   releaseHung: (status: number, text: string) => void
+  // The mod's `$.store`, each value read back as JSON, as the host keeps it.
+  store: Map<string, unknown>
 }
 
 export type Row = {
@@ -113,7 +116,7 @@ export const USAGE = {
 export function setUp(on: On, env: Record<string, string> = {}, store: Record<string, unknown> = {}): World {
   const clock = mock.clock(on, { now: 0 })
   mock.env(on, { HOME, USER: 'dev', ...env })
-  mock.store(on, store)
+  const asJson = (value: unknown): unknown => JSON.parse(JSON.stringify(value)) as unknown
   const hung: ((answer: { value: { status: number; ok: boolean; headers: Record<string, string>; text: string } }) => void)[] = []
   const heldWrites: { path: string; text: string; resolve: (answer: { value: undefined }) => void }[] = []
   const world: World = {
@@ -157,8 +160,19 @@ export function setUp(on: On, env: Record<string, string> = {}, store: Record<st
     releaseHung: (status, text) => {
       for (const resolve of hung.splice(0)) resolve({ value: { status, ok: status >= 200 && status < 300, headers: {}, text } })
     },
+    store: new Map(Object.entries(store).map(([key, value]) => [key, asJson(value)])),
   }
 
+  on('store.get', ($, e) => ({ value: world.store.get(e.key) }))
+  on('store.set', ($, e) => {
+    world.store.set(e.key, asJson(e.value))
+    return { value: undefined }
+  })
+  on('store.delete', ($, e) => {
+    world.store.delete(e.key)
+    return { value: undefined }
+  })
+  on('store.keys', () => ({ value: [...world.store.keys()] }))
   on('session.start', () => ({ cwd: '/work/my-repo' }))
   on('session.end', ($, e) => ({ sessionId: e.sessionId }))
   on('session.id', () => (world.sessionIdRefused ? { deny: 'refused by policy' } : { value: world.sessionId }))

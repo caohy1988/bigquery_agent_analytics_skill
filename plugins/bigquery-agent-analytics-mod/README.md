@@ -272,9 +272,18 @@ While that lasts, the mod shows a notice:
 * **A dim transcript line** comes once per kind of problem, with the reason
   (redacted) and, for a missing dataset, the command. A `-p` or SDK host
   receives it as `ui_log`.
-* **The status line** shows the same notice.
+* **The status line** shows the headline and the fix, with the count of
+  rows waiting; the command is on the band, the transcript line and
+  `/bqaa-status`.
 * **`/bqaa-status`** adds a `notice` line, and for a missing dataset a
   `setup` line with the command.
+
+A command too long for the band's line (very long names, or a deep mod
+directory) is not cut there or in the transcript line, where a command cut
+short would not run: they say to run the one `/bqaa-status` shows whole.
+No command is offered when its path holds text the redaction would change
+(a path segment shaped like `token=…`), or when it is longer than
+`/bqaa-status` can show whole.
 
 The next send or replay that BigQuery takes clears the notice. So does a
 400 refusing the rows themselves, which shows that BigQuery found the table
@@ -290,7 +299,13 @@ and took the credentials. Recovery is quick:
   the retries replay the parked rows until every one has landed, a replay
   that lands only some included, so they land and the notice clears
   without a prompt. That covers rows parked while a table the mod just
-  made was not visible yet.
+  made was not visible yet. A file another session is replaying, or one
+  that could not be listed, read or rewritten, keeps its rows waiting for
+  the next replay (a row sent before a rewrite failed goes again, and
+  `event_id` dedups it). A replay that runs by itself stops between
+  requests for rows queued meanwhile, which go first.
+* A replay's 401 gets a fresh token and one more try, as a send's does, and
+  a second 401 is the credentials notice.
 * Rows refused for a missing permission wait for `/bqaa-backfill`, and the
   transcript says so when rows flow again. So do rows BigQuery refuses on a
   replay: they move to a `rejected` file, and no replay that runs by itself
@@ -566,8 +581,8 @@ GROUP BY model
   for a dataset or table BigQuery cannot find back off exponentially (1 s
   doubling to 60 s, with jitter; at most 30 s while no credentials work or
   the dataset cannot be found) and retry a batch up to 3 times with the same
-  `insertId`s. A 401 gets a fresh token and one retry at once, and only a
-  second 401 counts as a failure. A 2xx
+  `insertId`s. A 401 gets a fresh token and one retry at once, on a send or
+  a replay, and only a second 401 counts as a failure. A 2xx
   answer counts as delivered only when it is a valid insertAll response: a
   body cut off at the response limit, a non-JSON page or an `insertErrors`
   entry that names no row of the batch leaves the outcome unknown, so the rows
@@ -592,13 +607,17 @@ GROUP BY model
   `retry` files are also replayed 15 seconds after a session starts and once
   BigQuery recovers in a session that parked rows. While none is queued,
   the paced retries replay them too, until every row parked for the
-  configured table (by this session, or left by a replay) has landed. A
-  replay that runs by itself sends `spill` and `retry` rows only, whatever
-  file holds them. Rows BigQuery refuses on any replay (an invalid row, a
+  configured table (by this session, or left by a replay) has landed: a
+  file another session holds, or one that could not be listed, read or
+  rewritten, keeps its rows waiting for the next replay. A replay that runs
+  by itself stops between requests for rows queued meanwhile, which go
+  first, and sends `spill` and `retry` rows only, whatever file holds
+  them. Rows BigQuery refuses on any replay (an invalid row, a
   400, 403 access denied) move to `rejected-*.jsonl` and wait for
   `/bqaa-backfill`, as a send's refused rows do. Access denied is the
   notice; the other refusals are on the status line, and `/bqaa-status`
-  counts them in its last-backfill line. A replay that BigQuery takes clears
+  counts them in its last-backfill line. A row `/bqaa-backfill` sends again
+  from a `rejected` file, and BigQuery refuses again, counts once. A replay that BigQuery takes clears
   the notice, as a send does. A replay reads a file
   only when its completion record is there and matches every line above it:
   the API's writes are not atomic, so another session can read a file
@@ -616,7 +635,8 @@ GROUP BY model
   `event_id` dedups them). A file over 4 MiB, which the API cannot read, is
   reported by `/bqaa-status` and the backfill instead of being passed over. A
   per-file lease in `$.store` keeps two sessions from replaying the same file
-  at once (best effort; `event_id` dedups the rest).
+  at once (best effort; `event_id` dedups the rest); a session that finds a
+  file leased tries it again at its next replay.
 * **Fail open:** a hook's bookkeeping runs behind `.catch` or inside `try`;
   the writer never throws into a hook; every failure path ends in sent, on
   disk, or counted as dropped. An environment variable a policy refuses reads
@@ -639,9 +659,9 @@ never payloads or tokens (the agent reads a command's output too).
   background; a dim transcript line reports the result.
 
 When BigQuery refuses rows or retries run out, the mod also sets a status line
-under the prompt (`⚠ bigquery-agent-analytics-mod: …`) until the next
-successful send; its count of refused rows covers every row refused since
-rows last landed. While no credentials work, a permission is missing or
+under the prompt (`⚠ bigquery-agent-analytics-mod: …`) until rows land
+again, sent or replayed; its count of refused rows covers every row refused
+since rows last landed. While no credentials work, a permission is missing or
 BigQuery cannot find the dataset, that line, the band above the prompt and
 `/bqaa-status` give the fix (see
 [If rows cannot be written](#if-rows-cannot-be-written)). The host keeps a
@@ -765,7 +785,7 @@ The test command runs the `tests/*.test.ts` files against the host CLI's own
 test kit, with no session, sign-in, GCP or network: `$.http.fetch`,
 `$.process.run`, `$.fs` and `$.store` are stubbed, and `mock.clock` drives the
 timers; the `$.fs` stubs measure files in UTF-8 bytes and refuse a file over
-4 MiB, as the host does. 198 tests cover the captured rows and their spans,
+4 MiB, as the host does. 212 tests cover the captured rows and their spans,
 subagent runs in the order the host raises them (one invocation and one
 trace for the turn, a span per run, a SubagentStart that comes late or never),
 the session-start row raised before or during `session.start`'s setup,
@@ -804,7 +824,8 @@ They also cover what happens when credentials fail:
   rows parked meanwhile replayed by the retries once a sign-in works;
 * a 401's immediate retry with a fresh token;
 * the role to ask for on a 403;
-* retries at least every 30 s, and a prompt's retry from a timer;
+* the wait before the next retry capped at 30 s, and a prompt's retry from
+  a timer;
 * `prompt.submit` passing every prompt on with no request and no process
   while it runs, with the token command failing, BigQuery refusing the
   credentials, or either never answering. Each of those tests runs with a
@@ -821,7 +842,11 @@ And when BigQuery cannot find the dataset or table:
 * rows retried, and parked as retries, never refused;
 * every row landing once it is found, with new rows or with none (a session
   left idle), and a prompt's retry from a timer;
-* retries at least every 30 s;
+* the wait before the next retry capped at 30 s;
+* a command longer than the band's line pointed to `/bqaa-status`, which
+  shows it whole; a long one that fits shown whole in the band and the
+  transcript line; `/bqaa-status`'s command whole beside very long names;
+  no command for a path redaction would change, or one too long to show;
 * a table the mod made that BigQuery still cannot find after two minutes,
   on a send or on a replay with nothing queued, and table creation turned
   off;
@@ -839,7 +864,18 @@ And the replay that runs by itself while nothing is queued:
   which is the notice) moves to a `rejected` file, with no further request
   or file, and `/bqaa-backfill` still sends it;
 * a refused row in a `retry` file, as earlier versions rewrote them, is
-  never sent by it.
+  never sent by it;
+* a file another session leases, then lets go: its rows land once the
+  lease ends; a file it cannot empty, or a directory it cannot list: its
+  rows stay due and land once that works again;
+* it stops between requests for a row queued meanwhile, which goes first,
+  with no backoff, and then goes on;
+* rows refused on a send and then on a replay all counted on the status
+  line, which a replay whose rows are only asked for again leaves as it
+  was; a replay's second 401 is the credentials notice; `/bqaa-backfill`
+  run twice while access is denied counts the rows it refuses again once;
+* the status line for rows parked after retries, with automatic replay on
+  and off.
 
 And the other additions:
 

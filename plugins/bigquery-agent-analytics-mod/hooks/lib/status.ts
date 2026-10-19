@@ -25,6 +25,11 @@ const kb = (bytes: number): string => (bytes < 1024 ? `${bytes} B` : `${(bytes /
 
 const names = (list: readonly string[]): string => `${list.slice(0, 5).join(', ')}${list.length > 5 ? ', ...' : ''}`
 
+// A line that names the table, cut for very long names: the setup command
+// after it (at most 4,000 characters) then always fits whole in the 8,000
+// the command's output keeps.
+const short = (line: string): string => redactDiagnostic(line, 1000)
+
 export function formatStatus(args: {
   config: Config
   writer: Writer
@@ -39,7 +44,7 @@ export function formatStatus(args: {
   const k = s.counters
   const target = c.dryRun ? `dry run -> ${c.dryRunDir}` : c.project && c.dataset ? `${tableRef(c)} (${c.location})` : 'not configured'
   const lines = [
-    `BigQuery Agent Analytics mod: ${c.enabled ? 'enabled' : 'disabled'}, target ${target}`,
+    short(`BigQuery Agent Analytics mod: ${c.enabled ? 'enabled' : 'disabled'}, target ${target}`),
     `queue: ${s.queued} rows (${kb(s.queuedBytes)}), ${s.inFlight} in flight; flush every ${c.flushIntervalMs} ms`,
     `rows: captured ${k.captured}, sent ${k.sent}, dead-lettered ${k.failed} (${k.rejected} refused), spilled ${k.spilled}, dropped ${s.dropped}, not captured ${k.skipped}`,
     `requests: ${k.batches} ok, ${k.retries} retried; last success ${ago(now, s.lastSuccessAt)}`,
@@ -47,7 +52,7 @@ export function formatStatus(args: {
   if (s.consecutiveFailures > 0) lines.push(`backing off: ${s.consecutiveFailures} failure(s) in a row, next try in about ${Math.max(0, Math.round((s.pausedUntil - now) / 1000))}s`)
   if (s.problem) {
     const { headline, fix } = writer.problemText()
-    lines.push(`notice (since ${ago(now, s.problem.since)}): rows are not being written: ${headline} (${s.problem.reason.slice(0, 200)}); to fix, ${fix}; ${s.waiting} row(s) waiting`)
+    lines.push(short(`notice (since ${ago(now, s.problem.since)}): rows are not being written: ${headline} (${s.problem.reason.slice(0, 200)}); to fix, ${fix}; ${s.waiting} row(s) waiting`))
     const command = writer.setupCommand()
     if (command !== null) lines.push(`setup: ${command}`)
   }

@@ -330,6 +330,70 @@ test("the setup.sh path is one shell word, a quote or a closing backslash in it 
   expect(windows.writer.problemText().fix).toBe('create it, or correct the project and dataset options; rows wait, and are sent once BigQuery finds it (a few minutes after it is made)')
 })
 
+test('a setup command too long for the band and the transcript line is pointed to there, and /bqaa-status shows it whole', { options: { project: 'my-gcp-project', dataset: 'd'.repeat(450) } }, async ($, on) => {
+  const world = setUp(on)
+  world.replies = [DATASET_MISSING]
+  await startSession($)
+  await world.clock.advance(5000)
+  const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...BAND })
+  const run = (await ui.find({ type: 'Text', text: /^Run / }))?.text
+  await ui.unmount()
+  expect(run).toBe('Run the setup command /bqaa-status shows (too long for this line)')
+  const notice = noticeLines(world)
+  expect(notice.length).toBe(1)
+  expect(notice[0] ?? '').toMatch(/\. Run the setup command \/bqaa-status shows \(too long for this line\); this clears once rows are written again\.$/)
+  const d = 'd'.repeat(450)
+  const setup = (await statusText($)).split('\n').find(l => l.startsWith('setup: ')) ?? ''
+  expect(setup.length > 1000).toBe(true)
+  expect(setup).toMatch(new RegExp(`^setup: BQAA_PROJECT_ID=my-gcp-project BQAA_DATASET=${d} BQAA_TABLE=agent_events BQAA_VIEWS_DATASET=${d}_reporting BQAA_LOCATION=US bash '/[^']*/setup\\.sh'$`))
+})
+
+test('a long setup command that fits the band shows whole there and in the transcript line', { options: { project: 'my-gcp-project', dataset: 'd'.repeat(300) } }, async ($, on) => {
+  const world = setUp(on)
+  world.replies = [DATASET_MISSING]
+  await startSession($)
+  await world.clock.advance(5000)
+  const d = 'd'.repeat(300)
+  const command = new RegExp(`^BQAA_PROJECT_ID=my-gcp-project BQAA_DATASET=${d} BQAA_TABLE=agent_events BQAA_VIEWS_DATASET=${d}_reporting BQAA_LOCATION=US bash '/[^']*/setup\\.sh'$`)
+  const run = (await band($)).run ?? ''
+  expect(run.slice('Run: '.length)).toMatch(command)
+  const notice = noticeLines(world)[0] ?? ''
+  expect(notice.length > 1000).toBe(true)
+  expect(notice.endsWith(`. ${run}; this clears once rows are written again.`)).toBe(true)
+})
+
+test('/bqaa-status shows the setup command whole when the names around it are very long', { options: { project: 'my-gcp-project', dataset: 'd'.repeat(1014), table: 't'.repeat(1024) } }, async ($, on) => {
+  const world = setUp(on, { BQAA_AUTO_CREATE_TABLE: 'false' })
+  world.replies = [TABLE_MISSING]
+  await startSession($)
+  await world.clock.advance(5000)
+  const d = 'd'.repeat(1014)
+  const t = 't'.repeat(1024)
+  const setup = (await statusText($)).split('\n').find(l => l.startsWith('setup: ')) ?? ''
+  expect(setup).toMatch(new RegExp(`^setup: BQAA_PROJECT_ID=my-gcp-project BQAA_DATASET=${d} BQAA_TABLE=${t} BQAA_VIEWS_DATASET=${d}_reporting BQAA_LOCATION=US bash '/[^']*/setup\\.sh'$`))
+})
+
+test('a setup command longer than /bqaa-status could show whole is not offered', { options: { project: `${'a'.repeat(4000)}.example:my-gcp-project`, dataset: 'agent_analytics' } }, async ($, on) => {
+  const world = setUp(on)
+  world.replies = [DATASET_MISSING]
+  await startSession($)
+  await world.clock.advance(5000)
+  const shown = await band($)
+  expect(shown.line ?? '').toMatch(/^rows are not being written: BigQuery cannot find the dataset /)
+  expect(shown.run).toBeUndefined()
+  expect(await statusText($)).not.toMatch(/^setup: /m)
+})
+
+test('a mod directory whose path redaction would change gets the fix with no command, rather than a command that would not run', async () => {
+  const w = handBuilt([DATASET_MISSING], '/opt/token=abcdefghijklmnopqrstuvwxyz0123456789/bigquery-agent-analytics-mod')
+  w.enqueue()
+  await w.writer.flush()
+  expect(w.writer.problem).toMatchObject({ kind: 'destination', missing: 'dataset' })
+  expect(w.writer.setupCommand()).toBeNull()
+  expect(w.writer.commandLine()).toBeNull()
+  expect(w.writer.problemText().fix).toBe('create it, or correct the project and dataset options; rows wait, and are sent once BigQuery finds it (a few minutes after it is made)')
+})
+
 test('names setup.sh would refuse get the fix with no command', { options: { project: 'my-gcp-project', dataset: 'agent-analytics' } }, async ($, on) => {
   const world = setUp(on)
   world.replies = [DATASET_MISSING]

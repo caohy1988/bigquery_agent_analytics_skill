@@ -124,6 +124,15 @@ test('a failed request is retried with the same insertIds, then succeeds', { opt
   expect(await statusText($)).toMatch(/sent 3, dead-lettered 0/)
 })
 
+test('with automatic replay off, the status line for rows parked after retries says /bqaa-backfill sends them', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on, { BQAA_AUTO_BACKFILL: 'false' })
+  world.replies = [UNAVAILABLE]
+  await startSession($)
+  for (let t = 0; t < 6; t += 1) await world.clock.advance(5000)
+  expect(deadLetterRows(world).length).toBe(1)
+  expect(world.statusLines.at(-1) ?? '').toMatch(/^BQAA: 1 row\(s\) parked after retries \(HTTP 503: .*\); \/bqaa-backfill sends them$/)
+})
+
 test('rows that exhaust their retries go to a dead-letter file, and are replayed once BigQuery is back', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on)
   world.replies = [UNAVAILABLE, UNAVAILABLE, UNAVAILABLE, UNAVAILABLE, OK_INSERT]
@@ -147,7 +156,7 @@ test('rows that exhaust their retries go to a dead-letter file, and are replayed
   expect(lines.map(l => l.row.event_type)).toEqual(['STATE_DELTA', 'TOOL_STARTING', 'TOOL_COMPLETED'])
   expect(lines[0]).toMatchObject({ kind: 'retry', attempts: 4, table: 'my-gcp-project.agent_analytics.agent_events' })
   expect(lines[0]?.reason ?? '').toMatch(/HTTP 503/)
-  expect(world.statusLines.some(l => (l ?? '').includes('parked after retries'))).toBe(true)
+  expect(world.statusLines.some(l => /^BQAA: 3 row\(s\) parked after retries \(HTTP 503: .*\); they are replayed on their own$/.test(l ?? ''))).toBe(true)
 
   // BigQuery answers again: new rows go out, then the parked ones follow.
   await $.tool.call({ tool: 'Read', file_path: 'b.ts' })

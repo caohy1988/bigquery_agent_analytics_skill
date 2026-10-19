@@ -1,10 +1,11 @@
 // The replay that runs by itself at the paced retries while nothing is
 // queued (a session left idle). It goes on until every row waiting for it
 // has landed, a replay that lands only some included, and it starts for rows
-// parked while a table the mod just made was not visible yet. Rows BigQuery
-// refuses on it move to `rejected` files, as a send's refused rows do, and
-// wait for /bqaa-backfill: no replay that runs by itself sends them again,
-// and no request or file follows for them.
+// parked while a table the mod just made was not visible yet. A file another
+// session holds, or one that cannot be read, listed or rewritten, keeps its
+// rows due. Rows BigQuery refuses on it move to `rejected` files, as a send's
+// refused rows do, and wait for /bqaa-backfill: no replay that runs by itself
+// sends them again, and no request or file follows for them.
 
 import { type Engine, expect, test } from 'claude-code/testing'
 
@@ -42,6 +43,7 @@ const DENIED = {
   text: '{"error":{"code":403,"message":"Access Denied: Table my-gcp-project:agent_analytics.agent_events: Permission bigquery.tables.updateData denied","errors":[{"reason":"accessDenied"}],"status":"PERMISSION_DENIED"}}',
 }
 const INVALID = { status: 400, text: '{"error":{"code":400,"message":"Invalid value for the table schema","errors":[{"reason":"invalid"}],"status":"INVALID_ARGUMENT"}}' }
+const UNAUTHENTICATED = { status: 401, text: '{"error":{"code":401,"message":"Request had invalid authentication credentials.","status":"UNAUTHENTICATED"}}' }
 
 const statusText = async ($: Engine): Promise<string> => (await $.command.run({ command: 'bqaa-status', args: '', ...COMMAND })).text ?? ''
 
@@ -265,4 +267,199 @@ test('rows parked for one table stay due while another table is configured, and 
   config = resolveConfig({ project: 'my-gcp-project', dataset: 'agent_analytics', deadLetterDir: '/dl' }, {})
   for (let t = 0; t < 24; t += 1) await tick()
   expect(waiting()).toBe(0)
+})
+
+test('a file another session holds while an idle replay runs stays due: once that lease ends, an idle replay here sends its rows', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  world.replies = [DATASET_MISSING]
+  await startSession($)
+  await leaveIdle($, world)
+  const parked = parkedIn(world, 'retry')
+  expect(parked.length).toBe(1)
+  const name = ([...world.files.keys()].find(path => path.startsWith(`${PARTITION_DIR}/retry-`)) ?? '').split('/').pop()
+  // Another session is replaying the file, and holds its lease.
+  const lease = `lease:${TABLE_REF}/${name}`
+  world.store.set(lease, { by: 'another-session', until: Date.now() + 600_000 })
+  world.replies = [OK_INSERT]
+  const requests = world.insertCalls().length
+  await idleFor(world, 2)
+  expect(world.insertCalls().length).toBe(requests)
+  expect(parkedIn(world, 'retry')).toEqual(parked)
+  // That session stopped part-way, and its lease ran out (ended here: the
+  // test clock leaves Date.now alone).
+  world.store.set(lease, { by: 'another-session', until: 0 })
+  await idleFor(world, 2)
+  expect(deadLetterRows(world).length).toBe(0)
+  expect(idsOf(world.insertCalls().at(-1)?.body ?? '{"rows":[]}')).toEqual(parked)
+})
+
+test('a replay that cannot empty its file once the rows land leaves them due: once writes work again, an idle replay sends them again and empties it', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  world.replies = [DATASET_MISSING]
+  await startSession($)
+  await leaveIdle($, world)
+  const parked = parkedIn(world, 'retry')
+  expect(parked.length).toBe(1)
+  world.replies = [OK_INSERT]
+  world.failWrites = true
+  await idleFor(world, 1)
+  // Sent, but the file could not be emptied: the row is still there.
+  const requests = world.insertCalls().filter(f => f.answered === 200).length
+  expect(requests > 0).toBe(true)
+  expect(parkedIn(world, 'retry')).toEqual(parked)
+  expect(await statusText($)).toMatch(/last backfill \(recovery, [^)]*\): 0 file\(s\), 0 rows sent, 0 left; stopped: .*EACCES/)
+  world.failWrites = false
+  await idleFor(world, 2)
+  expect(world.insertCalls().filter(f => f.answered === 200).length > requests).toBe(true)
+  expect(deadLetterRows(world).length).toBe(0)
+})
+
+test('a replay that cannot list the dead-letter directory leaves the rows due and says why; the next one sends them', { options: OPTIONS }, async ($, on) => {
+  let failLists = false
+  on('fs.list', { path: PARTITION_DIR }, ($, e, next) => (failLists ? { deny: `EIO: ${e.path}` } : next(e)))
+  const world = setUp(on)
+  world.replies = [DATASET_MISSING]
+  await startSession($)
+  await leaveIdle($, world)
+  const parked = parkedIn(world, 'retry')
+  world.replies = [OK_INSERT]
+  failLists = true
+  await idleFor(world, 1)
+  expect(parkedIn(world, 'retry')).toEqual(parked)
+  expect(await statusText($)).toMatch(/last backfill \(recovery, [^)]*\): 0 file\(s\), 0 rows sent, 0 left; stopped: cannot list .*EIO/)
+  failLists = false
+  await idleFor(world, 2)
+  expect(deadLetterRows(world).length).toBe(0)
+})
+
+test('rows refused on a send, then on a replay whose answer lands none, all count on the status line', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  world.replies = [DATASET_MISSING]
+  await startSession($)
+  await leaveIdle($, world)
+  expect(parkedIn(world, 'retry').length).toBe(1)
+  // The tool call's two rows are refused whole on their send; then the
+  // replay's answer refuses the parked row. No row has landed.
+  world.replies = [INVALID, FIRST_REFUSED]
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
+  await idleFor(world, 2)
+  expect(parkedIn(world, 'retry')).toEqual([])
+  expect(parkedIn(world, 'rejected').length).toBe(3)
+  expect(await statusText($)).toMatch(/rows: captured 3, sent 0,/)
+  expect(world.statusLines.at(-1)).toBe('BQAA: 3 row(s) refused (invalid: no such field: extra); fix, then /bqaa-backfill')
+})
+
+test('a replay whose rows BigQuery only asks for again leaves the refused count on the status line, until rows land', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  world.replies = [DATASET_MISSING]
+  await startSession($)
+  await leaveIdle($, world)
+  world.replies = [INVALID, FIRST_AGAIN]
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
+  await idleFor(world, 2)
+  expect(parkedIn(world, 'retry').length).toBe(1)
+  expect(world.statusLines.at(-1) ?? '').toMatch(/^BQAA: 2 row\(s\) refused \(HTTP 400: Invalid value for the table schema\); fix, then \/bqaa-backfill$/)
+  world.replies = [OK_INSERT]
+  await idleFor(world, 2)
+  expect(parkedIn(world, 'retry')).toEqual([])
+  expect(world.statusLines.at(-1)).toBeUndefined()
+})
+
+test('a replay BigQuery answers with a 401, and again with a fresh token, is the credentials notice, as a send is', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  world.replies = [DATASET_MISSING]
+  await startSession($)
+  await leaveIdle($, world)
+  expect((await band($)).line ?? '').toMatch(/BigQuery cannot find the dataset/)
+  world.replies = [UNAUTHENTICATED]
+  const requests = world.insertCalls().length
+  await idleFor(world, 1)
+  expect((await band($)).line ?? '').toMatch(/^rows are not being written: no working Google credentials\. /)
+  // Each replay tries once more with a fresh token.
+  expect((world.insertCalls().length - requests) % 2).toBe(0)
+  expect(parkedIn(world, 'retry').length).toBe(1)
+})
+
+test('/bqaa-backfill run again while access is denied counts the rows it refuses again once', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  world.replies = [DENIED]
+  await startSession($)
+  await world.clock.advance(5000)
+  expect((await band($)).waiting).toBe(' 1 row(s) waiting.')
+  for (let i = 0; i < 2; i += 1) {
+    await $.command.run({ command: 'bqaa-backfill', args: '', ...COMMAND })
+    await world.clock.advance(1000)
+  }
+  expect(world.insertCalls().length).toBe(3)
+  expect((await band($)).waiting).toBe(' 1 row(s) waiting.')
+  expect(parkedIn(world, 'rejected').length).toBe(1)
+})
+
+test('an idle replay of many parked rows stops between requests for rows queued meanwhile: they go first, then the replay goes on', async () => {
+  // A writer built by hand. Its rows are parked after one try, all in one
+  // file; the replay then sends one row a request.
+  const base = resolveConfig({ project: 'my-gcp-project', dataset: 'agent_analytics', deadLetterDir: '/dl' }, {})
+  let config = { ...base, maxRetries: 0 }
+  let now = 0
+  let answer = DATASET_MISSING
+  let holdNext = false
+  let release: (() => void) | null = null
+  const timers: { at: number; fn: () => void; live: boolean }[] = []
+  const files = new Map<string, string>()
+  const sent: string[][] = []
+  const io: Io = {
+    now: () => now,
+    after: (ms, fn) => {
+      const timer = { at: now + ms, fn, live: true }
+      timers.push(timer)
+      return { cancel: () => (timer.live = false) }
+    },
+    fetch: async (url, init) => {
+      if (answer === OK_INSERT) sent.push(idsOf(init.body ?? '{"rows":[]}'))
+      if (holdNext) {
+        holdNext = false
+        await new Promise<void>(resolve => (release = resolve))
+      }
+      return answer
+    },
+    runCommand: async () => ({ exitCode: 0, stdout: `${'a'.repeat(24)}\n`, stderr: '' }),
+    envToken: async () => undefined,
+    writeFile: async (path, text) => {
+      files.set(path, text)
+    },
+    readFile: async path => files.get(path) ?? '',
+    listDir: async dir => [...files].filter(([path]) => path.startsWith(`${dir}/`)).map(([path, text]) => ({ name: path.slice(dir.length + 1), kind: 'file', size: text.length })),
+    storeGet: async () => undefined,
+    storeSet: async () => undefined,
+    storeDelete: async () => undefined,
+    status: () => undefined,
+    debug: () => undefined,
+  }
+  const writer = new Writer(io, () => config, () => 'hand-built-session')
+  const tick = async (): Promise<void> => {
+    now += 31_000
+    for (const timer of timers.filter(t => t.live && t.at <= now).sort((a, b) => a.at - b.at)) {
+      timer.live = false
+      timer.fn()
+    }
+    await writer.flush()
+  }
+  const row = (n: number) => buildRow({ eventType: 'STATE_DELTA', timestampMs: 0, eventId: String(n).repeat(32), agent: 'coding-agent', sessionId: 'hand-built-session', invocationId: null, userId: 'dev', traceId: null, spanId: null, parentSpanId: null, content: {}, attributes: {}, maxPayloadChars: 16384 }).row
+  for (const n of [1, 2, 3]) writer.enqueue(row(n), 0)
+  await tick()
+  expect(writer.queue.length).toBe(0)
+  config = { ...base, maxBatchRows: 1 }
+  answer = OK_INSERT
+  // The replay's first request takes a while; a row is queued meanwhile.
+  holdNext = true
+  const flushing = tick()
+  for (let i = 0; i < 10 && release === null; i += 1) await Promise.resolve()
+  writer.enqueue(row(4), 0)
+  ;(release as (() => void) | null)?.()
+  await flushing
+  // It stopped for the queued row, which is no failure: no backoff.
+  expect(writer.snapshot().consecutiveFailures).toBe(0)
+  for (let t = 0; t < 4; t += 1) await tick()
+  expect(sent).toEqual([['1'.repeat(32)], ['4'.repeat(32)], ['2'.repeat(32)], ['3'.repeat(32)]])
+  expect([...files.values()].reduce((rows, text) => rows + parseFile(text).lines.length, 0)).toBe(0)
 })

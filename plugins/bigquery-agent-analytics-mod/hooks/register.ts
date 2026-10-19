@@ -24,7 +24,7 @@ import type { BqaaRow } from './lib/rows.ts'
 import { redactDiagnostic } from './lib/sanitize.ts'
 import { type DeadLetterSummary, formatStatus } from './lib/status.ts'
 import { type StepCtx, type StepResult, type ToolCtx, type ToolOutcome, Tracer, errorText } from './lib/tracer.ts'
-import { type Io, Writer } from './lib/writer.ts'
+import { COMMAND_LINE_CHARS, type Io, Writer } from './lib/writer.ts'
 
 let options: Options = {}
 let config: Config = resolveConfig({}, {})
@@ -404,7 +404,7 @@ export const register: Register = (on, registered) => {
     const problem = current?.problem ?? null
     if (current === null || problem === null || e.props.hasSurvey) return theirs
     const { headline, fix } = current.problemText()
-    const command = current.setupCommand()
+    const run = current.commandLine()
     const { Box, Text } = $.ui.resolve(e)
     const line = Box({
       flexDirection: 'row',
@@ -415,7 +415,7 @@ export const register: Register = (on, registered) => {
         Text({ dimColor: true, children: ` ${current.waitingRows()} row(s) waiting.` }),
       ],
     })
-    const lines = command === null ? [line] : [line, Text({ dimColor: true, children: clean(`Run: ${command}`, 1000) })]
+    const lines = run === null ? [line] : [line, Text({ dimColor: true, children: clean(run, COMMAND_LINE_CHARS) })]
     return Box({ flexDirection: 'column', children: [...lines, theirs] })
   })
 
