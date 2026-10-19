@@ -163,7 +163,7 @@ test('a prompt after the dataset is made sends at once, from a timer: the hook i
   expect((await band($)).line).toBeUndefined()
 })
 
-test('while BigQuery cannot find the dataset, a retry comes at least every 30 s', { options: OPTIONS }, async ($, on) => {
+test('while BigQuery cannot find the dataset, the wait before a retry is capped at 30 s', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on)
   world.replies = [DATASET_MISSING]
   await startSession($)

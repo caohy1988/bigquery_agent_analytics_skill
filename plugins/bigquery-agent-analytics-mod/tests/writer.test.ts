@@ -875,7 +875,7 @@ async function splitReplay(failNewFiles: boolean) {
   const writer = new Writer(io, () => config, () => 'replay-session')
   const report = await writer.backfill(['spill'], 'command')
   const ids = [...files.values()].flatMap(text => parseFile(text).lines.map(line => line.row.event_id))
-  const incomplete = [...files].filter(([path, text]) => path !== source && !parseFile(text).complete).map(([path]) => path)
+  const incomplete = [...files].filter(([path, text]) => path !== source && !path.includes('/outcome-') && !parseFile(text).complete).map(([path]) => path)
   return { files, source, report, ids, incomplete }
 }
 
@@ -895,7 +895,7 @@ test('a replay that splits what is left writes every part before emptying its so
 
 test('a write that fails while a replay splits leaves the source whole', async () => {
   const { files, source, report, ids } = await splitReplay(true)
-  expect(report.error ?? '').toMatch(/disk full/)
+  expect(report.held ?? report.error ?? '').toMatch(/disk full/)
   expect(parseFile(files.get(source) ?? '').lines.length).toBe(1000)
   expect(new Set(ids).size).toBe(1000)
 })

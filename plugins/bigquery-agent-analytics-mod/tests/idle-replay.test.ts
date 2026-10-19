@@ -779,10 +779,10 @@ const doneMark = (files: Map<string, string>, name: string): boolean => {
 // mark, nor the mark a replay leaves before it sends.
 const recordFile = (path: string): boolean => path.includes('/outcome-') && !path.includes('/outcome-done-') && !path.includes('/outcome-sending-')
 
-// Two sessions that both replay a file, as two that read its lease before
-// either wrote it: the first's request waits until `release`, and the
-// second's mark until that request is out (each passes the check after its
-// own mark).
+// Two sessions that both replay a file: the first's request waits until
+// `release`, and the second's mark until that request is out. The second
+// sends past the first's mark only as /bqaa-backfill (which these callers
+// make it): a replay that runs by itself leaves the file to the first.
 function bothSend(w: ReturnType<typeof twoWriters>): { release: () => void } {
   let release = (): void => undefined
   let out = (): void => undefined
@@ -821,7 +821,7 @@ function twoWriters(answer: (ids: string[]) => { status: number; text: string })
   const statuses: (string | undefined)[] = []
   // `from`: the store takes that many of a replay's records, then no more.
   // `get` may name the keys whose reads fail.
-  let storeFails: { get?: boolean | ((key: string) => boolean); set?: boolean; from?: number } = {}
+  let storeFails: { get?: boolean | ((key: string) => boolean); set?: boolean | ((key: string) => boolean); from?: number } = {}
   let records = 0
   const io = (session: string): Io => ({
     now: () => 0,
@@ -855,7 +855,7 @@ function twoWriters(answer: (ids: string[]) => { status: number; text: string })
       return store.get(key)
     },
     storeSet: async (key, value) => {
-      if (key.startsWith('replayed:') && (storeFails.set || (storeFails.from !== undefined && records >= storeFails.from))) throw new Error('the store could not be written')
+      if (key.startsWith('replayed:') && ((typeof storeFails.set === 'function' ? storeFails.set(key) : storeFails.set) || (storeFails.from !== undefined && records >= storeFails.from))) throw new Error('the store could not be written')
       if (key.startsWith('replayed:')) records += 1
       const json = JSON.parse(JSON.stringify(value)) as unknown
       if (bytes(JSON.stringify(Object.fromEntries(new Map(store).set(key, json)))) > 4 * 1024 * 1024) throw new Error('the store would pass 4 MiB of JSON')
@@ -876,7 +876,7 @@ function twoWriters(answer: (ids: string[]) => { status: number; text: string })
     refuse: (f: ((path: string) => boolean) | null) => (refuseWrite = f === null ? null : (path, text) => text !== '' && f(path)),
     // Refuses the writes `f` picks, emptying a file included.
     refuseWrites: (f: ((path: string, text: string) => boolean) | null) => (refuseWrite = f),
-    failStore: (fails: { get?: boolean | ((key: string) => boolean); set?: boolean; from?: number }) => (storeFails = fails),
+    failStore: (fails: { get?: boolean | ((key: string) => boolean); set?: boolean | ((key: string) => boolean); from?: number }) => (storeFails = fails),
     recordWrites: () => records,
     tear: (f: ((path: string, text: string) => boolean) | null, at = 0.5) => {
       tearWrite = f
@@ -999,8 +999,9 @@ test('a writer back after another one finished its outcome, and replayed what it
   w.files.set(source, packFiles([line(a, 'retry'), line(b, 'retry')])[0] as string)
   // The first writer records the outcome, and can write none of what is left.
   const first = w.writer('first-session')
-  w.refuse(path => path !== source)
+  w.refuse(path => path !== source && !path.includes('/outcome-sending-'))
   await first.backfill(['spill', 'retry'], 'auto')
+  expect([w.sentOf(a), w.sentOf(b), w.recordWrites()]).toEqual([1, 1, 1])
   // Another session writes all of it, but cannot empty the source; its next
   // replay sends the row asked for again, and BigQuery refuses it.
   w.refuseWrites((path, text) => path === source && text === '')
@@ -1019,14 +1020,19 @@ test('a writer back after another one finished its outcome, and replayed what it
   expect([...w.store.keys()]).toEqual([])
 })
 
-test('two writers that replay one file at the same time write what it left once', async () => {
+test('two writers that replay one file at the same time send it at most once, and what it left is written once', async () => {
   const w = twoWriters(() => FIRST_REFUSED)
   const source = `/dl/${TABLE_REF}/retry-20261013T200102003Z-earlier-1.jsonl`
-  w.files.set(source, packFiles([line('a'.repeat(32), 'retry')])[0] as string)
-  // Both read the lease before either writes it, and both send the row.
+  const a = 'a'.repeat(32)
+  w.files.set(source, packFiles([line(a, 'retry')])[0] as string)
+  // Both read the lease before either writes it; each then reads the other's
+  // mark beside its own, and neither sends. The next replay sends it.
   await Promise.all([w.writer('first-session').backfill(['spill', 'retry'], 'auto'), w.writer('second-session').backfill(['spill', 'retry'], 'auto')])
-  expect(w.copiesOf('a'.repeat(32))).toBe(1)
-  expect(w.files.get(source)).toBe('')
+  expect(w.sentOf(a) <= 1).toBe(true)
+  await w.writer('first-session').backfill(['spill', 'retry'], 'auto')
+  expect([w.sentOf(a), w.copiesOf(a), w.files.get(source)]).toEqual([1, 1, ''])
+  // Each lets its own mark go: the two that sent nothing, and the one that finished the file.
+  expect([...w.files].filter(([path, text]) => path.includes('/outcome-sending-') && text !== '').length).toBe(0)
 })
 
 test('a record that cannot be read leaves its file waiting: no writer sends any of it, and once it can be read the file is only emptied', async () => {
@@ -1086,7 +1092,7 @@ test('a record neither the store nor a file takes: nothing of what the replay le
   await writer.backfill(['spill', 'retry'], 'auto')
   expect([w.sentOf(a), w.copiesOf(a)]).toEqual([1, 0])
   expect(w.files.get(source)).toBe(text)
-  expect(report.error ?? '').toMatch(/could not record the replay of .*retry-20261013T200102003Z-earlier-1\.jsonl, so nothing more of what it left is written/)
+  expect(report.held ?? '').toMatch(/could not record the replay of .*retry-20261013T200102003Z-earlier-1\.jsonl, so nothing more of what it left is written/)
   w.failStore({})
   w.refuseWrites(null)
   await writer.backfill(['spill', 'retry'], 'auto')
@@ -1272,7 +1278,7 @@ test('a replay whose answer comes after another session recorded and wrote out i
   // Both read the lease before either writes it; the first's answer waits.
   const { release } = bothSend(w)
   const first = w.writer('first-session').backfill(['spill', 'retry'], 'auto')
-  await w.writer('second-session').backfill(['spill', 'retry'], 'auto')
+  await w.writer('second-session').backfill(['spill', 'retry'], 'command')
   expect(w.copiesOf(a)).toBe(1)
   release()
   await first
@@ -1313,7 +1319,7 @@ test('a replay whose answer comes after another session finished the file and em
   // The other session writes the rejected file, empties the source and lets
   // its record go, all before the first session's answer comes; the mark it
   // left beside the file is gone too, as a day later.
-  await w.writer('second-session').backfill(['spill', 'retry'], 'auto')
+  await w.writer('second-session').backfill(['spill', 'retry'], 'command')
   expect([w.files.get(source), [...w.store.keys()]]).toEqual(['', []])
   for (const path of [...w.files.keys()].filter(path => path.includes('/outcome-'))) w.files.set(path, '')
   release()
@@ -1330,7 +1336,7 @@ test('a replay whose answer comes late, while the record it would adopt cannot b
   const { release } = bothSend(w)
   const firstWriter = w.writer('first-session')
   const first = firstWriter.backfill(['spill', 'retry'], 'auto')
-  await w.writer('second-session').backfill(['spill', 'retry'], 'auto')
+  await w.writer('second-session').backfill(['spill', 'retry'], 'command')
   w.failStore({ get: true })
   release()
   await first
@@ -1624,7 +1630,8 @@ test('a record another session writes late, beside a file finished meanwhile, ne
   })
   const first = w.writer('first-session').backfill(['spill', 'retry'], 'auto')
   const second = w.writer('second-session')
-  await second.backfill(['spill', 'retry'], 'auto')
+  // As /bqaa-backfill, which goes past the first session's mark.
+  await second.backfill(['spill', 'retry'], 'command')
   expect([w.files.get(source), doneMark(w.files, name), w.copiesOf(a)]).toEqual(['', true, 1])
   letGo()
   await first
@@ -1710,7 +1717,7 @@ test('a replay that changes nothing (its rows only asked for again) lets its mar
   const text = packFiles([line(a, 'retry')])[0] as string
   w.files.set(source, text)
   await w.writer('first-session').backfill(['spill', 'retry'], 'auto')
-  expect([w.sentOf(a), w.files.get(source), w.files.get(`/dl/${TABLE_REF}/outcome-sending-${name}`)]).toEqual([1, text, ''])
+  expect([w.sentOf(a), w.files.get(source), [...w.files].filter(([path, text]) => path.includes('/outcome-sending-') && text !== '').length]).toEqual([1, text, 0])
   await w.writer('second-session').backfill(['spill', 'retry'], 'auto')
   expect(w.sentOf(a)).toBe(2)
 })
@@ -1745,8 +1752,8 @@ for (const why of ['cut off', 'unreadable', 'marked by another replay', 'not mar
     w.files.set(later, packFiles([line(b, 'retry')])[0] as string)
     if (why === 'cut off') w.files.set(`/dl/${TABLE_REF}/outcome-${first}`, '{"size":900,"fates":"W","refu')
     if (why === 'unreadable') w.failStore({ get: key => key.endsWith(`/${first}`) })
-    if (why === 'not markable') w.refuseWrites(path => path.endsWith(`/outcome-sending-${first}`))
-    if (why === 'marked by another replay') w.files.set(`/dl/${TABLE_REF}/outcome-sending-${first}`, sealFile(`${JSON.stringify({ size: new TextEncoder().encode(w.files.get(`/dl/${TABLE_REF}/${first}`) as string).length, sending: true, by: 'another-writer' })}\n`))
+    if (why === 'not markable') w.refuseWrites((path, text) => path.includes('/outcome-sending-') && path.endsWith(`-${first}`) && text !== '')
+    if (why === 'marked by another replay') w.files.set(`/dl/${TABLE_REF}/outcome-sending-anotherwriter-${first}`, sealFile(`${JSON.stringify({ size: new TextEncoder().encode(w.files.get(`/dl/${TABLE_REF}/${first}`) as string).length, sending: true, by: 'another-writer' })}\n`))
     const report = await w.writer('a-session').backfill(['spill', 'retry'], 'auto')
     expect([w.sentOf(a), w.sentOf(b), w.files.get(later)]).toEqual([0, 1, ''])
     expect(report.error).toBe(null)
@@ -1773,7 +1780,7 @@ test('a file of what is left that the record of its emptied parent does not name
   expect([w.files.get(late), w.sentOf(a), w.copiesOf(a)]).toEqual(['', 1, 1])
 })
 
-test('of two sessions whose marks land one after the other, before the first reads its own back, only the later sends', async () => {
+test('two sessions whose marks both stand when each reads them back send none of the file, and let their own go: the next replay sends it once', async () => {
   const w = twoWriters(() => OK_INSERT)
   const source = `/dl/${TABLE_REF}/retry-20261013T200102003Z-earlier-1.jsonl`
   const a = 'a'.repeat(32)
@@ -1792,6 +1799,10 @@ test('of two sessions whose marks land one after the other, before the first rea
     return secondMarked
   })
   await Promise.all([w.writer('first-session').backfill(['spill', 'retry'], 'auto'), w.writer('second-session').backfill(['spill', 'retry'], 'auto')])
+  expect(w.sentOf(a)).toBe(0)
+  expect([...w.files].filter(([path, text]) => path.includes('/outcome-sending-') && text !== '').length).toBe(0)
+  w.holdReads(null)
+  await w.writer('third-session').backfill(['spill', 'retry'], 'auto')
   expect([w.sentOf(a), w.files.get(source)]).toEqual([1, ''])
 })
 
@@ -1839,7 +1850,8 @@ test('a replay with nothing left to write never writes its done mark over the on
     return new Promise<void>(resolve => (letGo = resolve))
   })
   const first = w.writer('first-session').backfill(['spill', 'retry'], 'auto')
-  await w.writer('second-session').backfill(['spill', 'retry'], 'auto')
+  // As /bqaa-backfill, which goes past the first session's mark.
+  await w.writer('second-session').backfill(['spill', 'retry'], 'command')
   const done = w.files.get(`/dl/${TABLE_REF}/outcome-done-${name}`)
   expect([w.files.get(source), doneMark(w.files, name), w.copiesOf(a)]).toEqual(['', true, 1])
   letGo()
@@ -1857,11 +1869,129 @@ test('a replay that changed nothing lets go only its own mark: another session\'
   w.refuseWrites(recordFile)
   const { release } = bothSend(w)
   const first = w.writer('first-session').backfill(['spill', 'retry'], 'auto')
-  await w.writer('second-session').backfill(['spill', 'retry'], 'auto')
+  await w.writer('second-session').backfill(['spill', 'retry'], 'command')
   answer = FIRST_AGAIN
   release()
   await first
   const report = await w.writer('third-session').backfill(['spill', 'retry'], 'auto')
   expect(w.sentOf(a)).toBe(2)
   expect(report.held ?? '').toMatch(/sent rows and has recorded no outcome/)
+})
+
+test('a session whose mark is written late, after another session sent the file and could record its outcome nowhere, sends none of it', async () => {
+  const w = twoWriters(() => FIRST_REFUSED)
+  const source = `/dl/${TABLE_REF}/retry-20261013T200102003Z-earlier-1.jsonl`
+  const a = 'a'.repeat(32)
+  w.files.set(source, packFiles([line(a, 'retry')])[0] as string)
+  w.failStore({ set: true })
+  w.refuseWrites(recordFile)
+  let release = (): void => undefined
+  const heldMark = new Promise<void>(resolve => (release = resolve))
+  w.holdWrites((session, path) => (session === 'second-session' && path.includes('/outcome-sending-') ? heldMark : undefined))
+  const first = w.writer('first-session').backfill(['spill', 'retry'], 'auto')
+  const second = w.writer('second-session').backfill(['spill', 'retry'], 'auto')
+  await first
+  expect(w.sentOf(a)).toBe(1)
+  release()
+  await second
+  expect(w.sentOf(a)).toBe(1)
+})
+
+test('a replay that changed nothing lets go of its own mark only: another session\'s, written meanwhile, its outcome recorded nowhere, keeps a third from sending the file, however late the letting go lands', async () => {
+  let answer = FIRST_AGAIN
+  const w = twoWriters(() => answer)
+  const source = `/dl/${TABLE_REF}/retry-20261013T200102003Z-earlier-1.jsonl`
+  const a = 'a'.repeat(32)
+  w.files.set(source, packFiles([line(a, 'retry')])[0] as string)
+  w.failStore({ set: true })
+  w.refuseWrites(recordFile)
+  let clearing = (): void => undefined
+  let release = (): void => undefined
+  const atClear = new Promise<void>(resolve => (clearing = resolve))
+  const heldClear = new Promise<void>(resolve => (release = resolve))
+  w.holdWrites((session, path, text) => {
+    if (!path.includes('/outcome-sending-')) return undefined
+    if (session === 'second-session' && text !== '') return atClear
+    if (session === 'first-session' && text === '') {
+      answer = FIRST_REFUSED
+      clearing()
+      return heldClear
+    }
+    return undefined
+  })
+  const first = w.writer('first-session').backfill(['spill', 'retry'], 'auto')
+  // As /bqaa-backfill, which goes past the first session's mark: a replay
+  // that runs by itself would leave the file to the first.
+  await w.writer('second-session').backfill(['spill', 'retry'], 'command')
+  expect(w.sentOf(a)).toBe(2)
+  release()
+  await first
+  await w.writer('third-session').backfill(['spill', 'retry'], 'auto')
+  expect(w.sentOf(a)).toBe(2)
+})
+
+test('a mark another session writes late and cut off part-way stands, and leaves the first session\'s mark standing too: a third session sends none of the file', async () => {
+  const w = twoWriters(() => FIRST_REFUSED)
+  const source = `/dl/${TABLE_REF}/retry-20261013T200102003Z-earlier-1.jsonl`
+  const a = 'a'.repeat(32)
+  w.files.set(source, packFiles([line(a, 'retry')])[0] as string)
+  w.failStore({ set: true })
+  w.refuseWrites(recordFile)
+  let release = (): void => undefined
+  const heldMark = new Promise<void>(resolve => (release = resolve))
+  w.holdWrites((session, path) => (session === 'second-session' && path.includes('/outcome-sending-') ? heldMark : undefined))
+  const first = w.writer('first-session').backfill(['spill', 'retry'], 'auto')
+  const second = w.writer('second-session').backfill(['spill', 'retry'], 'auto')
+  await first
+  expect(w.sentOf(a)).toBe(1)
+  w.tear(path => path.includes('/outcome-sending-'))
+  release()
+  await second
+  expect(w.sentOf(a)).toBe(1)
+  w.tear(null)
+  const report = await w.writer('third-session').backfill(['spill', 'retry'], 'auto')
+  expect(w.sentOf(a)).toBe(1)
+  expect(report.held ?? '').toMatch(/sent rows and has recorded no outcome/)
+})
+
+test('a file whose outcome can be recorded nowhere leaves only itself waiting: the files after it are replayed in the same pass', async () => {
+  const w = twoWriters(() => FIRST_REFUSED)
+  const first = 'retry-20261013T200102003Z-earlier-1.jsonl'
+  const later = `/dl/${TABLE_REF}/retry-20261013T200102004Z-earlier-2.jsonl`
+  const [a, b] = ['a'.repeat(32), 'b'.repeat(32)]
+  w.files.set(`/dl/${TABLE_REF}/${first}`, packFiles([line(a, 'retry')])[0] as string)
+  w.files.set(later, packFiles([line(b, 'retry')])[0] as string)
+  w.failStore({ set: key => key.endsWith(`/${first}`) })
+  w.refuseWrites((path, text) => recordFile(path) && path.endsWith(first) && text !== '')
+  const report = await w.writer('a-session').backfill(['spill', 'retry'], 'auto')
+  expect([w.sentOf(a), w.sentOf(b), w.files.get(later), w.copiesOf(b)]).toEqual([1, 1, '', 1])
+  expect(report.error).toBe(null)
+  expect(report.held ?? '').toMatch(/could not record the replay of .*earlier-1\.jsonl/)
+})
+
+test('a file emptied from its done mark is reported with its outcome: its rows left and refused', async () => {
+  const w = twoWriters(() => FIRST_REFUSED)
+  const name = 'retry-20261013T200102003Z-earlier-1.jsonl'
+  const source = `/dl/${TABLE_REF}/${name}`
+  w.files.set(source, packFiles([line('a'.repeat(32), 'retry')])[0] as string)
+  w.refuseWrites((path, text) => path === source && text === '')
+  await w.writer('first-session').backfill(['spill', 'retry'], 'auto')
+  expect(doneMark(w.files, name)).toBe(true)
+  w.refuseWrites(null)
+  const report = await w.writer('second-session').backfill(['spill', 'retry'], 'auto')
+  expect([w.files.get(source), report.files, report.rowsLeft, report.rowsRefused]).toEqual(['', 1, 1, 1])
+})
+
+test('another writer\'s mark cut off part-way, with no outcome recorded, is taken as standing: a replay that runs by itself sends none of the file, and /bqaa-backfill replays it afresh', async () => {
+  const w = twoWriters(() => OK_INSERT)
+  const name = 'retry-20261013T200102003Z-earlier-1.jsonl'
+  const source = `/dl/${TABLE_REF}/${name}`
+  const a = 'a'.repeat(32)
+  w.files.set(source, packFiles([line(a, 'retry')])[0] as string)
+  w.files.set(`/dl/${TABLE_REF}/outcome-sending-anotherwriter-${name}`, '{"size":900,"sending":tr')
+  const report = await w.writer('a-session').backfill(['spill', 'retry'], 'auto')
+  expect([w.sentOf(a), report.skippedFiles]).toEqual([0, 1])
+  expect(report.held ?? '').toMatch(/sent rows and has recorded no outcome/)
+  await w.writer('a-session').backfill(['spill', 'retry', 'rejected'], 'command')
+  expect([w.sentOf(a), w.files.get(source)]).toEqual([1, ''])
 })
