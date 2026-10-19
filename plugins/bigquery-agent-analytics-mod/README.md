@@ -729,7 +729,8 @@ GROUP BY model
   writable, another writer's mark beside it, or its own mark not written)
   holds up none of the files after it, and `/bqaa-status`,
   like the `/bqaa-backfill` transcript line, says why the first such file
-  was left (`left waiting:`). A file
+  was left (`left waiting:`), another session's lease on a file, or a file
+  of what is left waiting on its parent's record, included. A file
   that cannot be emptied stays on disk, its rows landed or in the newer
   files, and each replay tries to empty it. A file over 4 MiB, which the
   API cannot read, is reported by `/bqaa-status` and the backfill instead
@@ -746,8 +747,8 @@ GROUP BY model
   the file, so at most one sends it, and if each reads the other's,
   neither does, and the next replay sends it; a `/bqaa-backfill force` that
   sends past another writer's mark, and whose answer comes second, finds
-  the other's record, and writes out that outcome, not its own, or finds
-  the file already done, and writes nothing, so what is left is written
+  the other's record and writes nothing of its own (that outcome goes on,
+  at the next replay), or finds the file already done, and writes nothing, so what is left is written
   once, unless both record theirs at the same moment; a write already under
   way when the other session finishes lands, and the marks above have the
   next replay empty it unsent); a session that finds a file leased tries
@@ -916,7 +917,7 @@ test kit, with no session, sign-in, GCP or network: `$.http.fetch`,
 `$.process.run`, `$.fs` and `$.store` are stubbed, and `mock.clock` drives the
 timers; the `$.fs` stubs measure files in UTF-8 bytes and refuse a file over
 4 MiB, and the `$.store` stub a store over 4 MiB of JSON in all, as the host
-does. 300 tests cover the captured rows and their spans,
+does. 302 tests cover the captured rows and their spans,
 subagent runs in the order the host raises them (one invocation and one
 trace for the turn, a span per run, a SubagentStart that comes late or never),
 the session-start row raised before or during `session.start`'s setup,
@@ -1084,8 +1085,11 @@ And the replay that runs by itself while nothing is queued:
   another writer finished the file, landing cut off, in a file of its own,
   taking nothing from that writer's; `/bqaa-backfill` sending none of a
   file another session's replay is sending, saying why in its transcript
-  line, and `/bqaa-backfill force` replaying such a file afresh; two
-  writers of one session never giving two files one name; a done
+  line, and `/bqaa-backfill force` replaying such a file afresh; a file
+  another session's lease holds, and one of what is left waiting on its
+  parent's record, each saying why; of two whole done marks for one file,
+  every writer going by the later; two writers of one session never giving
+  two files one name; a done
   mark cut off part-way, with no other record, leaving the file waiting,
   for `/bqaa-backfill` too, and `/bqaa-backfill force` replaying it
   afresh; a file of what is left that the record

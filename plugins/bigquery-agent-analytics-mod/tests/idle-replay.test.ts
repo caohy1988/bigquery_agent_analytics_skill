@@ -2148,6 +2148,38 @@ test('a done mark write still out when another writer finished the file, landing
   expect([w.sentOf(a), w.copiesOf(a), w.files.get(source)]).toEqual([1, 1, ''])
 })
 
+test('a file another session\'s lease holds, and one of what is left whose parent that lease holds, say why they wait', async () => {
+  const w = twoWriters(() => OK_INSERT)
+  const parent = 'retry-20261013T200102003Z-earlier-1.jsonl'
+  const child = `/dl/${TABLE_REF}/retry-20261013T200103003Z-earlier-2.jsonl`
+  w.files.set(`/dl/${TABLE_REF}/${parent}`, packFiles([line('e'.repeat(32), 'retry')])[0] as string)
+  w.store.set(`lease:${TABLE_REF}/${parent}`, { by: 'another-session', until: Number.MAX_SAFE_INTEGER })
+  const alone = await w.writer('a-session').backfill(['spill', 'retry'], 'auto')
+  expect([alone.held, alone.skippedFiles, w.sent]).toEqual([`another session's lease holds ${parent} (ten minutes at most); it waits for the next replay`, 1, []])
+  // Its record, in the store, has the file it left not yet written.
+  w.store.set(`replayed:${TABLE_REF}/${parent}`, { size: new TextEncoder().encode(w.files.get(`/dl/${TABLE_REF}/${parent}`) ?? '').length, fates: 'W', reasons: [], refusals: [], files: [child], written: [false], waits: true, seq: 1 })
+  w.files.set(child, packFiles([line('d'.repeat(32), 'retry')], parent)[0] as string)
+  const both = await w.writer('a-session').backfill(['spill', 'retry'], 'auto')
+  expect([both.held, both.skippedFiles, w.sent]).toEqual(['retry-20261013T200103003Z-earlier-2.jsonl waits until the replay of the file it came from has it as written', 2, []])
+})
+
+test('of two whole done marks for one file, every writer goes by the later: what the earlier names, and the later does not, is emptied unsent', async () => {
+  const w = twoWriters(() => OK_INSERT)
+  const parent = 'retry-20261013T200102003Z-earlier-1.jsonl'
+  const [named, unnamed] = [`/dl/${TABLE_REF}/retry-20261013T200103003Z-later-2.jsonl`, `/dl/${TABLE_REF}/retry-20261013T200103004Z-earlier-3.jsonl`]
+  const [d, e] = ['d'.repeat(32), 'e'.repeat(32)]
+  w.files.set(`/dl/${TABLE_REF}/${parent}`, '')
+  // Listed first, and first by name, the earlier mark (number 3); then the
+  // later one (number 5).
+  const mark = (files: string[], seq: number): string => sealFile(`${JSON.stringify({ size: 900, fates: 'W', reasons: [], refusals: [], files, written: files.map(() => true), waits: true, seq, retired: true })}\n`)
+  w.files.set(`/dl/${TABLE_REF}/outcome-done-aaaaaaaaaa-${parent}`, mark([unnamed], 3))
+  w.files.set(`/dl/${TABLE_REF}/outcome-done-zzzzzzzzzz-${parent}`, mark([named], 5))
+  w.files.set(named, packFiles([line(d, 'retry')], parent)[0] as string)
+  w.files.set(unnamed, packFiles([line(e, 'retry')], parent)[0] as string)
+  await w.writer('a-session').backfill(['spill', 'retry'], 'auto')
+  expect([w.sentOf(d), w.sentOf(e), w.files.get(named), w.files.get(unnamed)]).toEqual([1, 0, '', ''])
+})
+
 test('two writers of one session, one taking over from the other, never give two files one name: neither writes over what the other left', async () => {
   const w = twoWriters(() => FIRST_AGAIN)
   const [one, two] = [`/dl/${TABLE_REF}/retry-20261013T200102003Z-earlier-1.jsonl`, `/dl/${TABLE_REF}/retry-20261013T200102004Z-earlier-2.jsonl`]

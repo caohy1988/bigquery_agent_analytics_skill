@@ -1275,8 +1275,13 @@ export class Writer {
     }
     const files: string[] = []
     const sizes = new Map<string, number>()
-    // Empty files a write still under way may fill (said last, below).
+    // Empty files a write still under way may fill, files another session's
+    // lease holds, and files of what is left whose parent's record does not
+    // have them yet: why each waits, said last (below), after any reason of
+    // another file's.
     const emptyWaiting: string[] = []
+    const leased: string[] = []
+    const parentWaits: string[] = []
     for (const e of entries) {
       const kind = kindOf(e.name)
       if (e.kind !== 'file' || kind === null || !kinds.includes(kind)) continue
@@ -1335,7 +1340,9 @@ export class Writer {
         const lease = (await this.io.storeGet(leaseKey)) as { by?: string; until?: number } | undefined
         if (lease && typeof lease.until === 'number' && lease.until > this.io.now() && lease.by !== me) {
           // Another session replays it. Should that one stop part-way, the
-          // rows still wait, so a replay here tries the file again.
+          // rows still wait, so a replay here tries the file again (force
+          // too, once the lease has run out).
+          leased.push(name)
           report.skippedFiles += 1
           if (kindOf(name) !== 'rejected') tally.waiting += 1
           continue
@@ -1433,6 +1440,7 @@ export class Writer {
             if (fate === 'wait') {
               // Written by a replay of another file whose record does not have
               // it as written yet: it waits until that replay is finished.
+              parentWaits.push(name)
               report.skippedFiles += 1
               if (kindOf(name) !== 'rejected') tally.waiting += 1
             } else if (fate === 'drop') {
@@ -1463,6 +1471,8 @@ export class Writer {
       }
     }
     if (emptyWaiting.length > 0) report.held ??= diagnostic(`${emptyWaiting[0]} is empty, perhaps still being written; it waits for the next replay`)
+    if (parentWaits.length > 0) report.held ??= diagnostic(`${parentWaits[0]} waits until the replay of the file it came from has it as written`)
+    if (leased.length > 0) report.held ??= diagnostic(`another session's lease holds ${leased[0]} (ten minutes at most); it waits for the next replay`)
     // Another replay of this table follows by itself while rows wait: rows
     // this one left, files it did not read (another session's lease on them
     // included), files not whole or empty that a write still under way may
@@ -1540,14 +1550,18 @@ export class Writer {
     // its own. One cut off part-way, with no other whole record, is cut off
     // too: the file's outcome may have been done, and none of it goes but by
     // /bqaa-backfill force.
+    // Of two whole ones (two outcomes recorded at the same moment), the later
+    // by number, then by name: every writer reads the same one.
     const entries = await this.io.listDir(source.dir)
     let doneTorn = false
-    for (const entry of entries) {
+    let done: Partial<Journal> | undefined
+    for (const entry of [...entries].sort((x, y) => (x.name < y.name ? -1 : x.name > y.name ? 1 : 0))) {
       if (doneMarkerOf(entry.name, source.name) === null || entry.size === 0) continue
-      const done = journalOf(await this.io.readFile(joinPath(source.dir, entry.name)))
-      if (done === 'torn') doneTorn = true
-      else if (fits(done) && done.retired === true) return { journal: done, filed: true }
+      const kept = journalOf(await this.io.readFile(joinPath(source.dir, entry.name)))
+      if (kept === 'torn') doneTorn = true
+      else if (fits(kept) && kept.retired === true && (done === undefined || seqOf(kept) > seqOf(done))) done = kept
     }
+    if (done !== undefined) return { journal: done, filed: true }
     const read = ((await this.io.storeGet(source.recordKey)) ?? undefined) as Partial<Journal> | undefined
     const stored = fits(read) ? read : undefined
     let filed: Partial<Journal> | undefined
@@ -1969,7 +1983,11 @@ export class Writer {
         // work, whatever it made of each row. The command's replay sends
         // the refused rows too, so its count of rows parked meanwhile starts
         // over.
-        if (trigger === 'command' || trigger === 'force') this.parkedDuringProblem = 0
+        if (trigger === 'command' || trigger === 'force') {
+          this.parkedDuringProblem = 0
+          this.parkedIds.clear()
+          this.parkedRough = false
+        }
         let landed = 0
         const refused: string[] = []
         let refusal = ''

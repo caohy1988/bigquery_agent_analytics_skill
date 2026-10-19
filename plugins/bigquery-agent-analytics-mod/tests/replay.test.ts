@@ -146,5 +146,5 @@ test('a dead-letter file with no completion record is kept as it is and reported
   await world.clock.advance(15_000)
   expect(world.sentRows().some(r => r.event_id === 'f'.repeat(32))).toBe(false)
   expect(world.files.get(path)).toBe(text)
-  expect(await statusText($)).toMatch(/1 file\(s\) without a completion record \(still being written, or left by a writer that stopped\), kept and not replayed: spill-20261013T200102003Z-stopped-1\.jsonl/)
+  expect(await statusText($)).toMatch(/1 file\(s\) without a completion record \(still being written, or left by a writer that stopped\), kept, not replayed yet: spill-20261013T200102003Z-stopped-1\.jsonl/)
 })
