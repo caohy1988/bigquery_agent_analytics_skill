@@ -51,7 +51,7 @@ const settle = async () => {
 // value stands at it, as the host's), and the writes still to answer.
 // `hold` picks the store keys whose writes wait; `holdState` the state
 // writes that wait, `refuseState` those refused; `read` may hold store reads.
-function host({ hold = () => false, holdState = () => false, refuseState = () => false, read } = {}) {
+function host({ hold = () => false, holdState = () => false, refuseState = () => false, read, liveReads = false } = {}) {
   const store = new Map()
   const state = new Map()
   const held = []
@@ -72,7 +72,7 @@ function host({ hold = () => false, holdState = () => false, refuseState = () =>
     return new Promise(resolve => held.push({ key: 'state', value, release: () => resolve(land()) }))
   }
   const card = () => state.get('welcome')?.value
-  return { store, state, held, write, stateSet, read, card, release: key => held.splice(held.findIndex(h => h.key === key), 1)[0].release() }
+  return { store, state, held, write, stateSet, read, card, liveReads, release: key => held.splice(held.findIndex(h => h.key === key), 1)[0].release() }
 }
 
 // Store reads that wait while `holding` says so, until `answer`.
@@ -108,7 +108,8 @@ async function load(h, options = {}, version = null) {
     state: {
       get: async ref => {
         if (h.stateRead) await h.stateRead(ref.key)
-        const at = dispatch.getStore()
+        // `liveReads`: a host whose reads see what stands at once.
+        const at = h.liveReads ? undefined : dispatch.getStore()
         if (at && !at.moment) at.moment = structuredClone(h.state)
         const now = (at?.moment ?? h.state).get(ref.key) ?? { value: undefined, version: 0 }
         return { value: structuredClone(now.value), version: now.version }
@@ -742,6 +743,42 @@ const tests = {
     assert.equal(h.card().closed, false)
     assert.equal(await b.shown(), true)
     assert.equal(h.store.get(CLOSED), undefined)
+  },
+  async 'a run whose read of the session state answers after a later load showed another version\'s card leaves that card alone, also where reads see what stands at once'() {
+    const h = host({ liveReads: true })
+    let answer
+    let first = true
+    h.stateRead = key => (key === 'welcome' && first ? ((first = false), new Promise(resolve => (answer = resolve))) : undefined)
+    const a = await load(h)
+    await a.start()
+    h.stateRead = undefined
+    const b = await load(h, {}, NEXT)
+    await b.start()
+    assert.equal(h.card().version, NEXT)
+    answer()
+    await settle()
+    assert.equal(h.card().version, NEXT)
+    assert.equal(await b.shown(), true)
+    assert.equal(a.greetings() + b.greetings(), 1)
+  },
+  async 'a read of the close that never answers stops no read of it ten seconds on'() {
+    const realNow = Date.now
+    try {
+      let now = 1_000_000
+      Date.now = () => now
+      const h = host()
+      const a = await load(h)
+      await a.start()
+      const reads = heldReads(h, key => key === CLOSED)
+      assert.equal(await a.shown(), true)
+      assert.equal(await a.shown(), true)
+      assert.equal(reads.count(), 1)
+      now += 11_000
+      assert.equal(await a.shown(), true)
+      assert.equal(reads.count(), 2)
+    } finally {
+      Date.now = realNow
+    }
   },
   async 'draws of the card while its read of the close waits start no other read of it'() {
     const h = host()

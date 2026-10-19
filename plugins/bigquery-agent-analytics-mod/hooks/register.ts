@@ -292,6 +292,9 @@ async function startWelcome($: EngineInterface, e: SessionStartInput, sessionId:
   if (start !== welcomeStarts) return
   const isOurs = (card: Welcome | null): boolean => card !== null && card.version === PLUGIN_VERSION && sessionId !== null && card.sessionId === sessionId
   if (isOurs(held.value)) return takeOver($, sessionId as string, start, rank)
+  // A card a later load or run showed (another version's, after an update in
+  // the session) is left alone.
+  if (held.value !== null && (held.value.rank ?? 0) > rank) return
   let opened: { welcome: Welcome; isNew: boolean } | null
   try {
     // This session's close is read whether or not its greeting is there: Got
@@ -304,12 +307,9 @@ async function startWelcome($: EngineInterface, e: SessionStartInput, sessionId:
     if (sessionId !== null && greetedBy(latest, greeted)?.sessionId === sessionId) {
       landing = await $.store.get(cardKey(PLUGIN_VERSION, sessionId))
     } else if (greetedBy(latest, greeted) === null) {
-      // A new card: the versions greeted before name the one it replaces.
-      try {
-        versions = greetedVersions(await $.store.keys())
-      } catch {
-        versions = []
-      }
+      // A new card: the versions greeted before name the one it replaces (a
+      // store that cannot list them cannot tell: no card).
+      versions = greetedVersions(await $.store.keys())
     }
     opened = openWelcome({ latest, greeted, landing, closed, versions }, sessionId, key)
   } catch {
@@ -417,12 +417,16 @@ async function stillOpen($: EngineInterface, sessionId: string): Promise<boolean
 }
 
 // The store's close for the card the band draws, read again in the
-// background each time it draws it, one read at a time: Got it in an earlier
-// load, its state write refused and its store write late, hides the card
-// here once that write lands, with no reload and no press.
+// background each time it draws it, one read at a time (one that has not
+// answered in CLOSE_READ_MS stops no other): Got it in an earlier load, its
+// state write refused and its store write late, hides the card here once
+// that write lands, with no reload and no press.
 let closeRead: Promise<void> | null = null
+let closeReadAt = 0
+const CLOSE_READ_MS = 10_000
 function checkClosed($: EngineInterface, version: string, sessionId: string): void {
-  if (closeRead !== null) return
+  if (closeRead !== null && Date.now() - closeReadAt < CLOSE_READ_MS) return
+  closeReadAt = Date.now()
   closeRead = $.store
     .get(closedKey(version, sessionId))
     .then(closed => {
@@ -484,9 +488,10 @@ function rowsLanded($: EngineInterface, by: string, total: number, to: string | 
     return { ...card, counted: { ...card.counted, [by]: total }, sent: card.sent + total - had, ...(first ? { landedAt: Date.now(), landedTo: to } : {}) }
   })
     .then(card => {
-      if (card === null || !first) return
+      if (card === null) return
+      // At every change: a landing whose write failed goes again.
       records?.update(card)
-      if (card.owner !== ownerOf(welcomeStarts)) return
+      if (!first || card.owner !== ownerOf(welcomeStarts)) return
       try {
         $.ui.toast(clean(landedToast(config), 500), { timeoutMs: 15_000 })
       } catch {

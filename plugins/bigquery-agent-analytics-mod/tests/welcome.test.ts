@@ -297,6 +297,41 @@ for (const operation of ['get', 'set'] as const) {
   })
 }
 
+test('a store that cannot list the versions greeted before shows no card and greets no one; once it can, the card names the one it replaced', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on, {}, { 'welcome:0.0.9': { sessionId: 'an-earlier-session', previous: null } })
+  world.refuseKeys = true
+  await startSession($)
+  await world.clock.settle()
+  expect((await band($)).texts).toEqual(['drawn beneath'])
+  expect(welcomeLines(world.transcript)).toEqual([])
+  expect(greeted(world)).toBeUndefined()
+  world.refuseKeys = false
+  await $.session.start(START)
+  await world.clock.settle()
+  expect((await band($)).texts.slice(1, 3)).toEqual([`BigQuery Agent Analytics mod updated to ${PLUGIN_VERSION}`, ' was 0.0.9'])
+})
+
+test('a landing whose store write is refused is written once more rows land', { options: OPTIONS }, async ($, on) => {
+  let refusing = true
+  on('store.set', { key: OWN }, ($, e, next) => (refusing ? { deny: 'the store could not be written' } : next(e)))
+  const world = setUp(on, {}, {})
+  await startSession($)
+  await world.clock.advance(5000)
+  expect((await band($)).texts[4]).toBe(landed(1))
+  expect(own(world)).toBeUndefined()
+  refusing = false
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
+  await world.clock.advance(5000)
+  expect(own(world)).toMatchObject({ landedTo: HERE })
+})
+
+test('a flush interval of no whole number of seconds is said as it is', { options: { ...OPTIONS, flushIntervalMs: 1500 } }, async ($, on) => {
+  const world = setUp(on, {}, {})
+  await startSession($)
+  await world.clock.settle()
+  expect((await band($)).texts[4]).toBe('◌ Waiting for the first rows, sent every 1500 ms while you work · /bqaa-status shows the counts')
+})
+
 test('a close read that never answers, the greeting never written, shows no card and greets no one', { options: OPTIONS }, async ($, on) => {
   let reads = 0
   on('store.get', { key: CLOSED }, () => {

@@ -37,6 +37,28 @@ function heldStore(): { writes: [string, unknown][]; pending: () => number; answ
 
 const CARD: Welcome = { version: PLUGIN_VERSION, previous: null, sessionId: SESSION_ID, landedAt: null, landedTo: null, closed: false, sent: 0, counted: {}, destination: HERE, owner: 'a-load:1', rank: 1 }
 
+for (const what of ['greeting', 'landing'] as const) {
+  test(`a ${what} whose write fails goes again at the card's next change`, async () => {
+    const writes: [string, unknown][] = []
+    let refusing = true
+    const key = what === 'greeting' ? `welcome:${PLUGIN_VERSION}` : OWN
+    const save = async (k: string, value: unknown): Promise<void> => {
+      if (refusing && k === key) throw new Error('the store could not be written')
+      writes.push([k, value])
+    }
+    const records = new CardRecords(save, CARD, what === 'greeting')
+    records.update({ ...CARD, landedAt: 1, landedTo: HERE, sent: 1 })
+    for (let i = 0; i < 10; i += 1) await Promise.resolve()
+    expect(writes.some(([k]) => k === key)).toBe(false)
+    refusing = false
+    // More rows land: the card changes again, its landing as it was.
+    records.update({ ...CARD, landedAt: 1, landedTo: HERE, sent: 3 })
+    for (let i = 0; i < 10; i += 1) await Promise.resolve()
+    expect(writes.filter(([k]) => k === key).length).toBe(1)
+    expect(writes.find(([k]) => k === OWN)?.[1]).toEqual({ landedAt: 1, landedTo: HERE })
+  })
+}
+
 test("a card's greeting and landing go one at a time, each with the card as it is by then; its close is not held behind them", async () => {
   const store = heldStore()
   const records = new CardRecords(store.save, CARD, true)

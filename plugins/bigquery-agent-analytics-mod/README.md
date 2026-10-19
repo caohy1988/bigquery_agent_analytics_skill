@@ -240,15 +240,17 @@ whose reads have not answered, or never do, draws none, and a Got it in
 another load while it took the card over hides it. That close is read
 whether or not the store has the greeting: a session resumed after Got it,
 its greeting's write lost, shows no card and greets no more. Each draw reads the
-store's close again in the background, so a close another load wrote late
+store's close again in the background (one read at a time; one that has
+not answered in 10 s stops no other), so a close another load wrote late
 (its state write refused) hides the card once it lands, with no reload and
 no press. Of two loads, the later one shows the card: each session start
 takes the next number of a count the session's state keeps, then waits one
 tick of the host's clock, a wait a hot reload cancels for the load it
 replaces. A load whose number came back after a later load started takes
 nothing over, and of the loads that go on a later one ranks higher,
-whatever the clock says; a load whose reads answer after a later load took
-the card over leaves it to that one, and a later load whose first write of the card
+whatever the clock says; no run replaces a card a later load or run
+showed, another version's included; a load whose reads answer after a later
+load took the card over leaves it to that one, and a later load whose first write of the card
 an earlier one beat takes the card over, with no second greeting. Each
 writer's rows count once, however often or late it says so. If rows now go
 somewhere else (another table, or BigQuery after a dry run), the card waits
@@ -269,8 +271,9 @@ not show. The store makes "once" a best effort:
 
 * if the records cannot be written, the next session shows the card again,
   and a reload in a session that keeps no `$.state` shows it as the store
-  last had it;
-* if they cannot be read, no card shows, after a reload too;
+  last had it (a write that fails goes again when more rows land);
+* if they cannot be read, or the versions greeted before cannot be listed,
+  no card shows, after a reload too;
 * two sessions started at the same moment can both show it;
 * a reload in the moment between Got it and its store write landing (its
   state write refused) shows the card again, until the write lands and the
@@ -1061,7 +1064,7 @@ test kit, with no session, sign-in, GCP or network: `$.http.fetch`,
 `$.process.run`, `$.fs` and `$.store` are stubbed, and `mock.clock` drives the
 timers; the `$.fs` stubs measure files in UTF-8 bytes and refuse a file over
 4 MiB, and the `$.store` stub a store over 4 MiB of JSON in all, as the host
-does. 383 tests cover the captured rows and their spans,
+does. 388 tests cover the captured rows and their spans,
 subagent runs in the order the host raises them (one invocation and one
 trace for the turn, a span per run, a SubagentStart that comes late or never),
 the session-start row raised before or during `session.start`'s setup,
@@ -1308,7 +1311,11 @@ And the welcome card:
   sessions from showing it; a reload in its session showing it again as it
   was; no card, line, record or session state in a run with no one at the
   prompt; no card and no line for a session the store has closed, its
-  greeting never written, its read of that close answering or not; an
+  greeting never written, its read of that close answering or not; no card
+  and no line while the store cannot list the versions greeted before, and
+  the card naming the one it replaced once it can; a landing whose store
+  write is refused written once more rows land; a flush interval of no
+  whole number of seconds said in milliseconds; an
   update back to an older version greeted as a change;
 * a store read or write that never answers holding up nothing, the session's
   start included; rows that land while the store is read; a read that
@@ -1325,7 +1332,8 @@ And the welcome card:
   late write of an older version's never greeting this one again; the
   version it replaced, the newest greeted before; "updated" only for a
   newer version, pre-releases part by part; the card's write queue on its
-  own; rows the writer before a reload lands counting on the card after
+  own, a greeting or landing whose write fails going again at the card's
+  next change; rows the writer before a reload lands counting on the card after
   it; a close whose session-state write is refused hiding the card, and
   the store's close keeping it hidden after a reload;
 * a reload to another table, or out of a dry run, waiting for rows to land
@@ -1420,7 +1428,11 @@ on the next prompt; that a close an earlier load writes late, its state
 close refused, hides the card a later load took over once it lands; that
 a session resumed with no state after Got it, the greeting's write lost,
 shows no card and greets no more, its read of the close answering or not;
-that a Got it, a takeover's stored close or a prompt in a load of the
+that a run whose read of the state answers after a later load showed
+another version's card leaves that card alone, with reads that see what
+stands at once too; that a read of the close that never answers stops no
+read of it ten seconds on; that a Got it, a takeover's stored close or a
+prompt in a load of the
 version before an update, its write or its reads answering late, never
 closes the card of the version after it; and that draws of the card while
 its read of the close waits start no other read of it.

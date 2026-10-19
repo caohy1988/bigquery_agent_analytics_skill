@@ -45,6 +45,8 @@ export type World = {
   sessionIdRefused: boolean
   // Makes `$.fs.write` refuse every write, or the writes this picks.
   failWrites: boolean
+  // `$.store.keys` refused.
+  refuseKeys: boolean
   refuseWrite: ((path: string, text: string) => boolean) | null
   // When files were last written, as the listing says (none: 0).
   mtimes: Map<string, number>
@@ -155,6 +157,7 @@ export function setUp(on: On, env: Record<string, string> = {}, store: Record<st
     sessionId: SESSION_ID,
     sessionIdRefused: false,
     failWrites: false,
+    refuseKeys: false,
     refuseWrite: null,
     mtimes: new Map(),
     hangWrites: false,
@@ -195,7 +198,7 @@ export function setUp(on: On, env: Record<string, string> = {}, store: Record<st
     world.store.delete(e.key)
     return { value: undefined }
   })
-  on('store.keys', () => ({ value: [...world.store.keys()] }))
+  on('store.keys', () => (world.refuseKeys ? { deny: 'the store could not be listed' } : { value: [...world.store.keys()] }))
   on('session.start', () => ({ cwd: '/work/my-repo' }))
   on('session.end', ($, e) => ({ sessionId: e.sessionId }))
   on('session.id', () => (world.sessionIdRefused ? { deny: 'refused by policy' } : { value: world.sessionId }))

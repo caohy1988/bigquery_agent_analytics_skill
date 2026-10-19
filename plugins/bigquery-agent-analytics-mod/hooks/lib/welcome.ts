@@ -128,7 +128,8 @@ export class CardRecords {
     this.write()
   }
 
-  // The card changed (rows landed): its landing follows.
+  // The card changed (rows landed, or more did): its landing follows, and a
+  // write that failed before goes again.
   update(card: Welcome): void {
     const was = this.card
     this.card = card
@@ -146,8 +147,9 @@ export class CardRecords {
     try {
       while (this.greetingDue || this.landingDue) {
         const { version, previous, sessionId, landedAt, landedTo } = this.card
+        const greeting = this.greetingDue
         try {
-          if (this.greetingDue) {
+          if (greeting) {
             this.greetingDue = false
             await this.save(greetedKey(version), { sessionId, previous })
           } else {
@@ -155,8 +157,12 @@ export class CardRecords {
             if (sessionId !== null) await this.save(cardKey(version, sessionId), { landedAt, landedTo })
           }
         } catch {
-          // Not recorded: the next session shows the card again, or a reload
-          // with no `$.state` shows it as the store last had it.
+          // Not recorded: it goes again at the card's next change (rows that
+          // land later). Until then the next session shows the card again, or
+          // a reload with no `$.state` shows it as the store last had it.
+          if (greeting) this.greetingDue = true
+          else this.landingDue = true
+          break
         }
       }
     } finally {
@@ -223,7 +229,7 @@ export function welcomeCard(w: Welcome, c: Config, sent: number): WelcomeCard {
     return { tone: 'warning', glyph: '◇', title: `${title}, not set up yet`, tag, lines }
   }
   const landed = w.landedAt !== null
-  const every = `every ${Math.round(c.flushIntervalMs / 1000)} s`
+  const every = c.flushIntervalMs % 1000 === 0 ? `every ${c.flushIntervalMs / 1000} s` : `every ${c.flushIntervalMs} ms`
   const status = '/bqaa-status shows the counts'
   if (c.dryRun) {
     return {
