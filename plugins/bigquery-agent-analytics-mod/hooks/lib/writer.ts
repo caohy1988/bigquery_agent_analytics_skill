@@ -424,10 +424,10 @@ export class Writer {
   // Replays whose outcome is not all written out yet, by the file's path: a
   // later replay finishes writing it and sends none of the file again.
   private rewrites = new Map<string, Rewrite>()
-  // The name this writer leaves in its marks (`markSending`), and the names
-  // it takes a mark of for its own: an outcome it would hold, if it had one.
-  private readonly mark = Math.random().toString(36).slice(2)
-  private marks = new Set([this.mark])
+  // The name this writer leaves in its marks (`markSending`), ten base-36
+  // characters: a mark of its own is one whose outcome it would hold, if it
+  // had one.
+  private readonly mark = Math.random().toString(36).slice(2, 12).padEnd(10, '0')
   // Problem kinds already announced with a toast and a transcript line.
   private announced = new Set<ProblemKind>()
   // Where the last token came from: the fix differs.
@@ -468,10 +468,11 @@ export class Writer {
   // Takes over the rows another writer still queues (oldest first).
   adopt(previous: Writer): void {
     this.queue.unshift(previous.queue.takeAll())
-    // And the outcomes it held, one whose record no store or file took
-    // included.
-    for (const [path, rewrite] of previous.rewrites) this.rewrites.set(path, rewrite)
-    for (const mark of previous.marks) this.marks.add(mark)
+    // And the outcomes it holds, one whose record no store or file took
+    // included: the same map, so an outcome a replay still under way there
+    // comes to is held here too. Its marks stay its own: one with no
+    // outcome held keeps this writer from sending the file, as another's.
+    this.rewrites = previous.rewrites
   }
 
   // Asks for a flush shortly, outside the caller's dispatch.
@@ -1353,7 +1354,7 @@ export class Writer {
           // refused: none goes by itself from here, and /bqaa-backfill, asked
           // to send it, replays it afresh. A mark of this writer's own is no
           // other replay's: it would hold the outcome.
-          if (held === undefined && trigger !== 'command' && found.pending.some(by => !this.marks.has(by))) {
+          if (held === undefined && trigger !== 'command' && found.pending.some(by => by !== this.mark)) {
             report.held ??= diagnostic(`a replay of ${name} sent rows and has recorded no outcome; /bqaa-backfill replays the file afresh`)
             report.skippedFiles += 1
             if (kindOf(name) !== 'rejected') tally.waiting += 1
@@ -1375,7 +1376,14 @@ export class Writer {
           const text = await this.io.readFile(path)
           const parsed = parseFile(text)
           if (text !== '' && !parsed.complete) report.incompleteFiles.push(name)
-          else if (text !== '') {
+          else if (text !== '' && utf8Length(text) !== source.size) {
+            // Written further since it was listed (a write that had not
+            // finished then): its record, and every mark, go by the size the
+            // listing gave, so it waits for the next replay to list it whole.
+            report.held ??= diagnostic(`${name} changed while it was read; it waits for the next replay`)
+            report.skippedFiles += 1
+            if (kindOf(name) !== 'rejected') tally.waiting += 1
+          } else if (text !== '') {
             const fate = parsed.parent === null ? 'go' : await this.parentFate(dir, parsed.parent, path, listed.get(parsed.parent) ?? 0, c)
             if (fate === 'wait') {
               // Written by a replay of another file whose record does not have
@@ -1480,10 +1488,14 @@ export class Writer {
   private async readJournal(source: Source): Promise<Found | Pending | 'torn' | undefined> {
     // A record of another size is not this file's (`size` -1: any size).
     const fits = (journal: Partial<Journal> | undefined): journal is Partial<Journal> => journal !== undefined && (source.size < 0 || journal.size === source.size)
-    // In a file of its own, which no write of a record goes to.
+    // In a file of its own, which no write of a record goes to. One cut off
+    // part-way, with no other whole record, is cut off too: the file's
+    // outcome may have been done, and none of it goes by itself.
+    let doneTorn = false
     if (this.io.exists === undefined || (await this.io.exists(source.doneFile))) {
       const done = journalOf(await this.io.readFile(source.doneFile))
-      if (done !== 'torn' && fits(done) && done.retired === true) return { journal: done, filed: true }
+      if (done === 'torn') doneTorn = true
+      else if (fits(done) && done.retired === true) return { journal: done, filed: true }
     }
     const read = ((await this.io.storeGet(source.recordKey)) ?? undefined) as Partial<Journal> | undefined
     const stored = fits(read) ? read : undefined
@@ -1501,7 +1513,7 @@ export class Writer {
     }
     if (stored === undefined) {
       if (filed !== undefined) return { journal: filed, filed: true }
-      if (torn) return 'torn'
+      if (torn || doneTorn) return 'torn'
       const by = await this.marksOn(source)
       return by.length === 0 ? undefined : { pending: by }
     }
@@ -1639,6 +1651,10 @@ export class Writer {
   private async writeOut(path: string, rewrite: Rewrite): Promise<boolean> {
     this.rewrites.set(path, rewrite)
     const found = Writer.recorded(await this.readJournal(rewrite))
+    // Finished already (the file left again, by a late copy, say), here or
+    // at any check below: the mark that it was done stands as it is, never
+    // written again, and only the file is emptied.
+    let finished = found !== undefined && found !== 'torn' && found.journal.retired === true
     let recorded = false
     if (found !== undefined && found !== 'torn') {
       if (!Writer.catchUp(rewrite, found)) {
@@ -1683,8 +1699,18 @@ export class Writer {
       const found = Writer.recorded(await this.readJournal(rewrite))
       if (found === 'torn' || (found !== undefined && found.journal.size === rewrite.size && !Writer.catchUp(rewrite, found))) {
         this.rewrites.delete(path)
+        // Another outcome finished the file: a record of this one that the
+        // store took meanwhile is let go, as that writer let its own go.
+        if (found !== 'torn' && found.journal.retired === true) {
+          try {
+            await this.io.storeDelete(rewrite.recordKey)
+          } catch {
+            // Left; the done mark stands over it.
+          }
+        }
         return false
       }
+      if (found !== undefined && found.journal.retired === true) finished = true
       return true
     }
     for (const file of rewrite.files) {
@@ -1696,7 +1722,7 @@ export class Writer {
       await record()
     }
     if (!(await stillOurs())) return false
-    const done = await this.markDone(rewrite)
+    const done = finished || (await this.markDone(rewrite))
     try {
       await this.io.writeFile(path, '')
     } catch (err) {
@@ -1756,7 +1782,7 @@ export class Writer {
       return false
     }
     const found = Writer.recorded(await this.readJournal(source))
-    const others = found === 'torn' || found === undefined ? (await this.marksOn(source)).filter(by => !this.marks.has(by)) : []
+    const others = found === 'torn' || found === undefined ? (await this.marksOn(source)).filter(by => by !== this.mark) : []
     if ((found !== undefined && found !== 'torn') || (trigger !== 'command' && others.length > 0) || (await this.io.readFile(path)) === '') {
       await this.unmark(source)
       return false

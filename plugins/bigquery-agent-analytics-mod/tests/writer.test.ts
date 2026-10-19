@@ -245,6 +245,21 @@ test('a permission error parks rows as refused; /bqaa-backfill sends them once f
   expect(await statusText($)).toMatch(/last backfill \(command, .*\): 1 file\(s\), 3 rows sent, 0 left/)
 })
 
+test('the /bqaa-backfill transcript line says why a file was left waiting', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  world.replies = [DENIED, OK_INSERT]
+  await startSession($)
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
+  await world.clock.advance(5000)
+  expect(deadLetterFiles(world).length).toBe(1)
+  // No mark can be written beside the file: none of it is sent.
+  world.refuseWrite = (path, text) => path.includes('/outcome-sending-') && text !== ''
+  await $.command.run({ command: 'bqaa-backfill', args: '', ...COMMAND })
+  await world.clock.settle()
+  expect(world.acceptedRows().length).toBe(0)
+  expect(world.logs.some(l => /^bqaa backfill: .*; left waiting: could not mark the replay of rejected-\S+ before sending, so none of it is sent/.test(l))).toBe(true)
+})
+
 test('a refused token is fetched again', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on)
   world.replies = [UNAUTHENTICATED, OK_INSERT]
