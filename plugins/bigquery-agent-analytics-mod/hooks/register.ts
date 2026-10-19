@@ -65,6 +65,19 @@ const WELCOME_STATE = { plugin: 'bigquery-agent-analytics-mod', key: 'welcome' }
 // above every earlier one that shows the card (`startWelcome` stops a load
 // replaced before its number came back), whatever the clock says.
 const LOADS_STATE = { plugin: 'bigquery-agent-analytics-mod', key: 'loads' } as const
+// Each writer's rows landed so far in the session, by writer and destination
+// (`countKey`), whatever the card shows: a card that opens starts its count
+// there (`startWelcome`), so rows landed before it, while no card showed or
+// the card was closed included, never count on it.
+const DELIVERED_STATE = { plugin: 'bigquery-agent-analytics-mod', key: 'delivered' } as const
+// A writer's rows landed in one destination: the key of `counted` and of
+// `delivered`.
+const countKey = (by: string, to: string): string => `${by}@${to}`
+// What this load's writers have landed, by `countKey`.
+const landedByWriter = new Map<string, number>()
+// Whether this session shows a card (a person at the prompt): only then is
+// `delivered` kept.
+let cardSession = false
 
 // Rows captured before session.start built the writer (an event the engine
 // raised first); handed over once it exists.
@@ -327,15 +340,25 @@ async function startWelcome($: EngineInterface, e: SessionStartInput, sessionId:
   // first, say), which this run takes over from there, with no greeting of
   // its own; a card a later load or run showed, left to it; or an earlier
   // one's of another version (an update in the session), which this run's
-  // card replaces, tried again at the state as it stands now. What the card
-  // it replaces had counted of each writer it keeps: rows that writer lands
-  // from here count once, as rows landed while this card shows.
+  // card replaces, tried again at the state as it stands now. Its count
+  // starts from the rows every other writer has landed so far (the
+  // session's `delivered`, and what the card it replaces had counted), so
+  // an earlier load's rows landed before this card count once, as rows
+  // landed while it shows, only from here; this run's own rows, landed while
+  // the records were read, it counts at once.
   let version = held.version
   let replaced = held.value
   let isSet = false
   let card = shown
   for (let i = 0; i < 8 && !isSet; i += 1) {
-    card = { ...shown, counted: { ...(replaced?.counted ?? {}) } }
+    let delivered: Record<string, number> = {}
+    try {
+      delivered = (await $.state.get(DELIVERED_STATE)).value ?? {}
+    } catch {
+      // None known: what the card it replaces had counted.
+    }
+    const others = Object.fromEntries(Object.entries(delivered).filter(([id]) => !id.startsWith(`${me}@`)))
+    card = { ...shown, counted: baselines(others, replaced?.counted ?? {}) }
     try {
       isSet = (await $.state.set(WELCOME_STATE, card, { ifVersion: version })).isSet
     } catch {
@@ -371,7 +394,7 @@ async function startWelcome($: EngineInterface, e: SessionStartInput, sessionId:
   redrawBand($)
   // Rows that landed while the records were read (this writer's rows go
   // where this configuration sends them): the card says so now, once.
-  if (writer !== null) rowsLanded($, me, writer.counters.sent, key)
+  if (key !== null) rowsLanded($, countKey(me, key), landedByWriter.get(countKey(me, key)) ?? 0, key)
 }
 
 // This session's card as the session's state has it (after a reload, or
@@ -412,7 +435,7 @@ async function takeOver($: EngineInterface, sessionId: string, start: number, ra
   cardReady = cardId(PLUGIN_VERSION, sessionId)
   redrawBand($)
   // Rows this writer landed while the records were read: counted once.
-  if (writer !== null) rowsLanded($, me, writer.counters.sent, key)
+  if (key !== null) rowsLanded($, countKey(me, key), landedByWriter.get(countKey(me, key)) ?? 0, key)
 }
 
 // Whether the store has no close for this session's card, read once more
@@ -496,15 +519,18 @@ function redrawBand($: EngineInterface): void {
 // the band may be collapsed. Rows a writer of another configuration sent
 // elsewhere say nothing here; rows an earlier load sends where the card
 // counts them count.
-function rowsLanded($: EngineInterface, by: string, total: number, to: string | null): void {
+function rowsLanded($: EngineInterface, id: string, total: number, to: string | null): void {
   if (to === null || total <= 0) return
   let first = false
-  void changeCard($, card => {
-    const had = card.counted?.[by] ?? 0
-    if (card.closed || card.destination !== to || total <= had) return null
-    first = card.landedAt === null
-    return { ...card, counted: { ...card.counted, [by]: total }, sent: card.sent + total - had, ...(first ? { landedAt: Date.now(), landedTo: to } : {}) }
-  })
+  void noteDelivered($, id, total)
+    .then(() =>
+      changeCard($, card => {
+        const had = card.counted?.[id] ?? 0
+        if (card.closed || card.destination !== to || total <= had) return null
+        first = card.landedAt === null
+        return { ...card, counted: { ...card.counted, [id]: total }, sent: card.sent + total - had, ...(first ? { landedAt: Date.now(), landedTo: to } : {}) }
+      }),
+    )
     .then(card => {
       if (card === null) return
       // At every change: a landing whose write failed goes again.
@@ -519,6 +545,31 @@ function rowsLanded($: EngineInterface, by: string, total: number, to: string | 
     .catch(() => {
       internalErrors += 1
     })
+}
+
+// The writer and destination `id` has landed `total` rows in all: the
+// session's `delivered` says so, whatever the card shows, in a session that
+// shows cards. Only ever up, at the version read, read again on a miss; one
+// that cannot be written leaves a later card to count from what it knows.
+async function noteDelivered($: EngineInterface, id: string, total: number): Promise<void> {
+  if (!cardSession) return
+  try {
+    for (let i = 0; i < 8; i += 1) {
+      const held = await $.state.get(DELIVERED_STATE)
+      const now = held.value ?? {}
+      if ((now[id] ?? 0) >= total) return
+      if ((await $.state.set(DELIVERED_STATE, { ...now, [id]: total }, { ifVersion: held.version })).isSet) return
+    }
+  } catch {
+    // No session state here, or refused: no card counts from it.
+  }
+}
+
+// Each key's highest total of the maps given: what a card opening counts from.
+function baselines(...maps: Record<string, number>[]): Record<string, number> {
+  const out: Record<string, number> = {}
+  for (const map of maps) for (const [key, total] of Object.entries(map)) if (typeof total === 'number' && total > (out[key] ?? 0)) out[key] = total
+  return out
 }
 
 // Got it was pressed, or (`landedOnly`) a prompt came after rows landed
@@ -605,7 +656,8 @@ export const register: Register = (on, registered) => {
     const start = ++welcomeStarts
     cardReady = null
     // Its rank, in a session a person sees (a `-p` run draws no card).
-    const ranked = e.isInteractive && e.surface !== null ? nextLoad($).catch(() => null) : Promise.resolve(null)
+    cardSession = e.isInteractive && e.surface !== null
+    const ranked = cardSession ? nextLoad($).catch(() => null) : Promise.resolve(null)
     try {
       config = resolveConfig(options, await readEnv($))
       clockAfter = (ms, fn) => $.clock.after(ms, fn)
@@ -639,7 +691,14 @@ export const register: Register = (on, registered) => {
         redraw: () => $.ui.invalidate('ui.render'),
         // Where setup.sh is, for the fix when BigQuery cannot find the dataset.
         pluginRoot: $.plugin.root,
-        sent: (rows, to) => rowsLanded($, ownerOf(start), own?.counters.sent ?? rows, destinationKey(to)),
+        sent: (rows, to) => {
+          const key = destinationKey(to)
+          if (key === null || rows <= 0) return
+          const id = countKey(ownerOf(start), key)
+          const total = (landedByWriter.get(id) ?? 0) + rows
+          landedByWriter.set(id, total)
+          rowsLanded($, id, total, key)
+        },
       }
       const previous = writer
       const own: Writer = new Writer(io, () => config, () => tracer.sessionId)

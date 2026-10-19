@@ -213,7 +213,8 @@ version or between versions that do not compare, it says "changed to".
   after rows landed, it stays until Got it too.
 * While a problem stops rows (see
   [If rows cannot be written](#if-rows-cannot-be-written)), its notice has
-  the band. The card comes back once rows land.
+  the band. The card comes back once the problem clears (rows land, or
+  BigQuery takes a request, whatever it makes of its rows).
 
 The mod notes in its own store (`$.store`) the version it greeted and the
 session that showed the card (key `welcome:<version>`), so no later session
@@ -256,7 +257,12 @@ load took the card over leaves it to that one, and a later load whose first writ
 an earlier one beat takes the card over, with no second greeting; a later
 version's (an update in the session) shows its own card over the earlier
 version's, with its own greeting. Each
-writer's rows count once, however often or late it says so. If rows now go
+writer's rows count once, however often or late it says so, counted apart
+for each place they land. The session's state also keeps each writer's
+rows landed so far, whatever the card shows (none, closed, or counting
+elsewhere), and a new card counts from there: rows an earlier load landed
+before it opened never count on it, while rows its own session start landed
+as it read the store do. If rows now go
 somewhere else (another table or location, or BigQuery after a dry run), the card waits
 again until rows land there, and a prompt closes it only once they have,
 hiding it and writing the store's close at once, as Got it does; rows sent
@@ -1056,6 +1062,7 @@ cd plugins/bigquery-agent-analytics-mod && claude plugin test
 bash tests/setup.test.sh
 bash tests/version.test.sh    # plugin.json and PLUGIN_VERSION agree
 node tests/reload.test.mjs    # node 24: the welcome card across a fresh load
+bash tests/state-contract.test.sh   # the host's $.state, as the reload test models it
 python3 tests/views.test.py   # needs DuckDB: python3 -m pip install duckdb
 npx -p typescript tsc -p .    # once the host CLI has loaded the mod (below)
 ```
@@ -1389,6 +1396,14 @@ calls. It checks:
   `<dataset>_reporting` even when the shell already sets `BQAA_VIEWS_DATASET`
   (valid or not), or another project, dataset or table.
 
+`tests/state-contract.test.sh` checks, with the host CLI's own test runtime,
+what `tests/reload.test.mjs` models of the host's `$.state`, so its stand-in
+never sets its own rules: a small mod of its own (`tests/state-contract`,
+its check kept as `state.contract.ts`, a name this mod's tests leave alone)
+reads one value, waits while another dispatch writes, then writes at the
+version it read: the other write is not seen until a write of its own,
+landed or missed, brings the whole moment up to date.
+
 `tests/version.test.sh` checks that `plugin.json` and `PLUGIN_VERSION` name
 the same version: the welcome card greets an update by the latter.
 
@@ -1398,7 +1413,8 @@ does, which the test kit cannot, under node 24 with a small stand-in for
 writes and reads held and let go in any order). Its `$.state` keeps a
 version for each value and lands a conditional write only at it, and every
 `$.state.get` of one event reads one moment until a write of its own, landed
-or missed, brings the whole moment up to date, as the host's does; its writes can be held or
+or missed, brings the whole moment up to date, and the versions of all its
+values come from one sequence, as the host's test runtime does; its writes can be held or
 refused, its reads held. Its `$.clock.sleep` answers only in the newest
 load: a hot reload cancels the waits of the load it replaces. A load may be
 of another version of the code, its config naming that version, as after
@@ -1445,7 +1461,9 @@ read of it ten seconds on, and one that answers after the next began
 leaves that one's turn alone; that its own `$.state` reads one moment an
 event, brought up to date whole by a conditional write of its own, landed
 or missed; that rows the version before an update lands after the updated
-version showed its card count once there; that where no session id is
+version showed its card count once there, and so do its rows landed after
+its own card was closed, or while the session showed no card, before the
+update: none of those count; that where no session id is
 known no card shows and no one is greeted, after a reload too;
 that a Got it, a takeover's stored close or a
 prompt in a load of the
