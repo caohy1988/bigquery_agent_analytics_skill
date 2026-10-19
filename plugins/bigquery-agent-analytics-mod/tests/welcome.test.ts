@@ -5,13 +5,20 @@
 // next prompt after they land, or Got it, closes it, and no later session
 // shows it. A problem notice has the band first; a run with no one at the
 // prompt shows nothing and leaves the store alone; nothing waits on the
-// store for the card, session.start included.
+// store for the card, session.start included. The greeting record names
+// the version greeted and the session; the card's own record, which only
+// that card writes, what became of it, written in order, so that a write
+// that answers late never undoes a close.
 
 import { type Engine, expect, test } from 'claude-code/testing'
 
-import { PLUGIN_VERSION } from '../hooks/lib/config.ts'
+import { PLUGIN_VERSION, resolveConfig } from '../hooks/lib/config.ts'
+import { packFiles } from '../hooks/lib/deadletter.ts'
+import { buildRow } from '../hooks/lib/rows.ts'
+import { CardRecords, type Welcome } from '../hooks/lib/welcome.ts'
+import { type Io, Writer } from '../hooks/lib/writer.ts'
 
-import { COMMAND, DRY_RUN_DIR, OK_INSERT, OPTIONS, SESSION_ID, type World, deadLetterFiles, setUp, startSession } from './helpers.ts'
+import { COMMAND, DRY_RUN_DIR, OK_INSERT, OPTIONS, SESSION_ID, TABLE_REF, type World, deadLetterFiles, setUp, startSession } from './helpers.ts'
 
 const PLUGIN = 'bigquery-agent-analytics-mod'
 
@@ -53,7 +60,12 @@ async function band($: Engine, props: { hasSurvey?: boolean; maxRows?: number } 
 }
 
 const welcomeLines = (lines: string[]): string[] => lines.filter(l => l.startsWith('bqaa: BigQuery Agent Analytics mod'))
+// The greeting record, and this session's card's own record.
 const stored = (world: World): unknown => world.store.get('welcome')
+const OWN = `welcome:${PLUGIN_VERSION}:${SESSION_ID}`
+const own = (world: World): unknown => world.store.get(OWN)
+const GREETING = { version: PLUGIN_VERSION, previous: null, sessionId: SESSION_ID }
+const START = { surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' } as const
 const statusText = async ($: Engine): Promise<string> => (await $.command.run({ command: 'bqaa-status', args: '', ...COMMAND })).text ?? ''
 
 test('a fresh install shows the welcome card, then that the first rows landed, and the next prompt closes it', { options: OPTIONS }, async ($, on) => {
@@ -62,13 +74,15 @@ test('a fresh install shows the welcome card, then that the first rows landed, a
   expect(await band($)).toEqual({ texts: [...INSTALLED, RECORDS, WAITING, 'drawn beneath'], boxed: true, button: 'Got it' })
   expect(welcomeLines(world.transcript)).toEqual([`bqaa: BigQuery Agent Analytics mod installed (${PLUGIN_VERSION}): records ${WHAT} to ${TABLE} (US); /bqaa-status shows what was sent.`])
   // Recorded at once: no later session shows it.
-  expect(stored(world)).toEqual({ version: PLUGIN_VERSION, previous: null, sessionId: SESSION_ID, landedAt: null, landedTo: null, closed: false })
+  await world.clock.settle()
+  expect(stored(world)).toEqual(GREETING)
+  expect(own(world)).toBeUndefined()
   // The session-start row lands.
   await world.clock.advance(5000)
   expect((await band($)).texts).toEqual([...INSTALLED, RECORDS, landed(1), 'drawn beneath'])
   expect(world.toasts).toEqual([`BQAA: first rows landed in ${TABLE}`])
-  expect(typeof (stored(world) as { landedAt: unknown }).landedAt).toBe('number')
-  expect(stored(world)).toMatchObject({ landedTo: HERE })
+  expect(typeof (own(world) as { landedAt: unknown }).landedAt).toBe('number')
+  expect(own(world)).toMatchObject({ landedTo: HERE, closed: false })
   // The count moves with each send; one toast.
   await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
   await world.clock.advance(5000)
@@ -77,7 +91,9 @@ test('a fresh install shows the welcome card, then that the first rows landed, a
   // The person's next prompt: the card has done its job.
   await $.prompt.submit(PROMPT)
   expect(await band($)).toEqual({ texts: ['drawn beneath'], boxed: false, button: undefined })
-  expect(stored(world)).toMatchObject({ closed: true })
+  await world.clock.settle()
+  expect(own(world)).toMatchObject({ closed: true })
+  expect(stored(world)).toEqual(GREETING)
   await world.clock.advance(5000)
   expect(world.toasts.length).toBe(1)
   expect(welcomeLines(world.transcript).length).toBe(1)
@@ -94,25 +110,25 @@ test('a band drawn before the session started shows the card at once, before any
 })
 
 const SHOWN_BEFORE = [
-  ['an earlier session showed the card', { version: PLUGIN_VERSION, previous: null, sessionId: 'an-earlier-session', landedAt: null, closed: false }],
-  ['this session showed it and it was closed', { version: PLUGIN_VERSION, previous: null, sessionId: SESSION_ID, landedAt: 1, closed: true }],
+  ['an earlier session showed the card', { welcome: { version: PLUGIN_VERSION, previous: null, sessionId: 'an-earlier-session' } }],
+  ['this session showed it and it was closed', { welcome: GREETING, [OWN]: { landedAt: 1, landedTo: HERE, closed: true } }],
 ] as const
 
-for (const [name, record] of SHOWN_BEFORE) {
+for (const [name, records] of SHOWN_BEFORE) {
   test(`no card, line or toast when ${name}`, { options: OPTIONS }, async ($, on) => {
-    const world = setUp(on, {}, { welcome: record })
+    const world = setUp(on, {}, records)
     await startSession($)
     await world.clock.advance(5000)
     expect(world.acceptedRows().length).toBe(1)
     expect((await band($)).texts).toEqual(['drawn beneath'])
     expect(welcomeLines(world.transcript)).toEqual([])
     expect(world.toasts).toEqual([])
-    expect(stored(world)).toEqual(record)
+    expect(Object.fromEntries([...world.store].filter(([key]) => key.startsWith('welcome')))).toEqual(records)
   })
 }
 
 test('a reload in the session that showed the card shows it again as it was, with no second line or toast', { options: OPTIONS }, async ($, on) => {
-  const world = setUp(on, {}, { welcome: { version: PLUGIN_VERSION, previous: null, sessionId: SESSION_ID, landedAt: 1, landedTo: HERE, closed: false } })
+  const world = setUp(on, {}, { welcome: GREETING, [OWN]: { landedAt: 1, landedTo: HERE, closed: false } })
   await startSession($)
   // A reload starts the counts over: no count until rows land again.
   expect((await band($)).texts).toEqual([...INSTALLED, RECORDS, '✓ First rows landed in BigQuery · /bqaa-status shows the counts', 'drawn beneath'])
@@ -123,11 +139,19 @@ test('a reload in the session that showed the card shows it again as it was, wit
 })
 
 test('an update greets the new version and names the one it replaced', { options: OPTIONS }, async ($, on) => {
-  const world = setUp(on, {}, { welcome: { version: '0.0.9', previous: null, sessionId: 'an-earlier-session', landedAt: 1, closed: true } })
+  const world = setUp(on, {}, { welcome: { version: '0.0.9', previous: null, sessionId: 'an-earlier-session' } })
   await startSession($)
   expect((await band($)).texts).toEqual(['✓ ', `BigQuery Agent Analytics mod updated to ${PLUGIN_VERSION}`, ' was 0.0.9', RECORDS, WAITING, 'drawn beneath'])
   expect(welcomeLines(world.transcript)).toEqual([`bqaa: BigQuery Agent Analytics mod updated to ${PLUGIN_VERSION} (from 0.0.9): records ${WHAT} to ${TABLE} (US); /bqaa-status shows what was sent.`])
-  expect(stored(world)).toEqual({ version: PLUGIN_VERSION, previous: '0.0.9', sessionId: SESSION_ID, landedAt: null, landedTo: null, closed: false })
+  await world.clock.settle()
+  expect(stored(world)).toEqual({ version: PLUGIN_VERSION, previous: '0.0.9', sessionId: SESSION_ID })
+})
+
+test('a change back to an older version is greeted as a change, not an update', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on, {}, { welcome: { version: '99.0.0', previous: PLUGIN_VERSION, sessionId: 'an-earlier-session' } })
+  await startSession($)
+  expect((await band($)).texts.slice(0, 3)).toEqual(['✓ ', `BigQuery Agent Analytics mod changed to ${PLUGIN_VERSION}`, ' was 99.0.0'])
+  expect(welcomeLines(world.transcript)).toEqual([`bqaa: BigQuery Agent Analytics mod changed to ${PLUGIN_VERSION} (from 99.0.0): records ${WHAT} to ${TABLE} (US); /bqaa-status shows what was sent.`])
 })
 
 test('not set up: the card says what to set, stays after a prompt, and Got it closes it for good', { options: {} }, async ($, on) => {
@@ -144,7 +168,8 @@ test('not set up: the card says what to set, stays after a prompt, and Got it cl
   await ui.press({ key: CLOSE })
   expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toEqual(['drawn beneath'])
   await ui.unmount()
-  expect(stored(world)).toMatchObject({ closed: true })
+  await world.clock.settle()
+  expect(own(world)).toMatchObject({ closed: true })
 })
 
 test('a missing dataset has the band first; once rows land, the card says so', { options: OPTIONS }, async ($, on) => {
@@ -220,14 +245,17 @@ for (const operation of ['get', 'set'] as const) {
 test('a session left open never writes over a newer version another session greeted meanwhile', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on, {}, {})
   await startSession($)
-  const newer = { version: '0.2.0', previous: PLUGIN_VERSION, sessionId: 'a-newer-session', landedAt: 10, landedTo: HERE, closed: true }
+  await world.clock.settle()
+  const newer = { version: '0.2.0', previous: PLUGIN_VERSION, sessionId: 'a-newer-session' }
   world.store.set('welcome', newer)
-  // This session's rows land, then its card is closed: neither touches the record.
+  // This session's rows land, then its card is closed: both go to its own
+  // record, never to the greeting.
   await world.clock.advance(5000)
   expect((await band($)).texts).toEqual([...INSTALLED, RECORDS, landed(1), 'drawn beneath'])
   await $.prompt.submit(PROMPT)
   await world.clock.settle()
   expect(stored(world)).toEqual(newer)
+  expect(own(world)).toMatchObject({ landedTo: HERE, closed: true })
 })
 
 test('rows that land while the store is still being read: the card says so as soon as it shows', { options: OPTIONS }, async ($, on) => {
@@ -243,7 +271,8 @@ test('rows that land while the store is still being read: the card says so as so
   await world.clock.settle()
   expect((await band($)).texts).toEqual([...INSTALLED, RECORDS, landed(1), 'drawn beneath'])
   expect(world.toasts).toEqual([`BQAA: first rows landed in ${TABLE}`])
-  expect(stored(world)).toMatchObject({ landedTo: HERE })
+  expect(own(world)).toMatchObject({ landedTo: HERE })
+  expect(stored(world)).toEqual(GREETING)
 })
 
 test('a store read that answers after session.start ran again is not used: one card, one line', { options: OPTIONS }, async ($, on) => {
@@ -269,7 +298,7 @@ test('a reload from a dry run to BigQuery waits for rows to land in BigQuery: fi
   await startSession($)
   await world.clock.advance(5000)
   expect(world.fetches.length).toBe(0)
-  expect(stored(world)).toMatchObject({ landedTo: `dry run: ${DRY_RUN_DIR}` })
+  expect(own(world)).toMatchObject({ landedTo: `dry run: ${DRY_RUN_DIR}` })
   // The dry run is turned off, and the mod loads again in the same session.
   dryRun = false
   await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' })
@@ -332,4 +361,313 @@ test('the card is boxed where the band has the rows for a border, lines alone wh
   expect(await band($, { maxRows: 5 })).toEqual({ texts: [...INSTALLED, RECORDS, WAITING, 'drawn beneath'], boxed: true, button: 'Got it' })
   expect(await band($, { maxRows: 4 })).toEqual({ texts: [...INSTALLED, RECORDS, WAITING, 'drawn beneath'], boxed: false, button: 'Got it' })
   expect(await band($, { hasSurvey: true })).toEqual({ texts: ['drawn beneath'], boxed: false, button: undefined })
+})
+
+// A store write the test lets land when it calls the returned function.
+function holdWrites(): { hold: (value: { key: string; value: unknown }, world: World) => Promise<{ value: undefined }>; release: () => void } {
+  const held: (() => void)[] = []
+  return {
+    hold: (e, world) =>
+      new Promise(resolve =>
+        held.push(() => {
+          world.store.set(e.key, JSON.parse(JSON.stringify(e.value)) as unknown)
+          resolve({ value: undefined })
+        }),
+      ),
+    release: () => {
+      for (const land of held.splice(0)) land()
+    },
+  }
+}
+
+async function pressGotIt($: Engine): Promise<void> {
+  const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...BAND })
+  await ui.press({ key: CLOSE })
+  await ui.unmount()
+}
+
+test('a close made while the greeting is still being written stays closed: the greeting lands, then the close, and a reload shows no card', { options: OPTIONS }, async ($, on) => {
+  const writes = holdWrites()
+  on('store.set', { key: 'welcome' }, ($, e) => writes.hold(e, world))
+  const world = setUp(on, {}, {})
+  await startSession($)
+  await pressGotIt($)
+  await world.clock.settle()
+  // The close waits behind the greeting.
+  expect(own(world)).toBeUndefined()
+  writes.release()
+  await world.clock.settle()
+  expect(stored(world)).toEqual(GREETING)
+  expect(own(world)).toEqual({ landedAt: null, landedTo: null, closed: true })
+  await $.session.start(START)
+  await world.clock.settle()
+  expect((await band($)).texts).toEqual(['drawn beneath'])
+})
+
+test('a landing written late never reopens the card a prompt closed after it', { options: OPTIONS }, async ($, on) => {
+  const writes = holdWrites()
+  let first = true
+  on('store.set', { key: OWN }, ($, e) => {
+    if (!first) {
+      world.store.set(e.key, e.value)
+      return { value: undefined }
+    }
+    first = false
+    return writes.hold(e, world)
+  })
+  const world = setUp(on, {}, {})
+  await startSession($)
+  await world.clock.advance(5000)
+  expect((await band($)).texts[4]).toBe(landed(1))
+  // The landing's write has not answered when the prompt closes the card.
+  await $.prompt.submit(PROMPT)
+  writes.release()
+  await world.clock.settle()
+  expect(own(world)).toMatchObject({ landedTo: HERE, closed: true })
+  await $.session.start(START)
+  await world.clock.settle()
+  expect((await band($)).texts).toEqual(['drawn beneath'])
+})
+
+test('a reload while the landing is still being written, then Got it: the close is written last', { options: OPTIONS }, async ($, on) => {
+  const writes = holdWrites()
+  let first = true
+  on('store.set', { key: OWN }, ($, e) => {
+    if (!first) {
+      world.store.set(e.key, e.value)
+      return { value: undefined }
+    }
+    first = false
+    return writes.hold(e, world)
+  })
+  const world = setUp(on, {}, {})
+  await startSession($)
+  await world.clock.advance(5000)
+  await $.session.start(START)
+  await world.clock.settle()
+  expect((await band($)).texts[4]).toBe('✓ First rows landed in BigQuery · /bqaa-status shows the counts')
+  await pressGotIt($)
+  writes.release()
+  await world.clock.settle()
+  expect(own(world)).toMatchObject({ landedTo: HERE, closed: true })
+})
+
+test('a newer version another session greets while this card writes its landing keeps its greeting', { options: OPTIONS }, async ($, on) => {
+  const writes = holdWrites()
+  on('store.set', { key: OWN }, ($, e) => writes.hold(e, world))
+  const world = setUp(on, {}, {})
+  await startSession($)
+  await world.clock.advance(5000)
+  const newer = { version: '0.2.0', previous: PLUGIN_VERSION, sessionId: 'a-newer-session' }
+  world.store.set('welcome', newer)
+  writes.release()
+  await world.clock.settle()
+  expect(stored(world)).toEqual(newer)
+  expect(own(world)).toMatchObject({ landedTo: HERE, closed: false })
+})
+
+test('a reload while the greeting is still being written shows the same card again, with no second line', { options: OPTIONS }, async ($, on) => {
+  on('store.set', { key: 'welcome' }, () => new Promise<never>(() => undefined))
+  const world = setUp(on, {}, {})
+  await startSession($)
+  await $.session.start(START)
+  await world.clock.settle()
+  expect((await band($)).texts).toEqual([...INSTALLED, RECORDS, WAITING, 'drawn beneath'])
+  expect(welcomeLines(world.transcript).length).toBe(1)
+})
+
+test('a reload after Got it shows no card while the close is still being written', { options: OPTIONS }, async ($, on) => {
+  // The greeting lands; no later write does.
+  let greeted = false
+  on('store.set', { key: 'welcome' }, ($, e, next) => {
+    if (greeted) return new Promise<never>(() => undefined)
+    greeted = true
+    return next(e)
+  })
+  on('store.set', { key: OWN }, () => new Promise<never>(() => undefined))
+  const world = setUp(on, {}, {})
+  await startSession($)
+  await world.clock.settle()
+  expect(stored(world)).toEqual(GREETING)
+  await pressGotIt($)
+  await $.session.start(START)
+  await world.clock.settle()
+  expect((await band($)).texts).toEqual(['drawn beneath'])
+})
+
+test('a store read from an earlier session.start that answers while a later one is still setting up shows nothing', { options: OPTIONS }, async ($, on) => {
+  let release: (() => void) | undefined
+  let answer: ((stored: { value: unknown }) => void) | undefined
+  let slow = false
+  on('env.get', { name: 'BQAA_PROJECT_ID' }, () => (slow ? new Promise(resolve => (release = () => resolve({ value: undefined }))) : { value: undefined }))
+  on('store.get', { key: 'welcome' }, () => (answer === undefined ? new Promise<{ value: unknown }>(resolve => (answer = resolve)) : { value: world.store.get('welcome') }))
+  const world = setUp(on, {}, {})
+  await startSession($)
+  slow = true
+  let started = false
+  void $.session.start(START).then(() => {
+    started = true
+  })
+  await world.clock.settle()
+  expect(started).toBe(false)
+  answer?.({ value: undefined })
+  await world.clock.settle()
+  expect(welcomeLines(world.transcript)).toEqual([])
+  expect((await band($)).texts).toEqual(['drawn beneath'])
+  release?.()
+  await world.clock.settle()
+  expect(started).toBe(true)
+  expect(welcomeLines(world.transcript).length).toBe(1)
+})
+
+test('rows of a send still in flight across a reload to another table do not land the card there', { options: {} }, async ($, on) => {
+  let dataset = 'events_a'
+  on('env.get', { name: 'BQAA_DATASET' }, () => ({ value: dataset }))
+  const world = setUp(on, { BQAA_PROJECT_ID: 'my-gcp-project' }, {})
+  world.replies = [{ hang: true }]
+  await startSession($)
+  await world.clock.advance(5000)
+  expect(world.insertCalls().map(f => f.url.includes('/datasets/events_a/'))).toEqual([true])
+  dataset = 'events_b'
+  await $.session.start(START)
+  await world.clock.settle()
+  // The send to events_a lands now.
+  world.releaseHung(200, OK_INSERT.text)
+  await world.clock.settle()
+  expect(world.insertCalls().some(f => f.url.includes('/datasets/events_b/'))).toBe(false)
+  expect((await band($)).texts[4]).toBe(WAITING)
+  expect(world.toasts).toEqual([])
+  await $.prompt.submit(PROMPT)
+  expect((await band($)).texts[4]).toBe(WAITING)
+  await world.clock.settle()
+  expect(own(world)).toBeUndefined()
+})
+
+test('rows of a dry-run write still in flight across a reload to BigQuery do not land the card there', { options: OPTIONS }, async ($, on) => {
+  let dryRun = true
+  on('env.get', { name: 'BQAA_DRY_RUN' }, () => ({ value: dryRun ? 'true' : undefined }))
+  const world = setUp(on, {}, {})
+  world.hangWrites = true
+  await startSession($)
+  await world.clock.advance(5000)
+  dryRun = false
+  await $.session.start(START)
+  await world.clock.settle()
+  // The dry-run file is written now.
+  world.hangWrites = false
+  world.releaseWrites()
+  await world.clock.settle()
+  expect([...world.files.keys()].some(path => path.startsWith(DRY_RUN_DIR))).toBe(true)
+  expect(world.insertCalls().length).toBe(0)
+  expect((await band($)).texts[4]).toBe(WAITING)
+  expect(world.toasts).toEqual([])
+})
+
+test('a reload to capture off, after rows landed, keeps the card until Got it', { options: OPTIONS }, async ($, on) => {
+  let enabled = true
+  on('env.get', { name: 'BQAA_TRACE_ENABLED' }, () => ({ value: enabled ? undefined : 'false' }))
+  const world = setUp(on, {}, {})
+  await startSession($)
+  await world.clock.advance(5000)
+  expect((await band($)).texts[4]).toBe(landed(1))
+  enabled = false
+  await $.session.start(START)
+  await world.clock.settle()
+  expect((await band($)).texts[1]).toBe('BigQuery Agent Analytics mod installed, capture off')
+  await $.prompt.submit(PROMPT)
+  expect((await band($)).texts[1]).toBe('BigQuery Agent Analytics mod installed, capture off')
+  await pressGotIt($)
+  expect((await band($)).texts).toEqual(['drawn beneath'])
+})
+
+test('a prompt that does not come from the terminal leaves a landed card up; the next one typed there closes it', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on, {}, {})
+  await startSession($)
+  await world.clock.advance(5000)
+  await $.prompt.submit({ ...PROMPT, origin: { kind: 'task-notification' } })
+  expect((await band($)).texts[4]).toBe(landed(1))
+  await $.prompt.submit(PROMPT)
+  expect((await band($)).texts).toEqual(['drawn beneath'])
+})
+
+// A dead-letter line for this table.
+const parked = (n: number): string =>
+  JSON.stringify({
+    v: 1,
+    kind: 'spill',
+    reason: 'session ended before these rows were confirmed sent',
+    attempts: 0,
+    failed_at: '2026-10-13T20:01:02.003Z',
+    table: TABLE_REF,
+    row: buildRow({ eventType: 'STATE_DELTA', timestampMs: 0, eventId: String(n).repeat(32), agent: 'coding-agent', sessionId: 'earlier', invocationId: null, userId: 'dev', traceId: null, spanId: null, parentSpanId: null, content: {}, attributes: {}, maxPayloadChars: 16384 }).row,
+  })
+
+test('the writer says rows landed, with the configuration they went under: per replay request, before its file is emptied, and for a dry run at session end', async () => {
+  const told: [number, string][] = []
+  const files = new Map<string, string>()
+  let failWrites = false
+  const io = (now: () => number): Io => ({
+    now,
+    after: () => ({ cancel: () => undefined }),
+    fetch: async () => OK_INSERT,
+    runCommand: async () => ({ exitCode: 0, stdout: `${'a'.repeat(24)}\n`, stderr: '' }),
+    envToken: async () => undefined,
+    writeFile: async (path, text) => {
+      if (failWrites && !path.includes('/outcome-')) throw new Error(`EACCES: ${path}`)
+      files.set(path, text)
+    },
+    readFile: async path => files.get(path) ?? '',
+    listDir: async dir => [...files].filter(([path]) => path.startsWith(`${dir}/`)).map(([path, text]) => ({ name: path.slice(dir.length + 1), kind: 'file', size: text.length })),
+    storeGet: async () => undefined,
+    storeSet: async () => undefined,
+    storeDelete: async () => undefined,
+    status: () => undefined,
+    debug: () => undefined,
+    sent: (rows, to) => told.push([rows, to.dryRun ? `dry run: ${to.dryRunDir}` : to.dataset]),
+  })
+  const config = resolveConfig({ project: 'my-gcp-project', dataset: 'agent_analytics', deadLetterDir: '/dl' }, {})
+  files.set(`/dl/${TABLE_REF}/spill-20261013T200102003Z-earlier-1.jsonl`, packFiles([parked(1), parked(2), parked(3)])[0] as string)
+  // BigQuery takes the three rows; the file then cannot be emptied (the
+  // replay's mark and record beside it can be written).
+  failWrites = true
+  await new Writer(io(() => 0), () => config, () => 'hand-built-session').backfill(['spill'], 'command')
+  expect(told).toEqual([[3, 'agent_analytics']])
+  failWrites = false
+  const dryRun = resolveConfig({ project: 'my-gcp-project', dataset: 'agent_analytics', deadLetterDir: '/dl', dryRun: true }, {})
+  const writer = new Writer(io(() => 0), () => dryRun, () => 'hand-built-session')
+  writer.enqueue(buildRow({ eventType: 'STATE_DELTA', timestampMs: 0, eventId: '4'.repeat(32), agent: 'coding-agent', sessionId: 'hand-built-session', invocationId: null, userId: 'dev', traceId: null, spanId: null, parentSpanId: null, content: {}, attributes: {}, maxPayloadChars: 16384 }).row, 0)
+  await writer.spillForExit(1000)
+  expect(told).toEqual([[3, 'agent_analytics'], [1, `dry run: ${dryRun.dryRunDir}`]])
+})
+
+test("a card's writes go one at a time, in order, each with the card as it is by then, and a close stays in every later write", async () => {
+  const writes: [string, unknown][] = []
+  const pending: (() => void)[] = []
+  const save = (key: string, value: unknown): Promise<void> =>
+    new Promise(resolve =>
+      pending.push(() => {
+        writes.push([key, value])
+        resolve()
+      }),
+    )
+  const answer = async (): Promise<void> => {
+    pending.shift()?.()
+    for (let i = 0; i < 5; i += 1) await Promise.resolve()
+  }
+  const card: Welcome = { version: PLUGIN_VERSION, previous: null, sessionId: SESSION_ID, landedAt: null, landedTo: null, closed: false }
+  const records = new CardRecords(save, card, true)
+  // While the greeting is written: rows land, the card is closed, and a
+  // stale copy of it, from before the close, comes after.
+  records.update({ ...card, landedAt: 5, landedTo: HERE })
+  records.update({ ...card, landedAt: 5, landedTo: HERE, closed: true })
+  records.update({ ...card, landedAt: 5, landedTo: HERE })
+  expect(pending.length).toBe(1)
+  await answer()
+  await answer()
+  expect(pending.length).toBe(0)
+  expect(writes).toEqual([
+    ['welcome', GREETING],
+    [OWN, { landedAt: 5, landedTo: HERE, closed: true }],
+  ])
+  expect(records.card.closed).toBe(true)
 })

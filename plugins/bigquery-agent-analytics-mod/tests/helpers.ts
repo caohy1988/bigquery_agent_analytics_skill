@@ -122,9 +122,9 @@ export const USAGE = {
   model: 'example-model',
 }
 
-// The store once an earlier session greeted this version and closed its
-// welcome card: the tests start from that, but the welcome card's own.
-export const GREETED = { welcome: { version: PLUGIN_VERSION, previous: null, sessionId: 'an-earlier-session', landedAt: 1, closed: true } } as const
+// The store once an earlier session greeted this version: the tests start
+// from that, but the welcome card's own.
+export const GREETED = { welcome: { version: PLUGIN_VERSION, previous: null, sessionId: 'an-earlier-session' } } as const
 
 export function setUp(on: On, env: Record<string, string> = {}, store: Record<string, unknown> = GREETED): World {
   const clock = mock.clock(on, { now: 0 })

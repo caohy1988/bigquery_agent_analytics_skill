@@ -20,14 +20,14 @@
 
 import type { EngineInterface, Register, SessionStartInput } from 'claude-code'
 
-import { type Config, type EnvSnapshot, type Options, canDeliver, deadLetterPartition, destinationDir, joinPath, resolveConfig, tableRef } from './lib/config.ts'
+import { type Config, type EnvSnapshot, type Options, PLUGIN_VERSION, canDeliver, deadLetterPartition, destinationDir, joinPath, resolveConfig, tableRef } from './lib/config.ts'
 import { HOST_FILE_BYTES, kindOf } from './lib/deadletter.ts'
 import { randomIds } from './lib/ids.ts'
 import type { BqaaRow } from './lib/rows.ts'
 import { redactDiagnostic } from './lib/sanitize.ts'
 import { type DeadLetterSummary, formatStatus } from './lib/status.ts'
 import { type StepCtx, type StepResult, type ToolCtx, type ToolOutcome, Tracer, errorText } from './lib/tracer.ts'
-import { WELCOME_KEY, type Welcome, destinationKey, isOwnRecord, landedToast, openWelcome, welcomeCard, welcomeNotice } from './lib/welcome.ts'
+import { CardRecords, WELCOME_KEY, type Welcome, cardKey, destinationKey, greetedHere, greetedVersion, landedToast, openWelcome, welcomeCard, welcomeNotice } from './lib/welcome.ts'
 import { COMMAND_LINE_CHARS, type Io, Writer } from './lib/writer.ts'
 
 let options: Options = {}
@@ -42,9 +42,11 @@ let clockAfter: ((ms: number, fn: () => void) => { cancel: () => void }) | null 
 // The welcome card (lib/welcome.ts) in the first session after the mod is
 // installed or updated; null in any other session, and once it is closed.
 let welcome: Welcome | null = null
-// Counts the starts of the card: a store read that answers after a later
-// session.start began is not used.
+// Counts session.start runs: a store read for the card that answers after a
+// later one began is not used.
 let welcomeStarts = 0
+// The writes of the last card this module showed (`CardRecords`).
+let records: CardRecords | null = null
 
 // Rows captured before session.start built the writer (an event the engine
 // raised first); handed over once it exists.
@@ -226,31 +228,43 @@ async function lookUpHostname($: EngineInterface): Promise<void> {
 // In a session a person sees (a `-p` run draws no band): the welcome card
 // for a version not greeted yet, recorded at once so that no later session
 // shows it, or the card a reload in its own session left open. Runs in the
-// background: nothing waits on the store for it.
-async function startWelcome($: EngineInterface, e: SessionStartInput, sessionId: string | null): Promise<void> {
-  const start = ++welcomeStarts
-  welcome = null
+// background: nothing waits on the store for it. `start` is the
+// session.start run it belongs to.
+async function startWelcome($: EngineInterface, e: SessionStartInput, sessionId: string | null, start: number): Promise<void> {
   if (!e.isInteractive || e.surface === null) return
-  let stored: unknown
+  let greeted: unknown
+  let own: unknown
   try {
-    stored = await $.store.get(WELCOME_KEY)
+    greeted = await $.store.get(WELCOME_KEY)
+    if (start !== welcomeStarts) return
+    // What this module wrote may not have landed yet: its own card's
+    // greeting and state stand until the store holds this version's.
+    if (records !== null && greetedVersion(greeted) !== records.card.version) {
+      const { version, previous, sessionId: by } = records.card
+      greeted = { version, previous, sessionId: by }
+    }
+    if (records !== null && records.isFor(sessionId)) own = records.card
+    else if (sessionId !== null && greetedHere(greeted, sessionId)) own = await $.store.get(cardKey(PLUGIN_VERSION, sessionId))
   } catch {
     // Unable to tell whether it showed before: never a card each session.
     return
   }
   // session.start ran again meanwhile: the card is that start's to show.
   if (start !== welcomeStarts) return
-  const opened = openWelcome(stored, sessionId, destinationKey(config))
+  const key = destinationKey(config)
+  const opened = openWelcome(greeted, own, sessionId, key)
   if (opened === null) return
   welcome = opened.welcome
   // The band may be drawn already, from before this session started.
   redrawBand($)
+  const save = (key: string, value: unknown): Promise<void> => $.store.set(key, value)
   if (opened.isNew) {
-    void saveWelcome($, opened.welcome)
+    records = new CardRecords(save, opened.welcome, true)
     $.ui.log(clean(welcomeNotice(opened.welcome, config)))
-  }
-  // Rows that landed while the store was read: the card says so now.
-  if (writer !== null && writer.counters.sent > 0) rowsLanded($)
+  } else if (records === null || !records.isFor(sessionId)) records = new CardRecords(save, opened.welcome, false)
+  // Rows that landed while the store was read (this writer's rows go where
+  // this configuration sends them): the card says so now.
+  if (writer !== null && writer.counters.sent > 0) rowsLanded($, key)
 }
 
 // A surface that draws no band may refuse the redraw: nothing to draw then.
@@ -262,33 +276,21 @@ function redrawBand($: EngineInterface): void {
   }
 }
 
-async function saveWelcome($: EngineInterface, shown: Welcome): Promise<void> {
-  try {
-    await $.store.set(WELCOME_KEY, shown)
-  } catch {
-    // Not recorded: the card shows again in the next session.
-  }
-}
-
-// What happened to the card since: written only over its own record, so that
-// a session left open never undoes a newer version another one greeted.
-async function updateWelcome($: EngineInterface, shown: Welcome): Promise<void> {
-  try {
-    if (isOwnRecord(await $.store.get(WELCOME_KEY), shown)) await $.store.set(WELCOME_KEY, shown)
-  } catch {
-    // Not recorded: a reload shows the card as it was before.
-  }
-}
-
-// Rows landed: the card's count moves, and the first time, it says they
-// landed, with a toast as well, as the band may be collapsed.
-function rowsLanded($: EngineInterface): void {
+// Rows landed in `to` (their destination's `destinationKey`): the card's
+// count moves, and the first time rows land where this configuration sends
+// them, it says so, with a toast as well, as the band may be collapsed. Rows
+// that a writer of an earlier configuration sent elsewhere say nothing here.
+function rowsLanded($: EngineInterface, to: string | null): void {
   const shown = welcome
   if (shown === null) return
-  if (shown.landedAt === null) {
-    welcome = { ...shown, landedAt: Date.now(), landedTo: destinationKey(config) }
-    void updateWelcome($, welcome)
-    $.ui.toast(clean(landedToast(config), 500), { timeoutMs: 15_000 })
+  if (shown.landedAt === null && to !== null && to === destinationKey(config)) {
+    welcome = { ...shown, landedAt: Date.now(), landedTo: to }
+    records?.update(welcome)
+    try {
+      $.ui.toast(clean(landedToast(config), 500), { timeoutMs: 15_000 })
+    } catch {
+      // No toast here: the card says it.
+    }
   }
   redrawBand($)
 }
@@ -298,7 +300,7 @@ function closeWelcome($: EngineInterface): void {
   const shown = welcome
   if (shown === null) return
   welcome = null
-  void updateWelcome($, { ...shown, closed: true })
+  records?.update({ ...shown, closed: true })
   redrawBand($)
 }
 
@@ -345,6 +347,10 @@ export const register: Register = (on, registered) => {
   awaitingConfig.length = 0
 
   on('session.start', async ($, e, next) => {
+    // A store read for the card from an earlier run is not used from here
+    // on, and that run's card is gone until this run's shows.
+    const start = ++welcomeStarts
+    welcome = null
     try {
       config = resolveConfig(options, await readEnv($))
       clockAfter = (ms, fn) => $.clock.after(ms, fn)
@@ -378,7 +384,7 @@ export const register: Register = (on, registered) => {
         redraw: () => $.ui.invalidate('ui.render'),
         // Where setup.sh is, for the fix when BigQuery cannot find the dataset.
         pluginRoot: $.plugin.root,
-        sent: () => rowsLanded($),
+        sent: (rows, to) => rowsLanded($, destinationKey(to)),
       }
       const previous = writer
       writer = new Writer(io, () => config, () => tracer.sessionId)
@@ -430,7 +436,7 @@ export const register: Register = (on, registered) => {
     }
     // In the background: neither the first prompt nor anything above waits
     // on the store for the welcome card.
-    void startWelcome($, e, tracer.sessionId).catch(() => {
+    void startWelcome($, e, tracer.sessionId, start).catch(() => {
       internalErrors += 1
     })
     return next(e)
@@ -482,8 +488,9 @@ export const register: Register = (on, registered) => {
         }),
       )
       safely(() => writer?.retrySoon())
-      // Rows landed before this prompt: the welcome card has said what it is for.
-      if (welcome !== null && welcome.landedAt !== null) safely(() => closeWelcome($))
+      // Rows landed before this prompt, typed at the terminal: the welcome
+      // card has said what it is for.
+      if (welcome !== null && welcome.landedAt !== null && e.origin.kind === 'composer') safely(() => closeWelcome($))
     }
     return entered
   }).catch(($, e, next) => next(e))

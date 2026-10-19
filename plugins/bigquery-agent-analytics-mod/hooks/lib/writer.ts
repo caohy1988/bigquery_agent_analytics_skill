@@ -57,8 +57,10 @@ export type Io = {
   // without a command.
   pluginRoot?: string
   // Rows just landed: BigQuery took them (a send or a replay), or a dry run
-  // wrote them. The welcome card says when the first ones do.
-  sent?: (rows: number) => void
+  // wrote them (at session end too), under `to`, the configuration they
+  // were sent with. The welcome card says when the first ones land where
+  // it says rows go.
+  sent?: (rows: number, to: Config) => void
 }
 
 // Why rows cannot be written: no working credentials (the token source
@@ -657,7 +659,7 @@ export class Writer {
     }
     switch (outcome.kind) {
       case 'ok':
-        this.succeeded(batch.length)
+        this.succeeded(batch.length, c)
         return true
       case 'partial': {
         const rejected: Queued[] = []
@@ -670,7 +672,7 @@ export class Writer {
             reasons.push(reason)
           } else if (outcome.retry.has(i)) retry.push(q)
         })
-        this.succeeded(batch.length - rejected.length - retry.length)
+        this.succeeded(batch.length - rejected.length - retry.length, c)
         // Every row handed on before either write is waited for: the refused
         // to their file, those asked for again back to the queue.
         const writes: Promise<void>[] = []
@@ -711,13 +713,13 @@ export class Writer {
     }
   }
 
-  private succeeded(rows: number): void {
+  private succeeded(rows: number, c: Config): void {
     this.batchOpen = false
     const hadFailures = this.consecutiveFailures > 0
     this.counters.sent += rows
     this.counters.batches += 1
     this.tookRequest(rows)
-    if (rows > 0) this.call(() => this.io.sent?.(rows))
+    if (rows > 0) this.call(() => this.io.sent?.(rows, c))
     // BigQuery is reachable again: replay what this session parked on disk.
     if (hadFailures && this.parked.recoverable && this.config().autoBackfill) {
       this.parked.recoverable = false
@@ -1178,7 +1180,7 @@ export class Writer {
   private async writeDryRun(batch: Queued[], c: Config): Promise<boolean> {
     try {
       await this.writeDryRunFiles(batch, c)
-      this.succeeded(batch.length)
+      this.succeeded(batch.length, c)
       return true
     } catch (err) {
       await this.retryLater(batch, `dry run write failed: ${errorText(err)}`)
@@ -1280,6 +1282,7 @@ export class Writer {
       try {
         await this.writeDryRunFiles(rows, c)
         this.counters.sent += rows.length
+        this.call(() => this.io.sent?.(rows.length, c))
       } catch (err) {
         this.counters.dropped += rows.length
         this.recordError(`dry run write at exit failed (${rows.length} rows lost): ${errorText(err)}`)
@@ -1603,7 +1606,6 @@ export class Writer {
     if (emptyWaiting.length > 0) report.held ??= diagnostic(`${emptyWaiting[0]} is empty, perhaps still being written; it waits for the next replay`)
     if (parentWaits.length > 0) report.held ??= diagnostic(`${parentWaits[0]} waits until the replay of the file it came from has it as written`)
     if (leased.length > 0) report.held ??= diagnostic(`another session's lease holds ${leased[0]} (ten minutes at most); it waits for the next replay`)
-    if (report.rowsSent > 0) this.call(() => this.io.sent?.(report.rowsSent))
     // Another replay of this table follows by itself while rows wait: rows
     // this one left, files it did not read (another session's lease on them
     // included), files not whole or empty that a write still under way may
@@ -2187,6 +2189,8 @@ export class Writer {
         // then this request's refusals start it again.
         this.tookRequest(landed)
         this.refusedOnReplay(refused, refusal)
+        // Said at once, before the file is emptied (which may fail).
+        if (landed > 0) this.call(() => this.io.sent?.(landed, c))
         // Rows asked for again, and nothing else, leave the file as it was.
         if (outcome.kind === 'ok' || outcome.retry.size < chunk.length) changed = true
         continue
