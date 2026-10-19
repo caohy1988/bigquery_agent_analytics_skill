@@ -52,7 +52,7 @@ export function formatStatus(args: {
   if (s.consecutiveFailures > 0) lines.push(`backing off: ${s.consecutiveFailures} failure(s) in a row, next try in about ${Math.max(0, Math.round((s.pausedUntil - now) / 1000))}s`)
   if (s.problem) {
     const { headline, fix } = writer.problemText()
-    lines.push(short(`notice (since ${ago(now, s.problem.since)}): rows are not being written: ${headline} (${s.problem.reason.slice(0, 200)}); to fix, ${fix}; ${s.waiting} row(s) waiting`))
+    lines.push(short(`notice (since ${ago(now, s.problem.since)}): rows are not being written: ${headline} (${s.problem.reason.slice(0, 200)}); to fix, ${fix}; ${s.waitingText} row(s) waiting`))
     const command = writer.setupCommand()
     if (command !== null) lines.push(`setup: ${command}`)
   }

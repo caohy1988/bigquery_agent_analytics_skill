@@ -412,7 +412,7 @@ export const register: Register = (on, registered) => {
       children: [
         Text({ color: 'warning', bold: true, children: '⚠ BQAA: ' }),
         Text({ children: clean(`rows are not being written: ${headline}. To fix, ${fix}.`, 500) }),
-        Text({ dimColor: true, children: ` ${current.waitingRows()} row(s) waiting.` }),
+        Text({ dimColor: true, children: ` ${current.waitingText()} row(s) waiting.` }),
       ],
     })
     const lines = run === null ? [line] : [line, Text({ dimColor: true, children: clean(run, COMMAND_LINE_CHARS) })]

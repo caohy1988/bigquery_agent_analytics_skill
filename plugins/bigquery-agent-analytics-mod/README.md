@@ -301,11 +301,13 @@ and took the credentials. Recovery is quick:
   without a prompt. That covers rows parked while a table the mod just
   made was not visible yet. A file another session is replaying, or one
   that could not be listed or read, keeps its rows waiting for the next
-  replay. When what a replay left of a file cannot all be written, or the
-  file cannot be emptied, the replay's outcome is kept: the next replay
-  writes the rest under the same names and empties the file, and none of
-  its rows goes again. A replay that runs by itself stops between requests
-  for rows queued meanwhile, which go first.
+  replay. A replay records what became of each of a file's rows in
+  `$.store` before it writes what is left, so when what is left cannot all
+  be written, or the file cannot be emptied, the next replay of any
+  writer, in this session or another, writes the rest under the same names
+  and empties the file, and none of its rows goes again. A replay that
+  runs by itself stops between requests for rows queued meanwhile, which
+  go first.
 * A replay's 401 gets a fresh token and one more try, as a send's does, and
   a second 401 is the credentials notice.
 * Rows refused for a missing permission wait for `/bqaa-backfill`, and the
@@ -621,7 +623,9 @@ GROUP BY model
   counts them in its last-backfill line. Each row counts once, in the order
   the requests came: one `/bqaa-backfill` sends again from a `rejected`
   file, and BigQuery refuses again, is not counted twice, and rows that land
-  end the count of the refusals before them. A replay that BigQuery takes
+  end the count of the refusals before them. A count keeps the ids of
+  10,000 rows; past that a row may count again, and the count reads "about
+  N". A replay that BigQuery takes
   clears the notice, as a send does. A replay reads a file
   only when its completion record is there and matches every line above it:
   the API's writes are not atomic, so another session can read a file
@@ -634,15 +638,19 @@ GROUP BY model
   new files first, each kind to files of its own and each file with its
   completion record, and only then is the replayed file truncated. A replay
   whose rows BigQuery only asks for again rewrites nothing. The API has no
-  rename either, so a write that fails leaves that file as it was, and the
-  replay's outcome is kept: the next replay writes the rest of what is left
-  under the same names, then empties the file, and sends none of its rows
-  again. Once all of what is left is written, a record in `$.store` (one per
-  file, removed once the file is emptied) says so, so no session sends the
-  file again; a file that cannot be emptied stays on disk, its rows in the
-  newer files, and each replay tries to empty it. A session that never saw
-  an outcome only partly written may send that file once more (`event_id`
-  dedups it). A file over 4 MiB, which the API cannot read, is
+  rename either, so a write that fails leaves that file as it was. Before
+  it writes what is left, a replay records its outcome in `$.store` (one
+  record per file: what became of each row, a letter each, the refusals'
+  reasons, and the names of the files of what is left, each marked once
+  written; removed once the file is emptied). Any writer that replays the
+  file next, this session's or another's, a later session.start's
+  included, finds the record: it writes from the file and the record what
+  is still missing, under the same names, never a file already written,
+  then empties the file, and sends none of its rows again. A file that
+  cannot be emptied stays on disk, its rows landed or in the newer files,
+  and each replay tries to empty it. Only when the record itself cannot be
+  written does a later writer send the file again (`event_id` dedups it).
+  A file over 4 MiB, which the API cannot read, is
   reported by `/bqaa-status` and the backfill instead of being passed over. A
   per-file lease in `$.store` keeps two sessions from replaying the same file
   at once (best effort; `event_id` dedups the rest); a session that finds a
@@ -804,7 +812,7 @@ The test command runs the `tests/*.test.ts` files against the host CLI's own
 test kit, with no session, sign-in, GCP or network: `$.http.fetch`,
 `$.process.run`, `$.fs` and `$.store` are stubbed, and `mock.clock` drives the
 timers; the `$.fs` stubs measure files in UTF-8 bytes and refuse a file over
-4 MiB, as the host does. 221 tests cover the captured rows and their spans,
+4 MiB, as the host does. 227 tests cover the captured rows and their spans,
 subagent runs in the order the host raises them (one invocation and one
 trace for the turn, a span per run, a SubagentStart that comes late or never),
 the session-start row raised before or during `session.start`'s setup,
@@ -893,7 +901,13 @@ And the replay that runs by itself while nothing is queued:
   writes work, and the rows left going on; a file another session already
   wrote out, by the record it left, and one this session wrote out, after
   the next session.start: emptied, never sent; a file written out under a
-  kept outcome never written again;
+  kept outcome never written again; what is left only partly written,
+  finished by the writers of three later session.start runs, and by
+  another session's writer, sending none of it and copying no row; an
+  outcome recorded before any of what is left was written, written whole
+  by the next writer; a file of what is left that `/bqaa-backfill` sent and
+  emptied meanwhile never written again; a record that does not fit the
+  file never trusted;
 * it stops between requests for a row queued meanwhile, which goes first,
   with no backoff, and then goes on;
 * rows refused on a send and then on a replay all counted on the status
@@ -903,7 +917,8 @@ And the replay that runs by itself while nothing is queued:
   counts the rows it refuses again once, on the status line and while
   access is denied, and a row an earlier session refused once; a row
   refused again after rows landed, or under a later access-denied notice,
-  counted again there;
+  counted again there; past the 10,000 rows a count keeps, the status line
+  saying about;
 * the status line for rows parked after retries, with automatic replay on
   and off.
 
