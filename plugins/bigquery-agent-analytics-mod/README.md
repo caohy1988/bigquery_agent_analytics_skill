@@ -180,6 +180,42 @@ session wait for it. A dataset or table made moments ago can still answer
 "Not found" to streaming inserts for a few minutes; rows wait through that
 too, and land on their own.
 
+### Once it is installed
+
+The first session after an install, or after an update to a new version,
+shows a card above the prompt (terminal and desktop): the mod is on, what it
+records, and the table it writes to.
+
+```
+╭──────────────────────────────────────────────────────────────────────────╮
+│ ✓ BigQuery Agent Analytics mod installed 0.1.0                [ Got it ] │
+│ Records sessions, turns, model requests and tool calls to                │
+│ my-gcp-project.agent_analytics.agent_events (US).                        │
+│ ✓ First rows landed in BigQuery · 1 sent · /bqaa-status shows the counts │
+╰──────────────────────────────────────────────────────────────────────────╯
+```
+
+Until BigQuery takes the first rows, its last line reads `◌ Waiting for the
+first rows, sent every 5 s while you work`. They usually land at the first
+send, a few seconds in, and then a toast says so as well, and the count goes
+up with each send. Your next prompt after that closes the card, and so does
+**Got it** (ctrl+x tab, then Enter). A transcript line, which the model does
+not read, keeps what it said.
+
+* With no project or dataset set, the card says that nothing is recorded
+  until they are set in `/config` (or `BQAA_PROJECT_ID` and `BQAA_DATASET`).
+  No rows can land, so it stays until Got it.
+* In a dry run, or with capture turned off, the card says so.
+* While a problem stops rows (see
+  [If rows cannot be written](#if-rows-cannot-be-written)), its notice has
+  the band. The card comes back once rows land.
+
+The mod notes the version it greeted in its own store (`$.store`, key
+`welcome`), so no later session shows the card. A reload in the same session
+(`/reload-plugins`, or an option changed in `/config`) shows it again as it
+was.
+A `-p` run draws no band: it shows nothing and leaves the store alone.
+
 ## Configure
 
 Options are the plugin's `userConfig` (the install dialog, `/plugin configure`,
@@ -961,7 +997,7 @@ test kit, with no session, sign-in, GCP or network: `$.http.fetch`,
 `$.process.run`, `$.fs` and `$.store` are stubbed, and `mock.clock` drives the
 timers; the `$.fs` stubs measure files in UTF-8 bytes and refuse a file over
 4 MiB, and the `$.store` stub a store over 4 MiB of JSON in all, as the host
-does. 336 tests cover the captured rows and their spans,
+does. 350 tests cover the captured rows and their spans,
 subagent runs in the order the host raises them (one invocation and one
 trace for the turn, a span per run, a SubagentStart that comes late or never),
 the session-start row raised before or during `session.start`'s setup,
@@ -1196,6 +1232,21 @@ And the replay that runs by itself while nothing is queued:
 * the status line for rows parked after retries, with automatic replay on
   and off.
 
+And the welcome card:
+
+* its lines for a fresh install, an update, a dry run, capture off and no
+  project or dataset, drawn through `$.ui.mount`, in a band drawn before the
+  session started too, with its transcript line;
+* the first rows landing, from a send or from a replay, with one toast and
+  the count going up; a problem notice holding the band until then;
+* the next prompt after rows land, or Got it, closing it, and the record that
+  keeps later sessions from showing it; a reload in its session showing it
+  again as it was; no card, line or record in a run with no one at the
+  prompt;
+* a store that never answers holding up neither the rows nor the commands;
+* its border only where the band has the rows for one, and a survey left
+  alone.
+
 And the other additions:
 
 * permission decisions: an accept during the call, a rejection after it, a
@@ -1307,6 +1358,7 @@ hooks/lib/bigquery.ts        insertAll / tables.insert requests, answer classifi
 hooks/lib/deadletter.ts      dead-letter file format, files sized in UTF-8 bytes
 hooks/lib/config.ts          options and environment
 hooks/lib/status.ts          /bqaa-status text
+hooks/lib/welcome.ts         the welcome card's text, and the record of the version greeted
 setup.sh                     creates the dataset, table, views dataset and views (bq CLI)
 sql/                         DDL and sample queries
 sql/views/                   the usage views setup.sh makes

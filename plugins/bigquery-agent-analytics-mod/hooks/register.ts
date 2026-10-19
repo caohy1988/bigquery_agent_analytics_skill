@@ -14,8 +14,11 @@
 // other hooks because their bookkeeping runs inside `safely` or a `try`.
 // While rows cannot be written for lack of credentials or permission, the
 // band above the prompt says what is wrong; no prompt ever waits on that.
+// With nothing wrong, in the first session after an install or an update,
+// the band shows a welcome card: that the mod is on, where rows go, and when
+// the first ones land.
 
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, Register, SessionStartInput } from 'claude-code'
 
 import { type Config, type EnvSnapshot, type Options, canDeliver, deadLetterPartition, destinationDir, joinPath, resolveConfig, tableRef } from './lib/config.ts'
 import { HOST_FILE_BYTES, kindOf } from './lib/deadletter.ts'
@@ -24,6 +27,7 @@ import type { BqaaRow } from './lib/rows.ts'
 import { redactDiagnostic } from './lib/sanitize.ts'
 import { type DeadLetterSummary, formatStatus } from './lib/status.ts'
 import { type StepCtx, type StepResult, type ToolCtx, type ToolOutcome, Tracer, errorText } from './lib/tracer.ts'
+import { WELCOME_KEY, type Welcome, landedToast, openWelcome, welcomeCard, welcomeNotice } from './lib/welcome.ts'
 import { COMMAND_LINE_CHARS, type Io, Writer } from './lib/writer.ts'
 
 let options: Options = {}
@@ -34,6 +38,10 @@ let internalErrors = 0
 // The host's timer, from session.start's `$`, for work that waits briefly
 // outside any hook (a finished tool call waiting for its decision).
 let clockAfter: ((ms: number, fn: () => void) => { cancel: () => void }) | null = null
+
+// The welcome card (lib/welcome.ts) in the first session after the mod is
+// installed or updated; null in any other session, and once it is closed.
+let welcome: Welcome | null = null
 
 // Rows captured before session.start built the writer (an event the engine
 // raised first); handed over once it exists.
@@ -212,6 +220,68 @@ async function lookUpHostname($: EngineInterface): Promise<void> {
   }
 }
 
+// In a session a person sees (a `-p` run draws no band): the welcome card
+// for a version not greeted yet, recorded at once so that no later session
+// shows it, or the card a reload in its own session left open.
+async function startWelcome($: EngineInterface, e: SessionStartInput, sessionId: string | null): Promise<void> {
+  welcome = null
+  if (!e.isInteractive || e.surface === null) return
+  let stored: unknown
+  try {
+    stored = await $.store.get(WELCOME_KEY)
+  } catch {
+    // Unable to tell whether it showed before: never a card each session.
+    return
+  }
+  const opened = openWelcome(stored, sessionId)
+  if (opened === null) return
+  welcome = opened.welcome
+  // The band may be drawn already, from before this session started.
+  redrawBand($)
+  if (!opened.isNew) return
+  await saveWelcome($, opened.welcome)
+  $.ui.log(clean(welcomeNotice(opened.welcome, config)))
+}
+
+// A surface that draws no band may refuse the redraw: nothing to draw then.
+function redrawBand($: EngineInterface): void {
+  try {
+    $.ui.invalidate('ui.render')
+  } catch {
+    // No band here.
+  }
+}
+
+async function saveWelcome($: EngineInterface, shown: Welcome): Promise<void> {
+  try {
+    await $.store.set(WELCOME_KEY, shown)
+  } catch {
+    // Not recorded: the card shows again in the next session.
+  }
+}
+
+// Rows landed: the card's count moves, and the first time, it says they
+// landed, with a toast as well, as the band may be collapsed.
+function rowsLanded($: EngineInterface): void {
+  const shown = welcome
+  if (shown === null) return
+  if (shown.landedAt === null) {
+    welcome = { ...shown, landedAt: Date.now() }
+    void saveWelcome($, welcome)
+    $.ui.toast(clean(landedToast(config), 500), { timeoutMs: 15_000 })
+  }
+  redrawBand($)
+}
+
+// Got it was pressed, or a prompt came after rows landed.
+function closeWelcome($: EngineInterface): void {
+  const shown = welcome
+  if (shown === null) return
+  welcome = null
+  void saveWelcome($, { ...shown, closed: true })
+  redrawBand($)
+}
+
 // This table's dead-letter files, those elsewhere in the dead-letter
 // directory (other tables' subdirectories, at most 50 of them, and files from
 // the older flat layout), and files too large to read back.
@@ -288,6 +358,7 @@ export const register: Register = (on, registered) => {
         redraw: () => $.ui.invalidate('ui.render'),
         // Where setup.sh is, for the fix when BigQuery cannot find the dataset.
         pluginRoot: $.plugin.root,
+        sent: () => rowsLanded($),
       }
       const previous = writer
       writer = new Writer(io, () => config, () => tracer.sessionId)
@@ -334,6 +405,12 @@ export const register: Register = (on, registered) => {
     }
     try {
       await $.command.register({ name: 'bqaa-backfill', description: 'BigQuery Agent Analytics: resend rows parked in the dead-letter directory', argumentHint: '[force]', immediate: true })
+    } catch {
+      internalErrors += 1
+    }
+    // Last, and in its own try: nothing above waits on the welcome card.
+    try {
+      await startWelcome($, e, tracer.sessionId)
     } catch {
       internalErrors += 1
     }
@@ -386,6 +463,8 @@ export const register: Register = (on, registered) => {
         }),
       )
       safely(() => writer?.retrySoon())
+      // Rows landed before this prompt: the welcome card has said what it is for.
+      if (welcome !== null && welcome.landedAt !== null) safely(() => closeWelcome($))
     }
     return entered
   }).catch(($, e, next) => next(e))
@@ -393,13 +472,41 @@ export const register: Register = (on, registered) => {
   // The band above the prompt while rows cannot be written for lack of
   // credentials or permission, or because BigQuery cannot find the dataset:
   // what is wrong, the fix (for a missing dataset, the setup.sh command on a
-  // line of its own), and how many rows wait. What the mods after this one
-  // draw there stays, under these lines; a survey has the band to itself.
+  // line of its own), and how many rows wait. Otherwise, in the session that
+  // greets an install or an update, the welcome card. What the mods after
+  // this one draw there stays, under these lines; a survey has the band to
+  // itself.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const theirs = await next(e)
     const current = writer
-    const problem = current?.problem ?? null
-    if (current === null || problem === null || e.props.hasSurvey) return theirs
+    if (current === null || e.props.hasSurvey) return theirs
+    if (current.problem === null) {
+      const shown = welcome
+      if (shown === null) return theirs
+      const card = welcomeCard(shown, config, current.counters.sent)
+      const { Box, Button, Text } = $.ui.resolve(e)
+      const title = Box({
+        flexDirection: 'row',
+        justifyContent: 'space-between',
+        children: [
+          Box({
+            flexDirection: 'row',
+            flexWrap: 'wrap',
+            flexShrink: 1,
+            children: [
+              Text({ color: card.tone, bold: true, children: `${card.glyph} ` }),
+              Text({ bold: true, children: clean(card.title, 200) }),
+              Text({ dimColor: true, children: ` ${clean(card.tag, 100)}` }),
+            ],
+          }),
+          Button({ key: 'bqaa-welcome-close', label: 'Got it', role: 'dismiss', onPress: () => closeWelcome($) }),
+        ],
+      })
+      const lines = card.lines.map(line => Text({ ...(line.tone ? { color: line.tone } : {}), ...(line.dim ? { dimColor: true } : {}), children: clean(line.text, 500) }))
+      // In a box where the band has the rows for its border; lines alone where not.
+      const frame = e.props.maxRows >= lines.length + 3 ? { borderStyle: 'round', borderColor: card.tone, paddingX: 1 } : {}
+      return Box({ flexDirection: 'column', children: [Box({ flexDirection: 'column', ...frame, children: [title, ...lines] }), theirs] })
+    }
     const { headline, fix } = current.problemText()
     const run = current.commandLine()
     const { Box, Text } = $.ui.resolve(e)

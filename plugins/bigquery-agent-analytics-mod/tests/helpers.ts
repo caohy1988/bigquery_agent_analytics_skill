@@ -8,6 +8,8 @@
 import { type Engine, type MockClock, mock } from 'claude-code/testing'
 import type { On, TurnStepChunk, TurnStepResult } from 'claude-code'
 
+import { PLUGIN_VERSION } from '../hooks/lib/config.ts'
+
 export type FetchCall = { url: string; method: string; headers: Record<string, string>; body: string; answered: number | 'reject' | 'hang' }
 export type FetchReply = { status: number; text: string } | { reject: string } | { hang: true }
 export type StepReply = { chunks?: TurnStepChunk[]; result: Partial<TurnStepResult> }
@@ -67,6 +69,10 @@ export type World = {
   releaseHung: (status: number, text: string) => void
   // The mod's `$.store`, each value read back as JSON, as the host keeps it.
   store: Map<string, unknown>
+  // Makes `$.store.get` never answer.
+  hangStore: boolean
+  // The slash commands the mod registered.
+  registered: string[]
 }
 
 export type Row = {
@@ -118,7 +124,11 @@ export const USAGE = {
   model: 'example-model',
 }
 
-export function setUp(on: On, env: Record<string, string> = {}, store: Record<string, unknown> = {}): World {
+// The store once an earlier session greeted this version and closed its
+// welcome card: the tests start from that, but the welcome card's own.
+export const GREETED = { welcome: { version: PLUGIN_VERSION, previous: null, sessionId: 'an-earlier-session', landedAt: 1, closed: true } } as const
+
+export function setUp(on: On, env: Record<string, string> = {}, store: Record<string, unknown> = GREETED): World {
   const clock = mock.clock(on, { now: 0 })
   mock.env(on, { HOME, USER: 'dev', ...env })
   const asJson = (value: unknown): unknown => JSON.parse(JSON.stringify(value)) as unknown
@@ -169,9 +179,11 @@ export function setUp(on: On, env: Record<string, string> = {}, store: Record<st
       for (const resolve of hung.splice(0)) resolve({ value: { status, ok: status >= 200 && status < 300, headers: {}, text } })
     },
     store: new Map(Object.entries(store).map(([key, value]) => [key, asJson(value)])),
+    hangStore: false,
+    registered: [],
   }
 
-  on('store.get', ($, e) => ({ value: world.store.get(e.key) }))
+  on('store.get', ($, e) => (world.hangStore ? new Promise<never>(() => {}) : { value: world.store.get(e.key) }))
   // As the host, a store of no more than 4 MiB of JSON in all.
   on('store.set', ($, e) => {
     const value = asJson(e.value)
@@ -188,7 +200,10 @@ export function setUp(on: On, env: Record<string, string> = {}, store: Record<st
   on('session.end', ($, e) => ({ sessionId: e.sessionId }))
   on('session.id', () => (world.sessionIdRefused ? { deny: 'refused by policy' } : { value: world.sessionId }))
   on('session.version', () => ({ value: { version: '2.1.296', base: '2.1.296' } }))
-  on('command.register', ($, e) => ({ value: { command: e.name } }))
+  on('command.register', ($, e) => {
+    world.registered.push(e.name)
+    return { value: { command: e.name } }
+  })
   on('ui.status', ($, e) => {
     world.statusLines.push(e.text)
     return { value: undefined }

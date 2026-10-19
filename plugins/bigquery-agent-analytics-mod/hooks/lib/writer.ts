@@ -56,6 +56,9 @@ export type Io = {
   // BigQuery cannot find names the script there. Absent, the fix is told
   // without a command.
   pluginRoot?: string
+  // Rows just landed: BigQuery took them (a send or a replay), or a dry run
+  // wrote them. The welcome card says when the first ones do.
+  sent?: (rows: number) => void
 }
 
 // Why rows cannot be written: no working credentials (the token source
@@ -714,6 +717,7 @@ export class Writer {
     this.counters.sent += rows
     this.counters.batches += 1
     this.tookRequest(rows)
+    if (rows > 0) this.call(() => this.io.sent?.(rows))
     // BigQuery is reachable again: replay what this session parked on disk.
     if (hadFailures && this.parked.recoverable && this.config().autoBackfill) {
       this.parked.recoverable = false
@@ -1599,6 +1603,7 @@ export class Writer {
     if (emptyWaiting.length > 0) report.held ??= diagnostic(`${emptyWaiting[0]} is empty, perhaps still being written; it waits for the next replay`)
     if (parentWaits.length > 0) report.held ??= diagnostic(`${parentWaits[0]} waits until the replay of the file it came from has it as written`)
     if (leased.length > 0) report.held ??= diagnostic(`another session's lease holds ${leased[0]} (ten minutes at most); it waits for the next replay`)
+    if (report.rowsSent > 0) this.call(() => this.io.sent?.(report.rowsSent))
     // Another replay of this table follows by itself while rows wait: rows
     // this one left, files it did not read (another session's lease on them
     // included), files not whole or empty that a write still under way may

@@ -13,6 +13,7 @@ import {
   COMMAND,
   DEAD_LETTER_DIR,
   DRY_RUN_DIR,
+  GREETED,
   HOST_FILE_BYTES,
   OK_INSERT,
   OPTIONS,
@@ -489,7 +490,7 @@ test('configured for the other table, replay sends its rows there and leaves thi
 
 test('a file another session is replaying is left to it', { options: OPTIONS }, async ($, on) => {
   const name = 'spill-20261013T200102003Z-othersession-1.jsonl'
-  const world = setUp(on, {}, { [`lease:${TABLE_REF}/${name}`]: { by: 'other-session', until: Date.now() + 60_000 } })
+  const world = setUp(on, {}, { ...GREETED, [`lease:${TABLE_REF}/${name}`]: { by: 'other-session', until: Date.now() + 60_000 } })
   world.files.set(`${PARTITION_DIR}/${name}`, '{"v":1}\n')
   await startSession($)
   await world.clock.advance(15_000)
