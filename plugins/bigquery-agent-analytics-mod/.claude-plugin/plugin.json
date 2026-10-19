@@ -8,6 +8,7 @@
   "homepage": "https://adk.dev/integrations/bigquery-agent-analytics/",
   "repository": "https://github.com/haiyuan-eng-google/bigquery_agent_analytics_skill",
   "license": "MIT",
+  "types": "./types/index.d.ts",
   "keywords": [
     "bigquery",
     "agent-analytics",

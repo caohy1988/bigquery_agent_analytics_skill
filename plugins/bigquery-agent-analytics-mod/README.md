@@ -201,8 +201,10 @@ send, a few seconds in, and then a toast says so as well, and the count goes
 up with each send. The next prompt you type at the terminal after that
 closes the card (one from elsewhere, such as a task's notification, leaves
 it), and so does **Got it** (ctrl+x tab, then Enter). A transcript line,
-which the model does not read, keeps what it said. An update back to an
-older version says "changed to", not "updated to".
+which the model does not read, keeps what it said. The card says "updated
+to" only for a version known to be newer than the one before it (by its
+numbers, a release after its own pre-release); otherwise, back to an older
+version or between versions that do not compare, it says "changed to".
 
 * With no project or dataset set, the card says that nothing is recorded
   until they are set in `/config` (or `BQAA_PROJECT_ID` and `BQAA_DATASET`).
@@ -213,24 +215,30 @@ older version says "changed to", not "updated to".
   [If rows cannot be written](#if-rows-cannot-be-written)), its notice has
   the band. The card comes back once rows land.
 
-The mod notes the version it greeted, and the session that showed the card,
-in its own store (`$.store`, key `welcome`), so no later session shows the
-card. What became of the card (rows landed, and where; closed) goes to a
-record of its own (key `welcome:<version>:<session>`), which no other
-session writes, so a session left open never writes over a newer version
-another session greeted. The card's writes go one at a time, in order, each
-with the card as it is by then, so one that answers late never undoes a
-close. A reload in the same session (`/reload-plugins`, or an option changed
-in `/config`) shows the card again as it was. If rows now go somewhere else
-(another table, or BigQuery after a dry run), the card waits again until
-rows land there; rows sent under the earlier configuration that land after
-the reload do not count.
+The mod notes in its own store (`$.store`) the version it greeted and the
+session that showed the card (key `welcome:<version>`), so no later session
+shows the card; the versions noted give the next version's card the one it
+replaced. What became of the card goes to keys of its own version and
+session: when rows first landed, and where (`welcome:<version>:<session>`),
+and that it was closed (`…:closed`, a key no other write touches). No
+session writes another version's or session's keys, so a session left open
+never writes over a newer version another session greeted, and no write
+that answers late, from this load of the mod or an earlier one, undoes a
+close. The session also keeps the card in `$.state`, which a reload
+(`/reload-plugins`, or an option changed in `/config`) keeps while the
+mod's own variables start over: the reload shows the card again as it was,
+its count included, closed stays closed, and a greeting or a close still
+being written to the store gives no second line and no reopened card. If
+rows now go somewhere else (another table, or BigQuery after a dry run),
+the card waits again until rows land there; rows sent under the earlier
+configuration that land after the reload do not count.
 A `-p` run draws no band: it shows nothing and leaves the store alone.
 Nothing waits on the store for the card, the session's start included; the
 card shows once the store answers. The store makes "once" a best effort:
 
 * if the records cannot be written, the next session shows the card again,
-  and a reload shows it as the store last had it;
+  and a reload in a session that keeps no `$.state` shows it as the store
+  last had it;
 * if they cannot be read, no card shows;
 * two sessions started at the same moment can both show it;
 * reinstalling the same version shows no card while the store keeps the
@@ -1001,6 +1009,7 @@ claude plugin validate plugins/bigquery-agent-analytics-mod
 cd plugins/bigquery-agent-analytics-mod && claude plugin test
 bash tests/setup.test.sh
 bash tests/version.test.sh    # plugin.json and PLUGIN_VERSION agree
+node tests/reload.test.mjs    # node 24: the welcome card across a fresh load
 python3 tests/views.test.py   # needs DuckDB: python3 -m pip install duckdb
 npx -p typescript tsc -p .    # once the host CLI has loaded the mod (below)
 ```
@@ -1018,7 +1027,7 @@ test kit, with no session, sign-in, GCP or network: `$.http.fetch`,
 `$.process.run`, `$.fs` and `$.store` are stubbed, and `mock.clock` drives the
 timers; the `$.fs` stubs measure files in UTF-8 bytes and refuse a file over
 4 MiB, and the `$.store` stub a store over 4 MiB of JSON in all, as the host
-does. 370 tests cover the captured rows and their spans,
+does. 376 tests cover the captured rows and their spans,
 subagent runs in the order the host raises them (one invocation and one
 trace for the turn, a span per run, a SubagentStart that comes late or never),
 the session-start row raised before or during `session.start`'s setup,
@@ -1271,9 +1280,13 @@ And the welcome card:
   still setting up;
 * the writes in order: a close made while the greeting, or a landing, is
   still being written stays closed; a reload while either is still being
-  written showing the card as it is, with no second line, and a close after
-  it written last; a newer version another session greets, before or while
-  this card writes, kept; the card's write queue on its own;
+  written showing the card as it is, its count kept, with no second line; a
+  landing an earlier load is still writing landing before or after the
+  close a reload's Got it writes, the card staying closed; a newer version
+  another session greets, before or while this card writes, kept, and a
+  late write of an older version's never greeting this one again; the
+  version it replaced, the newest greeted before; "updated" only for a
+  newer version; the card's write queue on its own;
 * a reload to another table, or out of a dry run, waiting for rows to land
   there, rows of a send or a dry-run write still in flight across it
   included; a reload to capture off keeping the card until Got it; the
@@ -1317,6 +1330,16 @@ calls. It checks:
 
 `tests/version.test.sh` checks that `plugin.json` and `PLUGIN_VERSION` name
 the same version: the welcome card greets an update by the latter.
+
+`tests/reload.test.mjs` loads `hooks/register.ts` afresh, as a hot reload
+does, which the test kit cannot, under node 24 with a small stand-in for
+`$` (its `$.state` held for the session, its `$.store` across loads, store
+writes answering late in either order). It checks that a card closed before
+a reload stays closed while the close is still being written, that a
+greeting still being written gives one transcript line across loads, and
+that a landing an earlier load is still writing never undoes the close a
+later load writes, before or after it, nor in a new process with no
+`$.state`.
 
 `tests/views.test.py` runs both views in DuckDB. It uses five dialect
 substitutions, and each must match. The fixture is a table shared by this
@@ -1401,7 +1424,8 @@ setup.sh                     creates the dataset, table, views dataset and views
 sql/                         DDL and sample queries
 sql/views/                   the usage views setup.sh makes
 examples/sample-rows.jsonl   fixture output
-tests/                       plugin-test suites, setup.test.sh for setup.sh, and version.test.sh
+tests/                       plugin-test suites, setup.test.sh for setup.sh, version.test.sh, and reload.test.mjs
+types/index.d.ts             the values the mod keeps in the session's $.state
 ```
 
 The credential notice, the identity options, the permission decisions,

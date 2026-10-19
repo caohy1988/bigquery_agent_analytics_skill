@@ -27,7 +27,7 @@ import type { BqaaRow } from './lib/rows.ts'
 import { redactDiagnostic } from './lib/sanitize.ts'
 import { type DeadLetterSummary, formatStatus } from './lib/status.ts'
 import { type StepCtx, type StepResult, type ToolCtx, type ToolOutcome, Tracer, errorText } from './lib/tracer.ts'
-import { CardRecords, WELCOME_KEY, type Welcome, cardKey, destinationKey, greetedHere, greetedVersion, landedToast, openWelcome, welcomeCard, welcomeNotice } from './lib/welcome.ts'
+import { CardRecords, WELCOME_KEY, type Welcome, cardKey, closedKey, destinationKey, greetedBy, greetedKey, greetedVersions, landedToast, openWelcome, reopenWelcome, welcomeCard, welcomeNotice } from './lib/welcome.ts'
 import { COMMAND_LINE_CHARS, type Io, Writer } from './lib/writer.ts'
 
 let options: Options = {}
@@ -45,8 +45,10 @@ let welcome: Welcome | null = null
 // Counts session.start runs: a store read for the card that answers after a
 // later one began is not used.
 let welcomeStarts = 0
-// The writes of the last card this module showed (`CardRecords`).
+// The writes of the card this load of the code showed (`CardRecords`).
 let records: CardRecords | null = null
+// Where the session keeps the card for a reload of this code (types/).
+const WELCOME_STATE = { plugin: 'bigquery-agent-analytics-mod', key: 'welcome' } as const
 
 // Rows captured before session.start built the writer (an event the engine
 // raised first); handed over once it exists.
@@ -227,44 +229,70 @@ async function lookUpHostname($: EngineInterface): Promise<void> {
 
 // In a session a person sees (a `-p` run draws no band): the welcome card
 // for a version not greeted yet, recorded at once so that no later session
-// shows it, or the card a reload in its own session left open. Runs in the
-// background: nothing waits on the store for it. `start` is the
-// session.start run it belongs to.
+// shows it, or the card this session showed, as a reload left it. Runs in
+// the background: nothing waits on the store for it. `start` is the
+// session.start run it belongs to. Nothing of an earlier load of this code
+// is used: a reload starts it afresh, keeping `$.state` alone.
 async function startWelcome($: EngineInterface, e: SessionStartInput, sessionId: string | null, start: number): Promise<void> {
   if (!e.isInteractive || e.surface === null) return
-  let greeted: unknown
-  let own: unknown
+  const key = destinationKey(config)
+  // The card this session showed, as it left it (the greeting and a close
+  // included, written to the store or not). Where the session keeps no
+  // state, the store's records decide.
+  let kept: Welcome | null = null
   try {
-    greeted = await $.store.get(WELCOME_KEY)
-    if (start !== welcomeStarts) return
-    // What this module wrote may not have landed yet: its own card's
-    // greeting and state stand until the store holds this version's.
-    if (records !== null && greetedVersion(greeted) !== records.card.version) {
-      const { version, previous, sessionId: by } = records.card
-      greeted = { version, previous, sessionId: by }
+    kept = (await $.state.get(WELCOME_STATE)).value ?? null
+  } catch {
+    kept = null
+  }
+  let opened: { welcome: Welcome; isNew: boolean } | null
+  try {
+    if (kept !== null && kept.version === PLUGIN_VERSION && sessionId !== null && kept.sessionId === sessionId) opened = reopenWelcome(kept, key)
+    else {
+      const [latest, greeted] = await Promise.all([$.store.get(WELCOME_KEY), $.store.get(greetedKey(PLUGIN_VERSION))])
+      if (start !== welcomeStarts) return
+      let landing: unknown
+      let closed: unknown
+      let versions: string[] = []
+      if (sessionId !== null && greetedBy(latest, greeted)?.sessionId === sessionId) {
+        ;[landing, closed] = await Promise.all([$.store.get(cardKey(PLUGIN_VERSION, sessionId)), $.store.get(closedKey(PLUGIN_VERSION, sessionId))])
+      } else if (greetedBy(latest, greeted) === null) {
+        // A new card: the versions greeted before name the one it replaces.
+        try {
+          versions = greetedVersions(await $.store.keys())
+        } catch {
+          versions = []
+        }
+      }
+      opened = openWelcome({ latest, greeted, landing, closed, versions }, sessionId, key)
     }
-    if (records !== null && records.isFor(sessionId)) own = records.card
-    else if (sessionId !== null && greetedHere(greeted, sessionId)) own = await $.store.get(cardKey(PLUGIN_VERSION, sessionId))
   } catch {
     // Unable to tell whether it showed before: never a card each session.
     return
   }
   // session.start ran again meanwhile: the card is that start's to show.
-  if (start !== welcomeStarts) return
-  const key = destinationKey(config)
-  const opened = openWelcome(greeted, own, sessionId, key)
-  if (opened === null) return
+  if (start !== welcomeStarts || opened === null) return
   welcome = opened.welcome
   // The band may be drawn already, from before this session started.
   redrawBand($)
-  const save = (key: string, value: unknown): Promise<void> => $.store.set(key, value)
-  if (opened.isNew) {
-    records = new CardRecords(save, opened.welcome, true)
-    $.ui.log(clean(welcomeNotice(opened.welcome, config)))
-  } else if (records === null || !records.isFor(sessionId)) records = new CardRecords(save, opened.welcome, false)
-  // Rows that landed while the store was read (this writer's rows go where
-  // this configuration sends them): the card says so now.
-  if (writer !== null && writer.counters.sent > 0) rowsLanded($, key)
+  keepWelcome($, opened.welcome)
+  records = new CardRecords((key, value) => $.store.set(key, value), opened.welcome, opened.isNew)
+  if (opened.isNew) $.ui.log(clean(welcomeNotice(opened.welcome, config)))
+  // Rows that landed while the records were read (this writer's rows go
+  // where this configuration sends them): the card says so now.
+  if (writer !== null && writer.counters.sent > 0) rowsLanded($, writer.counters.sent, key)
+}
+
+// The card, for a reload of this code to show as it is now; one a reload
+// cannot read is shown from the store's records.
+function keepWelcome($: EngineInterface, card: Welcome): void {
+  try {
+    void $.state.set(WELCOME_STATE, card).catch(() => {
+      internalErrors += 1
+    })
+  } catch {
+    internalErrors += 1
+  }
 }
 
 // A surface that draws no band may refuse the redraw: nothing to draw then.
@@ -276,15 +304,17 @@ function redrawBand($: EngineInterface): void {
   }
 }
 
-// Rows landed in `to` (their destination's `destinationKey`): the card's
-// count moves, and the first time rows land where this configuration sends
-// them, it says so, with a toast as well, as the band may be collapsed. Rows
+// `rows` landed in `to` (their destination's `destinationKey`): where this
+// configuration sends rows, the card counts them, and the first time it
+// says they landed, with a toast as well, as the band may be collapsed. Rows
 // that a writer of an earlier configuration sent elsewhere say nothing here.
-function rowsLanded($: EngineInterface, to: string | null): void {
+function rowsLanded($: EngineInterface, rows: number, to: string | null): void {
   const shown = welcome
-  if (shown === null) return
-  if (shown.landedAt === null && to !== null && to === destinationKey(config)) {
-    welcome = { ...shown, landedAt: Date.now(), landedTo: to }
+  if (shown === null || to === null || to !== destinationKey(config)) return
+  const first = shown.landedAt === null
+  welcome = { ...shown, sent: shown.sent + rows, ...(first ? { landedAt: Date.now(), landedTo: to } : {}) }
+  keepWelcome($, welcome)
+  if (first) {
     records?.update(welcome)
     try {
       $.ui.toast(clean(landedToast(config), 500), { timeoutMs: 15_000 })
@@ -300,7 +330,9 @@ function closeWelcome($: EngineInterface): void {
   const shown = welcome
   if (shown === null) return
   welcome = null
-  records?.update({ ...shown, closed: true })
+  const closed = { ...shown, closed: true }
+  keepWelcome($, closed)
+  records?.update(closed)
   redrawBand($)
 }
 
@@ -384,7 +416,7 @@ export const register: Register = (on, registered) => {
         redraw: () => $.ui.invalidate('ui.render'),
         // Where setup.sh is, for the fix when BigQuery cannot find the dataset.
         pluginRoot: $.plugin.root,
-        sent: (rows, to) => rowsLanded($, destinationKey(to)),
+        sent: (rows, to) => rowsLanded($, rows, destinationKey(to)),
       }
       const previous = writer
       writer = new Writer(io, () => config, () => tracer.sessionId)
@@ -509,7 +541,7 @@ export const register: Register = (on, registered) => {
     if (current.problem === null) {
       const shown = welcome
       if (shown === null) return theirs
-      const card = welcomeCard(shown, config, current.counters.sent)
+      const card = welcomeCard(shown, config, shown.sent)
       const { Box, Button, Text } = $.ui.resolve(e)
       const title = Box({
         flexDirection: 'row',

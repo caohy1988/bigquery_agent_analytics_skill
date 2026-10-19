@@ -2,31 +2,37 @@
 // mod is installed, or updated to a new version: that the mod is on, what it
 // records and where to, and once rows land, that they did. Nothing else on
 // screen says so while rows are written without trouble. No `$` here, like
-// status.ts: register.ts reads the records from `$.store`, hands
-// CardRecords its writes, and draws the card.
+// status.ts: register.ts reads the records from `$.state` and `$.store`,
+// hands CardRecords its writes, and draws the card.
 
+import type { WelcomeState } from '../../types'
 import { type Config, PLUGIN_VERSION, canDeliver, tableRef } from './config.ts'
 
-// The `$.store` key of the greeting record (`Greeting`).
+// The records the card keeps in `$.store`, each written by the session that
+// showed it, and only under keys of that version and session, so no write of
+// another version or session, however late it answers, lands on them:
+// - `welcome:<version>`: that this version was greeted, by which session, and
+//   the version before it; written once, when the card first shows, so no
+//   later session shows it. The versions greeted, listed, give the next
+//   version's card the one it replaced;
+// - `welcome:<version>:<session>`: when rows first landed while the card
+//   showed, and where (`destinationKey`);
+// - `welcome:<version>:<session>:closed`: that it was closed, a key no other
+//   write touches, so no write that answers late undoes a close.
+// `welcome` alone is read, never written: earlier versions kept the version
+// greeted there.
 export const WELCOME_KEY = 'welcome'
-
-// The `$.store` key of one card's own record (`CardState`), which that card
-// alone writes: what one session writes never lands on another's record.
+export const greetedKey = (version: string): string => `${WELCOME_KEY}:${version}`
 export const cardKey = (version: string, sessionId: string): string => `${WELCOME_KEY}:${version}:${sessionId}`
+export const closedKey = (version: string, sessionId: string): string => `${cardKey(version, sessionId)}:closed`
 
-// The version greeted, the version greeted before it (null on a fresh
-// install), and the session that showed the card. That session writes it
-// once, when the card first shows, and no later session shows the card.
-export type Greeting = { version: string; previous: string | null; sessionId: string | null }
-
-// What became of a card: when rows first landed while it showed and where
-// they went (`destinationKey`), and whether it was closed. A reload in its
-// session (/reload-plugins, an option changed in /config) shows the card
-// again as it was, waiting again if rows now go elsewhere, unless it was
-// closed.
-export type CardState = { landedAt: number | null; landedTo: string | null; closed: boolean }
-
-export type Welcome = Greeting & CardState
+// The card: the version greeted, the one greeted before it (null on a fresh
+// install), the session that showed it, when rows first landed and where,
+// whether it was closed, and how many rows landed there while it showed. The
+// session keeps it in `$.state`, so a reload (/reload-plugins, an option
+// changed in /config) shows it again as it was, unless it was closed,
+// waiting again if rows now go elsewhere.
+export type Welcome = WelcomeState
 
 export type Tone = 'success' | 'suggestion' | 'warning' | 'inactive'
 
@@ -54,62 +60,79 @@ export const destinationKey = (c: Config): string | null => (!c.enabled || !canD
 // The version a greeting record names, if it names one.
 export const greetedVersion = (greeted: unknown): string | null => (isObject(greeted) && typeof greeted.version === 'string' ? greeted.version : null)
 
-// Whether the greeting record says this session greeted this version: its
-// card's own record then says what became of the card.
-export const greetedHere = (greeted: unknown, sessionId: string | null): boolean => sessionId !== null && isObject(greeted) && greeted.version === PLUGIN_VERSION && greeted.sessionId === sessionId
+// The versions greeted, from the store's keys (`welcome:<version>`).
+export const greetedVersions = (keys: readonly string[]): string[] =>
+  keys.filter(key => key.startsWith(`${WELCOME_KEY}:`) && key.split(':').length === 2).map(key => key.slice(WELCOME_KEY.length + 1))
 
-// At session start, from the greeting record and, when this session greeted
-// this version, the card's own record (`own`): a new card for a version not
-// greeted yet, the same card after a reload in the session that showed it
-// (unless it was closed; waiting again if rows now go elsewhere, so `key` is
-// this configuration's `destinationKey`), else none.
-export function openWelcome(greeted: unknown, own: unknown, sessionId: string | null, key: string | null): { welcome: Welcome; isNew: boolean } | null {
-  const seen = isObject(greeted) ? greeted : {}
-  const version = greetedVersion(greeted)
-  if (version !== PLUGIN_VERSION) {
-    return { welcome: { version: PLUGIN_VERSION, previous: version, sessionId, landedAt: null, landedTo: null, closed: false }, isNew: true }
+// Who greeted this version, from its own record (`welcome:<version>`), or
+// from `welcome` when that names this version; null when no one did.
+export function greetedBy(latest: unknown, greeted: unknown): { sessionId: string | null; previous: string | null } | null {
+  const record = isObject(greeted) ? greeted : greetedVersion(latest) === PLUGIN_VERSION && isObject(latest) ? latest : null
+  if (record === null) return null
+  return { sessionId: typeof record.sessionId === 'string' ? record.sessionId : null, previous: typeof record.previous === 'string' ? record.previous : null }
+}
+
+// What `$.store` holds for the card: `welcome` (`latest`), this version's
+// greeting, this session's landing and close, and the versions greeted.
+export type WelcomeRecords = { latest: unknown; greeted: unknown; landing: unknown; closed: unknown; versions: readonly string[] }
+
+// At session start, from the records in `$.store`: a new card for a version
+// not greeted yet, the card of the session that showed it after a reload
+// that kept no `$.state` (unless it was closed; waiting again if rows now go
+// elsewhere, so `key` is this configuration's `destinationKey`), else none.
+export function openWelcome(records: WelcomeRecords, sessionId: string | null, key: string | null): { welcome: Welcome; isNew: boolean } | null {
+  const by = greetedBy(records.latest, records.greeted)
+  if (by === null) {
+    // The version it replaces: the newest greeted before (an update's last
+    // one; a change back's newer one).
+    const before = [...records.versions, greetedVersion(records.latest)].filter((v): v is string => v !== null && v !== PLUGIN_VERSION)
+    const previous = before.reduce<string | null>((newest, v) => (newest === null || isNewer(v, newest) ? v : newest), null)
+    return { welcome: { version: PLUGIN_VERSION, previous, sessionId, landedAt: null, landedTo: null, closed: false, sent: 0 }, isNew: true }
   }
-  if (!greetedHere(greeted, sessionId)) return null
-  const state = isObject(own) ? own : {}
-  if (state.closed === true) return null
-  const previous = typeof seen.previous === 'string' ? seen.previous : null
-  const here = key !== null && typeof state.landedAt === 'number' && state.landedTo === key
-  return { welcome: { version, previous, sessionId, landedAt: here ? (state.landedAt as number) : null, landedTo: here ? key : null, closed: false }, isNew: false }
+  if (sessionId === null || by.sessionId !== sessionId || records.closed === true) return null
+  const landing = isObject(records.landing) ? records.landing : {}
+  const here = key !== null && typeof landing.landedAt === 'number' && landing.landedTo === key
+  return { welcome: { version: PLUGIN_VERSION, previous: by.previous, sessionId, landedAt: here ? (landing.landedAt as number) : null, landedTo: here ? key : null, closed: false, sent: 0 }, isNew: false }
+}
+
+// After a reload in the session that showed the card, from what `$.state`
+// kept of it: none once closed; else the card as it was, its landing kept
+// only if rows still go there.
+export function reopenWelcome(kept: Welcome, key: string | null): { welcome: Welcome; isNew: boolean } | null {
+  if (kept.closed) return null
+  const here = key !== null && kept.landedAt !== null && kept.landedTo === key
+  return { welcome: { ...kept, landedAt: here ? kept.landedAt : null, landedTo: here ? key : null, sent: here ? kept.sent : 0 }, isNew: false }
 }
 
 // One card's writes to `$.store` (register.ts passes `save`), in the
-// background, one at a time and in order: the greeting record first (for a
-// new card), then the card's own record, which no other session writes.
-// Each write takes the card as it is by then, so a write that answers late
-// never undoes a later change, and a close is in every write after it.
-// Nothing waits on them; one that never answers holds up only the writes
-// after it.
+// background, one at a time: its greeting first (for a new card), then its
+// landing and its close as they come,
+// each written with the card as it is by then, the close once. Each module
+// load writes through its own CardRecords; the keys keep them apart: no
+// write of another load, however late it answers, undoes a close. Nothing
+// waits on them; one that never answers holds up only the writes after it.
 export class CardRecords {
   card: Welcome
+  // Writes one value to `$.store`.
+  private readonly save: (key: string, value: unknown) => Promise<void>
   private greetingDue: boolean
-  private stateDue = false
+  private landingDue = false
+  private closeDue = false
   private writing = false
 
-  // `save` writes one value to `$.store`.
-  constructor(
-    private readonly save: (key: string, value: unknown) => Promise<void>,
-    card: Welcome,
-    greet: boolean,
-  ) {
+  constructor(save: (key: string, value: unknown) => Promise<void>, card: Welcome, greet: boolean) {
+    this.save = save
     this.card = card
     this.greetingDue = greet
     this.write()
   }
 
-  // Whether these are the records of the card `sessionId` showed.
-  isFor(sessionId: string | null): boolean {
-    return sessionId !== null && this.card.sessionId === sessionId
-  }
-
-  // The card changed (rows landed, it was closed): its own record follows.
+  // The card changed (rows landed, it was closed): what changed follows.
   update(card: Welcome): void {
-    this.card = { ...card, closed: this.card.closed || card.closed }
-    this.stateDue = true
+    const was = this.card
+    this.card = { ...card, closed: was.closed || card.closed }
+    if (this.card.landedAt !== was.landedAt || this.card.landedTo !== was.landedTo) this.landingDue = true
+    if (this.card.closed && !was.closed) this.closeDue = true
     this.write()
   }
 
@@ -121,19 +144,22 @@ export class CardRecords {
 
   private async drain(): Promise<void> {
     try {
-      while (this.greetingDue || this.stateDue) {
-        const { version, previous, sessionId, landedAt, landedTo, closed } = this.card
+      while (this.greetingDue || this.landingDue || this.closeDue) {
+        const { version, previous, sessionId, landedAt, landedTo } = this.card
         try {
           if (this.greetingDue) {
             this.greetingDue = false
-            await this.save(WELCOME_KEY, { version, previous, sessionId })
+            await this.save(greetedKey(version), { sessionId, previous })
+          } else if (this.landingDue) {
+            this.landingDue = false
+            if (sessionId !== null) await this.save(cardKey(version, sessionId), { landedAt, landedTo })
           } else {
-            this.stateDue = false
-            if (sessionId !== null) await this.save(cardKey(version, sessionId), { landedAt, landedTo, closed })
+            this.closeDue = false
+            if (sessionId !== null) await this.save(closedKey(version, sessionId), true)
           }
         } catch {
           // Not recorded: the next session shows the card again, or a reload
-          // shows it as the store last had it.
+          // with no `$.state` shows it as the store last had it.
         }
       }
     } finally {
@@ -142,21 +168,31 @@ export class CardRecords {
   }
 }
 
-// Whether `version` comes before `than`, both dot-separated numbers; false
-// when either is not.
-const isOlder = (version: string, than: string): boolean => {
-  const a = version.split('.').map(Number)
-  const b = than.split('.').map(Number)
-  if (![...a, ...b].every(Number.isInteger)) return false
-  for (let i = 0; i < Math.max(a.length, b.length); i += 1) {
-    const step = (a[i] ?? 0) - (b[i] ?? 0)
-    if (step !== 0) return step < 0
-  }
-  return false
+// A version's parts: its dot-separated numbers and what follows a `-`, or
+// null when it is not of that form.
+const parts = (version: string): { numbers: number[]; pre: string | null } | null => {
+  const match = /^(\d+(?:\.\d+)*)(?:-(.+))?$/.exec(version)
+  if (match === null) return null
+  return { numbers: (match[1] as string).split('.').map(Number), pre: match[2] ?? null }
 }
 
-// Installed, updated, or, back to an older version, changed.
-const arrival = (w: Welcome): string => (w.previous === null ? 'installed' : `${isOlder(w.version, w.previous) ? 'changed' : 'updated'} to ${w.version}`)
+// Whether `version` is known to come after `than`: by its numbers, then a
+// release after its own pre-release (`0.2.0` after `0.2.0-rc.1`), then
+// pre-releases by their text. False when either is of another form.
+const isNewer = (version: string, than: string): boolean => {
+  const a = parts(version)
+  const b = parts(than)
+  if (a === null || b === null) return false
+  for (let i = 0; i < Math.max(a.numbers.length, b.numbers.length); i += 1) {
+    const step = (a.numbers[i] ?? 0) - (b.numbers[i] ?? 0)
+    if (step !== 0) return step > 0
+  }
+  if (a.pre === null || b.pre === null) return a.pre === null && b.pre !== null
+  return a.pre > b.pre
+}
+
+// Installed; updated, to a version known to be newer; else changed.
+const arrival = (w: Welcome): string => (w.previous === null ? 'installed' : `${isNewer(w.version, w.previous) ? 'updated' : 'changed'} to ${w.version}`)
 
 // Why nothing is recorded, when the configuration leaves nowhere to write.
 const unset = (c: Config): string => (c.dryRun ? (c.problems[0] ?? 'the dry run has nowhere to write') : `nothing is recorded until ${NOT_SET_UP}`)
