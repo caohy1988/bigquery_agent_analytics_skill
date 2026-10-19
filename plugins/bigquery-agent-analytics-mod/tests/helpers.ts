@@ -305,8 +305,10 @@ export const json = (text: string | null): Record<string, unknown> => (text === 
 
 export const byType = (rows: Row[], type: string): Row[] => rows.filter(r => r.event_type === type)
 
+// The dead-letter files that hold something (not the replay records kept
+// beside them, `outcome-…`).
 export function deadLetterFiles(world: World): [string, string][] {
-  return [...world.files.entries()].filter(([p, text]) => p.startsWith(`${DEAD_LETTER_DIR}/`) && text.length > 0)
+  return [...world.files.entries()].filter(([p, text]) => p.startsWith(`${DEAD_LETTER_DIR}/`) && text.length > 0 && /^(spill|retry|rejected)-/.test(p.split('/').pop() ?? ''))
 }
 
 // The rows parked in dead-letter files, file by file in name (time) order.

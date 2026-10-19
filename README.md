@@ -41,6 +41,8 @@ It also records each model request with its token usage and latency, and
 subagents with their own spans. Use it or the tracing plugin against a table,
 not both.
 
+`--marketplace` needs v2.1.292 or later:
+
 ```bash
 claude plugin install bigquery-agent-analytics-mod \
   --marketplace haiyuan-eng-google/bigquery_agent_analytics_skill \

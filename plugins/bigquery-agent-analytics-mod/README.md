@@ -287,8 +287,8 @@ No command is offered when its path holds text the redaction would change
 `/bqaa-status` can show whole.
 
 The next send or replay that BigQuery takes clears the notice. So does a
-400 refusing the rows themselves, which shows that BigQuery found the table
-and took the credentials. Recovery is quick:
+400 refusing the rows themselves, which shows that BigQuery found the table,
+took the credentials and let the identity write. Recovery is quick:
 
 * While credentials or a missing dataset are the problem, the wait before
   the next retry is at most 30 seconds. The retry then goes at the next
@@ -657,16 +657,26 @@ GROUP BY model
   whole behind it means nothing of what is left was written: the writer
   that holds the outcome writes it again, any other replay that runs by
   itself leaves the file waiting, and `/bqaa-backfill`, asked to send it,
-  replays it afresh. The record is removed, and those files emptied, once
-  the replayed file is emptied. Nothing of what is left is written until
+  replays it afresh. An empty one of those files beside a file that still
+  holds its rows counts as cut off too (a write that stopped before its
+  first byte). Once the replayed file is emptied its record stays a day,
+  marked as done, in one of those two files (the store's copy goes): a
+  late write of another session's copy of a file it left is then emptied
+  unsent, another session's late outcome for it stops there, and a file
+  of what is left that the mark does not name is a late copy of another
+  session's outcome, emptied unsent too. Such records of files emptied more
+  than a day ago are emptied at the next replay. Nothing of what is left is written until
   the record is: when neither the store nor those files take it, the
   replayed file stays as it was, and this session tries again at each
   replay (a later session, not knowing, sends its rows again; `event_id`
   dedups them). Each file of what is left names the file it came from, and
   no replay takes it until that file's record has it as written (or names
-  other files, or is gone): one written whose mark the record could not
-  keep waits, and the writer that finishes the outcome writes it again
-  over the copy no one took. Any writer that
+  other files, or is gone, or its file is emptied): one written whose mark
+  the record could not keep waits, and the writer that finishes the
+  outcome writes it again over the copy no one took. Before it records
+  anything, a writer reads the record, and the file, again: another
+  writer's outcome goes on instead; the file done, or emptied with no
+  record whole, it writes nothing. Any writer that
   replays the file next, this session's or another's, a later
   session.start's included, reads the record, even one that holds the
   outcome itself: it writes from the file and the record what is still
@@ -681,10 +691,12 @@ GROUP BY model
   from replaying the same file at once (best effort: two that read the
   lease at the same moment both send the file, and `event_id` dedups it;
   the one whose answer comes second finds the other's record, and writes
-  out that outcome, not its own, or finds the file already emptied, and
+  out that outcome, not its own, or finds the file already done, and
   writes nothing, so what is left is written once, unless both record
-  theirs at the same moment); a session that finds a file leased tries it
-  again at its next replay.
+  theirs at the same moment; a write already under way when the other
+  session finishes lands, and the marks above have the next replay empty
+  it unsent); a session that finds a file leased tries it again at its
+  next replay.
 * **Fail open:** a hook's bookkeeping runs behind `.catch` or inside `try`;
   the writer never throws into a hook; every failure path ends in sent, on
   disk, or counted as dropped. An environment variable a policy refuses reads
@@ -843,7 +855,7 @@ test kit, with no session, sign-in, GCP or network: `$.http.fetch`,
 `$.process.run`, `$.fs` and `$.store` are stubbed, and `mock.clock` drives the
 timers; the `$.fs` stubs measure files in UTF-8 bytes and refuse a file over
 4 MiB, and the `$.store` stub a store over 4 MiB of JSON in all, as the host
-does. 251 tests cover the captured rows and their spans,
+does. 262 tests cover the captured rows and their spans,
 subagent runs in the order the host raises them (one invocation and one
 trace for the turn, a span per run, a SubagentStart that comes late or never),
 the session-start row raised before or during `session.start`'s setup,
@@ -910,7 +922,8 @@ And when BigQuery cannot find the dataset or table:
 * a table the mod made that BigQuery still cannot find after two minutes,
   on a send or on a replay with nothing queued, and table creation turned
   off;
-* a 400 after the notice: the notice clears, and the rows are refused;
+* a 400 after the notice, the access-denied one included: the notice clears,
+  and the rows are refused;
 * a reload clearing the status line the previous load set, and the refused
   count on the status line covering every row since rows last landed.
 
@@ -964,7 +977,18 @@ And the replay that runs by itself while nothing is queued:
   one the later record has as written replayed; a replay whose answer
   comes after another session wrote out its outcome going on with that
   one, also when that record cannot be read at first, and writing nothing
-  of its own once that session has emptied the file;
+  of its own once that session has emptied the file, its mark gone or not;
+  a file of what is left whose parent was emptied going whatever an older
+  record of the parent says, and one the parent's done mark does not name
+  emptied unsent; a record write cut off before its first byte leaving the
+  file waiting; a write of a file of what is left that lands after another
+  session finished the outcome and replayed that file emptied unsent; an
+  outcome whose first record lands after another session finished the file
+  stopping at the done mark; a writer back from reading the file to resume
+  writing nothing once another writer finished it, its records in the store
+  or beside the file; no record written again when it already holds the
+  outcome; a writer that takes over in the same session holding what the
+  one before held; records of files emptied more than a day ago emptied;
 * it stops between requests for a row queued meanwhile, which goes first,
   with no backoff, and then goes on;
 * rows refused on a send and then on a replay all counted on the status

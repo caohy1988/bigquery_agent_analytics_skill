@@ -405,6 +405,14 @@ test('a project the redaction mistakes for a credential name still gets the setu
   expect(await statusText($)).toMatch(/^notice \(since .*\): rows are not being written: BigQuery cannot find the dataset auth-service-123\.agent_analytics; to fix, create it with the mod's setup\.sh; .*; \d+ row\(s\) waiting; cause: /m)
 })
 
+test('a mod directory with a line break in its path gets the fix with no command: a command on two lines cannot be copied whole', async () => {
+  const w = handBuilt([DATASET_MISSING], '/opt/mods\nbigquery-agent-analytics-mod')
+  w.enqueue()
+  await w.writer.flush()
+  expect(w.writer.problem).toMatchObject({ kind: 'destination', missing: 'dataset' })
+  expect(w.writer.setupCommand()).toBeNull()
+})
+
 test('a mod directory whose path redaction would change gets the fix with no command, rather than a command that would not run', async () => {
   const w = handBuilt([DATASET_MISSING], '/opt/token=abcdefghijklmnopqrstuvwxyz0123456789/bigquery-agent-analytics-mod')
   w.enqueue()
