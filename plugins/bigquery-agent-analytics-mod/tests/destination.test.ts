@@ -362,7 +362,12 @@ test('a long setup command that fits the band shows whole there and in the trans
   expect(notice.endsWith(`. ${run}; this clears once rows are written again.`)).toBe(true)
 })
 
-test('/bqaa-status shows the setup command whole when the names around it are very long', { options: { project: 'my-gcp-project', dataset: 'd'.repeat(1014), table: 't'.repeat(1024) } }, async ($, on) => {
+// Names this long put the lines before the command past the 8,000
+// characters /bqaa-status keeps, wherever the mod's directory is, unless
+// those lines are cut first.
+const LONG_PROJECT = `${'p'.repeat(300)}.example:my-gcp-project`
+
+test('/bqaa-status shows the setup command whole when the names around it are very long', { options: { project: LONG_PROJECT, dataset: 'd'.repeat(1014), table: 't'.repeat(1024) } }, async ($, on) => {
   const world = setUp(on, { BQAA_AUTO_CREATE_TABLE: 'false' })
   world.replies = [TABLE_MISSING]
   await startSession($)
@@ -370,7 +375,7 @@ test('/bqaa-status shows the setup command whole when the names around it are ve
   const d = 'd'.repeat(1014)
   const t = 't'.repeat(1024)
   const setup = (await statusText($)).split('\n').find(l => l.startsWith('setup: ')) ?? ''
-  expect(setup).toMatch(new RegExp(`^setup: BQAA_PROJECT_ID=my-gcp-project BQAA_DATASET=${d} BQAA_TABLE=${t} BQAA_VIEWS_DATASET=${d}_reporting BQAA_LOCATION=US bash '/[^']*/setup\\.sh'$`))
+  expect(setup).toMatch(new RegExp(`^setup: BQAA_PROJECT_ID=${LONG_PROJECT} BQAA_DATASET=${d} BQAA_TABLE=${t} BQAA_VIEWS_DATASET=${d}_reporting BQAA_LOCATION=US bash '/[^']*/setup\\.sh'$`))
 })
 
 test('a setup command longer than /bqaa-status could show whole is not offered', { options: { project: `${'a'.repeat(4000)}.example:my-gcp-project`, dataset: 'agent_analytics' } }, async ($, on) => {

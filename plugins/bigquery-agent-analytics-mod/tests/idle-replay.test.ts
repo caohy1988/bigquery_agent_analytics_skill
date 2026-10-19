@@ -293,7 +293,7 @@ test('a file another session holds while an idle replay runs stays due: once tha
   expect(idsOf(world.insertCalls().at(-1)?.body ?? '{"rows":[]}')).toEqual(parked)
 })
 
-test('a replay that cannot empty its file once the rows land leaves them due: once writes work again, an idle replay sends them again and empties it', { options: OPTIONS }, async ($, on) => {
+test('a replay that cannot empty its file once the rows land sends nothing again; once writes work, a replay empties it', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on)
   world.replies = [DATASET_MISSING]
   await startSession($)
@@ -302,15 +302,15 @@ test('a replay that cannot empty its file once the rows land leaves them due: on
   expect(parked.length).toBe(1)
   world.replies = [OK_INSERT]
   world.failWrites = true
-  await idleFor(world, 1)
-  // Sent, but the file could not be emptied: the row is still there.
-  const requests = world.insertCalls().filter(f => f.answered === 200).length
-  expect(requests > 0).toBe(true)
+  await idleFor(world, 2)
+  // Sent once; the file could not be emptied, and nothing goes again.
+  const landed = () => world.insertCalls().filter(f => f.answered === 200).length
+  expect(landed()).toBe(1)
   expect(parkedIn(world, 'retry')).toEqual(parked)
-  expect(await statusText($)).toMatch(/last backfill \(recovery, [^)]*\): 0 file\(s\), 0 rows sent, 0 left; stopped: .*EACCES/)
+  expect(await statusText($)).toMatch(/last error \([^)]*\): could not empty .* after its replay \(its rows landed or are in newer files\)/)
   world.failWrites = false
   await idleFor(world, 2)
-  expect(world.insertCalls().filter(f => f.answered === 200).length > requests).toBe(true)
+  expect(landed()).toBe(1)
   expect(deadLetterRows(world).length).toBe(0)
 })
 
@@ -462,4 +462,188 @@ test('an idle replay of many parked rows stops between requests for rows queued 
   for (let t = 0; t < 4; t += 1) await tick()
   expect(sent).toEqual([['1'.repeat(32)], ['4'.repeat(32)], ['2'.repeat(32)], ['3'.repeat(32)]])
   expect([...files.values()].reduce((rows, text) => rows + parseFile(text).lines.length, 0)).toBe(0)
+})
+
+// insertAll refused the first row of the request and asked for the second again.
+const FIRST_REFUSED_SECOND_AGAIN = {
+  status: 200,
+  text: JSON.stringify({
+    insertErrors: [
+      { index: 0, errors: [{ reason: 'invalid', message: 'no such field: extra' }] },
+      { index: 1, errors: [{ reason: 'backendError', message: 'try again' }] },
+    ],
+  }),
+}
+
+test('a refused row whose file cannot be emptied is sent once: no further request or file, and the file is emptied once it can be', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  world.replies = [DATASET_MISSING]
+  await startSession($)
+  await leaveIdle($, world)
+  const source = [...world.files.keys()].find(path => path.startsWith(`${PARTITION_DIR}/retry-`)) ?? ''
+  const parked = parkedIn(world, 'retry')
+  // The file can be read, but not emptied; new files can be written.
+  world.refuseWrite = (path, text) => path === source && text === ''
+  world.replies = [FIRST_REFUSED]
+  const requests = world.insertCalls().length
+  await idleFor(world, 5)
+  expect(world.insertCalls().length).toBe(requests + 1)
+  expect(parkedIn(world, 'rejected')).toEqual(parked)
+  expect([...world.files].filter(([path, text]) => path.includes('/rejected-') && text !== '').length).toBe(1)
+  expect(world.files.get(source) !== '').toBe(true)
+  // The record that its rows are written out: a new writer (the next
+  // session.start) sends none of it either.
+  expect(world.store.get(`replayed:${TABLE_REF}/${source.split('/').pop()}`)).toEqual({ size: new TextEncoder().encode(world.files.get(source) ?? '').length })
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' })
+  await idleFor(world, 2)
+  expect(world.insertCalls().length).toBe(requests + 1)
+  expect([...world.files].filter(([path, text]) => path.includes('/rejected-') && text !== '').length).toBe(1)
+  world.refuseWrite = null
+  await idleFor(world, 2)
+  expect(world.files.get(source)).toBe('')
+  expect(world.insertCalls().length).toBe(requests + 1)
+  expect(parkedIn(world, 'rejected')).toEqual(parked)
+  expect([...world.store.keys()].some(key => key.startsWith('replayed:'))).toBe(false)
+})
+
+test('a replay that can write only part of what it left sends nothing again, writes the rest under the same names once it can, then the rows left go on', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  const source = `${PARTITION_DIR}/retry-20261013T200102003Z-earlier-1.jsonl`
+  const refused = 'a'.repeat(32)
+  const asked = 'b'.repeat(32)
+  world.files.set(source, packFiles([line(refused, 'retry'), line(asked, 'retry')])[0] as string)
+  // New retry files cannot be written; rejected ones can.
+  world.refuseWrite = (path, text) => path !== source && path.startsWith(`${PARTITION_DIR}/retry-`) && text !== ''
+  world.replies = [FIRST_REFUSED_SECOND_AGAIN]
+  await startSession($)
+  await world.clock.advance(20_000)
+  const sent = (id: string) => world.sentRows().filter(row => row.event_id === id).length
+  expect(sent(refused)).toBe(1)
+  expect(parkedIn(world, 'rejected')).toEqual([refused])
+  const files = world.files.size
+  await idleFor(world, 5)
+  expect(sent(refused)).toBe(1)
+  expect(sent(asked)).toBe(1)
+  expect(world.files.size).toBe(files)
+  // Writes work again: the rest is written, the source emptied, and the row
+  // asked for again goes on, the refused one never.
+  world.refuseWrite = null
+  world.replies = [OK_INSERT]
+  await idleFor(world, 3)
+  expect(world.files.get(source)).toBe('')
+  expect(sent(refused)).toBe(1)
+  expect(sent(asked)).toBe(2)
+  expect(parkedIn(world, 'retry')).toEqual([])
+  expect(parkedIn(world, 'rejected')).toEqual([refused])
+})
+
+test('a file whose rows a replay of another session already wrote out is not sent again: it is only emptied', { options: OPTIONS }, async ($, on) => {
+  const source = `${PARTITION_DIR}/retry-20261013T200102003Z-earlier-1.jsonl`
+  const text = packFiles([line('c'.repeat(32), 'retry')])[0] as string
+  const written = packFiles([line('c'.repeat(32), 'rejected')])[0] as string
+  const world = setUp(on, {}, { [`replayed:${TABLE_REF}/retry-20261013T200102003Z-earlier-1.jsonl`]: { size: new TextEncoder().encode(text).length } })
+  world.files.set(source, text)
+  world.files.set(`${PARTITION_DIR}/rejected-20261013T200103003Z-earlier-2.jsonl`, written)
+  await startSession($)
+  await world.clock.advance(20_000)
+  expect(world.sentRows().some(row => row.event_id === 'c'.repeat(32))).toBe(false)
+  expect(world.files.get(source)).toBe('')
+  expect([...world.store.keys()].some(key => key.startsWith('replayed:'))).toBe(false)
+  expect(parkedIn(world, 'rejected')).toEqual(['c'.repeat(32)])
+})
+
+test("a row an earlier session refused, refused again by /bqaa-backfill while access is denied, counts once in the band", { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  world.files.set(`${PARTITION_DIR}/rejected-20261013T200102003Z-earlier-1.jsonl`, packFiles([line('d'.repeat(32), 'rejected')])[0] as string)
+  await startSession($)
+  await world.clock.advance(5000)
+  world.replies = [DENIED]
+  await $.command.run({ command: 'bqaa-backfill', args: '', ...COMMAND })
+  await world.clock.advance(1000)
+  expect((await band($)).waiting).toBe(' 1 row(s) waiting.')
+})
+
+test('a later request of the same replay that lands rows ends the refused count of the requests before it', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  world.files.set(`${PARTITION_DIR}/retry-20261013T200102003Z-earlier-1.jsonl`, packFiles([line('e'.repeat(32), 'retry')])[0] as string)
+  world.files.set(`${PARTITION_DIR}/retry-20261013T200102003Z-earlier-2.jsonl`, packFiles([line('f'.repeat(32), 'retry')])[0] as string)
+  await startSession($)
+  await world.clock.advance(5000)
+  world.replies = [FIRST_REFUSED, OK_INSERT]
+  await $.command.run({ command: 'bqaa-backfill', args: '', ...COMMAND })
+  await world.clock.advance(1000)
+  expect(parkedIn(world, 'rejected')).toEqual(['e'.repeat(32)])
+  expect(world.statusLines.at(-1)).toBeUndefined()
+})
+
+test('a row refused again after rows landed counts again: the count is of rows refused since rows last landed', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  world.replies = [INVALID]
+  await startSession($)
+  await world.clock.advance(5000)
+  expect(parkedIn(world, 'rejected').length).toBe(1)
+  expect(world.statusLines.at(-1) ?? '').toMatch(/^BQAA: 1 row\(s\) refused/)
+  // Rows land, then /bqaa-backfill sends the refused row, refused again.
+  world.replies = [OK_INSERT]
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
+  await world.clock.advance(5000)
+  expect(world.statusLines.at(-1)).toBeUndefined()
+  world.replies = [INVALID]
+  await $.command.run({ command: 'bqaa-backfill', args: '', ...COMMAND })
+  await world.clock.advance(1000)
+  expect(world.statusLines.at(-1) ?? '').toMatch(/^BQAA: 1 row\(s\) refused/)
+})
+
+test('a row denied again under a later access-denied notice counts in that notice', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  world.replies = [DENIED]
+  await startSession($)
+  await world.clock.advance(5000)
+  expect((await band($)).waiting).toBe(' 1 row(s) waiting.')
+  // Access comes back (rows land), then goes again.
+  world.replies = [OK_INSERT]
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
+  await world.clock.advance(5000)
+  expect((await band($)).line).toBeUndefined()
+  world.replies = [DENIED]
+  await $.command.run({ command: 'bqaa-backfill', args: '', ...COMMAND })
+  await world.clock.advance(1000)
+  expect((await band($)).waiting).toBe(' 1 row(s) waiting.')
+})
+
+test('/bqaa-backfill run again with BigQuery still refusing a row counts it once on the status line', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  world.replies = [INVALID]
+  await startSession($)
+  await world.clock.advance(5000)
+  for (let i = 0; i < 2; i += 1) {
+    await $.command.run({ command: 'bqaa-backfill', args: '', ...COMMAND })
+    await world.clock.advance(1000)
+  }
+  expect(world.insertCalls().length).toBe(3)
+  expect(world.statusLines.at(-1) ?? '').toMatch(/^BQAA: 1 row\(s\) refused/)
+})
+
+test('a file written out under a kept outcome is never written again: one /bqaa-backfill sent and emptied meanwhile stays empty', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  const source = `${PARTITION_DIR}/retry-20261013T200102003Z-earlier-1.jsonl`
+  const refused = 'a'.repeat(32)
+  world.files.set(source, packFiles([line(refused, 'retry'), line('b'.repeat(32), 'retry')])[0] as string)
+  world.refuseWrite = (path, text) => path !== source && path.startsWith(`${PARTITION_DIR}/retry-`) && text !== ''
+  world.replies = [FIRST_REFUSED_SECOND_AGAIN]
+  await startSession($)
+  await world.clock.advance(20_000)
+  const rejectedFile = [...world.files.keys()].find(path => path.startsWith(`${PARTITION_DIR}/rejected-`)) ?? ''
+  expect(parkedIn(world, 'rejected')).toEqual([refused])
+  // The refused row's cause is fixed, and /bqaa-backfill sends its file.
+  world.replies = [OK_INSERT]
+  await $.command.run({ command: 'bqaa-backfill', args: '', ...COMMAND })
+  await world.clock.advance(1000)
+  expect(world.files.get(rejectedFile)).toBe('')
+  world.refuseWrite = null
+  await idleFor(world, 3)
+  expect(world.files.get(rejectedFile)).toBe('')
+  expect(world.files.get(source)).toBe('')
+  expect(parkedIn(world, 'rejected')).toEqual([])
+  expect(world.sentRows().filter(row => row.event_id === refused).length).toBe(2)
 })

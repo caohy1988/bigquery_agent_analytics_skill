@@ -41,8 +41,9 @@ export type World = {
   // What `$.session.id()` answers, and whether a policy refuses it.
   sessionId: string
   sessionIdRefused: boolean
-  // Makes `$.fs.write` refuse every write.
+  // Makes `$.fs.write` refuse every write, or the writes this picks.
   failWrites: boolean
+  refuseWrite: ((path: string, text: string) => boolean) | null
   // Makes `$.fs.write` wait until `releaseWrites` is called.
   hangWrites: boolean
   releaseWrites: () => void
@@ -139,6 +140,7 @@ export function setUp(on: On, env: Record<string, string> = {}, store: Record<st
     sessionId: SESSION_ID,
     sessionIdRefused: false,
     failWrites: false,
+    refuseWrite: null,
     hangWrites: false,
     releaseWrites: () => {
       for (const held of heldWrites.splice(0)) {
@@ -212,7 +214,7 @@ export function setUp(on: On, env: Record<string, string> = {}, store: Record<st
     return { value: { status: reply.status, ok: reply.status >= 200 && reply.status < 300, headers: {}, text: reply.text } }
   })
   on('fs.write', ($, e) => {
-    if (world.failWrites) return { deny: `EACCES: ${e.path}` }
+    if (world.failWrites || world.refuseWrite?.(e.path, e.text)) return { deny: `EACCES: ${e.path}` }
     if (utf8Bytes(e.text) > HOST_FILE_BYTES) return { deny: `${e.path}: over the 4 MiB file limit` }
     if (world.hangWrites) return new Promise(resolve => heldWrites.push({ path: e.path, text: e.text, resolve }))
     world.files.set(e.path, e.text)
