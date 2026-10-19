@@ -434,7 +434,7 @@ const CLOSE_READ_MS = 10_000
 function checkClosed($: EngineInterface, version: string, sessionId: string): void {
   if (closeRead !== null && Date.now() - closeReadAt < CLOSE_READ_MS) return
   closeReadAt = Date.now()
-  closeRead = $.store
+  const read: Promise<void> = $.store
     .get(closedKey(version, sessionId))
     .then(closed => {
       if (closed !== true) return
@@ -445,8 +445,10 @@ function checkClosed($: EngineInterface, version: string, sessionId: string): vo
       internalErrors += 1
     })
     .finally(() => {
-      closeRead = null
+      // A read that answers after a later one began leaves that one's guard.
+      if (closeRead === read) closeRead = null
     })
+  closeRead = read
 }
 
 // Changes the card in `$.state`: reads it, applies `change`, and writes it

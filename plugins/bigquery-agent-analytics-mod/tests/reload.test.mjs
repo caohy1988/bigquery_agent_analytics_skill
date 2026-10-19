@@ -146,6 +146,8 @@ async function load(h, options = {}, version = null) {
   const band = async () => walk(await fire('ui.render', { component: 'AbovePrompt', props: { hasSurvey: false, maxRows: 10 } }))
   const button = async () => (await band()).find(n => n.type === 'Button')
   return {
+    // The stand-in itself, and the event it reads in, for a test of it.
+    $,
     texts: async () => (await band()).filter(n => n.type === 'Text').map(n => n.props.children),
     greetings: () => lines.filter(line => line.startsWith('bqaa: BigQuery Agent Analytics mod')).length,
     toasts: () => toasts.length,
@@ -804,6 +806,50 @@ const tests = {
       now += 11_000
       assert.equal(await a.shown(), true)
       assert.equal(reads.count(), 2)
+    } finally {
+      Date.now = realNow
+    }
+  },
+  async 'the stand-in reads one moment an event, which a missed conditional write brings up to date whole, as the host\'s'() {
+    const h = host()
+    const a = await load(h)
+    const ref = key => ({ plugin: 'bigquery-agent-analytics-mod', key })
+    let go
+    const gate = new Promise(resolve => (go = resolve))
+    const first = dispatch.run({ moment: null }, async () => {
+      const x = await a.$.state.get(ref('loads'))
+      await a.$.state.get(ref('welcome'))
+      await gate
+      const missed = await a.$.state.set(ref('loads'), 9, { ifVersion: x.version })
+      return { missed, x: await a.$.state.get(ref('loads')), y: await a.$.state.get(ref('welcome')) }
+    })
+    await dispatch.run({ moment: null }, async () => {
+      await a.$.state.set(ref('loads'), 1)
+      await a.$.state.set(ref('welcome'), { probe: true })
+    })
+    go()
+    const seen = await first
+    assert.equal(seen.missed.isSet, false)
+    assert.deepEqual([seen.x.value, seen.x.version, seen.y.value, seen.y.version], [1, 1, { probe: true }, 1])
+  },
+  async 'a read of the close that answers after the next one began leaves that one alone: no third read while it waits'() {
+    const realNow = Date.now
+    try {
+      let now = 1_000_000
+      Date.now = () => now
+      const h = host()
+      const a = await load(h)
+      await a.start()
+      const waiting = []
+      h.read = key => (key === CLOSED ? new Promise(resolve => waiting.push(() => resolve(structuredClone(h.store.get(key))))) : Promise.resolve(structuredClone(h.store.get(key))))
+      assert.equal(await a.shown(), true)
+      now += 11_000
+      assert.equal(await a.shown(), true)
+      assert.equal(waiting.length, 2)
+      waiting[0]()
+      await settle()
+      assert.equal(await a.shown(), true)
+      assert.equal(waiting.length, 2)
     } finally {
       Date.now = realNow
     }

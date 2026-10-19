@@ -221,9 +221,11 @@ shows the card; the versions noted give the next version's card the one it
 replaced. What became of the card goes to keys of its own version and
 session: when rows first landed, and where (`welcome:<version>:<session>`),
 and that it was closed (`…:closed`, a key no other write touches, written
-at once on its own, behind no other write). No
-session writes another version's or session's keys, so a session left open
-never writes over a newer version another session greeted, and no write
+at once on its own, behind no other write). A
+session writes only its own landing and close keys, and the greeting key of
+the version it greets (a load that reopens the card writes it again where
+the store has none), so a session left open never writes over a newer
+version another session greeted, and no write
 that answers late, from this load of the mod or an earlier one, undoes a
 close. The card itself lives in the session's `$.state`, which a reload
 (`/reload-plugins`, or an option changed in `/config`) keeps while the
@@ -255,7 +257,7 @@ an earlier one beat takes the card over, with no second greeting; a later
 version's (an update in the session) shows its own card over the earlier
 version's, with its own greeting. Each
 writer's rows count once, however often or late it says so. If rows now go
-somewhere else (another table, or BigQuery after a dry run), the card waits
+somewhere else (another table or location, or BigQuery after a dry run), the card waits
 again until rows land there, and a prompt closes it only once they have,
 hiding it and writing the store's close at once, as Got it does; rows sent
 under the earlier configuration that land after the reload do not count,
@@ -279,7 +281,11 @@ not show. The store makes "once" a best effort:
 * two sessions started at the same moment can both show it;
 * a reload in the moment between Got it and its store write landing (its
   state write refused) shows the card again, until the write lands and the
-  band draws again;
+  band draws again; a new process in that session, the greeting's write
+  lost too, can also write the greeting line once more;
+* `/clear`, `/resume` or `/branch` in the session that shows the card ends
+  it there (the session's state starts over, and no session start brings
+  it back); the version stays greeted;
 * reinstalling the same version shows no card while the store keeps the
   record.
 
@@ -1434,7 +1440,9 @@ shows no card and greets no more, its read of the close answering or not;
 that a run whose read of the state answers after a later load showed
 another version's card leaves that card alone, with reads that see what
 stands at once too; that a read of the close that never answers stops no
-read of it ten seconds on; that a Got it, a takeover's stored close or a
+read of it ten seconds on, and one that answers after the next began
+leaves that one's turn alone; that its own `$.state` reads one moment an
+event, brought up to date whole by a missed conditional write; that a Got it, a takeover's stored close or a
 prompt in a load of the
 version before an update, its write or its reads answering late, never
 closes the card of the version after it; that of the first card writes of
