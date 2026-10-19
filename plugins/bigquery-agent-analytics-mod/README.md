@@ -277,7 +277,8 @@ not show. The store makes "once" a best effort:
   and a reload in a session that keeps no `$.state` shows it as the store
   last had it (a write that fails goes again when more rows land);
 * if they cannot be read, or the versions greeted before cannot be listed,
-  no card shows, after a reload too;
+  no card shows, after a reload too, nor where no session id is known when
+  the session starts (the card's landing and close are kept under it);
 * two sessions started at the same moment can both show it;
 * a reload in the moment between Got it and its store write landing (its
   state write refused) shows the card again, until the write lands and the
@@ -1072,7 +1073,7 @@ test kit, with no session, sign-in, GCP or network: `$.http.fetch`,
 `$.process.run`, `$.fs` and `$.store` are stubbed, and `mock.clock` drives the
 timers; the `$.fs` stubs measure files in UTF-8 bytes and refuse a file over
 4 MiB, and the `$.store` stub a store over 4 MiB of JSON in all, as the host
-does. 388 tests cover the captured rows and their spans,
+does. 389 tests cover the captured rows and their spans,
 subagent runs in the order the host raises them (one invocation and one
 trace for the turn, a span per run, a SubagentStart that comes late or never),
 the session-start row raised before or during `session.start`'s setup,
@@ -1318,7 +1319,8 @@ And the welcome card:
   it (a prompt from elsewhere leaves it), and the records that keep later
   sessions from showing it; a reload in its session showing it again as it
   was; no card, line, record or session state in a run with no one at the
-  prompt; no card and no line for a session the store has closed, its
+  prompt; no card and no line for a session whose id is not known when it
+  starts; no card and no line for a session the store has closed, its
   greeting never written, its read of that close answering or not; no card
   and no line while the store cannot list the versions greeted before, and
   the card naming the one it replaced once it can; a landing whose store
@@ -1395,9 +1397,8 @@ does, which the test kit cannot, under node 24 with a small stand-in for
 `$` (its `$.state` held for the session, its `$.store` across loads, store
 writes and reads held and let go in any order). Its `$.state` keeps a
 version for each value and lands a conditional write only at it, and every
-`$.state.get` of one event reads one moment until a write of its own brings
-it up to date (a landed write, that value; a missed one, the whole moment),
-as the host's does; its writes can be held or
+`$.state.get` of one event reads one moment until a write of its own, landed
+or missed, brings the whole moment up to date, as the host's does; its writes can be held or
 refused, its reads held. Its `$.clock.sleep` answers only in the newest
 load: a hot reload cancels the waits of the load it replaces. A load may be
 of another version of the code, its config naming that version, as after
@@ -1442,7 +1443,11 @@ another version's card leaves that card alone, with reads that see what
 stands at once too; that a read of the close that never answers stops no
 read of it ten seconds on, and one that answers after the next began
 leaves that one's turn alone; that its own `$.state` reads one moment an
-event, brought up to date whole by a missed conditional write; that a Got it, a takeover's stored close or a
+event, brought up to date whole by a conditional write of its own, landed
+or missed; that rows the version before an update lands after the updated
+version showed its card count once there; that where no session id is
+known no card shows and no one is greeted, after a reload too;
+that a Got it, a takeover's stored close or a
 prompt in a load of the
 version before an update, its write or its reads answering late, never
 closes the card of the version after it; that of the first card writes of

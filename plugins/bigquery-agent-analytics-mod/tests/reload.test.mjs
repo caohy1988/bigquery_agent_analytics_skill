@@ -39,8 +39,8 @@ const OWN = `welcome:${PLUGIN_VERSION}:${SESSION}`
 const CLOSED = `${OWN}:closed`
 const START = { surface: 'terminal', isInteractive: true, cwd: '/work' }
 // The event a call of `$` is made under: every `$.state.get` of one reads
-// one moment, as the host's does, until a write of its own brings it up to
-// date: a landed one, that value; a missed one, the whole moment.
+// one moment, as the host's does, until a write of its own, landed or
+// missed, brings the whole moment up to date.
 const dispatch = new AsyncLocalStorage()
 const settle = async () => {
   for (let i = 0; i < 200; i += 1) await Promise.resolve()
@@ -117,12 +117,12 @@ async function load(h, options = {}, version = null) {
       set: async (ref, value, options) => {
         const result = await h.stateSet(ref, value, options)
         const at = dispatch.getStore()
-        if (at?.moment && result.isSet) at.moment.set(ref.key, structuredClone(h.state.get(ref.key)))
-        else if (at?.moment) at.moment = structuredClone(h.state)
+        if (at?.moment) at.moment = structuredClone(h.state)
         return result
       },
     },
-    session: { id: async () => SESSION, version: async () => ({ version: 'test' }) },
+    // `h.noSessionId`: a host that refuses the session's id.
+    session: { id: async () => (h.noSessionId ? Promise.reject(new Error('refused by policy')) : SESSION), version: async () => ({ version: 'test' }) },
     clock: {
       every: (ms, fn) => (timers.push(() => dispatch.run({ moment: null }, fn)), { cancel() {} }),
       after: () => ({ cancel() {} }),
@@ -831,6 +831,63 @@ const tests = {
     const seen = await first
     assert.equal(seen.missed.isSet, false)
     assert.deepEqual([seen.x.value, seen.x.version, seen.y.value, seen.y.version], [1, 1, { probe: true }, 1])
+  },
+  async 'the stand-in brings the whole moment up to date after a conditional write of its own lands too, as the host\'s'() {
+    const h = host()
+    const a = await load(h)
+    const ref = key => ({ plugin: 'bigquery-agent-analytics-mod', key })
+    let go
+    const gate = new Promise(resolve => (go = resolve))
+    const first = dispatch.run({ moment: null }, async () => {
+      const x = await a.$.state.get(ref('loads'))
+      await a.$.state.get(ref('welcome'))
+      await gate
+      const kept = await a.$.state.get(ref('welcome'))
+      const landed = await a.$.state.set(ref('loads'), 5, { ifVersion: x.version })
+      return { kept, landed, y: await a.$.state.get(ref('welcome')) }
+    })
+    await dispatch.run({ moment: null }, async () => {
+      await a.$.state.set(ref('welcome'), { probe: true })
+    })
+    go()
+    const seen = await first
+    assert.equal(seen.landed.isSet, true)
+    assert.deepEqual([seen.kept.value, seen.y.value, seen.y.version], [undefined, { probe: true }, 1])
+  },
+  async 'rows the version before an update lands after the updated version showed its card count once there: that card keeps what the one it replaced had counted'() {
+    let holding = false
+    const writes = []
+    const h = host()
+    h.writeFile = () => (holding ? new Promise(resolve => writes.push(resolve)) : Promise.resolve())
+    const a = await load(h)
+    await a.start()
+    await a.land()
+    assert.equal(h.card()?.sent, 1)
+    // Its next write waits; the updated version shows its card meanwhile.
+    holding = true
+    await a.land()
+    holding = false
+    assert.equal(writes.length, 1)
+    const b = await load(h, {}, NEXT)
+    await b.start()
+    assert.equal(h.card().version, NEXT)
+    assert.equal(h.card().sent, 0)
+    writes.splice(0).forEach(go => go())
+    await settle()
+    assert.equal(h.card().sent, 1)
+    assert.ok((await b.texts()).some(t => String(t).startsWith('✓ First rows written · 1 so far')))
+  },
+  async 'where the session id cannot be read no card shows and no one is greeted, after a reload too: Got it could keep no close'() {
+    const h = host({ hold: key => key.startsWith('welcome') })
+    h.noSessionId = true
+    const a = await load(h)
+    await a.start()
+    assert.equal(await a.shown(), false)
+    const b = await load(h)
+    await b.start()
+    assert.equal(await b.shown(), false)
+    assert.equal(a.greetings() + b.greetings(), 0)
+    assert.deepEqual([h.card(), h.held.length, [...h.store.keys()].filter(key => key.startsWith('welcome')).length], [undefined, 0, 0])
   },
   async 'a read of the close that answers after the next one began leaves that one alone: no third read while it waits'() {
     const realNow = Date.now

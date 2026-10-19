@@ -266,6 +266,9 @@ async function nextLoad($: EngineInterface): Promise<number | null> {
 // instead, where it ranks above the run that has it.
 async function startWelcome($: EngineInterface, e: SessionStartInput, sessionId: string | null, start: number, ranked: Promise<number | null>): Promise<void> {
   if (!e.isInteractive || e.surface === null) return
+  // Nor where the session's id cannot be read: its landing and its close
+  // are kept under it, so Got it could not keep the card closed.
+  if (sessionId === null) return
   const key = destinationKey(config)
   const me = ownerOf(start)
   const save = (key: string, value: unknown): Promise<void> => $.store.set(key, value)
@@ -317,17 +320,22 @@ async function startWelcome($: EngineInterface, e: SessionStartInput, sessionId:
     return
   }
   if (start !== welcomeStarts || opened === null) return
-  const card: Welcome = { ...opened.welcome, owner: me, rank }
+  const shown: Welcome = { ...opened.welcome, owner: me, rank }
   // Shown only if the state still stands as read: no other load has shown
   // or changed a card since. The one that does shows it, and greets. Where
   // another has: this version's card (an earlier load's whose write answered
   // first, say), which this run takes over from there, with no greeting of
   // its own; a card a later load or run showed, left to it; or an earlier
   // one's of another version (an update in the session), which this run's
-  // card replaces, tried again at the state as it stands now.
+  // card replaces, tried again at the state as it stands now. What the card
+  // it replaces had counted of each writer it keeps: rows that writer lands
+  // from here count once, as rows landed while this card shows.
   let version = held.version
+  let replaced = held.value
   let isSet = false
+  let card = shown
   for (let i = 0; i < 8 && !isSet; i += 1) {
+    card = { ...shown, counted: { ...(replaced?.counted ?? {}) } }
     try {
       isSet = (await $.state.set(WELCOME_STATE, card, { ifVersion: version })).isSet
     } catch {
@@ -344,6 +352,7 @@ async function startWelcome($: EngineInterface, e: SessionStartInput, sessionId:
     }
     if (isOurs(now.value)) return takeOver($, sessionId as string, start, rank)
     if (now.value !== null && (now.value.rank ?? 0) > rank) return
+    replaced = now.value
     version = now.version
   }
   if (!isSet) return

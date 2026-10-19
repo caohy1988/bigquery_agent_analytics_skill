@@ -249,6 +249,18 @@ test('rows parked while the dataset was missing land by replay in an idle sessio
   expect(world.toasts.at(-1)).toBe(`BQAA: first rows landed in ${TABLE}`)
 })
 
+test('a session whose id is not known when it starts shows no card and greets no one: Got it could keep no close of it', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on, {}, {})
+  // The host refuses the id, and no SessionStart named it before.
+  world.sessionIdRefused = true
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work/my-repo' })
+  await world.clock.settle()
+  expect(await band($)).toEqual({ texts: ['drawn beneath'], boxed: false, button: undefined })
+  expect(welcomeLines(world.transcript)).toEqual([])
+  expect(greeted(world)).toBeUndefined()
+  expect([...world.store.keys()].filter(key => key.startsWith('welcome'))).toEqual([])
+})
+
 test('a run with no one at the prompt shows no card and leaves the store and the session state alone', { options: OPTIONS }, async ($, on) => {
   const written: string[] = []
   on('state.set', ($, e, next) => {
