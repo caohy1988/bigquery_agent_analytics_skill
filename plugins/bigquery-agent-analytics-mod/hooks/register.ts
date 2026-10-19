@@ -337,7 +337,7 @@ export const register: Register = (on, registered) => {
       internalErrors += 1
     }
     try {
-      await $.command.register({ name: 'bqaa-backfill', description: 'BigQuery Agent Analytics: resend rows parked in the dead-letter directory', immediate: true })
+      await $.command.register({ name: 'bqaa-backfill', description: 'BigQuery Agent Analytics: resend rows parked in the dead-letter directory', argumentHint: '[force]', immediate: true })
     } catch {
       internalErrors += 1
     }
@@ -555,10 +555,13 @@ export const register: Register = (on, registered) => {
       const elsewhere = summary.elsewhere > 0 ? ` ${summary.elsewhere} file(s) elsewhere in ${config.deadLetterDir} are for other tables or an older layout; they are replayed only under a configuration for their table.` : ''
       return say(`BigQuery Agent Analytics mod: no dead-letter files for ${tableRef(config)} in ${summary.dir}.${elsewhere}`)
     }
-    // Runs in the background: the command returns now. Its result is a
-    // transcript line.
+    // `force` replays afresh, too, a file another session's replay holds (its
+    // mark, or its record cut off part-way): for a session that stopped
+    // mid-replay. Runs in the background: the command returns now. Its
+    // result is a transcript line.
+    const force = (e.args ?? '').trim() === 'force'
     void current
-      .backfill(['spill', 'retry', 'rejected'], 'command')
+      .backfill(['spill', 'retry', 'rejected'], force ? 'force' : 'command')
       .then(report => {
         const refused = report.rowsRefused ? `, ${report.rowsRefused} of them refused` : ''
         const other = report.otherTableRows ? ` (${report.otherTableRows} for another table)` : ''

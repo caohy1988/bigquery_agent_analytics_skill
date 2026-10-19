@@ -109,10 +109,12 @@ export const encodeLines = (lines: readonly DeadLetterLine[]): string[] => packF
 // The bodies `packFiles` seals, for a writer that counts each file's lines.
 export const packBodies = (lines: readonly string[]): string[] => packLines(lines, BODY_BYTES)
 
-export const fileName = (kind: DeadLetterKind, atMs: number, session: string | null, seq: number): string => {
+export const fileName = (kind: DeadLetterKind, atMs: number, session: string | null, seq: number, writer?: string): string => {
   const stamp = new Date(atMs).toISOString().replace(/[-:]/g, '').replace('.', '')
   const who = (session ?? 'nosession').replace(/[^A-Za-z0-9]/g, '').slice(0, 12) || 'nosession'
-  return `${kind}-${stamp}-${who}-${seq}.jsonl`
+  // The writer's own name, where given: two writers of one session (one
+  // taking over from the other) never make the same name.
+  return `${kind}-${stamp}-${who}-${writer === undefined ? '' : `${writer}-`}${seq}.jsonl`
 }
 
 export const kindOf = (name: string): DeadLetterKind | null => {

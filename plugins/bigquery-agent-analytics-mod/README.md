@@ -651,20 +651,24 @@ GROUP BY model
   it sends any of a file's rows, a replay writes its own mark beside the
   file (`outcome-sending-`, the writer's name, and the file's), a file no
   other writer writes or empties, and reads the marks and the file's record
-  back: another writer's mark (unless `/bqaa-backfill` asked for the file
-  afresh), an outcome recorded or the file done meanwhile, and it sends
-  none of the file and lets its own mark go. One that cannot write its mark
+  back: another writer's mark (unless `/bqaa-backfill force` asked for the
+  file afresh), an outcome recorded or the file done meanwhile, and it
+  sends none of the file and lets its own mark go. One that cannot write its mark
   sends none of it either: the rows wait. A replay that changes nothing
   (rows only asked for again, or no answer), or that finishes the file,
   lets its own mark go, so each try writes its one small file twice and
   adds no file per try. Each writer (each session, and each load of the mod
   in it) adds one such file beside a file it replays, emptied once it lets
-  its mark go; the API has no delete, so the emptied files stay (empty
-  files are safe to remove). A writer that finds another writer's mark,
-  whole or cut off part-way, and no outcome recorded (that writer still at
-  it, unable to write its record, or stopped after sending) sends none of
-  the file by itself: its rows may have been refused. `/bqaa-backfill`,
-  asked to send it, replays it afresh. The writer that takes over when the
+  its mark go, and not read once empty; the API has no delete, so the
+  emptied files stay (empty files are safe to remove). A writer that finds
+  another writer's mark, whole or cut off part-way, and no outcome recorded
+  (that writer still at it, unable to write its record, or stopped after
+  sending) sends none of the file, `/bqaa-backfill` included: its rows may
+  have been refused, and that writer may yet record what became of them.
+  `/bqaa-backfill force` replays it afresh, for a session that stopped
+  mid-replay; run while that session is in fact still replaying the file,
+  it can send a refused row once more, as two replays of one file each
+  keep what they learned. The writer that takes over when the
   mod reloads in a session holds the outcomes the one before it held, an
   outcome that one's replay comes to after the reload included, but not
   its marks: a mark of the one before whose outcome it does not hold keeps
@@ -681,19 +685,20 @@ GROUP BY model
   numbered, and a writer reads the later whole one, so an update cut off
   part-way leaves the one before it whole. A record cut off with none
   whole behind it means nothing of what is left was written: the writer
-  that holds the outcome writes it again, any other replay that runs by
-  itself leaves the file waiting, and `/bqaa-backfill`, asked to send it,
-  replays it afresh. An empty one of those files beside a file that still
+  that holds the outcome writes it again, any other replay leaves the file
+  waiting, and `/bqaa-backfill force` replays it afresh. An empty one of those files beside a file that still
   holds its rows counts as cut off too (a write that stopped before its
   first byte). Once every file of what is left is written, the record is
-  written as the mark that the file is done, in a file of its own
-  (`outcome-done-` and its name), which no write of a record goes to, so
-  no late write of another session's takes it over; then the replayed
-  file is emptied, and the store's copy of the record goes. The mark is
-  never written again: a late copy of a finished file is emptied with the
-  mark left as it was. One cut off part-way, with no other record whole,
-  counts as a record cut off (the file may have been done): the file
-  waits, and `/bqaa-backfill`, asked to send it, replays it afresh. The
+  written as the mark that the file is done, in a file of the writer's
+  own (`outcome-done-`, the writer's name, and the file's), which no write
+  of a record goes to and no other writer writes, so no late write of
+  another session's, a done mark of its own still being written included,
+  takes it away; then the replayed file is emptied, and the store's copy
+  of the record goes. A writer that finds a done mark never writes one:
+  a late copy of a finished file is emptied with the marks left as they
+  were. One cut off part-way, with no other record whole, counts as a
+  record cut off (the file may have been done): the file waits, and
+  `/bqaa-backfill force` replays it afresh. The
   mark is read before any other record: a late write of another session's copy of
   a file it left is then emptied unsent, another session's late outcome
   for it stops there, and a file of what is left that the mark does not
@@ -719,26 +724,31 @@ GROUP BY model
   (one may since have been replayed and emptied), then empties the file,
   and sends none of its rows again. A record that cannot be read leaves
   its file waiting for the next replay, never taken for no record. A file
-  a replay that runs by itself leaves waiting (its record cut off or
-  unreadable, or not writable, another writer's mark beside it, or its own
-  mark not written) holds up none of the files after it, and `/bqaa-status`,
+  a replay leaves waiting (its record cut off or unreadable, or not
+  writable, another writer's mark beside it, or its own mark not written)
+  holds up none of the files after it, and `/bqaa-status`,
   like the `/bqaa-backfill` transcript line, says why the first such file
   was left (`left waiting:`). A file
   that cannot be emptied stays on disk, its rows landed or in the newer
   files, and each replay tries to empty it. A file over 4 MiB, which the
   API cannot read, is reported by `/bqaa-status` and the backfill instead
-  of being passed over. A per-file lease in `$.store` keeps two sessions
-  from replaying the same file at once (best effort: of two that read the
-  lease at the same moment, one that reads the other's mark back beside its
-  own sends none of the file, so at most one sends it, and if each reads
-  the other's, neither does, and the next replay sends it; a
-  `/bqaa-backfill` that sends past another writer's mark, and whose answer
-  comes second, finds the other's record, and writes out that outcome, not
-  its own, or finds the file already done, and writes nothing, so what is
-  left is written once, unless both record theirs at the same moment; a
-  write already under way when the other session finishes lands, and the
-  marks above have the next replay empty it unsent); a session that finds a
-  file leased tries it again at its next replay.
+  of being passed over. A file read before its completion record was
+  written keeps its table due, so the paced replays read it again and send
+  it once it is whole; one never finished costs those reads and nothing
+  more. A per-file lease in `$.store` keeps two sessions from replaying the
+  same file at once (best effort: of two that read the lease at the same
+  moment, one that reads the other's mark back beside its own sends none of
+  the file, so at most one sends it, and if each reads the other's,
+  neither does, and the next replay sends it; a `/bqaa-backfill force` that
+  sends past another writer's mark, and whose answer comes second, finds
+  the other's record, and writes out that outcome, not its own, or finds
+  the file already done, and writes nothing, so what is left is written
+  once, unless both record theirs at the same moment; a write already under
+  way when the other session finishes lands, and the marks above have the
+  next replay empty it unsent); a session that finds a file leased tries
+  it again at its next replay. Files a replay writes are named with the
+  writer's name too, so two writers of one session never make the same
+  name.
 * **Fail open:** a hook's bookkeeping runs behind `.catch` or inside `try`;
   the writer never throws into a hook; every failure path ends in sent, on
   disk, or counted as dropped. An environment variable a policy refuses reads
@@ -758,7 +768,10 @@ never payloads or tokens (the agent reads a command's output too).
   large to read or without a completion record, the last backfill.
 * `/bqaa-flush`: send the queue now instead of at the next interval.
 * `/bqaa-backfill`: resend the configured table's dead-letter files in the
-  background; a dim transcript line reports the result.
+  background; a dim transcript line reports the result, and why any file
+  was left waiting. It leaves a file another session's replay holds (its
+  mark, or its record cut off part-way); `/bqaa-backfill force` replays
+  such a file afresh, for a session that stopped mid-replay.
 
 When BigQuery refuses rows or retries run out, the mod also sets a status line
 under the prompt (`⚠ bigquery-agent-analytics-mod: …`) until rows land
@@ -897,7 +910,7 @@ test kit, with no session, sign-in, GCP or network: `$.http.fetch`,
 `$.process.run`, `$.fs` and `$.store` are stubbed, and `mock.clock` drives the
 timers; the `$.fs` stubs measure files in UTF-8 bytes and refuse a file over
 4 MiB, and the `$.store` stub a store over 4 MiB of JSON in all, as the host
-does. 292 tests cover the captured rows and their spans,
+does. 297 tests cover the captured rows and their spans,
 subagent runs in the order the host raises them (one invocation and one
 trace for the turn, a span per run, a SubagentStart that comes late or never),
 the session-start row raised before or during `session.start`'s setup,
@@ -1013,7 +1026,8 @@ And the replay that runs by itself while nothing is queued:
   and the done mark left once the source is emptied; a first record cut off
   with none whole, written
   again by the writer that holds the outcome, left waiting by any other
-  replay that runs by itself, and replayed afresh by `/bqaa-backfill`; a
+  replay, `/bqaa-backfill` included, and replayed afresh by
+  `/bqaa-backfill force`; a
   file of what is left written while its record could not be updated, not
   replayed until the record has it, its rows then going once; one replayed
   once its parent's record names other files, and waiting while that
@@ -1051,7 +1065,8 @@ And the replay that runs by itself while nothing is queued:
   writer's mark away;
   a replay that sent rows and can record its outcome nowhere keeping every
   other session from sending the file, its writer finishing it once it
-  can, and `/bqaa-backfill` replaying it afresh once that writer is gone;
+  can, and `/bqaa-backfill force` replaying it afresh once that writer is
+  gone, `/bqaa-backfill` waiting as other replays do;
   a replay that changes nothing letting its mark go, and only its own; a
   mark its writer could not let go being that writer's own, its successor
   in the same session waiting on it as another session does; a file
@@ -1059,14 +1074,24 @@ And the replay that runs by itself while nothing is queued:
   copy of a finished file emptied with its done mark left as it was, also
   when every write of that mark is cut off and the emptying fails, and one
   another session writes while a writer writes the same outcome out never
-  written again by that writer; a done mark cut off part-way, with no other record, leaving the file waiting
-  and `/bqaa-backfill` replaying it afresh; a file of what is left that the record
+  written again by that writer; a done mark still being written when
+  another writer finished the file, landing cut off, in a file of its own,
+  taking nothing from that writer's; `/bqaa-backfill` sending none of a
+  file another session's replay is sending, saying why in its transcript
+  line, and `/bqaa-backfill force` replaying such a file afresh; two
+  writers of one session never giving two files one name; a done
+  mark cut off part-way, with no other record, leaving the file waiting,
+  for `/bqaa-backfill` too, and `/bqaa-backfill force` replaying it
+  afresh; a file of what is left that the record
   of its emptied parent does not name emptied unsent, the done mark there
   or not; the done mark letting a later replay empty a file the store's
   record of cannot be read, and reporting the file's rows left and
   refused;
 * it stops between requests for a row queued meanwhile, which goes first,
   with no backoff, and then goes on;
+* a retry file it read before its completion record was written is sent
+  once it is whole, and one never finished makes no request or file over
+  ten minutes of paced reads;
 * rows refused on a send and then on a replay all counted on the status
   line, which a replay whose rows are only asked for again leaves as it
   was, and a later request of the same replay that lands rows ends; a
