@@ -294,13 +294,15 @@ async function startWelcome($: EngineInterface, e: SessionStartInput, sessionId:
   if (isOurs(held.value)) return takeOver($, sessionId as string, start, rank)
   let opened: { welcome: Welcome; isNew: boolean } | null
   try {
-    const [latest, greeted] = await Promise.all([$.store.get(WELCOME_KEY), $.store.get(greetedKey(PLUGIN_VERSION))])
-    if (start !== welcomeStarts) return
+    // This session's close is read whether or not its greeting is there: Got
+    // it may have been written while the greeting's write was lost, and a
+    // resumed session (no state) then shows no card and greets no more.
+    const [latest, greeted, closed] = await Promise.all([$.store.get(WELCOME_KEY), $.store.get(greetedKey(PLUGIN_VERSION)), sessionId === null ? undefined : $.store.get(closedKey(PLUGIN_VERSION, sessionId))])
+    if (start !== welcomeStarts || closed === true) return
     let landing: unknown
-    let closed: unknown
     let versions: string[] = []
     if (sessionId !== null && greetedBy(latest, greeted)?.sessionId === sessionId) {
-      ;[landing, closed] = await Promise.all([$.store.get(cardKey(PLUGIN_VERSION, sessionId)), $.store.get(closedKey(PLUGIN_VERSION, sessionId))])
+      landing = await $.store.get(cardKey(PLUGIN_VERSION, sessionId))
     } else if (greetedBy(latest, greeted) === null) {
       // A new card: the versions greeted before name the one it replaces.
       try {

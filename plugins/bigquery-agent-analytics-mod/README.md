@@ -237,7 +237,9 @@ the store has wins over an open card in the state (a close whose state
 write was refused included). A load draws the card only once it has read
 the store's close for it, once more after taking the card over, so one
 whose reads have not answered, or never do, draws none, and a Got it in
-another load while it took the card over hides it. Each draw reads the
+another load while it took the card over hides it. That close is read
+whether or not the store has the greeting: a session resumed after Got it,
+its greeting's write lost, shows no card and greets no more. Each draw reads the
 store's close again in the background, so a close another load wrote late
 (its state write refused) hides the card once it lands, with no reload and
 no press. Of two loads, the later one shows the card: each session start
@@ -1055,7 +1057,7 @@ test kit, with no session, sign-in, GCP or network: `$.http.fetch`,
 `$.process.run`, `$.fs` and `$.store` are stubbed, and `mock.clock` drives the
 timers; the `$.fs` stubs measure files in UTF-8 bytes and refuse a file over
 4 MiB, and the `$.store` stub a store over 4 MiB of JSON in all, as the host
-does. 381 tests cover the captured rows and their spans,
+does. 383 tests cover the captured rows and their spans,
 subagent runs in the order the host raises them (one invocation and one
 trace for the turn, a span per run, a SubagentStart that comes late or never),
 the session-start row raised before or during `session.start`'s setup,
@@ -1301,7 +1303,8 @@ And the welcome card:
   it (a prompt from elsewhere leaves it), and the records that keep later
   sessions from showing it; a reload in its session showing it again as it
   was; no card, line, record or session state in a run with no one at the
-  prompt; an
+  prompt; no card and no line for a session the store has closed, its
+  greeting never written, its read of that close answering or not; an
   update back to an older version greeted as a change;
 * a store read or write that never answers holding up nothing, the session's
   start included; rows that land while the store is read; a read that
@@ -1371,9 +1374,10 @@ the same version: the welcome card greets an update by the latter.
 does, which the test kit cannot, under node 24 with a small stand-in for
 `$` (its `$.state` held for the session, its `$.store` across loads, store
 writes and reads held and let go in any order). Its `$.state` keeps a
-version for each value and lands a conditional write only at it, as the
-host's does, and its writes can be held or refused, its reads held. Its
-`$.clock.sleep` answers only in the newest load: a hot reload cancels the
+version for each value and lands a conditional write only at it, and every
+`$.state.get` of one event reads one moment until a write of its own brings
+that value up to date, as the host's does; its writes can be held or
+refused, its reads held. Its `$.clock.sleep` answers only in the newest load: a hot reload cancels the
 waits of the load it replaces. It checks that a card closed
 before a reload stays closed while the close is still being written; that
 a greeting still being written gives one transcript line across loads,
@@ -1406,8 +1410,10 @@ they started; that a load replaced while its read or write of the count is
 still out (its cancelled wait never answering, or refused) takes nothing
 over, the later load keeping its destination, counting its rows and closing
 on the next prompt; that a close an earlier load writes late, its state
-close refused, hides the card a later load took over once it lands; and
-that draws of the card while its read of the close waits start no other
+close refused, hides the card a later load took over once it lands; that
+a session resumed with no state after Got it, the greeting's write lost,
+shows no card and greets no more, its read of the close answering or not;
+and that draws of the card while its read of the close waits start no other
 read of it.
 
 `tests/views.test.py` runs both views in DuckDB. It uses five dialect

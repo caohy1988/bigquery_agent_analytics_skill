@@ -6,6 +6,7 @@
 // TypeScript as is), with a small stand-in for `$`. No network, no files.
 //   node tests/reload.test.mjs
 import assert from 'node:assert/strict'
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
@@ -16,6 +17,10 @@ const SESSION = 'reload-session'
 const OWN = `welcome:${PLUGIN_VERSION}:${SESSION}`
 const CLOSED = `${OWN}:closed`
 const START = { surface: 'terminal', isInteractive: true, cwd: '/work' }
+// The event a call of `$` is made under: every `$.state.get` of one reads
+// one moment, as the host's does, until a write of its own (landed or
+// missed) brings that value up to date.
+const dispatch = new AsyncLocalStorage()
 const settle = async () => {
   for (let i = 0; i < 200; i += 1) await Promise.resolve()
 }
@@ -82,14 +87,21 @@ async function load(h, options = {}) {
     state: {
       get: async ref => {
         if (h.stateRead) await h.stateRead(ref.key)
-        const now = h.state.get(ref.key) ?? { value: undefined, version: 0 }
+        const at = dispatch.getStore()
+        if (at && !at.moment) at.moment = structuredClone(h.state)
+        const now = (at?.moment ?? h.state).get(ref.key) ?? { value: undefined, version: 0 }
         return { value: structuredClone(now.value), version: now.version }
       },
-      set: h.stateSet,
+      set: async (ref, value, options) => {
+        const result = await h.stateSet(ref, value, options)
+        const at = dispatch.getStore()
+        if (at?.moment) at.moment.set(ref.key, structuredClone(h.state.get(ref.key)))
+        return result
+      },
     },
     session: { id: async () => SESSION, version: async () => ({ version: 'test' }) },
     clock: {
-      every: (ms, fn) => (timers.push(fn), { cancel() {} }),
+      every: (ms, fn) => (timers.push(() => dispatch.run({ moment: null }, fn)), { cancel() {} }),
       after: () => ({ cancel() {} }),
       sleep: () => new Promise((resolve, reject) => queueMicrotask(() => (h.current === index ? resolve() : h.refuseWaits && reject(new Error('cancelled by a reload'))))),
     },
@@ -106,7 +118,7 @@ async function load(h, options = {}) {
     http: { fetch: async () => Promise.reject(new Error('no network here')) },
     process: { run: async () => Promise.reject(new Error('no processes here')) },
   }
-  const fire = (name, e) => hooks.get(name)($, e, async x => (name === 'ui.render' ? null : x))
+  const fire = (name, e) => dispatch.run({ moment: null }, () => hooks.get(name)($, e, async x => (name === 'ui.render' ? null : x)))
   const walk = n => (n ? [n, ...(Array.isArray(n.props?.children) ? n.props.children.flatMap(walk) : typeof n.props?.children === 'object' ? walk(n.props.children) : [])] : [])
   const band = async () => walk(await fire('ui.render', { component: 'AbovePrompt', props: { hasSurvey: false, maxRows: 10 } }))
   const button = async () => (await band()).find(n => n.type === 'Button')
@@ -129,7 +141,7 @@ async function load(h, options = {}) {
     close: async () => {
       const b = await button()
       assert.ok(b, 'the card is up')
-      b.props.onPress()
+      dispatch.run({ moment: null }, () => b.props.onPress())
       await settle()
     },
     // The session's first row, written by the next flush (a dry run).
@@ -634,6 +646,27 @@ const tests = {
     assert.equal(await b.shown(), false)
     assert.equal(h.card().closed, false)
   },
+  ...Object.fromEntries(
+    ['answers', 'never answers'].map(mode => [
+      `a close written while the greeting's write was lost: a resumed session, its state gone, shows no card and greets no more (its read of the close ${mode})`,
+      async () => {
+        const h = host({ hold: key => key === `welcome:${PLUGIN_VERSION}` })
+        const a = await load(h)
+        await a.start()
+        await a.close()
+        assert.equal(h.store.get(CLOSED), true)
+        assert.equal(h.store.get(`welcome:${PLUGIN_VERSION}`), undefined)
+        h.state.clear()
+        heldReads(h, key => mode === 'never answers' && key === CLOSED)
+        const b = await load(h)
+        await b.start()
+        assert.equal(await b.shown(), false)
+        await settle()
+        assert.equal(await b.shown(), false)
+        assert.equal(a.greetings() + b.greetings(), 1)
+      },
+    ]),
+  ),
   async 'draws of the card while its read of the close waits start no other read of it'() {
     const h = host()
     const a = await load(h)

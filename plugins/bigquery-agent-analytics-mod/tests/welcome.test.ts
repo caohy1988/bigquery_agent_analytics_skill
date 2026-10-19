@@ -122,6 +122,7 @@ test('a band drawn before the session started shows the card at once, before any
 const SHOWN_BEFORE = [
   ['an earlier session showed the card', { welcome: { version: PLUGIN_VERSION, previous: null, sessionId: 'an-earlier-session' }, [GREETED_KEY]: { sessionId: 'an-earlier-session', previous: null } }],
   ['this session showed it and it was closed', { welcome: GREETING, [GREETED_KEY]: GREETED_HERE, [OWN]: { landedAt: 1, landedTo: HERE }, [CLOSED]: true }],
+  ['this session closed it, its greeting never written', { [CLOSED]: true }],
   ['an earlier session showed it, and a late write of an older version came after', { welcome: { version: '0.0.9', previous: null, sessionId: 'an-older-session' }, [GREETED_KEY]: { sessionId: 'an-earlier-session', previous: '0.0.9' } }],
 ] as const
 
@@ -295,6 +296,22 @@ for (const operation of ['get', 'set'] as const) {
     else expect(texts).toEqual([...INSTALLED, RECORDS, landed(1), 'drawn beneath'])
   })
 }
+
+test('a close read that never answers, the greeting never written, shows no card and greets no one', { options: OPTIONS }, async ($, on) => {
+  let reads = 0
+  on('store.get', { key: CLOSED }, () => {
+    reads += 1
+    return new Promise<never>(() => undefined)
+  })
+  const world = setUp(on, {}, { [CLOSED]: true })
+  await startSession($)
+  await world.clock.advance(5000)
+  expect(world.acceptedRows().length).toBe(1)
+  expect(reads).toBe(1)
+  expect((await band($)).texts).toEqual(['drawn beneath'])
+  expect(welcomeLines(world.transcript)).toEqual([])
+  expect(greeted(world)).toBeUndefined()
+})
 
 test('a session left open never writes over a newer version another session greeted meanwhile', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on, {}, {})
