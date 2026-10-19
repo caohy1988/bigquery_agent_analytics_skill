@@ -57,10 +57,8 @@ function heldReads(h, holding) {
 }
 
 let loads = 0
-// One load of the code against `h`, with `options` over the usual ones. A
-// load begins at least a millisecond after the one before, as a reload does.
+// One load of the code against `h`, with `options` over the usual ones.
 async function load(h, options = {}) {
-  await new Promise(resolve => setTimeout(resolve, 2))
   const { register } = await import(`${REGISTER}?load=${++loads}`)
   const hooks = new Map()
   const timers = []
@@ -76,7 +74,7 @@ async function load(h, options = {}) {
     store: { get: key => (h.read ? h.read(key) : Promise.resolve(structuredClone(h.store.get(key)))), set: h.write, delete: async key => void h.store.delete(key), keys: async () => [...h.store.keys()] },
     state: {
       get: async ref => {
-        if (h.stateRead) await h.stateRead()
+        if (h.stateRead) await h.stateRead(ref.key)
         const now = h.state.get(ref.key) ?? { value: undefined, version: 0 }
         return { value: structuredClone(now.value), version: now.version }
       },
@@ -110,6 +108,11 @@ async function load(h, options = {}) {
       await settle()
     },
     shown: async () => (await button()) !== undefined,
+    // A prompt typed at the terminal.
+    prompt: async () => {
+      await fire('prompt.submit', { text: 'hi', wait: false, origin: { kind: 'composer' } })
+      await settle()
+    },
     close: async () => {
       const b = await button()
       assert.ok(b, 'the card is up')
@@ -446,14 +449,14 @@ const tests = {
     await b.start()
     assert.equal(await b.shown(), false)
   },
-  async 'an earlier load whose read of the session state answers after a later load showed the card never takes it over'() {
+  async 'an earlier load whose read of the card answers after a later load showed the card never takes it over'() {
     const A = { deadLetterDir: '/home/dev/a/dead-letter' }
     const B = { deadLetterDir: '/home/dev/b/dead-letter' }
     const h = host()
     const a = await load(h, A)
-    // The earlier load's first read of the state waits.
+    // The earlier load's read of the card waits (its rank it has).
     const waiting = []
-    h.stateRead = () => new Promise(resolve => waiting.push(resolve))
+    h.stateRead = key => (key === 'welcome' ? new Promise(resolve => waiting.push(resolve)) : undefined)
     const starting = a.start()
     await settle()
     h.stateRead = undefined
@@ -484,6 +487,78 @@ const tests = {
     await a.land()
     assert.equal(h.card()?.sent, 1)
     assert.ok((await c.texts()).some(t => String(t).startsWith('✓ First rows written · 1 so far')))
+  },
+  async 'a reload whose takeover write answers after the earlier load\'s Got it (its state close refused) shows no card: the close is read again'() {
+    let holding = false
+    const h = host({ refuseState: value => value?.closed === true, holdState: value => holding && typeof value === 'object' && value !== null && 'owner' in value })
+    const a = await load(h)
+    await a.start()
+    holding = true
+    const b = await load(h)
+    await b.start()
+    assert.equal(h.held.filter(w => w.key === 'state').length, 1)
+    await a.close()
+    assert.equal(h.store.get(CLOSED), true)
+    holding = false
+    for (const w of h.held.filter(w => w.key === 'state')) h.held.splice(h.held.indexOf(w), 1)[0].release()
+    await settle()
+    assert.equal(await b.shown(), false)
+  },
+  async 'two loads whose first card writes both wait: the earlier one\'s lands first, and the later load takes the card over, with one greeting'() {
+    let holding = true
+    const h = host({ holdState: value => holding && typeof value === 'object' && value !== null && 'owner' in value })
+    const a = await load(h)
+    await a.start()
+    const b = await load(h)
+    await b.start()
+    const writes = h.held.filter(w => w.key === 'state')
+    assert.equal(writes.length, 2)
+    holding = false
+    for (const w of writes) {
+      h.held.splice(h.held.indexOf(w), 1)[0].release()
+      await settle()
+    }
+    assert.equal(await b.shown(), true)
+    assert.equal(a.greetings() + b.greetings(), 1)
+  },
+  async 'a prompt after rows landed, with session-state closes refused, closes the card here and in the store, and a new load shows none'() {
+    const h = host({ refuseState: value => value?.closed === true })
+    const a = await load(h)
+    await a.start()
+    await a.land()
+    await a.prompt()
+    assert.equal(h.store.get(CLOSED), true)
+    assert.equal(await a.shown(), false)
+    const b = await load(h)
+    await b.start()
+    assert.equal(await b.shown(), false)
+  },
+  async 'loads in the same millisecond, or with the clock set back, rank by when they started: the earlier one never takes the card from the later'() {
+    const realNow = Date.now
+    try {
+      for (const clock of [() => 1_000_000, (n => () => (n -= 60_000))(10_000_000)]) {
+        Date.now = clock
+        const A = { deadLetterDir: '/home/dev/a/dead-letter' }
+        const B = { deadLetterDir: '/home/dev/b/dead-letter' }
+        const h = host()
+        const a = await load(h, A)
+        await a.start()
+        let holding = true
+        const reads = heldReads(h, () => holding)
+        const b = await load(h, A)
+        await b.start()
+        holding = false
+        const c = await load(h, B)
+        await c.start()
+        reads.answer()
+        await settle()
+        assert.equal(h.card()?.destination, 'dry run: /home/dev/b/dry-run')
+        assert.equal(await c.shown(), true)
+        assert.equal(await b.shown(), false)
+      }
+    } finally {
+      Date.now = realNow
+    }
   },
 }
 

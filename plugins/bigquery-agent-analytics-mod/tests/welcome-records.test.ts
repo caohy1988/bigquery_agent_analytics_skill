@@ -1,7 +1,8 @@
 // The welcome card's writes to the store on their own (lib/welcome.ts): one
-// at a time, the greeting first, then the landing and the close, each with
-// the card as it is by then, the close once and never undone. In a file of
-// its own, so welcome.test.ts also runs against code without the queue.
+// at a time, the greeting first, then the landing, each with the card as it
+// is by then; the close is not among them (register.ts writes it on its own,
+// at once). In a file of its own, so welcome.test.ts also runs against code
+// without the queue.
 
 import { expect, test } from 'claude-code/testing'
 

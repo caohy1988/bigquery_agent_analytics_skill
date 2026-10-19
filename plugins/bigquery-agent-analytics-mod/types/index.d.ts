@@ -22,13 +22,18 @@ export type WelcomeState = {
   // one that speaks for it (a toast); rows an earlier load still sends only
   // count.
   owner: string
-  // How late that load and run came (when the load began, then the run), so
-  // a load whose reads answered late never takes the card from a later one.
+  // The rank of that load's run (`loads` when it ran), so a load whose reads
+  // answered late never takes the card from a later one.
   rank: number
 }
 
 declare module 'claude-code' {
   interface PluginState {
-    'bigquery-agent-analytics-mod': { welcome: WelcomeState | null }
+    'bigquery-agent-analytics-mod': {
+      welcome: WelcomeState | null
+      // How many session.start runs, of every load of the code, the session
+      // has seen: each run's rank (register.ts `nextLoad`).
+      loads: number
+    }
   }
 }

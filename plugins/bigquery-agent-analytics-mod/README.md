@@ -235,15 +235,21 @@ store alone, with no session state, starts its count over); a load whose
 start another load overtook shows nothing and greets no more; and a close
 the store has wins over an open card in the state (a close whose state
 write was refused included). A load draws the card only once it has read
-the store's close for it, so one whose reads have not answered, or never
-do, draws none. Of two loads, the later one shows the card: a load whose
-reads answer after a later load took the card over leaves it to that one.
-Each writer's rows count once, however often or late it says so. If rows
-now go somewhere else (another table, or BigQuery after a dry run), the
-card waits again until rows land there, and a prompt closes it only once
-they have; rows sent under the earlier configuration that land after the
-reload do not count, while rows an earlier load lands where the card
-counts them do, and the load that showed the card says so.
+the store's close for it, once more after taking the card over, so one
+whose reads have not answered, or never do, draws none, and a Got it in
+another load while it took the card over hides it. Of two loads, the later
+one shows the card: each session start takes the next number of a count
+the session's state keeps, so a later load or run ranks higher, whatever
+the clock says; a load whose reads answer after a later load took the card
+over leaves it to that one, and a later load whose first write of the card
+an earlier one beat takes the card over, with no second greeting. Each
+writer's rows count once, however often or late it says so. If rows now go
+somewhere else (another table, or BigQuery after a dry run), the card waits
+again until rows land there, and a prompt closes it only once they have,
+hiding it and writing the store's close at once, as Got it does; rows sent
+under the earlier configuration that land after the reload do not count,
+while rows an earlier load lands where the card counts them do, and the
+load that showed the card says so.
 A `-p` run draws no band: it shows nothing and leaves the store alone.
 Nothing waits on the session's state or the store for the card, the
 session's start included; the card shows once they answer, and with no
@@ -254,6 +260,8 @@ session state it does not show. The store makes "once" a best effort:
   last had it;
 * if they cannot be read, no card shows, after a reload too;
 * two sessions started at the same moment can both show it;
+* a reload in the moment between Got it and its store write landing (its
+  state write refused) shows the card again, until the write lands;
 * reinstalling the same version shows no card while the store keeps the
   record.
 
@@ -1378,8 +1386,14 @@ load whose reads answer after a later load took the card over for another
 destination leaves it to that load, its rows counting nowhere, and so does
 one whose read of the state answers late; that rows a new load lands while
 its reads wait count once, over repeated reloads, as do rows counted before
-the card moved away and back; and that a new load that cannot read the
-store shows no card.
+the card moved away and back; that a new load that cannot read the store
+shows no card; that a reload whose takeover write answers after another
+load's Got it (its state close refused) shows no card; that of two loads
+whose first card writes wait, the later takes the card over when the
+earlier's lands first, with one greeting; that a prompt after rows landed,
+its state close refused, closes the card here and in the store; and that
+loads in the same millisecond, or with the clock set back, rank by when
+they started.
 
 `tests/views.test.py` runs both views in DuckDB. It uses five dialect
 substitutions, and each must match. The fixture is a table shared by this
