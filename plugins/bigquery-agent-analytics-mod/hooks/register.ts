@@ -379,7 +379,9 @@ async function takeOver($: EngineInterface, sessionId: string, start: number, ra
   }
   if (start !== welcomeStarts) return
   const taken = await changeCard($, card => {
-    if (card.sessionId !== sessionId) return null
+    // Another version's card (an update in the session), or another
+    // session's: not this run's to close or take over.
+    if (card.version !== PLUGIN_VERSION || card.sessionId !== sessionId) return null
     if (stored.closed === true) return { ...card, closed: true }
     // A later load, or run, took the card over meanwhile: it shows it.
     if ((card.rank ?? 0) > rank) return null
@@ -501,11 +503,14 @@ function rowsLanded($: EngineInterface, by: string, total: number, to: string | 
 // on its own, at once, behind no other write (its key only ever says true),
 // whatever becomes of the state's write (refused, late, or never answered)
 // and whether or not this load has taken the card over yet. A prompt reads
-// the state first: only a card that shows rows landed here closes.
+// the state first: only a card that shows rows landed here closes. Either
+// closes only the card of this version and session, however often its write
+// is tried again: never one an update put in its place in the session.
 function closeWelcome($: EngineInterface, landedOnly = false): void {
   const sessionId = tracer.sessionId
   const id = cardId(PLUGIN_VERSION, sessionId)
   const here = destinationKey(config)
+  const isThis = (card: Welcome): boolean => card.version === PLUGIN_VERSION && card.sessionId === sessionId
   const landedHere = (card: Welcome): boolean => card.landedAt !== null && card.landedTo === here
   const close = (): void => {
     closedCard = id
@@ -520,10 +525,10 @@ function closeWelcome($: EngineInterface, landedOnly = false): void {
   void (async () => {
     if (landedOnly) {
       const shown = (await $.state.get(WELCOME_STATE)).value ?? null
-      if (shown === null || shown.closed || shown.sessionId !== sessionId || !landedHere(shown)) return
+      if (shown === null || shown.closed || !isThis(shown) || !landedHere(shown)) return
       close()
     }
-    await changeCard($, card => (card.closed || (landedOnly && !landedHere(card)) ? null : { ...card, closed: true }))
+    await changeCard($, card => (card.closed || !isThis(card) || (landedOnly && !landedHere(card)) ? null : { ...card, closed: true }))
   })().catch(() => {
     internalErrors += 1
   })

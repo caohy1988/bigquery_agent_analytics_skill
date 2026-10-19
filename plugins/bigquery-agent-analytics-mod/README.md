@@ -256,12 +256,16 @@ again until rows land there, and a prompt closes it only once they have,
 hiding it and writing the store's close at once, as Got it does; rows sent
 under the earlier configuration that land after the reload do not count,
 while rows an earlier load lands where the card counts them do, and the
-load that showed the card says so.
+load that showed the card says so. A close, or a stored close a takeover
+applies, is for the card of its own version and session alone, however
+often its write is tried again: a card an update put in its place in the
+session stays.
 A `-p` run draws no band: it shows nothing and leaves the store and the
 session's state alone.
-Nothing waits on the session's state or the store for the card, the
-session's start included; the card shows once they answer, and with no
-session state it does not show. The store makes "once" a best effort:
+Neither the session's start, a prompt nor the writer waits on the
+session's state or the store for the card (the band, drawing it, reads the
+state); the card shows once they answer, and with no session state it does
+not show. The store makes "once" a best effort:
 
 * if the records cannot be written, the next session shows the card again,
   and a reload in a session that keeps no `$.state` shows it as the store
@@ -1377,8 +1381,11 @@ writes and reads held and let go in any order). Its `$.state` keeps a
 version for each value and lands a conditional write only at it, and every
 `$.state.get` of one event reads one moment until a write of its own brings
 that value up to date, as the host's does; its writes can be held or
-refused, its reads held. Its `$.clock.sleep` answers only in the newest load: a hot reload cancels the
-waits of the load it replaces. It checks that a card closed
+refused, its reads held. Its `$.clock.sleep` answers only in the newest
+load: a hot reload cancels the waits of the load it replaces. A load may be
+of another version of the code, its config naming that version, as after
+an update in the session (node's module hooks; no file is written). It
+checks that a card closed
 before a reload stays closed while the close is still being written; that
 a greeting still being written gives one transcript line across loads,
 also with its state write in flight; that a landing an earlier load is
@@ -1413,8 +1420,10 @@ on the next prompt; that a close an earlier load writes late, its state
 close refused, hides the card a later load took over once it lands; that
 a session resumed with no state after Got it, the greeting's write lost,
 shows no card and greets no more, its read of the close answering or not;
-and that draws of the card while its read of the close waits start no other
-read of it.
+that a Got it, a takeover's stored close or a prompt in a load of the
+version before an update, its write or its reads answering late, never
+closes the card of the version after it; and that draws of the card while
+its read of the close waits start no other read of it.
 
 `tests/views.test.py` runs both views in DuckDB. It uses five dialect
 substitutions, and each must match. The fixture is a table shared by this

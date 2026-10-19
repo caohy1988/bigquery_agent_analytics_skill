@@ -7,12 +7,33 @@
 //   node tests/reload.test.mjs
 import assert from 'node:assert/strict'
 import { AsyncLocalStorage } from 'node:async_hooks'
+import { registerHooks } from 'node:module'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 import { PLUGIN_VERSION } from '../hooks/lib/config.ts'
 
 const REGISTER = pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '..', 'hooks', 'register.ts')).href
+// A load of another version of the code (an update in the session): its
+// modules load afresh, each under the `version` its importer carries, and
+// its config.ts names that version.
+const NEXT = '0.2.0'
+registerHooks({
+  resolve(specifier, context, nextResolve) {
+    const resolved = nextResolve(specifier, context)
+    const version = context.parentURL ? new URL(context.parentURL).searchParams.get('version') : null
+    if (version === null || !resolved.url.startsWith('file:') || !resolved.url.endsWith('.ts')) return resolved
+    return { ...resolved, url: `${resolved.url}?version=${version}` }
+  },
+  load(url, context, nextLoad) {
+    const at = new URL(url)
+    const version = at.searchParams.get('version')
+    if (version === null) return nextLoad(url, context)
+    const loaded = nextLoad(url, { ...context, format: 'module-typescript' })
+    if (!at.pathname.endsWith('/lib/config.ts')) return loaded
+    return { ...loaded, source: String(loaded.source).replace(/PLUGIN_VERSION = '[^']*'/, `PLUGIN_VERSION = '${version}'`) }
+  },
+})
 const SESSION = 'reload-session'
 const OWN = `welcome:${PLUGIN_VERSION}:${SESSION}`
 const CLOSED = `${OWN}:closed`
@@ -67,9 +88,9 @@ let loads = 0
 // load it replaces, so `$.clock.sleep` never answers there once a later load
 // is in, or (`h.refuseWaits`) is refused; its other calls may still answer,
 // late.
-async function load(h, options = {}) {
+async function load(h, options = {}, version = null) {
   const index = ++loads
-  const { register } = await import(`${REGISTER}?load=${index}`)
+  const { register } = await import(`${REGISTER}?load=${index}${version === null ? '' : `&version=${version}`}`)
   h.current = index
   const hooks = new Map()
   const timers = []
@@ -667,6 +688,61 @@ const tests = {
       },
     ]),
   ),
+  async 'a Got it of the version before an update, its session-state close written late, never closes the card of the version after it'() {
+    let holding = false
+    const h = host({ holdState: value => holding && value?.closed === true })
+    const a = await load(h)
+    await a.start()
+    holding = true
+    await a.close()
+    assert.equal(h.store.get(CLOSED), true)
+    assert.equal(h.held.length, 1)
+    holding = false
+    const b = await load(h, {}, NEXT)
+    await b.start()
+    assert.equal(h.card().version, NEXT)
+    assert.equal(await b.shown(), true)
+    h.release('state')
+    await settle()
+    assert.equal(h.card().closed, false)
+    assert.equal(await b.shown(), true)
+    assert.equal(h.store.get(`welcome:${NEXT}:${SESSION}:closed`), undefined)
+  },
+  async 'a takeover of the version before an update, its reads answering late, never puts its stored close on the card of the version after it'() {
+    let refusing = true
+    const h = host({ refuseState: value => refusing && value?.closed === true })
+    const a = await load(h)
+    await a.start()
+    await a.close()
+    refusing = false
+    let holding = true
+    const reads = heldReads(h, () => holding)
+    const b = await load(h)
+    await b.start()
+    holding = false
+    const c = await load(h, {}, NEXT)
+    await c.start()
+    assert.equal(await c.shown(), true)
+    reads.answer()
+    await settle()
+    assert.equal(h.card().version, NEXT)
+    assert.equal(h.card().closed, false)
+    assert.equal(await c.shown(), true)
+  },
+  async 'a prompt in a load of the version before an update never closes the card of the version after it'() {
+    const h = host()
+    const a = await load(h)
+    await a.start()
+    const b = await load(h, {}, NEXT)
+    await b.start()
+    await b.land()
+    assert.equal(typeof h.card().landedAt, 'number')
+    await a.prompt()
+    assert.equal(h.card().version, NEXT)
+    assert.equal(h.card().closed, false)
+    assert.equal(await b.shown(), true)
+    assert.equal(h.store.get(CLOSED), undefined)
+  },
   async 'draws of the card while its read of the close waits start no other read of it'() {
     const h = host()
     const a = await load(h)
