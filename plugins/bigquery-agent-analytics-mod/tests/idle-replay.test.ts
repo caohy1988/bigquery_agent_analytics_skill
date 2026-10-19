@@ -723,8 +723,10 @@ test('another session\'s writer resumes what a replay left only partly written: 
   expect(w.sent).toEqual(['a'.repeat(32), 'b'.repeat(32)])
   // The other session, with writes working again.
   w.refuse(null)
-  await w.writer('second-session').backfill(['spill', 'retry'], 'auto')
+  const report = await w.writer('second-session').backfill(['spill', 'retry'], 'auto')
   expect(w.sent).toEqual(['a'.repeat(32), 'b'.repeat(32)])
+  // Its last-backfill line counts the file it finished, and what it left.
+  expect(report).toMatchObject({ files: 1, rowsSent: 0, rowsLeft: 2 })
   expect(w.files.get(source)).toBe('')
   const lines = [...w.files].filter(([, text]) => text !== '').flatMap(([path, text]) => parseFile(text).lines.map(l => `${path.includes('/rejected-') ? 'rejected' : 'retry'}:${l.row.event_id.slice(0, 1)}`))
   expect(lines.sort()).toEqual(['rejected:a', 'retry:b'])
@@ -807,4 +809,20 @@ test('a record that does not fit the file (another size) is not trusted: the fil
   await w.writer('a-session').backfill(['spill', 'retry'], 'auto')
   expect(w.sent).toEqual(['c'.repeat(32)])
   expect(w.files.get(source)).toBe('')
+})
+
+test('rows with no id, in a file another writer made, each count once refused', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  const noId = (n: number): string => {
+    const parsed = JSON.parse(line(String(n).repeat(32), 'rejected')) as { row: { event_id?: string } }
+    delete parsed.row.event_id
+    return JSON.stringify(parsed)
+  }
+  world.files.set(`${PARTITION_DIR}/rejected-20261013T200102003Z-earlier-1.jsonl`, packFiles([noId(1), noId(2)])[0] as string)
+  await startSession($)
+  await world.clock.advance(5000)
+  world.replies = [{ status: 200, text: JSON.stringify({ insertErrors: [0, 1].map(index => ({ index, errors: [{ reason: 'invalid', message: 'no such field: extra' }] })) }) }]
+  await $.command.run({ command: 'bqaa-backfill', args: '', ...COMMAND })
+  await world.clock.advance(1000)
+  expect(world.statusLines.at(-1) ?? '').toMatch(/^BQAA: 2 row\(s\) refused /)
 })

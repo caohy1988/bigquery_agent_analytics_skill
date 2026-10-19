@@ -647,9 +647,16 @@ export class Writer {
     const { headline, fix } = this.problemText()
     const run = this.commandLine()
     this.call(() => this.io.toast?.(diagnostic(`BQAA: rows are not being written: ${headline}. To fix, ${fix}.`, 500)))
-    // The command line goes whole, after the rest is cut.
+    // The command line goes whole, after the rest is cut; on a line of its
+    // own where redaction would take it with the rest (a project named like
+    // a credential, `auth-…:` in the headline).
     const told = diagnostic(`bqaa: rows are not being written: ${headline} (${clean}). To fix, ${fix}`, 900)
-    this.call(() => this.io.notice?.(`${told}${run ? `. ${run}` : ''}; this clears once rows are written again.`))
+    const notice = `${told}${run ? `. ${run}` : ''}; this clears once rows are written again.`
+    if (run === null || diagnostic(notice, 2000).includes(run)) this.call(() => this.io.notice?.(notice))
+    else {
+      this.call(() => this.io.notice?.(`${told}; this clears once rows are written again.`))
+      this.call(() => this.io.notice?.(`bqaa: ${run}`))
+    }
   }
 
   // BigQuery refused rows for a reason of their own (a 400, say): it found
@@ -1154,6 +1161,8 @@ export class Writer {
           emptied = await this.writeOut(path, known)
           // What it wrote out waits for the next replay.
           if (known.waits) tally.waiting += 1
+          report.files += 1
+          report.rowsLeft += [...known.fates].filter(fate => fate !== 'L').length
         } else {
           const parsed = parseFile(await this.io.readFile(path))
           if (!parsed.complete) report.incompleteFiles.push(name)
@@ -1219,6 +1228,11 @@ export class Writer {
     let added = 0
     let rough = false
     for (const id of ids) {
+      // A row with no id (from a file another writer made) counts on its own.
+      if (typeof id !== 'string' || id === '') {
+        added += 1
+        continue
+      }
       if (seen.has(id)) continue
       added += 1
       if (seen.size < COUNTED_IDS) seen.add(id)

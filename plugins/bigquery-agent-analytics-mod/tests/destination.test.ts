@@ -389,6 +389,15 @@ test('a setup command longer than /bqaa-status could show whole is not offered',
   expect(await statusText($)).not.toMatch(/^setup: /m)
 })
 
+test('a project the redaction mistakes for a credential name still gets the setup command whole in the transcript, on a line of its own', { options: { project: 'auth-service-123', dataset: 'agent_analytics' } }, async ($, on) => {
+  const world = setUp(on)
+  world.replies = [DATASET_MISSING]
+  await startSession($)
+  await world.clock.advance(5000)
+  const command = /^bqaa: Run: BQAA_PROJECT_ID=auth-service-123 BQAA_DATASET=agent_analytics BQAA_TABLE=agent_events BQAA_VIEWS_DATASET=agent_analytics_reporting BQAA_LOCATION=US bash '\/[^']*\/setup\.sh'$/
+  expect(world.transcript.filter(line => command.test(line)).length).toBe(1)
+})
+
 test('a mod directory whose path redaction would change gets the fix with no command, rather than a command that would not run', async () => {
   const w = handBuilt([DATASET_MISSING], '/opt/token=abcdefghijklmnopqrstuvwxyz0123456789/bigquery-agent-analytics-mod')
   w.enqueue()

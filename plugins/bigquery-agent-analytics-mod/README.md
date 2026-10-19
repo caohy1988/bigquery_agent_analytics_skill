@@ -270,8 +270,9 @@ While that lasts, the mod shows a notice:
   survey.
 * **A toast** comes once per kind of problem in a session.
 * **A dim transcript line** comes once per kind of problem, with the reason
-  (redacted) and, for a missing dataset, the command. A `-p` or SDK host
-  receives it as `ui_log`.
+  (redacted) and, for a missing dataset, the command, which goes on a line
+  of its own when the redaction would take it with the rest (a project
+  named like a credential). A `-p` or SDK host receives it as `ui_log`.
 * **The status line** shows the headline and the fix, with the count of
   rows waiting; the command is on the band, the transcript line and
   `/bqaa-status`.
@@ -812,7 +813,7 @@ The test command runs the `tests/*.test.ts` files against the host CLI's own
 test kit, with no session, sign-in, GCP or network: `$.http.fetch`,
 `$.process.run`, `$.fs` and `$.store` are stubbed, and `mock.clock` drives the
 timers; the `$.fs` stubs measure files in UTF-8 bytes and refuse a file over
-4 MiB, as the host does. 227 tests cover the captured rows and their spans,
+4 MiB, as the host does. 229 tests cover the captured rows and their spans,
 subagent runs in the order the host raises them (one invocation and one
 trace for the turn, a span per run, a SubagentStart that comes late or never),
 the session-start row raised before or during `session.start`'s setup,
@@ -874,6 +875,8 @@ And when BigQuery cannot find the dataset or table:
   shows it whole; a long one that fits shown whole in the band and the
   transcript line; `/bqaa-status`'s command whole beside very long names;
   no command for a path redaction would change, or one too long to show;
+  the command on a transcript line of its own for a project the redaction
+  mistakes for a credential name;
 * a table the mod made that BigQuery still cannot find after two minutes,
   on a send or on a replay with nothing queued, and table creation turned
   off;
@@ -918,7 +921,8 @@ And the replay that runs by itself while nothing is queued:
   access is denied, and a row an earlier session refused once; a row
   refused again after rows landed, or under a later access-denied notice,
   counted again there; past the 10,000 rows a count keeps, the status line
-  saying about;
+  saying about; rows with no id each counted; a run that only finishes a
+  recorded outcome counted in its report;
 * the status line for rows parked after retries, with automatic replay on
   and off.
 
