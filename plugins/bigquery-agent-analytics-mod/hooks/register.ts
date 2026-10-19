@@ -276,6 +276,7 @@ export const register: Register = (on, registered) => {
           const read = await $.fs.read(path)
           return typeof read === 'string' ? read : ''
         },
+        exists: path => $.fs.exists(path),
         listDir: async path => (await $.fs.list(path)).map(entry => ({ name: entry.name, kind: entry.kind, size: entry.size })),
         storeGet: key => $.store.get(key),
         storeSet: (key, value) => $.store.set(key, value),

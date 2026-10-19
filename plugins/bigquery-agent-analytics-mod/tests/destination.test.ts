@@ -36,7 +36,7 @@ const TABLE_MISSING = {
 const TABLE_CREATED = { status: 200, text: '{"kind":"bigquery#table"}' }
 const INVALID = { status: 400, text: '{"error":{"code":400,"message":"Invalid value for the table schema","errors":[{"reason":"invalid"}],"status":"INVALID_ARGUMENT"}}' }
 
-const HEADLINE = 'BigQuery cannot find the dataset my-gcp-project:agent_analytics'
+const HEADLINE = 'BigQuery cannot find the dataset my-gcp-project.agent_analytics'
 const FIX = "create it with the mod's setup.sh; rows wait, and are sent once BigQuery finds it (a few minutes after it is made)"
 const LINE = `rows are not being written: ${HEADLINE}. To fix, ${FIX}.`
 // Every name setup.sh reads, the views dataset included, so none comes from
@@ -82,7 +82,7 @@ test('a dataset BigQuery cannot find is a notice with the setup.sh command, not 
   expect(notice).toContain(`${HEADLINE} (HTTP 404: Not found: Dataset my-gcp-project:agent_analytics). To fix, ${FIX}. Run: BQAA_PROJECT_ID=my-gcp-project `)
   expect(notice.endsWith("/setup.sh'; this clears once rows are written again.")).toBe(true)
   const status = await statusText($)
-  expect(status).toContain(`rows are not being written: ${HEADLINE} (HTTP 404: Not found: Dataset my-gcp-project:agent_analytics); to fix, ${FIX}; 3 row(s) waiting`)
+  expect(status).toContain(`rows are not being written: ${HEADLINE}; to fix, ${FIX}; 3 row(s) waiting; cause: HTTP 404: Not found: Dataset my-gcp-project:agent_analytics`)
   expect((status.split('\n').find(l => l.startsWith('setup: ')) ?? '').replace(/^setup: /, '')).toMatch(SETUP)
   // Nothing is refused.
   expect(status).toMatch(/dead-lettered 0 \(0 refused\)/)
@@ -204,7 +204,7 @@ test('with table creation off, a table BigQuery cannot find is the same notice, 
   await world.clock.advance(5000)
   expect(world.fetches.map(f => f.url.split('/').pop())).toEqual(['insertAll'])
   expect((await band($)).line).toBe(
-    "rows are not being written: BigQuery cannot find the table my-gcp-project:agent_analytics.agent_events. To fix, create it with the mod's setup.sh; rows wait, and are sent once BigQuery finds it (a few minutes after it is made).",
+    "rows are not being written: BigQuery cannot find the table my-gcp-project.agent_analytics.agent_events. To fix, create it with the mod's setup.sh; rows wait, and are sent once BigQuery finds it (a few minutes after it is made).",
   )
   expect(refusedFiles(world)).toEqual([])
 })
@@ -274,7 +274,7 @@ test('a table the mod made that BigQuery still cannot find after two minutes is 
   w.enqueue()
   await w.writer.flush()
   expect(w.writer.problem).toMatchObject({ kind: 'destination', missing: 'table' })
-  expect(w.writer.problemText().headline).toBe('BigQuery cannot find the table my-gcp-project:agent_analytics.agent_events')
+  expect(w.writer.problemText().headline).toBe('BigQuery cannot find the table my-gcp-project.agent_analytics.agent_events')
   expect(w.writer.setupCommand()).toBe("BQAA_PROJECT_ID=my-gcp-project BQAA_DATASET=agent_analytics BQAA_TABLE=agent_events BQAA_VIEWS_DATASET=agent_analytics_reporting BQAA_LOCATION=US bash '/opt/mods/bigquery-agent-analytics-mod/setup.sh'")
   // Rows past their retries are parked as retries; the table is made once.
   for (let i = 0; i < 4; i += 1) {
@@ -389,13 +389,20 @@ test('a setup command longer than /bqaa-status could show whole is not offered',
   expect(await statusText($)).not.toMatch(/^setup: /m)
 })
 
-test('a project the redaction mistakes for a credential name still gets the setup command whole in the transcript, on a line of its own', { options: { project: 'auth-service-123', dataset: 'agent_analytics' } }, async ($, on) => {
+test('a project the redaction mistakes for a credential name still gets the setup command whole in the transcript, on a line of its own, and the whole fix on the status line', { options: { project: 'auth-service-123', dataset: 'agent_analytics' } }, async ($, on) => {
   const world = setUp(on)
-  world.replies = [DATASET_MISSING]
+  // BigQuery names the dataset project:dataset, which the redaction takes,
+  // with the rest of the line, for a credential.
+  world.replies = [{ status: 404, text: '{"error":{"code":404,"message":"Not found: Dataset auth-service-123:agent_analytics","errors":[{"reason":"notFound"}],"status":"NOT_FOUND"}}' }]
   await startSession($)
   await world.clock.advance(5000)
   const command = /^bqaa: Run: BQAA_PROJECT_ID=auth-service-123 BQAA_DATASET=agent_analytics BQAA_TABLE=agent_events BQAA_VIEWS_DATASET=agent_analytics_reporting BQAA_LOCATION=US bash '\/[^']*\/setup\.sh'$/
   expect(world.transcript.filter(line => command.test(line)).length).toBe(1)
+  // The status line and the band name the dataset as project.dataset, which
+  // the redaction leaves whole, so the fix and the count follow it.
+  expect(world.statusLines.at(-1) ?? '').toMatch(/^BQAA: BigQuery cannot find the dataset auth-service-123\.agent_analytics\. To fix, create it with the mod's setup\.sh; .* \(\d+ row\(s\) waiting\)$/)
+  // /bqaa-status gives what BigQuery said last, so its cut keeps the fix.
+  expect(await statusText($)).toMatch(/^notice \(since .*\): rows are not being written: BigQuery cannot find the dataset auth-service-123\.agent_analytics; to fix, create it with the mod's setup\.sh; .*; \d+ row\(s\) waiting; cause: /m)
 })
 
 test('a mod directory whose path redaction would change gets the fix with no command, rather than a command that would not run', async () => {
@@ -415,7 +422,7 @@ test('names setup.sh would refuse get the fix with no command', { options: { pro
   await world.clock.advance(5000)
   const shown = await band($)
   expect(shown.line).toBe(
-    'rows are not being written: BigQuery cannot find the dataset my-gcp-project:agent-analytics. To fix, create it, or correct the project and dataset options; rows wait, and are sent once BigQuery finds it (a few minutes after it is made).',
+    'rows are not being written: BigQuery cannot find the dataset my-gcp-project.agent-analytics. To fix, create it, or correct the project and dataset options; rows wait, and are sent once BigQuery finds it (a few minutes after it is made).',
   )
   expect(shown.run).toBeUndefined()
   expect(noticeLines(world)[0] ?? '').not.toContain('Run:')
@@ -430,7 +437,7 @@ test("a dataset whose views dataset setup.sh would refuse gets no command", { op
   await startSession($)
   await world.clock.advance(5000)
   const shown = await band($)
-  expect((shown.line ?? '').startsWith(`rows are not being written: BigQuery cannot find the dataset my-gcp-project:${'d'.repeat(100)}`)).toBe(true)
+  expect((shown.line ?? '').startsWith(`rows are not being written: BigQuery cannot find the dataset my-gcp-project.${'d'.repeat(100)}`)).toBe(true)
   expect(shown.run).toBeUndefined()
   expect(await statusText($)).not.toMatch(/setup:/)
 })

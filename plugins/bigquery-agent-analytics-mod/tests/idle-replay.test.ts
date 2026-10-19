@@ -10,7 +10,7 @@
 import { type Engine, expect, test } from 'claude-code/testing'
 
 import { resolveConfig } from '../hooks/lib/config.ts'
-import { parseFile, packFiles } from '../hooks/lib/deadletter.ts'
+import { parseFile, packFiles, sealFile } from '../hooks/lib/deadletter.ts'
 import { buildRow } from '../hooks/lib/rows.ts'
 import { type Io, Writer } from '../hooks/lib/writer.ts'
 
@@ -140,7 +140,7 @@ test('a request BigQuery refuses whole on an idle replay parks its rows for /bqa
   expect(parkedIn(world, 'retry')).toEqual([])
   expect(parkedIn(world, 'rejected').sort()).toEqual([...parked].sort())
   const shown = await band($)
-  expect(shown.line).toBe('rows are not being written: BigQuery denied the identity access to the dataset. To fix, ask for roles/bigquery.dataEditor on my-gcp-project:agent_analytics, then run /bqaa-backfill.')
+  expect(shown.line).toBe('rows are not being written: BigQuery denied the identity access to the dataset. To fix, ask for roles/bigquery.dataEditor on my-gcp-project.agent_analytics, then run /bqaa-backfill.')
   expect(shown.waiting).toBe(' 3 row(s) waiting.')
   const requests = world.insertCalls().length
   const files = world.files.size
@@ -506,6 +506,32 @@ test('a refused row whose file cannot be emptied is sent once: no further reques
   expect([...world.store.keys()].some(key => key.startsWith('replayed:'))).toBe(false)
 })
 
+test('a file whose replay record cannot be read stays due: the replays that run by themselves send none of it, and empty it once the record can be read', { options: OPTIONS }, async ($, on) => {
+  const name = 'retry-20261013T200102003Z-earlier-1.jsonl'
+  let unreadable = false
+  on('store.get', { key: `replayed:${TABLE_REF}/${name}` }, ($, e, next) => (unreadable ? { deny: 'the store could not be read' } : next(e)))
+  const world = setUp(on)
+  const source = `${PARTITION_DIR}/${name}`
+  world.files.set(source, packFiles([line('a'.repeat(32), 'retry')])[0] as string)
+  world.refuseWrite = (path, text) => path === source && text === ''
+  world.replies = [FIRST_REFUSED]
+  await startSession($)
+  await world.clock.advance(20_000)
+  const requests = world.insertCalls().length
+  const copies = () => parkedIn(world, 'rejected').filter(id => id === 'a'.repeat(32)).length
+  expect(copies()).toBe(1)
+  unreadable = true
+  world.refuseWrite = null
+  await idleFor(world, 5)
+  expect(world.insertCalls().length).toBe(requests)
+  expect(world.files.get(source) !== '').toBe(true)
+  unreadable = false
+  await idleFor(world, 3)
+  expect(world.insertCalls().length).toBe(requests)
+  expect(world.files.get(source)).toBe('')
+  expect(copies()).toBe(1)
+})
+
 test('a replay that can write only part of what it left sends nothing again, writes the rest under the same names once it can, then the rows left go on', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on)
   const source = `${PARTITION_DIR}/retry-20261013T200102003Z-earlier-1.jsonl`
@@ -683,35 +709,63 @@ test('what a replay left, only partly written, is finished by the next session.s
 })
 
 // Two writers of their own, as two sessions have, on one dead-letter
-// directory and one store. BigQuery gives `answer`.
-function twoWriters(answer: () => { status: number; text: string }) {
+// directory and one store, which takes no more than 4 MiB of JSON in all, as
+// the host's. BigQuery gives `answer` for the ids of each request.
+function twoWriters(answer: (ids: string[]) => { status: number; text: string }) {
   const config = resolveConfig({ project: 'my-gcp-project', dataset: 'agent_analytics', deadLetterDir: '/dl' }, {})
   const files = new Map<string, string>()
   const store = new Map<string, unknown>()
   const sent: string[] = []
-  let refuseWrite: ((path: string) => boolean) | null = null
+  const bytes = (text: string): number => new TextEncoder().encode(text).length
+  let refuseWrite: ((path: string, text: string) => boolean) | null = null
+  // `from`: the store takes that many of a replay's records, then no more.
+  let storeFails: { get?: boolean; set?: boolean; from?: number } = {}
+  let records = 0
   const io = (session: string): Io => ({
     now: () => 0,
     after: () => ({ cancel: () => undefined }),
     fetch: async (url, init) => {
-      sent.push(...idsOf(init.body ?? '{"rows":[]}'))
-      return answer()
+      const ids = idsOf(init.body ?? '{"rows":[]}')
+      sent.push(...ids)
+      return answer(ids)
     },
     runCommand: async () => ({ exitCode: 0, stdout: `${'a'.repeat(24)}\n`, stderr: '' }),
     envToken: async () => undefined,
     writeFile: async (path, text) => {
-      if (refuseWrite?.(path) && text !== '') throw new Error(`EACCES: ${path} (${session})`)
+      if (refuseWrite?.(path, text)) throw new Error(`EACCES: ${path} (${session})`)
       files.set(path, text)
     },
     readFile: async path => files.get(path) ?? '',
-    listDir: async dir => [...files].filter(([path]) => path.startsWith(`${dir}/`)).map(([path, text]) => ({ name: path.slice(dir.length + 1), kind: 'file', size: new TextEncoder().encode(text).length })),
-    storeGet: async key => store.get(key),
-    storeSet: async (key, value) => void store.set(key, JSON.parse(JSON.stringify(value)) as unknown),
+    listDir: async dir => [...files].filter(([path]) => path.startsWith(`${dir}/`)).map(([path, text]) => ({ name: path.slice(dir.length + 1), kind: 'file', size: bytes(text) })),
+    storeGet: async key => {
+      if (storeFails.get && key.startsWith('replayed:')) throw new Error('the store could not be read')
+      return store.get(key)
+    },
+    storeSet: async (key, value) => {
+      if (key.startsWith('replayed:') && (storeFails.set || (storeFails.from !== undefined && records >= storeFails.from))) throw new Error('the store could not be written')
+      if (key.startsWith('replayed:')) records += 1
+      const json = JSON.parse(JSON.stringify(value)) as unknown
+      if (bytes(JSON.stringify(Object.fromEntries(new Map(store).set(key, json)))) > 4 * 1024 * 1024) throw new Error('the store would pass 4 MiB of JSON')
+      store.set(key, json)
+    },
     storeDelete: async key => void store.delete(key),
     status: () => undefined,
     debug: () => undefined,
   })
-  return { config, files, store, sent, writer: (session: string) => new Writer(io(session), () => config, () => session), refuse: (f: ((path: string) => boolean) | null) => (refuseWrite = f) }
+  return {
+    config,
+    files,
+    store,
+    sent,
+    writer: (session: string) => new Writer(io(session), () => config, () => session),
+    // Refuses the writes of what is left to the paths `f` picks.
+    refuse: (f: ((path: string) => boolean) | null) => (refuseWrite = f === null ? null : (path, text) => text !== '' && f(path)),
+    // Refuses the writes `f` picks, emptying a file included.
+    refuseWrites: (f: ((path: string, text: string) => boolean) | null) => (refuseWrite = f),
+    failStore: (fails: { get?: boolean; set?: boolean; from?: number }) => (storeFails = fails),
+    sentOf: (id: string) => sent.filter(x => x === id).length,
+    copiesOf: (id: string) => [...files].filter(([path, text]) => path.includes('/rejected-') && text !== '').flatMap(([, text]) => parseFile(text).lines).filter(l => l.row.event_id === id).length,
+  }
 }
 
 test('another session\'s writer resumes what a replay left only partly written: it sends none of it, writes the rest, and empties the file', async () => {
@@ -725,8 +779,9 @@ test('another session\'s writer resumes what a replay left only partly written: 
   w.refuse(null)
   const report = await w.writer('second-session').backfill(['spill', 'retry'], 'auto')
   expect(w.sent).toEqual(['a'.repeat(32), 'b'.repeat(32)])
-  // Its last-backfill line counts the file it finished, and what it left.
-  expect(report).toMatchObject({ files: 1, rowsSent: 0, rowsLeft: 2 })
+  // Its last-backfill line counts the file it finished, what it left, and
+  // how many of those were refused.
+  expect(report).toMatchObject({ files: 1, rowsSent: 0, rowsLeft: 2, rowsRefused: 1 })
   expect(w.files.get(source)).toBe('')
   const lines = [...w.files].filter(([, text]) => text !== '').flatMap(([path, text]) => parseFile(text).lines.map(l => `${path.includes('/rejected-') ? 'rejected' : 'retry'}:${l.row.event_id.slice(0, 1)}`))
   expect(lines.sort()).toEqual(['rejected:a', 'retry:b'])
@@ -811,7 +866,224 @@ test('a record that does not fit the file (another size) is not trusted: the fil
   expect(w.files.get(source)).toBe('')
 })
 
-test('rows with no id, in a file another writer made, each count once refused', { options: OPTIONS }, async ($, on) => {
+test('a writer back after another one finished its outcome, and replayed what it left, writes none of it again: the refused row goes twice in all, and is copied once', async () => {
+  let answer = FIRST_REFUSED_SECOND_AGAIN
+  const w = twoWriters(() => answer)
+  const source = `/dl/${TABLE_REF}/retry-20261013T200102003Z-earlier-1.jsonl`
+  const [a, b] = ['a'.repeat(32), 'b'.repeat(32)]
+  w.files.set(source, packFiles([line(a, 'retry'), line(b, 'retry')])[0] as string)
+  // The first writer records the outcome, and can write none of what is left.
+  const first = w.writer('first-session')
+  w.refuse(path => path !== source)
+  await first.backfill(['spill', 'retry'], 'auto')
+  // Another session writes all of it, but cannot empty the source; its next
+  // replay sends the row asked for again, and BigQuery refuses it.
+  w.refuseWrites((path, text) => path === source && text === '')
+  const second = w.writer('second-session')
+  await second.backfill(['spill', 'retry'], 'auto')
+  answer = FIRST_REFUSED
+  await second.backfill(['spill', 'retry'], 'auto')
+  expect([w.sentOf(b), w.copiesOf(b)]).toEqual([2, 1])
+  // The first writer comes back, writes working: the record says all of what
+  // is left is written, so it writes none of it again, only empties the file.
+  w.refuseWrites(null)
+  await first.backfill(['spill', 'retry'], 'auto')
+  await first.backfill(['spill', 'retry'], 'auto')
+  expect([w.sentOf(a), w.sentOf(b), w.copiesOf(a), w.copiesOf(b)]).toEqual([1, 2, 1, 1])
+  expect(w.files.get(source)).toBe('')
+  expect([...w.store.keys()]).toEqual([])
+})
+
+test('two writers that replay one file at the same time write what it left once', async () => {
+  const w = twoWriters(() => FIRST_REFUSED)
+  const source = `/dl/${TABLE_REF}/retry-20261013T200102003Z-earlier-1.jsonl`
+  w.files.set(source, packFiles([line('a'.repeat(32), 'retry')])[0] as string)
+  // Both read the lease before either writes it, and both send the row.
+  await Promise.all([w.writer('first-session').backfill(['spill', 'retry'], 'auto'), w.writer('second-session').backfill(['spill', 'retry'], 'auto')])
+  expect(w.copiesOf('a'.repeat(32))).toBe(1)
+  expect(w.files.get(source)).toBe('')
+})
+
+test('a record that cannot be read leaves its file waiting: no writer sends any of it, and once it can be read the file is only emptied', async () => {
+  const w = twoWriters(() => FIRST_REFUSED)
+  const source = `/dl/${TABLE_REF}/retry-20261013T200102003Z-earlier-1.jsonl`
+  const a = 'a'.repeat(32)
+  w.files.set(source, packFiles([line(a, 'retry')])[0] as string)
+  w.refuseWrites((path, text) => path === source && text === '')
+  await w.writer('first-session').backfill(['spill', 'retry'], 'auto')
+  expect([w.sentOf(a), w.copiesOf(a)]).toEqual([1, 1])
+  w.failStore({ get: true })
+  const second = w.writer('second-session')
+  const report = await second.backfill(['spill', 'retry'], 'auto')
+  expect([w.sentOf(a), w.copiesOf(a)]).toEqual([1, 1])
+  expect(report.error ?? '').toMatch(/^cannot read the replay record of retry-20261013T200102003Z-earlier-1\.jsonl: the store could not be read/)
+  expect(report.skippedFiles).toBe(1)
+  w.failStore({})
+  w.refuseWrites(null)
+  await second.backfill(['spill', 'retry'], 'auto')
+  expect([w.sentOf(a), w.copiesOf(a)]).toEqual([1, 1])
+  expect(w.files.get(source)).toBe('')
+})
+
+test('a record the store does not take is kept in a file beside the source: another writer resumes it from there, sending nothing again, and both files are emptied once they can be', async () => {
+  const w = twoWriters(() => FIRST_REFUSED)
+  const name = 'retry-20261013T200102003Z-earlier-1.jsonl'
+  const source = `/dl/${TABLE_REF}/${name}`
+  const a = 'a'.repeat(32)
+  w.files.set(source, packFiles([line(a, 'retry')])[0] as string)
+  w.failStore({ set: true })
+  w.refuseWrites((path, text) => path === source && text === '')
+  await w.writer('first-session').backfill(['spill', 'retry'], 'auto')
+  expect([w.sentOf(a), w.copiesOf(a)]).toEqual([1, 1])
+  await w.writer('second-session').backfill(['spill', 'retry'], 'auto')
+  expect([w.sentOf(a), w.copiesOf(a)]).toEqual([1, 1])
+  expect([...w.store.keys()]).toEqual([])
+  expect(w.files.get(`/dl/${TABLE_REF}/outcome-${name}`) ?? '').toMatch(/^\{"fates":"R",/)
+  w.failStore({})
+  w.refuseWrites(null)
+  await w.writer('third-session').backfill(['spill', 'retry'], 'auto')
+  expect([w.sentOf(a), w.copiesOf(a)]).toEqual([1, 1])
+  expect([w.files.get(source), w.files.get(`/dl/${TABLE_REF}/outcome-${name}`)]).toEqual(['', ''])
+  expect([...w.store.keys()]).toEqual([])
+})
+
+test('a record neither the store nor a file takes: nothing of what the replay left is written, and the writer sends none of it again until it can record it', async () => {
+  const w = twoWriters(() => FIRST_REFUSED)
+  const source = `/dl/${TABLE_REF}/retry-20261013T200102003Z-earlier-1.jsonl`
+  const a = 'a'.repeat(32)
+  const text = packFiles([line(a, 'retry')])[0] as string
+  w.files.set(source, text)
+  w.failStore({ set: true })
+  w.refuseWrites(path => path.includes('/outcome-'))
+  const writer = w.writer('a-session')
+  const report = await writer.backfill(['spill', 'retry'], 'auto')
+  await writer.backfill(['spill', 'retry'], 'auto')
+  expect([w.sentOf(a), w.copiesOf(a)]).toEqual([1, 0])
+  expect(w.files.get(source)).toBe(text)
+  expect(report.error ?? '').toMatch(/could not record the replay of .*retry-20261013T200102003Z-earlier-1\.jsonl, so nothing more of what it left is written/)
+  w.failStore({})
+  w.refuseWrites(null)
+  await writer.backfill(['spill', 'retry'], 'auto')
+  expect([w.sentOf(a), w.copiesOf(a)]).toEqual([1, 1])
+  expect(w.files.get(source)).toBe('')
+})
+
+test('a record the store took at first and then did not: what the file beside the source has as written counts too, so nothing replayed meanwhile is written again', async () => {
+  let answer = FIRST_REFUSED_SECOND_AGAIN
+  const w = twoWriters(() => answer)
+  const source = `/dl/${TABLE_REF}/retry-20261013T200102003Z-earlier-1.jsonl`
+  const [a, b] = ['a'.repeat(32), 'b'.repeat(32)]
+  w.files.set(source, packFiles([line(a, 'retry'), line(b, 'retry')])[0] as string)
+  // The store takes the first record (nothing written yet), then no more: the
+  // file beside the source holds the rest. The source cannot be emptied.
+  w.failStore({ from: 1 })
+  w.refuseWrites((path, text) => path === source && text === '')
+  const first = w.writer('first-session')
+  await first.backfill(['spill', 'retry'], 'auto')
+  expect(w.store.get(`replayed:${TABLE_REF}/retry-20261013T200102003Z-earlier-1.jsonl`)).toMatchObject({ written: [false, false] })
+  // Its next replay sends the row asked for again, which BigQuery refuses.
+  answer = FIRST_REFUSED
+  await first.backfill(['spill', 'retry'], 'auto')
+  expect([w.sentOf(b), w.copiesOf(b)]).toEqual([2, 1])
+  w.failStore({})
+  await w.writer('second-session').backfill(['spill', 'retry'], 'auto')
+  await w.writer('second-session').backfill(['spill', 'retry'], 'auto')
+  expect([w.sentOf(a), w.sentOf(b), w.copiesOf(a), w.copiesOf(b)]).toEqual([1, 2, 1, 1])
+})
+
+test('a record of the file\'s size that names fewer lines than the file holds is not trusted: the file is replayed, and no row is lost', async () => {
+  const w = twoWriters(() => OK_INSERT)
+  const name = 'retry-20261013T200102003Z-earlier-1.jsonl'
+  const source = `/dl/${TABLE_REF}/${name}`
+  const text = packFiles([line('c'.repeat(32), 'retry'), line('d'.repeat(32), 'retry')])[0] as string
+  w.files.set(source, text)
+  w.store.set(`replayed:${TABLE_REF}/${name}`, { size: new TextEncoder().encode(text).length, fates: 'W', reasons: [], refusals: [], files: [`/dl/${TABLE_REF}/retry-20261013T200103003Z-earlier-2.jsonl`], written: [false], waits: true })
+  await w.writer('a-session').backfill(['spill', 'retry'], 'auto')
+  expect(w.sent).toEqual(['c'.repeat(32), 'd'.repeat(32)])
+  expect(w.files.get(source)).toBe('')
+})
+
+test('a replay record stays small whatever BigQuery says: 4,500 rows refused for as many reasons fit the store with 16 reasons kept, and another writer sends none of them again', async () => {
+  const ids = Array.from({ length: 4500 }, (_, n) => n.toString(16).padStart(32, '0'))
+  const w = twoWriters(chunk => ({ status: 200, text: JSON.stringify({ insertErrors: chunk.map((id, index) => ({ index, errors: [{ reason: 'invalid', message: `row ${id}: ${'x'.repeat(940)}` }] })) }) }))
+  const name = 'retry-20261013T200102003Z-earlier-1.jsonl'
+  const source = `/dl/${TABLE_REF}/${name}`
+  const texts = packFiles(ids.map(id => line(id, 'retry')))
+  expect(texts.length).toBe(1)
+  w.files.set(source, texts[0] as string)
+  w.refuseWrites((path, text) => path === source && text === '')
+  await w.writer('first-session').backfill(['spill', 'retry'], 'auto')
+  await w.writer('second-session').backfill(['spill', 'retry'], 'auto')
+  expect(w.sent.length).toBe(4500)
+  const record = w.store.get(`replayed:${TABLE_REF}/${name}`) as { reasons: string[] }
+  expect(record.reasons.length).toBe(16)
+  expect(record.reasons[15]).toBe('refused for another reason (a replay keeps 16 reasons a file)')
+  expect(new TextEncoder().encode(JSON.stringify(record)).length < 64 * 1024).toBe(true)
+  expect(w.files.has(`/dl/${TABLE_REF}/outcome-${name}`)).toBe(false)
+  const rejected = [...w.files].filter(([path, text]) => path.includes('/rejected-') && text !== '').flatMap(([, text]) => parseFile(text).lines)
+  expect(rejected.length).toBe(4500)
+  expect(rejected.find(l => l.row.event_id === ids[0])?.reason).toMatch(new RegExp(`row ${ids[0]}: x`))
+  expect(rejected.find(l => l.row.event_id === ids[4499])?.reason).toBe('refused for another reason (a replay keeps 16 reasons a file)')
+})
+
+test('a record in the store that no longer fits the file does not hide the one beside it: the file is only emptied, and nothing is sent', async () => {
+  const w = twoWriters(() => FIRST_REFUSED)
+  const name = 'retry-20261013T200102003Z-earlier-1.jsonl'
+  const source = `/dl/${TABLE_REF}/${name}`
+  const rejected = `/dl/${TABLE_REF}/rejected-20261013T200103003Z-earlier-2.jsonl`
+  const text = packFiles([line('c'.repeat(32), 'retry')])[0] as string
+  const size = new TextEncoder().encode(text).length
+  w.files.set(source, text)
+  w.files.set(rejected, packFiles([line('c'.repeat(32), 'rejected')])[0] as string)
+  w.store.set(`replayed:${TABLE_REF}/${name}`, { size, fates: 'WW', reasons: [], refusals: [], files: [`/dl/${TABLE_REF}/retry-20261013T200103003Z-earlier-3.jsonl`], written: [false], waits: true })
+  w.files.set(`/dl/${TABLE_REF}/outcome-${name}`, sealFile(`${JSON.stringify({ size, fates: 'R', reasons: ['invalid: no such field: extra'], refusals: [0], files: [rejected], written: [true], waits: false })}\n`))
+  await w.writer('a-session').backfill(['spill', 'retry'], 'auto')
+  expect(w.sent).toEqual([])
+  expect([w.files.get(source), w.files.get(`/dl/${TABLE_REF}/outcome-${name}`)]).toEqual(['', ''])
+  expect(w.copiesOf('c'.repeat(32))).toBe(1)
+})
+
+test('a record beside the file that does not fit it is emptied with the replay afresh, so no later replay sends the file again', async () => {
+  const w = twoWriters(() => FIRST_REFUSED)
+  const name = 'retry-20261013T200102003Z-earlier-1.jsonl'
+  const source = `/dl/${TABLE_REF}/${name}`
+  const text = packFiles([line('c'.repeat(32), 'retry')])[0] as string
+  w.files.set(source, text)
+  w.files.set(`/dl/${TABLE_REF}/outcome-${name}`, sealFile(`${JSON.stringify({ size: new TextEncoder().encode(text).length, fates: 'WW', reasons: [], refusals: [], files: [`/dl/${TABLE_REF}/retry-20261013T200103003Z-earlier-3.jsonl`], written: [false], waits: true })}\n`))
+  // The source cannot be emptied, so the new outcome's record stays.
+  w.refuseWrites((path, text) => path === source && text === '')
+  const writer = w.writer('a-session')
+  for (let i = 0; i < 3; i += 1) await writer.backfill(['spill', 'retry'], 'auto')
+  await w.writer('another-session').backfill(['spill', 'retry'], 'auto')
+  expect([w.sentOf('c'.repeat(32)), w.copiesOf('c'.repeat(32))]).toEqual([1, 1])
+  expect(w.files.get(`/dl/${TABLE_REF}/outcome-${name}`)).toBe('')
+})
+
+test('a replay record too large for the store goes to the file beside the source, which another writer resumes from', async () => {
+  // Rows as small as a line can be, each refused for one of many reasons.
+  const small = (id: string): string => JSON.stringify({ v: 1, kind: 'retry', reason: '', attempts: 0, failed_at: '2026-10-13T20:01:02.003Z', table: TABLE_REF, row: { timestamp: '2026-10-13T20:01:02.003Z', event_type: 'TEST', event_id: id } })
+  const ids = Array.from({ length: 13_000 }, (_, n) => n.toString(16).padStart(8, '0'))
+  const w = twoWriters(chunk => ({ status: 200, text: JSON.stringify({ insertErrors: chunk.map((id, index) => ({ index, errors: [{ reason: 'invalid', message: `reason ${Number.parseInt(id, 16) % 1000}: ${'x'.repeat(980)}` }] })) }) }))
+  const name = 'retry-20261013T200102003Z-earlier-1.jsonl'
+  const source = `/dl/${TABLE_REF}/${name}`
+  const texts = packFiles(ids.map(small))
+  expect(texts.length).toBe(1)
+  w.files.set(source, texts[0] as string)
+  w.refuseWrites((path, text) => path === source && text === '')
+  await w.writer('first-session').backfill(['spill', 'retry'], 'auto')
+  await w.writer('second-session').backfill(['spill', 'retry'], 'auto')
+  expect(w.sent.length).toBe(13_000)
+  expect(w.store.has(`replayed:${TABLE_REF}/${name}`)).toBe(false)
+  const filed = parseFile(w.files.get(`/dl/${TABLE_REF}/outcome-${name}`) ?? '')
+  expect(filed.complete).toBe(true)
+  expect(new TextEncoder().encode(filed.unreadable[0] ?? '').length > 64 * 1024).toBe(true)
+  w.refuseWrites(null)
+  await w.writer('third-session').backfill(['spill', 'retry'], 'auto')
+  expect(w.sent.length).toBe(13_000)
+  expect([w.files.get(source), w.files.get(`/dl/${TABLE_REF}/outcome-${name}`)]).toEqual(['', ''])
+})
+
+test('rows with no id, in a file another writer made, each count once refused, however often /bqaa-backfill sends them', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on)
   const noId = (n: number): string => {
     const parsed = JSON.parse(line(String(n).repeat(32), 'rejected')) as { row: { event_id?: string } }
@@ -822,7 +1094,10 @@ test('rows with no id, in a file another writer made, each count once refused', 
   await startSession($)
   await world.clock.advance(5000)
   world.replies = [{ status: 200, text: JSON.stringify({ insertErrors: [0, 1].map(index => ({ index, errors: [{ reason: 'invalid', message: 'no such field: extra' }] })) }) }]
-  await $.command.run({ command: 'bqaa-backfill', args: '', ...COMMAND })
-  await world.clock.advance(1000)
-  expect(world.statusLines.at(-1) ?? '').toMatch(/^BQAA: 2 row\(s\) refused /)
+  // Run again, BigQuery still refusing them: each still counts once.
+  for (let i = 0; i < 2; i += 1) {
+    await $.command.run({ command: 'bqaa-backfill', args: '', ...COMMAND })
+    await world.clock.advance(1000)
+    expect(world.statusLines.at(-1) ?? '').toMatch(/^BQAA: 2 row\(s\) refused /)
+  }
 })

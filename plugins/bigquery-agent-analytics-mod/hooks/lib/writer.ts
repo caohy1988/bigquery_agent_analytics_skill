@@ -19,7 +19,7 @@ import { type Config, canDeliver, deadLetterPartition, destinationDir, joinPath,
 import { type HttpAnswer, TOKEN_INFO_URL, classifyInsert, createTableBody, insertAllBody, insertAllUrl, isDatasetMissing, tablesUrl } from './bigquery.ts'
 import { type DeadLetterKind, type DeadLetterLine, HOST_FILE_BYTES, MAX_FILE_BYTES, type ParsedFile, fileName, isDeadLetterKind, kindOf, lineText, packBodies, packFiles, packLines, parseFile, sealFile } from './deadletter.ts'
 import { BoundedQueue, type Queued } from './queue.ts'
-import { type BqaaRow, fitRow, rowBytes } from './rows.ts'
+import { type BqaaRow, fitRow, rowBytes, utf8Length } from './rows.ts'
 import { redactDiagnostic } from './sanitize.ts'
 import { errorText } from './tracer.ts'
 
@@ -36,6 +36,9 @@ export type Io = {
   envToken: () => Promise<string | undefined>
   writeFile: (path: string, text: string) => Promise<void>
   readFile: (path: string) => Promise<string>
+  // Whether a path exists. A writer without it reads the file, an empty text
+  // being no file.
+  exists?: (path: string) => Promise<boolean>
   listDir: (path: string) => Promise<readonly { name: string; kind: string; size: number }[]>
   storeGet: (key: string) => Promise<unknown>
   storeSet: (key: string, value: unknown) => Promise<void>
@@ -112,21 +115,29 @@ type ReplayTally = { waiting: number; requests: number }
 // What a replay made of a file's lines, one letter a line in the file's
 // order (L landed, W waits as it was, R refused, K kept as written: another
 // table's, or a kind this replay does not send), with each refused line's
-// reason (`refusals`, in the same order, indexes `reasons`).
+// reason (`refusals`, in the same order, indexes `reasons`, which holds
+// MAX_REASONS at most).
 type Outcome = { fates: string; reasons: string[]; refusals: number[] }
 
-// A file a replay has an outcome for: its size (a file is written once, under
-// a name of its own, so its name and size tell it), the outcome, the files
-// that hold what is left of it under the names given them (`text` null once
-// written), whether any of those holds rows that wait for a replay, and the
-// `$.store` key of the record that every writer reads (`Journal`).
-type Rewrite = Outcome & { size: number; files: { path: string; text: string | null }[]; waits: boolean; recordKey: string }
+// A replayed file, and where its record is: in `$.store` under `recordKey`,
+// or, when the store does not take it, in the file `recordFile` beside it
+// (`outcome-` and the file's name, which no replay takes for rows of any
+// kind). A file is written once, under a name of its own, so its name and
+// size tell it.
+type Source = { size: number; recordKey: string; recordFile: string }
 
-// The record of a Rewrite in `$.store`: written before what is left is,
-// updated as each file of it is written, removed once the source is emptied.
-// A writer that finds it (a later session.start's, another session's) writes
-// what is still missing, from the source and the outcome, and sends none of
-// the file's rows again.
+// A file a replay has an outcome for: the outcome, the files that hold what
+// is left of it under the names given them (`text` null once written),
+// whether any of those holds rows that wait for a replay, and whether its
+// record may be in `recordFile`.
+type Rewrite = Outcome & Source & { files: { path: string; text: string | null }[]; waits: boolean; filed: boolean }
+
+// The record of a Rewrite, which every writer reads: written before what is
+// left is, updated as each file of it is written, removed once the source is
+// emptied. A writer that finds it (a later session.start's, another
+// session's, or this one after another writer moved it on) writes what is
+// still missing, from the source and the outcome, and sends none of the
+// file's rows again.
 type Journal = Outcome & { size: number; files: string[]; written: boolean[]; waits: boolean }
 
 const TIMED_OUT = Symbol('timed out')
@@ -148,6 +159,15 @@ const DIAGNOSTIC_CHARS = 1000
 // Most row ids kept to count a refused or parked row once; past that, rows
 // are counted without the check.
 const COUNTED_IDS = 10_000
+// Most refusal reasons a replay keeps for one file: the first ones as
+// BigQuery gave them, then OTHER_REASON for every row refused for yet another.
+// So a file's replay record stays small: a letter and a small number a line,
+// these reasons, and the names of what is left.
+const MAX_REASONS = 16
+const OTHER_REASON = `refused for another reason (a replay keeps ${MAX_REASONS} reasons a file)`
+// Largest replay record kept in `$.store`, which holds 4 MiB of JSON in all
+// for every key of the mod's: a larger one goes to the file beside its source.
+const STORE_RECORD_BYTES = 64 * 1024
 // Longest `Run: <command>` line the band (register.ts) and the transcript
 // show whole; a longer command is shown whole by /bqaa-status alone.
 export const COMMAND_LINE_CHARS = 1000
@@ -186,6 +206,71 @@ const PLAIN_LOCATION = /^[A-Za-z0-9-]+$/
 // A path as one shell word: in single quotes, any single quote in it closed,
 // escaped and reopened.
 const shellQuote = (text: string): string => `'${text.replace(/'/g, `'\\''`)}'`
+
+// Each line's row as the refused and parked counts know it: its event_id,
+// or, for one with none (in a file another writer made), its content and how
+// many rows alike come before it, which a rewrite into another file keeps.
+// So such a row counts once however often it is refused. The content is a
+// 64-bit hash of the row's JSON: a checksum, not a secret.
+const rowKeys = (lines: readonly DeadLetterLine[]): string[] => {
+  const alike = new Map<string, number>()
+  return lines.map(line => {
+    const id = line.row.event_id
+    if (typeof id === 'string' && id !== '') return id
+    const text = JSON.stringify(line.row) ?? ''
+    let h1 = 0xdeadbeef
+    let h2 = 0x41c6ce57
+    for (let i = 0; i < text.length; i += 1) {
+      const ch = text.charCodeAt(i)
+      h1 = Math.imul(h1 ^ ch, 2654435761)
+      h2 = Math.imul(h2 ^ ch, 1597334677)
+    }
+    h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909)
+    h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909)
+    const key = `row:${(h2 >>> 0).toString(16).padStart(8, '0')}${(h1 >>> 0).toString(16).padStart(8, '0')}`
+    const before = alike.get(key) ?? 0
+    alike.set(key, before + 1)
+    return `${key}#${before}`
+  })
+}
+
+// Whether an outcome is one for these lines: a letter for each, and a reason
+// it holds for each refused one.
+const fitsLines = (file: ParsedFile, outcome: Outcome): boolean =>
+  outcome.fates.length === file.lines.length &&
+  /^[LWRK]*$/.test(outcome.fates) &&
+  outcome.refusals.length === outcome.fates.split('R').length - 1 &&
+  outcome.refusals.every(k => outcome.reasons[k] !== undefined)
+
+const sameNames = (a: readonly string[], b: readonly string[]): boolean => a.length === b.length && a.every((name, i) => name === b[i])
+
+// A record as a writer finds it, and whether one may be in the file beside
+// the source (to empty along with it).
+type Found = { journal: Partial<Journal>; filed: boolean }
+
+// Which files of what is left a record has as written: all of them for a
+// record that does not say.
+const writtenOf = (journal: Partial<Journal>): boolean[] => {
+  const files = Array.isArray(journal.files) ? journal.files : []
+  return Array.isArray(journal.written) ? files.map((_, i) => journal.written?.[i] === true) : files.map(() => true)
+}
+
+// A record kept in a file: its JSON on one line, then a completion record as
+// a dead-letter file ends with, so one cut off part-way is not read. A file
+// read as anything but text (none there, to a writer without `exists`) holds
+// none.
+const journalText = (journal: Journal): string => sealFile(`${JSON.stringify(journal)}\n`)
+const journalOf = (text: unknown): Partial<Journal> | undefined => {
+  if (typeof text !== 'string') return undefined
+  const parsed = parseFile(text)
+  const only = parsed.lines.length === 0 && parsed.unreadable.length === 1 ? parsed.unreadable[0] : undefined
+  if (!parsed.complete || only === undefined) return undefined
+  try {
+    return JSON.parse(only) as Partial<Journal>
+  } catch {
+    return undefined
+  }
+}
 
 // What a replay leaves of a file, from its outcome, as the files to write:
 // the lines that wait or were refused (a refused line as a `rejected` line,
@@ -649,7 +734,7 @@ export class Writer {
     this.call(() => this.io.toast?.(diagnostic(`BQAA: rows are not being written: ${headline}. To fix, ${fix}.`, 500)))
     // The command line goes whole, after the rest is cut; on a line of its
     // own where redaction would take it with the rest (a project named like
-    // a credential, `auth-…:` in the headline).
+    // a credential, `auth-…:` in the reason BigQuery gave).
     const told = diagnostic(`bqaa: rows are not being written: ${headline} (${clean}). To fix, ${fix}`, 900)
     const notice = `${told}${run ? `. ${run}` : ''}; this clears once rows are written again.`
     if (run === null || diagnostic(notice, 2000).includes(run)) this.call(() => this.io.notice?.(notice))
@@ -679,13 +764,14 @@ export class Writer {
     const was = this.problem
     if (was === null) return
     const parked = this.parkedDuringProblem
+    const about = this.parkedRough ? 'about ' : ''
     this.problem = null
     this.parkedDuringProblem = 0
     this.parkedIds.clear()
     this.parkedRough = false
     this.call(() => this.io.redraw?.())
     if (parked > 0 && (was.kind === 'permission' || !this.config().autoBackfill)) {
-      this.call(() => this.io.notice?.(`bqaa: rows are being written again; /bqaa-backfill sends the ${parked} row(s) parked while they could not be.`))
+      this.call(() => this.io.notice?.(`bqaa: rows are being written again; /bqaa-backfill sends the ${about}${parked} row(s) parked while they could not be.`))
     }
   }
 
@@ -702,9 +788,9 @@ export class Writer {
   problemText(): { headline: string; fix: string } {
     const c = this.config()
     const kind = this.problem?.kind ?? 'credentials'
-    if (kind === 'permission') return { headline: HEADLINE.permission, fix: `ask for roles/bigquery.dataEditor on ${c.project}:${c.dataset}, then run /bqaa-backfill` }
+    if (kind === 'permission') return { headline: HEADLINE.permission, fix: `ask for roles/bigquery.dataEditor on ${c.project}.${c.dataset}, then run /bqaa-backfill` }
     if (kind === 'destination') {
-      const what = this.problem?.missing === 'table' ? `the table ${c.project}:${c.dataset}.${c.table}` : `the dataset ${c.project}:${c.dataset}`
+      const what = this.problem?.missing === 'table' ? `the table ${c.project}.${c.dataset}.${c.table}` : `the dataset ${c.project}.${c.dataset}`
       const make = this.setupCommand() === null ? 'create it, or correct the project and dataset options' : "create it with the mod's setup.sh"
       return { headline: `BigQuery cannot find ${what}`, fix: `${make}; rows wait, and are sent once BigQuery finds it (a few minutes after it is made)` }
     }
@@ -1145,17 +1231,29 @@ export class Writer {
       }
       try {
         const path = joinPath(dir, name)
-        const size = sizes.get(name) ?? -1
-        const recordKey = `replayed:${destinationDir(tableRef(c))}/${name}`
+        const source: Source = { size: sizes.get(name) ?? -1, recordKey: `replayed:${destinationDir(tableRef(c))}/${name}`, recordFile: joinPath(dir, `outcome-${name}`) }
         // A replay already has this file's outcome: what is left of it is
         // written out (the rest of it, now), the file is emptied, and none
-        // of it goes again. Until it is emptied, its table stays due.
-        let known = this.rewrites.get(path)
-        if (known !== undefined && known.size !== size) {
+        // of it goes again. Until it is emptied, its table stays due. The
+        // record is read even when this writer holds the outcome: another
+        // writer may have written more of it since.
+        let held = this.rewrites.get(path)
+        if (held !== undefined && held.size !== source.size) {
           this.rewrites.delete(path)
-          known = undefined
+          held = undefined
         }
-        known ??= await this.resumeRewrite(path, recordKey, size, kindOf(name) ?? 'retry')
+        let found: Found | undefined
+        try {
+          found = await this.readJournal(source)
+        } catch (err) {
+          // It may have an outcome that cannot be read now: none of it goes
+          // until its record can be, and its rows wait.
+          report.error = diagnostic(`cannot read the replay record of ${name}: ${messageOf(err)}`)
+          report.skippedFiles += 1
+          if (kindOf(name) !== 'rejected') tally.waiting += 1
+          continue
+        }
+        const known = await this.resumeRewrite(path, source, kindOf(name) ?? 'retry', held, found)
         let emptied = true
         if (known !== undefined) {
           emptied = await this.writeOut(path, known)
@@ -1163,11 +1261,12 @@ export class Writer {
           if (known.waits) tally.waiting += 1
           report.files += 1
           report.rowsLeft += [...known.fates].filter(fate => fate !== 'L').length
+          report.rowsRefused += [...known.fates].filter(fate => fate === 'R').length
         } else {
           const parsed = parseFile(await this.io.readFile(path))
           if (!parsed.complete) report.incompleteFiles.push(name)
           else {
-            emptied = await this.backfillFile(dir, name, parsed, { size, recordKey }, c, kinds, trigger, report, tally)
+            emptied = await this.backfillFile(dir, name, parsed, source, c, kinds, trigger, report, tally)
             report.files += 1
           }
         }
@@ -1200,9 +1299,8 @@ export class Writer {
   // rows the access-denied notice counts, as a send's refused rows are, each
   // row once (one /bqaa-backfill sends again, and BigQuery refuses again,
   // is not counted twice; one an earlier session refused counts once here).
-  private refusedOnReplay(lines: readonly DeadLetterLine[], reason: string): void {
-    if (lines.length === 0) return
-    const ids = lines.map(line => line.row.event_id)
+  private refusedOnReplay(ids: readonly string[], reason: string): void {
+    if (ids.length === 0) return
     this.countRefused(ids)
     if (this.problem?.kind === 'permission') this.countParked(ids)
     if (this.problem !== null) this.showProblem()
@@ -1228,7 +1326,7 @@ export class Writer {
     let added = 0
     let rough = false
     for (const id of ids) {
-      // A row with no id (from a file another writer made) counts on its own.
+      // A row with no id counts on its own.
       if (typeof id !== 'string' || id === '') {
         added += 1
         continue
@@ -1241,32 +1339,64 @@ export class Writer {
     return { added, rough }
   }
 
-  // The Rewrite another writer recorded for the file `size` long under
-  // `recordKey`'s name, with what it had still to write rebuilt from the
-  // source; none when there is no such record (or it no longer fits the
-  // file, when it is let go).
-  private async resumeRewrite(path: string, recordKey: string, size: number, fileKind: DeadLetterKind): Promise<Rewrite | undefined> {
-    let journal: Partial<Journal> | undefined
-    try {
-      journal = (await this.io.storeGet(recordKey)) as Partial<Journal> | undefined
-    } catch {
-      return undefined
-    }
-    if (journal === undefined || journal === null || journal.size !== size) return undefined
+  // A file's replay record, wherever a writer left it: in `$.store`, and in
+  // the file beside it when the store did not take it (or it was too large
+  // for the store). When both hold the same outcome, a file of what is left
+  // counts as written if either says so. None when neither holds one; a
+  // record that cannot be read throws, and is never taken for none. One in a
+  // file cut off part-way is not read.
+  private async readJournal(source: Source): Promise<Found | undefined> {
+    const stored = ((await this.io.storeGet(source.recordKey)) ?? undefined) as Partial<Journal> | undefined
+    let filed: Partial<Journal> | undefined
+    if (this.io.exists === undefined || (await this.io.exists(source.recordFile))) filed = journalOf(await this.io.readFile(source.recordFile))
+    if (stored === undefined) return filed === undefined ? undefined : { journal: filed, filed: true }
+    if (filed === undefined) return { journal: stored, filed: false }
+    // Two outcomes: the file's was written when the store did not take it.
+    if (!Array.isArray(stored.files) || !Array.isArray(filed.files) || !sameNames(stored.files, filed.files)) return { journal: filed, filed: true }
+    const a = writtenOf(stored)
+    const b = writtenOf(filed)
+    return { journal: { ...stored, written: a.map((w, i) => w || b[i] === true) }, filed: true }
+  }
+
+  // What `rewrite` holds, brought up to its record: a file of what is left
+  // that the record has as written counts as written, and never goes back to
+  // unwritten (another writer may since have replayed and emptied it). False
+  // when the record is of another outcome for the file.
+  private static catchUp(rewrite: Rewrite, found: Found): boolean {
+    if (!sameNames(rewrite.files.map(f => f.path), Array.isArray(found.journal.files) ? found.journal.files : [])) return false
+    const written = writtenOf(found.journal)
+    rewrite.files.forEach((file, i) => {
+      if (written[i] === true) file.text = null
+    })
+    rewrite.filed ||= found.filed
+    return true
+  }
+
+  // The Rewrite for the file `source.size` long: what this writer holds of
+  // it, brought up to its record, or else the record's, with what it has
+  // still to write rebuilt from the source. With no record that fits the
+  // file, what this writer holds, if anything; a record that no longer fits
+  // the file is let go.
+  private async resumeRewrite(path: string, source: Source, fileKind: DeadLetterKind, held: Rewrite | undefined, found: Found | undefined): Promise<Rewrite | undefined> {
+    if (found === undefined || found.journal.size !== source.size) return held
+    if (held !== undefined && Writer.catchUp(held, found)) return held
+    const { journal } = found
     const paths = Array.isArray(journal.files) ? journal.files : []
-    const written = Array.isArray(journal.written) ? journal.written : paths.map(() => true)
+    const written = writtenOf(journal)
     const outcome: Outcome = { fates: typeof journal.fates === 'string' ? journal.fates : '', reasons: Array.isArray(journal.reasons) ? journal.reasons : [], refusals: Array.isArray(journal.refusals) ? journal.refusals : [] }
-    const rewrite: Rewrite = { ...outcome, size, recordKey, waits: journal.waits === true, files: paths.map(p => ({ path: p, text: null })) }
+    const rewrite: Rewrite = { ...outcome, ...source, waits: journal.waits === true, filed: found.filed, files: paths.map(p => ({ path: p, text: null })) }
     if (written.every(Boolean)) return rewrite
-    const texts = leftoverFiles(parseFile(await this.io.readFile(path)), fileKind, outcome)
-    if (texts.length !== paths.length) {
+    const lines = parseFile(await this.io.readFile(path))
+    const texts = fitsLines(lines, outcome) ? leftoverFiles(lines, fileKind, outcome) : null
+    if (texts === null || texts.length !== paths.length) {
       // Not this file's outcome after all: replay it afresh.
       try {
-        await this.io.storeDelete(recordKey)
+        await this.io.storeDelete(source.recordKey)
+        if (found.filed) await this.io.writeFile(source.recordFile, '')
       } catch {
         // It no longer fits the file; it is passed by again.
       }
-      return undefined
+      return held
     }
     rewrite.files = paths.map((p, i) => ({ path: p, text: written[i] === true ? null : (texts[i]?.text ?? '') }))
     return rewrite
@@ -1274,24 +1404,47 @@ export class Writer {
 
   // What a replay left of a file, written out: first the record of its
   // outcome, where every writer reads it, then each file of what is left,
-  // once (a write that fails stops the replay, and the next one, of this or
-  // any writer, writes the rest under the same names), then the source
-  // emptied. False when the source could not be emptied: it stays on disk,
-  // its rows landed or in the newer files, and the record keeps every
-  // session from sending it again; the next replay tries to empty it again.
+  // once, each followed by the record again (a write that fails stops the
+  // replay, and the next one, of this or any writer, writes the rest under
+  // the same names), then the source emptied. Nothing is written until the
+  // record is: one that neither the store nor the file beside the source
+  // takes stops the replay, and this writer tries again at the next. False
+  // when the source could not be emptied: it stays on disk, its rows landed
+  // or in the newer files, and the record keeps every session from sending
+  // it again; the next replay tries to empty it again.
   private async writeOut(path: string, rewrite: Rewrite): Promise<boolean> {
     this.rewrites.set(path, rewrite)
     const record = async (): Promise<void> => {
       const { fates, reasons, refusals, size, waits } = rewrite
       const journal: Journal = { fates, reasons, refusals, size, waits, files: rewrite.files.map(f => f.path), written: rewrite.files.map(f => f.text === null) }
+      if (utf8Length(JSON.stringify(journal)) <= STORE_RECORD_BYTES) {
+        try {
+          await this.io.storeSet(rewrite.recordKey, journal)
+          return
+        } catch {
+          // Not taken (the store is full, say): the file beside the source.
+        }
+      }
       try {
-        await this.io.storeSet(rewrite.recordKey, journal)
-      } catch {
-        // This writer still knows; another one may send the file again.
+        await this.io.writeFile(rewrite.recordFile, journalText(journal))
+        rewrite.filed = true
+      } catch (err) {
+        const message = `could not record the replay of ${path}, so nothing more of what it left is written: ${errorText(err)}`
+        this.recordError(message)
+        throw new Error(message)
       }
     }
     await record()
     for (const file of rewrite.files) {
+      if (file.text === null) continue
+      // Another writer may have written it since, or replayed the file at the
+      // same time with an outcome of its own: the record says.
+      const found = await this.readJournal(rewrite)
+      if (found !== undefined && found.journal.size === rewrite.size && !Writer.catchUp(rewrite, found)) {
+        // That outcome goes on, at the next replay, and no more of this one.
+        this.rewrites.delete(path)
+        return false
+      }
       if (file.text === null) continue
       await this.io.writeFile(file.path, file.text)
       file.text = null
@@ -1304,17 +1457,25 @@ export class Writer {
       return false
     }
     this.rewrites.delete(path)
+    // A record for an empty file is never read: no replay lists one.
     try {
       await this.io.storeDelete(rewrite.recordKey)
     } catch {
-      // A record for an empty file is never read: no replay lists one.
+      // Left for an empty file.
+    }
+    if (rewrite.filed) {
+      try {
+        await this.io.writeFile(rewrite.recordFile, '')
+      } catch {
+        // Left beside an empty file.
+      }
     }
     return true
   }
 
   // Replays one file; false when what it left is written out but the file
   // itself could not be emptied.
-  private async backfillFile(dir: string, name: string, file: ParsedFile, source: { size: number; recordKey: string }, c: Config, kinds: readonly DeadLetterKind[], trigger: BackfillReport['trigger'], report: BackfillReport, tally: ReplayTally): Promise<boolean> {
+  private async backfillFile(dir: string, name: string, file: ParsedFile, source: Source, c: Config, kinds: readonly DeadLetterKind[], trigger: BackfillReport['trigger'], report: BackfillReport, tally: ReplayTally): Promise<boolean> {
     const path = joinPath(dir, name)
     const { lines } = file
     const fileKind = kindOf(name) ?? 'retry'
@@ -1341,10 +1502,13 @@ export class Writer {
         if (line.table !== table) report.otherTableRows += 1
       }
     })
+    const keys = rowKeys(mine)
     // A row BigQuery refused: kept, with the reason, for /bqaa-backfill.
     const refuse = (n: number, reason: string): void => {
       report.rowsRefused += 1
-      const why = diagnostic(reason)
+      let why = diagnostic(reason)
+      // Past the reasons a replay keeps, one stands for every other.
+      if (!reasons.includes(why) && reasons.length >= MAX_REASONS - 1) why = OTHER_REASON
       let k = reasons.indexOf(why)
       if (k === -1) k = reasons.push(why) - 1
       fates[at[n] as number] = 'R'
@@ -1406,13 +1570,13 @@ export class Writer {
         // over.
         if (trigger === 'command') this.parkedDuringProblem = 0
         let landed = 0
-        const refused: DeadLetterLine[] = []
+        const refused: string[] = []
         let refusal = ''
         const { rejected, retry } = outcome.kind === 'partial' ? outcome : { rejected: new Map<number, string>(), retry: new Set<number>() }
-        chunk.forEach((line, i) => {
+        chunk.forEach((_, i) => {
           const reason = rejected.get(i)
           if (reason !== undefined) {
-            refused.push(line)
+            refused.push(keys[first + i] as string)
             refusal = reason
             refuse(first + i, reason)
           } else if (!retry.has(i)) {
@@ -1436,7 +1600,7 @@ export class Writer {
         if (outcome.permission) this.noteProblem('permission', outcome.message)
         else this.tableAnswered()
         chunk.forEach((line, i) => refuse(first + i, outcome.message))
-        this.refusedOnReplay(chunk, outcome.message)
+        this.refusedOnReplay(keys.slice(first, first + chunk.length), outcome.message)
         changed = true
         report.error = diagnostic(outcome.message)
         continue
@@ -1460,7 +1624,7 @@ export class Writer {
     const outcome: Outcome = { fates: fates.join(''), reasons, refusals }
     const rest = leftoverFiles(file, fileKind, outcome)
     const files = rest.map(({ kind, text }) => ({ path: joinPath(dir, fileName(kind, this.io.now(), this.sessionId(), ++this.seq)), text }))
-    return this.writeOut(path, { ...source, ...outcome, files, waits: rest.some(f => f.kind !== 'rejected') })
+    return this.writeOut(path, { ...source, ...outcome, files, waits: rest.some(f => f.kind !== 'rejected'), filed: false })
   }
 
   // ---- status ------------------------------------------------------------

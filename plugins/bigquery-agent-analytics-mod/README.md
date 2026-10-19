@@ -302,13 +302,15 @@ and took the credentials. Recovery is quick:
   without a prompt. That covers rows parked while a table the mod just
   made was not visible yet. A file another session is replaying, or one
   that could not be listed or read, keeps its rows waiting for the next
-  replay. A replay records what became of each of a file's rows in
-  `$.store` before it writes what is left, so when what is left cannot all
-  be written, or the file cannot be emptied, the next replay of any
-  writer, in this session or another, writes the rest under the same names
-  and empties the file, and none of its rows goes again. A replay that
-  runs by itself stops between requests for rows queued meanwhile, which
-  go first.
+  replay. A replay records what became of each of a file's rows before it
+  writes what is left (in `$.store`, or in a file beside it when the store
+  does not take the record), so when what is left cannot all be written, or
+  the file cannot be emptied, the next replay of any writer, in this
+  session or another, writes the rest under the same names and empties the
+  file, and none of its rows goes again. A record that cannot be read
+  leaves its file waiting, and nothing of what a replay left is written
+  until its record is. A replay that runs by itself stops between requests
+  for rows queued meanwhile, which go first.
 * A replay's 401 gets a fresh token and one more try, as a send's does, and
   a second 401 is the credentials notice.
 * Rows refused for a missing permission wait for `/bqaa-backfill`, and the
@@ -640,22 +642,33 @@ GROUP BY model
   completion record, and only then is the replayed file truncated. A replay
   whose rows BigQuery only asks for again rewrites nothing. The API has no
   rename either, so a write that fails leaves that file as it was. Before
-  it writes what is left, a replay records its outcome in `$.store` (one
-  record per file: what became of each row, a letter each, the refusals'
-  reasons, and the names of the files of what is left, each marked once
-  written; removed once the file is emptied). Any writer that replays the
-  file next, this session's or another's, a later session.start's
-  included, finds the record: it writes from the file and the record what
-  is still missing, under the same names, never a file already written,
-  then empties the file, and sends none of its rows again. A file that
-  cannot be emptied stays on disk, its rows landed or in the newer files,
-  and each replay tries to empty it. Only when the record itself cannot be
-  written does a later writer send the file again (`event_id` dedups it).
-  A file over 4 MiB, which the API cannot read, is
-  reported by `/bqaa-status` and the backfill instead of being passed over. A
-  per-file lease in `$.store` keeps two sessions from replaying the same file
-  at once (best effort; `event_id` dedups the rest); a session that finds a
-  file leased tries it again at its next replay.
+  it writes what is left, a replay records its outcome: one record per
+  file, with what became of each row (a letter each, and for a refused row
+  a number naming its reason), the refusals' reasons (16 at most: rows
+  refused for any reason past the first 15 share one that says so), and
+  the names of the files of what is left, each marked once written. The
+  record goes to `$.store`, which holds 4 MiB of JSON in all; one over
+  64 KiB, or one the store does not take, goes to a file beside the
+  replayed one (`outcome-` and its name, which no replay takes for rows).
+  It is removed, or that file emptied, once the replayed file is emptied. Nothing of what is left is written until the record is: when
+  neither the store nor the file takes it, the replayed file stays as it
+  was, and this session tries again at each replay (a later session, not
+  knowing, sends its rows again; `event_id` dedups them). Any writer that
+  replays the file next, this session's or another's, a later
+  session.start's included, reads the record, even one that holds the
+  outcome itself: it writes from the file and the record what is still
+  missing, under the same names, never a file the record has as written
+  (one may since have been replayed and emptied), then empties the file,
+  and sends none of its rows again. A record that cannot be read leaves
+  its file waiting for the next replay, never taken for no record. A file
+  that cannot be emptied stays on disk, its rows landed or in the newer
+  files, and each replay tries to empty it. A file over 4 MiB, which the
+  API cannot read, is reported by `/bqaa-status` and the backfill instead
+  of being passed over. A per-file lease in `$.store` keeps two sessions
+  from replaying the same file at once (best effort: two that read the
+  lease at the same moment both send the file, `event_id` dedups it, and
+  what it left is written once, as the record says); a session that finds
+  a file leased tries it again at its next replay.
 * **Fail open:** a hook's bookkeeping runs behind `.catch` or inside `try`;
   the writer never throws into a hook; every failure path ends in sent, on
   disk, or counted as dropped. An environment variable a policy refuses reads
@@ -813,7 +826,8 @@ The test command runs the `tests/*.test.ts` files against the host CLI's own
 test kit, with no session, sign-in, GCP or network: `$.http.fetch`,
 `$.process.run`, `$.fs` and `$.store` are stubbed, and `mock.clock` drives the
 timers; the `$.fs` stubs measure files in UTF-8 bytes and refuse a file over
-4 MiB, as the host does. 229 tests cover the captured rows and their spans,
+4 MiB, and the `$.store` stub a store over 4 MiB of JSON in all, as the host
+does. 241 tests cover the captured rows and their spans,
 subagent runs in the order the host raises them (one invocation and one
 trace for the turn, a span per run, a SubagentStart that comes late or never),
 the session-start row raised before or during `session.start`'s setup,
@@ -910,7 +924,19 @@ And the replay that runs by itself while nothing is queued:
   outcome recorded before any of what is left was written, written whole
   by the next writer; a file of what is left that `/bqaa-backfill` sent and
   emptied meanwhile never written again; a record that does not fit the
-  file never trusted;
+  file (another size, or fewer lines) never trusted; the writer that
+  recorded an outcome, back after another writer finished it and replayed
+  what it left, writing none of it again; two writers replaying one file
+  at once writing what it left once; a record that cannot be read leaving
+  its file waiting and due, with nothing sent; a record the store does not
+  take, or one over 64 KiB, kept in the file beside the source and resumed
+  from there, both files emptied once they can be; a record the store took
+  at first and then did not, where the file's marks count too; a record
+  in neither place leaving the file as it was until it can be written; a
+  store record that no longer fits not hiding the one beside the file, and
+  one beside it that does not fit emptied; 4,500 rows refused for as many
+  reasons kept with 16 reasons in a record under 64 KiB, with the store
+  holding 4 MiB in all, and none sent again;
 * it stops between requests for a row queued meanwhile, which goes first,
   with no backoff, and then goes on;
 * rows refused on a send and then on a replay all counted on the status
@@ -921,8 +947,9 @@ And the replay that runs by itself while nothing is queued:
   access is denied, and a row an earlier session refused once; a row
   refused again after rows landed, or under a later access-denied notice,
   counted again there; past the 10,000 rows a count keeps, the status line
-  saying about; rows with no id each counted; a run that only finishes a
-  recorded outcome counted in its report;
+  saying about; rows with no id each counted once, however often
+  `/bqaa-backfill` sends them; a run that only finishes a recorded outcome
+  counted in its report, its refused rows included;
 * the status line for rows parked after retries, with automatic replay on
   and off.
 

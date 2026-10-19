@@ -166,8 +166,11 @@ export function setUp(on: On, env: Record<string, string> = {}, store: Record<st
   }
 
   on('store.get', ($, e) => ({ value: world.store.get(e.key) }))
+  // As the host, a store of no more than 4 MiB of JSON in all.
   on('store.set', ($, e) => {
-    world.store.set(e.key, asJson(e.value))
+    const value = asJson(e.value)
+    if (utf8Bytes(JSON.stringify(Object.fromEntries(new Map(world.store).set(e.key, value)))) > HOST_FILE_BYTES) return { deny: 'the store would pass 4 MiB of JSON' }
+    world.store.set(e.key, value)
     return { value: undefined }
   })
   on('store.delete', ($, e) => {

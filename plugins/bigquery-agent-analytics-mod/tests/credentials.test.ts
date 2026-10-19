@@ -1,7 +1,8 @@
 // When rows cannot be written for lack of credentials or permission: the
 // band above the prompt, the toast, the transcript line and the status line,
 // each with the fix and the rows waiting; recovery soon after the fix; and
-// the opt-in `block` mode, which refuses prompts while no credentials work.
+// prompts passed through whatever the credentials do, the retired `block`
+// option included.
 
 import { type Engine, expect, test } from 'claude-code/testing'
 
@@ -76,7 +77,7 @@ test('without working credentials, the band, one toast and one transcript line g
   expect(world.toasts.length).toBe(1)
   expect(noticeLines(world).length).toBe(1)
   expect((await band($)).waiting).toBe(' 15 row(s) waiting.')
-  expect(await statusText($)).toMatch(/notice \(since .*\): rows are not being written: no working Google credentials \(authentication: token command .gcloud. exited 1: ERROR: .*\); to fix, run: gcloud auth application-default login; 15 row\(s\) waiting/)
+  expect(await statusText($)).toMatch(/notice \(since .*\): rows are not being written: no working Google credentials; to fix, run: gcloud auth application-default login; 15 row\(s\) waiting; cause: authentication: token command .gcloud. exited 1: ERROR: /)
 })
 
 test('the notice clears on the next successful send, and the rows go out', { options: OPTIONS }, async ($, on) => {
@@ -157,7 +158,7 @@ test('a missing permission is a notice with the role to ask for; /bqaa-backfill 
   await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
   await world.clock.advance(5000)
   const shown = await band($)
-  expect(shown.line).toBe('rows are not being written: BigQuery denied the identity access to the dataset. To fix, ask for roles/bigquery.dataEditor on my-gcp-project:agent_analytics, then run /bqaa-backfill.')
+  expect(shown.line).toBe('rows are not being written: BigQuery denied the identity access to the dataset. To fix, ask for roles/bigquery.dataEditor on my-gcp-project.agent_analytics, then run /bqaa-backfill.')
   expect(shown.waiting).toBe(' 3 row(s) waiting.')
   expect(world.toasts.length).toBe(1)
   // Access granted: new rows land, the band clears, and the transcript says

@@ -230,7 +230,7 @@ test('a permission error parks rows as refused; /bqaa-backfill sends them once f
   expect(file?.[0].startsWith(`${PARTITION_DIR}/rejected-`)).toBe(true)
   // The status line says what is wrong, and the fix, with the rows waiting.
   expect(world.statusLines.at(-1) ?? '').toBe(
-    'BQAA: BigQuery denied the identity access to the dataset. To fix, ask for roles/bigquery.dataEditor on my-gcp-project:agent_analytics, then run /bqaa-backfill (3 row(s) waiting)',
+    'BQAA: BigQuery denied the identity access to the dataset. To fix, ask for roles/bigquery.dataEditor on my-gcp-project.agent_analytics, then run /bqaa-backfill (3 row(s) waiting)',
   )
   // Refused rows are not replayed automatically.
   await world.clock.advance(60_000)

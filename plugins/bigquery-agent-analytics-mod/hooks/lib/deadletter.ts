@@ -20,8 +20,9 @@ export type DeadLetterKind =
   | 'spill'
   // Retries ran out on transient errors: sent by the next auto-backfill.
   | 'retry'
-  // BigQuery or the configuration refused them (permissions, missing table,
-  // invalid row): sent again only by an explicit /bqaa-backfill.
+  // BigQuery refused them (access denied, an invalid row or request): sent
+  // again only by an explicit /bqaa-backfill. Rows for a dataset or table
+  // BigQuery cannot find are not refused: they wait as `retry`.
   | 'rejected'
 
 export type DeadLetterLine = {
