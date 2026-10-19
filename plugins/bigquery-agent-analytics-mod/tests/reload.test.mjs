@@ -20,9 +20,12 @@ const settle = async () => {
   for (let i = 0; i < 200; i += 1) await Promise.resolve()
 }
 
-// What outlives a load of the code: the store, the session's state, and the
-// store writes still to answer (`hold` picks the keys whose writes wait).
-function host(hold = () => false) {
+// What outlives a load of the code: the store, the session's state (each
+// value with a version, a write with `ifVersion` landing only while the
+// value stands at it, as the host's), and the writes still to answer.
+// `hold` picks the store keys whose writes wait; `holdState` the state
+// writes that wait, `refuseState` those refused; `read` may hold store reads.
+function host({ hold = () => false, holdState = () => false, refuseState = () => false, read } = {}) {
   const store = new Map()
   const state = new Map()
   const held = []
@@ -31,7 +34,19 @@ function host(hold = () => false) {
     if (!hold(key)) return Promise.resolve(land())
     return new Promise(resolve => held.push({ key, release: () => resolve(land()) }))
   }
-  return { store, state, held, write, release: key => held.splice(held.findIndex(h => h.key === key), 1)[0].release() }
+  const stateSet = (ref, value, options) => {
+    if (refuseState(value)) return Promise.reject(new Error('refused by policy'))
+    const land = () => {
+      const now = state.get(ref.key) ?? { value: undefined, version: 0 }
+      if (options?.ifVersion !== undefined && options.ifVersion !== now.version) return { isSet: false, version: now.version }
+      state.set(ref.key, { value: structuredClone(value), version: now.version + 1 })
+      return { isSet: true, version: now.version + 1 }
+    }
+    if (!holdState(value)) return Promise.resolve(land())
+    return new Promise(resolve => held.push({ key: 'state', value, release: () => resolve(land()) }))
+  }
+  const card = () => state.get('welcome')?.value
+  return { store, state, held, write, stateSet, read, card, release: key => held.splice(held.findIndex(h => h.key === key), 1)[0].release() }
 }
 
 let loads = 0
@@ -41,6 +56,7 @@ async function load(h) {
   const hooks = new Map()
   const timers = []
   const lines = []
+  const toasts = []
   const on = (name, ...args) => {
     hooks.set(name, args.at(-1))
     return { catch: () => undefined }
@@ -48,13 +64,13 @@ async function load(h) {
   register(on, { project: 'my-gcp-project', dataset: 'agent_analytics', dryRun: true })
   const $ = {
     env: { get: async name => ({ HOME: '/home/dev' })[name] },
-    store: { get: async key => structuredClone(h.store.get(key)), set: h.write, delete: async key => void h.store.delete(key), keys: async () => [...h.store.keys()] },
+    store: { get: key => (h.read ? h.read(key) : Promise.resolve(structuredClone(h.store.get(key)))), set: h.write, delete: async key => void h.store.delete(key), keys: async () => [...h.store.keys()] },
     state: {
-      get: async ref => ({ value: structuredClone(h.state.get(ref.key)), version: 0 }),
-      set: async (ref, value) => {
-        h.state.set(ref.key, structuredClone(value))
-        return { isSet: true, version: 0 }
+      get: async ref => {
+        const now = h.state.get(ref.key) ?? { value: undefined, version: 0 }
+        return { value: structuredClone(now.value), version: now.version }
       },
+      set: h.stateSet,
     },
     session: { id: async () => SESSION, version: async () => ({ version: 'test' }) },
     clock: { every: (ms, fn) => (timers.push(fn), { cancel() {} }), after: () => ({ cancel() {} }) },
@@ -62,20 +78,23 @@ async function load(h) {
     plugin: { root: '/opt/mods/bigquery-agent-analytics-mod' },
     ui: {
       log: text => void lines.push(text),
-      toast: () => undefined,
+      toast: text => void toasts.push(text),
       status: () => undefined,
       invalidate: () => undefined,
       resolve: () => Object.fromEntries(['Box', 'Text', 'Button'].map(type => [type, props => ({ type, props })])),
     },
-    fs: { write: async () => undefined, read: async () => '', list: async () => [], exists: async () => false },
+    fs: { write: (...args) => (h.writeFile ? h.writeFile(...args) : Promise.resolve()), read: async () => '', list: async () => [], exists: async () => false },
     http: { fetch: async () => Promise.reject(new Error('no network here')) },
     process: { run: async () => Promise.reject(new Error('no processes here')) },
   }
   const fire = (name, e) => hooks.get(name)($, e, async x => (name === 'ui.render' ? null : x))
   const walk = n => (n ? [n, ...(Array.isArray(n.props?.children) ? n.props.children.flatMap(walk) : typeof n.props?.children === 'object' ? walk(n.props.children) : [])] : [])
-  const button = async () => walk(await fire('ui.render', { component: 'AbovePrompt', props: { hasSurvey: false, maxRows: 10 } })).find(n => n.type === 'Button')
+  const band = async () => walk(await fire('ui.render', { component: 'AbovePrompt', props: { hasSurvey: false, maxRows: 10 } }))
+  const button = async () => (await band()).find(n => n.type === 'Button')
   return {
+    texts: async () => (await band()).filter(n => n.type === 'Text').map(n => n.props.children),
     greetings: () => lines.filter(line => line.startsWith('bqaa: BigQuery Agent Analytics mod')).length,
+    toasts: () => toasts.length,
     start: async () => {
       await fire('session.start', START)
       await settle()
@@ -98,7 +117,7 @@ async function load(h) {
 
 const tests = {
   async 'a card closed before a reload stays closed while the close is still being written'() {
-    const h = host(() => true)
+    const h = host({ hold: () => true })
     const a = await load(h)
     await a.start()
     await a.close()
@@ -108,7 +127,7 @@ const tests = {
     assert.equal(a.greetings() + b.greetings(), 1)
   },
   async 'a greeting still being written gives one transcript line across loads, and the same card'() {
-    const h = host(() => true)
+    const h = host({ hold: () => true })
     const a = await load(h)
     await a.start()
     const b = await load(h)
@@ -120,7 +139,7 @@ const tests = {
     ['before', 'after'].map(order => [
       `a landing an earlier load is still writing lands ${order} the close a later load writes: the card stays closed`,
       async () => {
-        const h = host(key => key === OWN)
+        const h = host({ hold: key => key === OWN })
         const a = await load(h)
         await a.start()
         await a.land()
@@ -145,6 +164,156 @@ const tests = {
       },
     ]),
   ),
+  async 'a store read an earlier load is still waiting on, answering after a later load showed the card and it was closed, shows nothing, greets no more, and leaves it closed'() {
+    let answer
+    let first = true
+    const h = host({
+      read: key => {
+        if (first && key === 'welcome') {
+          first = false
+          return new Promise(resolve => (answer = () => resolve(undefined)))
+        }
+        return Promise.resolve(structuredClone(h.store.get(key)))
+      },
+    })
+    const a = await load(h)
+    await a.start()
+    const b = await load(h)
+    await b.start()
+    await b.close()
+    answer()
+    await settle()
+    const c = await load(h)
+    await c.start()
+    assert.equal(a.greetings() + b.greetings() + c.greetings(), 1)
+    assert.equal(h.store.get(CLOSED), true)
+    assert.equal(h.card()?.closed, true)
+    assert.equal(await c.shown(), false)
+  },
+  async 'a dry-run write an earlier load is still finishing, landing after a later load closed the card, leaves it closed'() {
+    const writes = []
+    const h = host()
+    h.writeFile = (path, text) => new Promise(resolve => writes.push(resolve))
+    const a = await load(h)
+    await a.start()
+    await a.land()
+    const b = await load(h)
+    await b.start()
+    await b.close()
+    for (const done of writes.splice(0)) done()
+    await settle()
+    const c = await load(h)
+    await c.start()
+    assert.equal(h.store.get(CLOSED), true)
+    assert.equal(h.card()?.closed, true)
+    assert.equal(await c.shown(), false)
+  },
+  async 'rows an earlier load lands where the card counts them, after a later load took the card over, count on it'() {
+    const writes = []
+    const h = host()
+    h.writeFile = (path, text) => new Promise(resolve => writes.push(resolve))
+    const a = await load(h)
+    await a.start()
+    await a.land()
+    const b = await load(h)
+    await b.start()
+    assert.ok((await b.texts()).some(t => String(t).startsWith('◌ Waiting for the first rows')))
+    for (const done of writes.splice(0)) done()
+    await settle()
+    assert.equal(h.card()?.sent, 1)
+    assert.ok((await b.texts()).some(t => String(t).startsWith('✓ First rows written · 1 so far')))
+    // The earlier load only counts: the card is the later load's to speak for.
+    assert.equal(a.toasts(), 0)
+  },
+  async 'a greeting an earlier load never got written is written by the load that reopens the card'() {
+    let greetings = 0
+    const h = host({ hold: key => key === `welcome:${PLUGIN_VERSION}` && ++greetings === 1 })
+    const a = await load(h)
+    await a.start()
+    assert.equal(h.store.get(`welcome:${PLUGIN_VERSION}`), undefined)
+    const b = await load(h)
+    await b.start()
+    await settle()
+    assert.deepEqual(h.store.get(`welcome:${PLUGIN_VERSION}`), { sessionId: SESSION, previous: null })
+    assert.equal(a.greetings() + b.greetings(), 1)
+  },
+  async 'a close the store has, whose session-state write was refused, wins over the open card the state still has'() {
+    const h = host({ refuseState: value => value?.closed === true })
+    const a = await load(h)
+    await a.start()
+    await a.close()
+    await settle()
+    assert.equal(h.store.get(CLOSED), true)
+    assert.equal(h.card()?.closed, false)
+    // The state still says open (its writes of a close are refused), but a
+    // new load reads the close from the store and never draws the card.
+    const b = await load(h)
+    await b.start()
+    assert.equal(await b.shown(), false)
+  },
+  async 'a close the store has, whose session-state write was refused once, is written back to the state by the next load'() {
+    let refusals = 0
+    const h = host({ refuseState: value => value?.closed === true && ++refusals === 1 })
+    const a = await load(h)
+    await a.start()
+    await a.close()
+    await settle()
+    assert.equal(h.store.get(CLOSED), true)
+    assert.equal(h.card()?.closed, false)
+    const b = await load(h)
+    await b.start()
+    assert.equal(h.card()?.closed, true)
+    assert.equal(await b.shown(), false)
+  },
+  async 'a close whose session-state write never answers is in the store at once, and a new load shows no card'() {
+    let holding = false
+    const h = host({ holdState: () => holding })
+    const a = await load(h)
+    await a.start()
+    holding = true
+    await a.close()
+    await settle()
+    assert.equal(h.store.get(CLOSED), true)
+    assert.equal(await a.shown(), false)
+    const b = await load(h)
+    await b.start()
+    assert.equal(await b.shown(), false)
+  },
+  async 'session-state writes that answer late, a close and then an earlier landing, leave the card closed'() {
+    let holding = false
+    const h = host({ holdState: () => holding })
+    const a = await load(h)
+    await a.start()
+    holding = true
+    await a.land()
+    await a.close()
+    holding = false
+    // The close's write answers first, then the landing's.
+    const close = h.held.findIndex(w => w.key === 'state' && w.value.closed === true)
+    h.held.splice(close, 1)[0].release()
+    await settle()
+    for (const w of h.held.splice(0)) w.release()
+    await settle()
+    // The landing's late write did not land over the close.
+    assert.equal(h.card()?.closed, true)
+    const b = await load(h)
+    await b.start()
+    assert.equal(h.card()?.closed, true)
+    assert.equal(await b.shown(), false)
+  },
+  async 'a greeting whose store write and session-state write are both still in flight gives one transcript line across loads'() {
+    let holding = true
+    const h = host({ hold: () => true, holdState: () => holding })
+    const a = await load(h)
+    const starting = a.start()
+    const b = await load(h)
+    holding = false
+    await b.start()
+    for (const w of h.held.filter(w => w.key === 'state').splice(0)) h.held.splice(h.held.indexOf(w), 1)[0].release()
+    await starting
+    await settle()
+    assert.equal(a.greetings() + b.greetings(), 1)
+  },
 }
 
 let failed = 0

@@ -138,7 +138,8 @@ for (const [name, records] of SHOWN_BEFORE) {
 test('a reload in the session that showed the card shows it again as it was, with no second line or toast', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on, {}, { welcome: GREETING, [GREETED_KEY]: GREETED_HERE, [OWN]: { landedAt: 1, landedTo: HERE } })
   await startSession($)
-  // A reload starts the counts over: no count until rows land again.
+  // Rebuilt from the store's records alone (no `$.state`), which keep no
+  // count: none until rows land again.
   expect((await band($)).texts).toEqual([...INSTALLED, RECORDS, '✓ First rows landed in BigQuery · /bqaa-status shows the counts', 'drawn beneath'])
   await world.clock.advance(5000)
   expect((await band($)).texts).toEqual([...INSTALLED, RECORDS, landed(1), 'drawn beneath'])
@@ -155,6 +156,12 @@ test('an update greets the new version and names the one it replaced', { options
   expect(greeted(world)).toEqual({ sessionId: SESSION_ID, previous: '0.0.9' })
   // The record an earlier version kept is read, never written.
   expect(stored(world)).toEqual({ version: '0.0.9', previous: null, sessionId: 'an-earlier-session' })
+})
+
+test('pre-releases are ordered part by part: rc.10 comes after rc.2', { options: OPTIONS }, async ($, on) => {
+  setUp(on, {}, { 'welcome:0.1.0-rc.2': { sessionId: 'an-older-session', previous: null }, 'welcome:0.1.0-rc.10': { sessionId: 'an-earlier-session', previous: '0.1.0-rc.2' } })
+  await startSession($)
+  expect((await band($)).texts.slice(1, 3)).toEqual([`BigQuery Agent Analytics mod updated to ${PLUGIN_VERSION}`, ' was 0.1.0-rc.10'])
 })
 
 test('the card names, as the version it replaced, the newest one greeted before', { options: OPTIONS }, async ($, on) => {
@@ -248,8 +255,14 @@ test('a run with no one at the prompt shows no card and leaves the store alone',
 
 for (const operation of ['get', 'set'] as const) {
   test(`a welcome store ${operation} that never answers holds up nothing: session.start returns, rows land, the commands are there`, { options: OPTIONS }, async ($, on) => {
-    if (operation === 'get') on('store.get', { key: 'welcome' }, () => new Promise<never>(() => undefined))
-    else on('store.set', { key: 'welcome' }, () => new Promise<never>(() => undefined))
+    // The reads start with `welcome`; the greeting's write goes to its version's key.
+    let held = 0
+    const hang = (): Promise<never> => {
+      held += 1
+      return new Promise<never>(() => undefined)
+    }
+    if (operation === 'get') on('store.get', { key: 'welcome' }, hang)
+    else on('store.set', { key: GREETED_KEY }, hang)
     const world = setUp(on, {}, {})
     let started = false
     void startSession($).then(() => {
@@ -260,6 +273,7 @@ for (const operation of ['get', 'set'] as const) {
     expect(world.acceptedRows().length).toBe(1)
     expect(world.registered).toEqual(['bqaa-status', 'bqaa-flush', 'bqaa-backfill'])
     // Never read: no card. Read, but never recorded: the card, with its rows.
+    expect(held).toBe(1)
     const texts = (await band($)).texts
     if (operation === 'get') expect(texts).toEqual(['drawn beneath'])
     else expect(texts).toEqual([...INSTALLED, RECORDS, landed(1), 'drawn beneath'])
@@ -674,4 +688,38 @@ test('the writer says rows landed, with the configuration they went under: per r
   writer.enqueue(buildRow({ eventType: 'STATE_DELTA', timestampMs: 0, eventId: '4'.repeat(32), agent: 'coding-agent', sessionId: 'hand-built-session', invocationId: null, userId: 'dev', traceId: null, spanId: null, parentSpanId: null, content: {}, attributes: {}, maxPayloadChars: 16384 }).row, 0)
   await writer.spillForExit(1000)
   expect(told).toEqual([[3, 'agent_analytics'], [1, `dry run: ${dryRun.dryRunDir}`]])
+})
+
+test('rows the writer before a reload lands where the card counts them count on the card after it', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on, {}, {})
+  world.replies = [{ hang: true }]
+  await startSession($)
+  await world.clock.advance(5000)
+  expect(world.insertCalls().length).toBe(1)
+  await $.session.start(START)
+  await world.clock.settle()
+  expect((await band($)).texts[4]).toBe(WAITING)
+  world.releaseHung(200, OK_INSERT.text)
+  await world.clock.settle()
+  expect((await band($)).texts[4]).toBe(landed(1))
+})
+
+test('a close whose session-state write is refused hides the card at once, and the store\'s close keeps it hidden after a reload', { options: OPTIONS }, async ($, on) => {
+  let refused = 0
+  on('state.set', { plugin: PLUGIN, key: 'welcome' }, ($, e, next) => {
+    if ((e.value as { closed?: boolean } | null)?.closed !== true) return next(e)
+    refused += 1
+    return { deny: 'refused by policy' }
+  })
+  const world = setUp(on, {}, {})
+  await startSession($)
+  await world.clock.settle()
+  await pressGotIt($)
+  await world.clock.settle()
+  expect(refused > 0).toBe(true)
+  expect((await band($)).texts).toEqual(['drawn beneath'])
+  expect(closedMark(world)).toBe(true)
+  await $.session.start(START)
+  await world.clock.settle()
+  expect((await band($)).texts).toEqual(['drawn beneath'])
 })

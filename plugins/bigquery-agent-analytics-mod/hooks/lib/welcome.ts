@@ -87,21 +87,22 @@ export function openWelcome(records: WelcomeRecords, sessionId: string | null, k
     // one; a change back's newer one).
     const before = [...records.versions, greetedVersion(records.latest)].filter((v): v is string => v !== null && v !== PLUGIN_VERSION)
     const previous = before.reduce<string | null>((newest, v) => (newest === null || isNewer(v, newest) ? v : newest), null)
-    return { welcome: { version: PLUGIN_VERSION, previous, sessionId, landedAt: null, landedTo: null, closed: false, sent: 0 }, isNew: true }
+    return { welcome: { version: PLUGIN_VERSION, previous, sessionId, landedAt: null, landedTo: null, closed: false, sent: 0, destination: key, owner: '' }, isNew: true }
   }
   if (sessionId === null || by.sessionId !== sessionId || records.closed === true) return null
   const landing = isObject(records.landing) ? records.landing : {}
   const here = key !== null && typeof landing.landedAt === 'number' && landing.landedTo === key
-  return { welcome: { version: PLUGIN_VERSION, previous: by.previous, sessionId, landedAt: here ? (landing.landedAt as number) : null, landedTo: here ? key : null, closed: false, sent: 0 }, isNew: false }
+  return { welcome: { version: PLUGIN_VERSION, previous: by.previous, sessionId, landedAt: here ? (landing.landedAt as number) : null, landedTo: here ? key : null, closed: false, sent: 0, destination: key, owner: '' }, isNew: false }
 }
 
 // After a reload in the session that showed the card, from what `$.state`
-// kept of it: none once closed; else the card as it was, its landing kept
-// only if rows still go there.
+// kept of it: none once closed; else the card as it was, counting where
+// rows go now (`key`), its landing and count kept only if that is where
+// they went.
 export function reopenWelcome(kept: Welcome, key: string | null): { welcome: Welcome; isNew: boolean } | null {
   if (kept.closed) return null
   const here = key !== null && kept.landedAt !== null && kept.landedTo === key
-  return { welcome: { ...kept, landedAt: here ? kept.landedAt : null, landedTo: here ? key : null, sent: here ? kept.sent : 0 }, isNew: false }
+  return { welcome: { ...kept, landedAt: here ? kept.landedAt : null, landedTo: here ? key : null, sent: here ? kept.sent : 0, destination: key }, isNew: false }
 }
 
 // One card's writes to `$.store` (register.ts passes `save`), in the
@@ -125,6 +126,11 @@ export class CardRecords {
     this.card = card
     this.greetingDue = greet
     this.write()
+  }
+
+  // The card was closed: the close follows, whatever else is known of it.
+  close(): void {
+    this.update({ ...this.card, closed: true })
   }
 
   // The card changed (rows landed, it was closed): what changed follows.
@@ -188,7 +194,22 @@ const isNewer = (version: string, than: string): boolean => {
     if (step !== 0) return step > 0
   }
   if (a.pre === null || b.pre === null) return a.pre === null && b.pre !== null
-  return a.pre > b.pre
+  // Pre-releases part by part: numbers as numbers, before words; more parts
+  // after the same ones come later (`rc.10` after `rc.2`, `rc.1.1` after `rc.1`).
+  const x = a.pre.split('.')
+  const y = b.pre.split('.')
+  for (let i = 0; i < Math.max(x.length, y.length); i += 1) {
+    const p = x[i]
+    const q = y[i]
+    if (p === undefined || q === undefined) return q === undefined
+    if (p === q) continue
+    const pn = /^\d+$/.test(p)
+    const qn = /^\d+$/.test(q)
+    if (pn && qn) return Number(p) > Number(q)
+    if (pn !== qn) return qn
+    return p > q
+  }
+  return false
 }
 
 // Installed; updated, to a version known to be newer; else changed.
@@ -197,8 +218,9 @@ const arrival = (w: Welcome): string => (w.previous === null ? 'installed' : `${
 // Why nothing is recorded, when the configuration leaves nowhere to write.
 const unset = (c: Config): string => (c.dryRun ? (c.problems[0] ?? 'the dry run has nowhere to write') : `nothing is recorded until ${NOT_SET_UP}`)
 
-// The card for this configuration, with `sent` rows landed so far (none
-// after a reload, which starts the counts over).
+// The card for this configuration, with `sent` rows landed where it counts
+// them (kept across a reload by `$.state`; a card rebuilt from the store's
+// records alone starts at none, as the store does not keep the count).
 export function welcomeCard(w: Welcome, c: Config, sent: number): WelcomeCard {
   const title = `BigQuery Agent Analytics mod ${arrival(w)}`
   const tag = w.previous === null ? w.version : `was ${w.previous}`

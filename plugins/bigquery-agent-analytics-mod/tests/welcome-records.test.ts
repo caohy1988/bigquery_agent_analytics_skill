@@ -34,7 +34,7 @@ function heldStore(): { writes: [string, unknown][]; pending: () => number; answ
   }
 }
 
-const CARD: Welcome = { version: PLUGIN_VERSION, previous: null, sessionId: SESSION_ID, landedAt: null, landedTo: null, closed: false, sent: 0 }
+const CARD: Welcome = { version: PLUGIN_VERSION, previous: null, sessionId: SESSION_ID, landedAt: null, landedTo: null, closed: false, sent: 0, destination: HERE, owner: 'a-load:1' }
 
 test("a card's writes go one at a time, each with the card as it is by then, and a close is written once, never undone", async () => {
   const store = heldStore()
