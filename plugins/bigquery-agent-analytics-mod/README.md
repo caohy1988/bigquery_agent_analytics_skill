@@ -643,6 +643,17 @@ GROUP BY model
   completion record, and only then is the replayed file truncated. A replay
   whose rows BigQuery only asks for again rewrites nothing. The API has no
   rename either, so a write that fails leaves that file as it was. Before
+  it sends any of a file's rows, a replay writes its mark beside the file
+  (`outcome-sending-` and its name), and reads the mark and the file's
+  record back: another session's mark, an outcome recorded or the file
+  done meanwhile, and it sends none of the file. One that cannot write its
+  mark sends none of it either: the rows wait. A replay that changes
+  nothing (rows only asked for again, or no answer) lets its mark go, so
+  each such try writes that one small file twice and adds no file. A
+  writer that finds another writer's mark and no outcome recorded (that
+  writer still at it, unable to write its record, or stopped after
+  sending) sends none of the file by itself: its rows may have been
+  refused. `/bqaa-backfill`, asked to send it, replays it afresh. Before
   it writes what is left, a replay records its outcome: one record per
   file, with what became of each row (a letter each, and for a refused row
   a number naming its reason), the refusals' reasons (16 at most: rows
@@ -659,17 +670,22 @@ GROUP BY model
   itself leaves the file waiting, and `/bqaa-backfill`, asked to send it,
   replays it afresh. An empty one of those files beside a file that still
   holds its rows counts as cut off too (a write that stopped before its
-  first byte). Once the replayed file is emptied its record stays a day,
-  marked as done, in one of those two files (the store's copy goes): a
-  late write of another session's copy of a file it left is then emptied
-  unsent, another session's late outcome for it stops there, and a file
-  of what is left that the mark does not name is a late copy of another
-  session's outcome, emptied unsent too. Such records of files emptied more
-  than a day ago are emptied at the next replay. Nothing of what is left is written until
-  the record is: when neither the store nor those files take it, the
-  replayed file stays as it was, and this session tries again at each
-  replay (a later session, not knowing, sends its rows again; `event_id`
-  dedups them). Each file of what is left names the file it came from, and
+  first byte). Once every file of what is left is written, the record is
+  written as the mark that the file is done, in a file of its own
+  (`outcome-done-` and its name), which no write of a record goes to, so
+  no late write of another session's takes it over; then the replayed
+  file is emptied, and the store's copy of the record goes. The mark is
+  read before any other record: a late write of another session's copy of
+  a file it left is then emptied unsent, another session's late outcome
+  for it stops there, and a file of what is left that the mark does not
+  name is a late copy of another session's outcome, emptied unsent too, as
+  it is where the mark could not be written and the record of the emptied
+  file has every file it names written. These files, of files emptied more
+  than a day ago, are emptied at the next replay. Nothing of what is left
+  is written until the record is: when neither the store nor those files
+  take it, the replayed file stays as it was, this session tries again at
+  each replay, and its mark keeps every other session from sending the
+  file. Each file of what is left names the file it came from, and
   no replay takes it until that file's record has it as written (or names
   other files, or is gone, or its file is emptied): one written whose mark
   the record could not keep waits, and the writer that finishes the
@@ -684,19 +700,24 @@ GROUP BY model
   (one may since have been replayed and emptied), then empties the file,
   and sends none of its rows again. A record that cannot be read leaves
   its file waiting for the next replay, never taken for no record. A file
+  a replay that runs by itself leaves waiting (its record cut off or
+  unreadable, another writer's mark beside it, or its own mark not
+  written) holds up none of the files after it, and `/bqaa-status` says
+  why it was left (`left waiting:`). A file
   that cannot be emptied stays on disk, its rows landed or in the newer
   files, and each replay tries to empty it. A file over 4 MiB, which the
   API cannot read, is reported by `/bqaa-status` and the backfill instead
   of being passed over. A per-file lease in `$.store` keeps two sessions
-  from replaying the same file at once (best effort: two that read the
-  lease at the same moment both send the file, and `event_id` dedups it;
-  the one whose answer comes second finds the other's record, and writes
-  out that outcome, not its own, or finds the file already done, and
-  writes nothing, so what is left is written once, unless both record
-  theirs at the same moment; a write already under way when the other
-  session finishes lands, and the marks above have the next replay empty
-  it unsent); a session that finds a file leased tries it again at its
-  next replay.
+  from replaying the same file at once (best effort: of two that read the
+  lease at the same moment, the one whose mark another's replaces sends
+  none of the file; two that read their marks back at the same moment
+  both send it, and `event_id` dedups it; the one whose answer comes
+  second finds the other's record, and writes out that outcome, not its
+  own, or finds the file already done, and writes nothing, so what is left
+  is written once, unless both record theirs at the same moment; a write
+  already under way when the other session finishes lands, and the marks
+  above have the next replay empty it unsent); a session that finds a
+  file leased tries it again at its next replay.
 * **Fail open:** a hook's bookkeeping runs behind `.catch` or inside `try`;
   the writer never throws into a hook; every failure path ends in sent, on
   disk, or counted as dropped. An environment variable a policy refuses reads
@@ -855,7 +876,7 @@ test kit, with no session, sign-in, GCP or network: `$.http.fetch`,
 `$.process.run`, `$.fs` and `$.store` are stubbed, and `mock.clock` drives the
 timers; the `$.fs` stubs measure files in UTF-8 bytes and refuse a file over
 4 MiB, and the `$.store` stub a store over 4 MiB of JSON in all, as the host
-does. 262 tests cover the captured rows and their spans,
+does. 279 tests cover the captured rows and their spans,
 subagent runs in the order the host raises them (one invocation and one
 trace for the turn, a span per run, a SubagentStart that comes late or never),
 the session-start row raised before or during `session.start`'s setup,
@@ -959,7 +980,8 @@ And the replay that runs by itself while nothing is queued:
   at once writing what it left once; a record that cannot be read leaving
   its file waiting and due, with nothing sent; a record the store does not
   take, or one over 64 KiB, kept in the file beside the source and resumed
-  from there, both files emptied once they can be; a record the store took
+  from there, and the done mark left beside the emptied source; a record
+  the store took
   at first and then did not, where the file's marks count too; a record
   in neither place leaving the file as it was until it can be written; a
   store record that no longer fits not hiding the one beside the file, and
@@ -967,7 +989,8 @@ And the replay that runs by itself while nothing is queued:
   reasons kept with 16 reasons in a record under 64 KiB, with the store
   holding 4 MiB in all, and none sent again; a record update beside the
   source cut off part-way, the one before it read, nothing sent again,
-  both files emptied after; a first record cut off with none whole, written
+  and the done mark left once the source is emptied; a first record cut off
+  with none whole, written
   again by the writer that holds the outcome, left waiting by any other
   replay that runs by itself, and replayed afresh by `/bqaa-backfill`; a
   file of what is left written while its record could not be updated, not
@@ -989,6 +1012,23 @@ And the replay that runs by itself while nothing is queued:
   or beside the file; no record written again when it already holds the
   outcome; a writer that takes over in the same session holding what the
   one before held; records of files emptied more than a day ago emptied;
+  a record another session writes late, beside a file finished meanwhile,
+  never standing over its done mark, and a replay with nothing left to
+  write never writing its done mark over another's; a replay whose mark
+  lands after the file was finished, or after another session recorded
+  its outcome, or after another session's mark replaced its own, sending
+  none of it; a replay that cannot write its mark sending none of the
+  file, and a file it leaves waiting (its record cut off or unreadable,
+  another writer's mark, its mark not written) holding up none after it;
+  a replay that sent rows and can record its outcome nowhere keeping every
+  other session from sending the file, its writer finishing it once it
+  can, and `/bqaa-backfill` replaying it afresh once that writer is gone;
+  a replay that changes nothing letting its mark go, and only its own; a
+  mark its writer could not let go being that writer's own, and its
+  successor's in the same session; a file of what is left that the record
+  of its emptied parent does not name emptied unsent, the done mark there
+  or not; the done mark letting a later replay empty a file the store's
+  record of cannot be read;
 * it stops between requests for a row queued meanwhile, which goes first,
   with no backoff, and then goes on;
 * rows refused on a send and then on a replay all counted on the status

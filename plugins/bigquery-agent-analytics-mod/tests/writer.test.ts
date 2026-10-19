@@ -861,7 +861,8 @@ async function splitReplay(failNewFiles: boolean) {
     envToken: async () => undefined,
     readFile: async path => files.get(path) ?? '',
     writeFile: async (path, text) => {
-      if (failNewFiles && path !== source) throw new Error('disk full')
+      // The replay's mark and record files beside the source are written.
+      if (failNewFiles && path !== source && !path.includes('/outcome-')) throw new Error('disk full')
       files.set(path, text)
     },
     listDir: async () => [{ name: source.split('/').pop() as string, kind: 'file', size: utf8Bytes(encoded[0] as string) }],

@@ -104,6 +104,13 @@ export type BackfillReport = {
   // Files with no completion record that matches them: still being written,
   // or left by a writer that stopped part-way. Kept as they are, not read.
   incompleteFiles: string[]
+  // Why the first file this replay left waiting for itself alone was left
+  // (its record cannot be read, or is cut off, or another replay's mark
+  // stands over it, or this replay could not write its own): the replay
+  // goes on with the files after it.
+  held: string | null
+  // What stopped the replay (the network, the credentials, the directory):
+  // the files after it wait for the next one.
   error: string | null
   finishedAt: number | null
 }
@@ -125,10 +132,13 @@ type Outcome = { fates: string; reasons: string[]; refusals: number[] }
 // `recordFiles` beside it (`outcome-` and the file's name, then `outcome-b-`
 // and it: no replay takes either for rows), which take the record's
 // updates in turn, so one cut off part-way leaves the one before it whole.
+// Two more files beside it, which no record is written to: `doneFile`
+// (`outcome-done-`), the mark that the file was done, and `markFile`
+// (`outcome-sending-`), the mark a replay leaves before it sends any of it.
 // A file is written once, under a name of its own, so its name and size tell
 // it; `live` while it still holds its rows (a record of an emptied file is
 // read for the files it left).
-type Source = { name: string; size: number; recordKey: string; recordFiles: readonly string[]; live: boolean }
+type Source = { name: string; size: number; recordKey: string; recordFiles: readonly string[]; doneFile: string; markFile: string; live: boolean }
 
 // A file a replay has an outcome for: the outcome, the files that hold what
 // is left of it under the names given them (`text` null once written),
@@ -137,11 +147,12 @@ type Source = { name: string; size: number; recordKey: string; recordFiles: read
 type Rewrite = Outcome & Source & { files: { path: string; text: string | null }[]; waits: boolean; filed: boolean; seq: number }
 
 // The record of a Rewrite, which every writer reads: written before what is
-// left is, updated as each file of it is written, and kept a day once the
-// source is emptied, marked `retired` (the mark that the file was done). A
-// writer that finds it (a later session.start's, another session's, or this
-// one after another writer moved it on) writes what is still missing, from
-// the source and the outcome, and sends none of the file's rows again.
+// left is, and updated as each file of it is written; once every one is,
+// written as the mark that the file was done (`retired`, in `doneFile`),
+// which is kept a day. A writer that finds it (a later session.start's,
+// another session's, or this one after another writer moved it on) writes
+// what is still missing, from the source and the outcome, and sends none of
+// the file's rows again.
 type Journal = Outcome & { size: number; files: string[]; written: boolean[]; waits: boolean; seq: number; retired?: boolean }
 
 const TIMED_OUT = Symbol('timed out')
@@ -238,6 +249,9 @@ const sameNames = (a: readonly string[], b: readonly string[]): boolean => a.len
 // A record as a writer finds it, and whether one may be in a file beside the
 // source (to empty along with it).
 type Found = { journal: Partial<Journal>; filed: boolean }
+// No outcome recorded, and a replay's mark (`pending`, the writer that left
+// it): it sent rows, or is about to, and may yet record one.
+type Pending = { pending: string }
 
 // Where the record of the file `name`, `size` long, in `dir` is kept.
 const sourceFor = (dir: string, name: string, size: number, c: Config): Source => ({
@@ -245,10 +259,15 @@ const sourceFor = (dir: string, name: string, size: number, c: Config): Source =
   size,
   recordKey: `replayed:${destinationDir(tableRef(c))}/${name}`,
   recordFiles: [joinPath(dir, `outcome-${name}`), joinPath(dir, `outcome-b-${name}`)],
+  doneFile: joinPath(dir, `outcome-done-${name}`),
+  markFile: joinPath(dir, `outcome-sending-${name}`),
   live: true,
 })
 // The source file of a record file's name, if it is one.
-const recordOf = (name: string): string | null => (name.startsWith('outcome-b-') ? name.slice(10) : name.startsWith('outcome-') ? name.slice(8) : null)
+const recordOf = (name: string): string | null => {
+  for (const prefix of ['outcome-done-', 'outcome-sending-', 'outcome-b-', 'outcome-']) if (name.startsWith(prefix)) return name.slice(prefix.length)
+  return null
+}
 
 // Which files of what is left a record has as written: all of them for a
 // record that does not say.
@@ -275,6 +294,16 @@ const journalOf = (text: unknown): Partial<Journal> | 'torn' | undefined => {
   } catch {
     return 'torn'
   }
+}
+
+// The writer named by the mark a replay leaves before it sends (`markFile`)
+// for the file `size` long (-1: any size); none for a file that is empty,
+// absent or cut off (its writer sent nothing then: a mark is written whole
+// before any row goes).
+const markOf = (text: unknown, size: number): string | undefined => {
+  const mark = journalOf(text) as { size?: unknown; sending?: unknown; by?: unknown } | 'torn' | undefined
+  if (mark === undefined || mark === 'torn' || mark.sending !== true || typeof mark.by !== 'string') return undefined
+  return size < 0 || mark.size === size ? mark.by : undefined
 }
 
 // What a replay leaves of the file `name`, from its outcome, as the files to
@@ -384,6 +413,10 @@ export class Writer {
   // Replays whose outcome is not all written out yet, by the file's path: a
   // later replay finishes writing it and sends none of the file again.
   private rewrites = new Map<string, Rewrite>()
+  // The name this writer leaves in its marks (`markSending`), and the names
+  // it takes a mark of for its own: an outcome it would hold, if it had one.
+  private readonly mark = Math.random().toString(36).slice(2)
+  private marks = new Set([this.mark])
   // Problem kinds already announced with a toast and a transcript line.
   private announced = new Set<ProblemKind>()
   // Where the last token came from: the fix differs.
@@ -427,6 +460,7 @@ export class Writer {
     // And the outcomes it held, one whose record no store or file took
     // included.
     for (const [path, rewrite] of previous.rewrites) this.rewrites.set(path, rewrite)
+    for (const mark of previous.marks) this.marks.add(mark)
   }
 
   // Asks for a flush shortly, outside the caller's dispatch.
@@ -1165,6 +1199,7 @@ export class Writer {
         skippedFiles: 0,
         oversizedFiles: [],
         incompleteFiles: [],
+        held: null,
         error: diagnostic(errorText(err)),
         finishedAt: this.io.now(),
       }
@@ -1183,7 +1218,7 @@ export class Writer {
 
   private async backfillRun(kinds: DeadLetterKind[], trigger: BackfillReport['trigger'], dir: string, parked: number): Promise<BackfillReport> {
     const c = this.config()
-    const report: BackfillReport = { trigger, files: 0, rowsSent: 0, rowsLeft: 0, rowsRefused: 0, otherTableRows: 0, skippedFiles: 0, oversizedFiles: [], incompleteFiles: [], error: null, finishedAt: null }
+    const report: BackfillReport = { trigger, files: 0, rowsSent: 0, rowsLeft: 0, rowsRefused: 0, otherTableRows: 0, skippedFiles: 0, oversizedFiles: [], incompleteFiles: [], held: null, error: null, finishedAt: null }
     const tally: ReplayTally = { waiting: 0, requests: 0 }
     const finish = (): BackfillReport => {
       report.finishedAt = this.io.now()
@@ -1275,13 +1310,13 @@ export class Writer {
           this.rewrites.delete(path)
           held = undefined
         }
-        let found: Found | 'torn' | undefined
+        let found: Found | Pending | 'torn' | undefined
         try {
           found = await this.readJournal(source)
         } catch (err) {
           // It may have an outcome that cannot be read now: none of it goes
           // until its record can be, and its rows wait.
-          report.error = diagnostic(`cannot read the replay record of ${name}: ${messageOf(err)}`)
+          report.held ??= diagnostic(`cannot read the replay record of ${name}: ${messageOf(err)}`)
           report.skippedFiles += 1
           if (kindOf(name) !== 'rejected') tally.waiting += 1
           continue
@@ -1293,7 +1328,22 @@ export class Writer {
           // any other replay that runs by itself leaves the file waiting, and
           // /bqaa-backfill, asked to send it, replays it afresh.
           if (held === undefined && trigger !== 'command') {
-            report.error = diagnostic(`the replay record of ${name} is cut off part-way; /bqaa-backfill replays the file afresh`)
+            report.held ??= diagnostic(`the replay record of ${name} is cut off part-way; /bqaa-backfill replays the file afresh`)
+            report.skippedFiles += 1
+            if (kindOf(name) !== 'rejected') tally.waiting += 1
+            continue
+          }
+          found = undefined
+        }
+        if (found !== undefined && 'pending' in found) {
+          // A replay sent rows of it, or was about to, and recorded no
+          // outcome: its writer may yet (still at it, or unable to write its
+          // record now), or it stopped. Its rows may have gone, and been
+          // refused: none goes by itself from here, and /bqaa-backfill, asked
+          // to send it, replays it afresh. A mark of this writer's own is no
+          // other replay's: it would hold the outcome.
+          if (held === undefined && trigger !== 'command' && !this.marks.has(found.pending)) {
+            report.held ??= diagnostic(`a replay of ${name} sent rows and has recorded no outcome; /bqaa-backfill replays the file afresh`)
             report.skippedFiles += 1
             if (kindOf(name) !== 'rejected') tally.waiting += 1
             continue
@@ -1401,16 +1451,22 @@ export class Writer {
     return { added, rough }
   }
 
-  // A file's replay record, wherever a writer left it: in `$.store`, and in
-  // the files beside it when the store did not take it (or it was too large
-  // for the store), the later of the two whole ones. When the store and the
-  // file hold the same outcome, a file of what is left counts as written if
-  // either says so. None when no record of the file's size is there; `torn`
-  // when only one cut off part-way is. A record that cannot be read throws,
-  // and is never taken for none.
-  private async readJournal(source: Source): Promise<Found | 'torn' | undefined> {
+  // A file's replay record, wherever a writer left it: the mark that it was
+  // done, which stands over any other; else in `$.store`, and in the files
+  // beside it when the store did not take it (or it was too large for the
+  // store), the later of the two whole ones. When the store and the file
+  // hold the same outcome, a file of what is left counts as written if either
+  // says so. With none of the file's size there, `torn` when one cut off
+  // part-way is, else `pending` where a replay's mark is, else none. A record
+  // that cannot be read throws, and is never taken for none.
+  private async readJournal(source: Source): Promise<Found | Pending | 'torn' | undefined> {
     // A record of another size is not this file's (`size` -1: any size).
     const fits = (journal: Partial<Journal> | undefined): journal is Partial<Journal> => journal !== undefined && (source.size < 0 || journal.size === source.size)
+    // In a file of its own, which no write of a record goes to.
+    if (this.io.exists === undefined || (await this.io.exists(source.doneFile))) {
+      const done = journalOf(await this.io.readFile(source.doneFile))
+      if (done !== 'torn' && fits(done) && done.retired === true) return { journal: done, filed: true }
+    }
     const read = ((await this.io.storeGet(source.recordKey)) ?? undefined) as Partial<Journal> | undefined
     const stored = fits(read) ? read : undefined
     let filed: Partial<Journal> | undefined
@@ -1425,7 +1481,12 @@ export class Writer {
       if (kept === 'torn') torn = true
       else if (fits(kept) && (filed === undefined || seqOf(kept) > seqOf(filed))) filed = kept
     }
-    if (stored === undefined) return filed !== undefined ? { journal: filed, filed: true } : torn ? 'torn' : undefined
+    if (stored === undefined) {
+      if (filed !== undefined) return { journal: filed, filed: true }
+      if (torn) return 'torn'
+      const by = await this.markOn(source)
+      return by === undefined ? undefined : { pending: by }
+    }
     if (filed === undefined) return { journal: stored, filed: torn }
     // Two outcomes: the file's was written when the store did not take it.
     if (!Array.isArray(stored.files) || !Array.isArray(filed.files) || !sameNames(stored.files, filed.files)) return { journal: filed, filed: true }
@@ -1439,22 +1500,26 @@ export class Writer {
   // record has it as written, or names other files (another replay's
   // outcome), or is gone; `wait` while the parent still holds its rows and
   // its record may yet write the file again, or while that record cannot be
-  // read, or is cut off. Once the parent is emptied, its record says nothing
-  // against a file it names (all were written before it was emptied), and
-  // `drop` is a file that the record, kept as the mark the parent was done,
-  // does not name: a late copy of another session's outcome, whose rows the
-  // outcome that did the parent has.
+  // read, is cut off, or is yet to be written (a replay's mark). Once the
+  // parent is emptied, its record says nothing against a file it names (all
+  // were written before it was emptied), and `drop` is a file that the
+  // record that did the parent does not name: a late copy of another
+  // session's outcome, whose rows that outcome has.
   private async parentFate(dir: string, parent: string, path: string, size: number, c: Config): Promise<'go' | 'wait' | 'drop'> {
-    let found: Found | 'torn' | undefined
+    let found: Found | Pending | 'torn' | undefined
     try {
       found = await this.readJournal(size > 0 ? sourceFor(dir, parent, size, c) : { ...sourceFor(dir, parent, -1, c), live: false })
     } catch {
       return 'wait'
     }
-    if (found === 'torn') return size > 0 ? 'wait' : 'go'
+    if (found === 'torn' || (found !== undefined && 'pending' in found)) return size > 0 ? 'wait' : 'go'
     if (found === undefined) return 'go'
     const at = (Array.isArray(found.journal.files) ? found.journal.files : []).indexOf(path)
-    if (at === -1) return found.journal.retired === true ? 'drop' : 'go'
+    // Not named: a late copy of another session's outcome, where the record
+    // is the mark the parent was done, or a whole one of an emptied parent
+    // with every file it names written (its done mark lost, or never written:
+    // its outcome has every row of the parent).
+    if (at === -1) return found.journal.retired === true || (size === 0 && writtenOf(found.journal).every(Boolean)) ? 'drop' : 'go'
     return size === 0 || writtenOf(found.journal)[at] === true ? 'go' : 'wait'
   }
 
@@ -1549,12 +1614,13 @@ export class Writer {
   // the file, or recorded more of this outcome or one of its own, while this
   // one read or sent. Another outcome: that one goes on, at the next replay;
   // this one done (the mark has every file written): nothing more is
-  // written. No whole record, and the file emptied: nothing is written
-  // either. A record that cannot be read keeps this outcome here
-  // until it can be.
+  // written. No whole record (a replay's mark is none), and the file
+  // emptied: nothing is written either. A record that cannot be read keeps
+  // this outcome here until it can be. The same check comes before each
+  // file of what is left, and before the mark that the file was done.
   private async writeOut(path: string, rewrite: Rewrite): Promise<boolean> {
     this.rewrites.set(path, rewrite)
-    const found = await this.readJournal(rewrite)
+    const found = Writer.recorded(await this.readJournal(rewrite))
     let recorded = false
     if (found !== undefined && found !== 'torn') {
       if (!Writer.catchUp(rewrite, found)) {
@@ -1592,21 +1658,27 @@ export class Writer {
       }
     }
     if (!recorded) await record()
-    for (const file of rewrite.files) {
-      if (file.text === null) continue
-      // Another writer may have written it since, or replayed the file at the
-      // same time with an outcome of its own: the record says.
-      const found = await this.readJournal(rewrite)
+    // Another writer may have written a file of it since, replayed the file
+    // at the same time with an outcome of its own, or finished it: the record
+    // says. That outcome goes on, at the next replay, and no more of this one.
+    const stillOurs = async (): Promise<boolean> => {
+      const found = Writer.recorded(await this.readJournal(rewrite))
       if (found === 'torn' || (found !== undefined && found.journal.size === rewrite.size && !Writer.catchUp(rewrite, found))) {
-        // That outcome goes on, at the next replay, and no more of this one.
         this.rewrites.delete(path)
         return false
       }
+      return true
+    }
+    for (const file of rewrite.files) {
+      if (file.text === null) continue
+      if (!(await stillOurs())) return false
       if (file.text === null) continue
       await this.io.writeFile(file.path, file.text)
       file.text = null
       await record()
     }
+    if (!(await stillOurs())) return false
+    const done = await this.markDone(rewrite)
     try {
       await this.io.writeFile(path, '')
     } catch (err) {
@@ -1614,29 +1686,63 @@ export class Writer {
       return false
     }
     this.rewrites.delete(path)
-    await this.retire(rewrite)
+    if (done) {
+      try {
+        await this.io.storeDelete(rewrite.recordKey)
+      } catch {
+        // Left; the done mark stands over it.
+      }
+    }
     return true
   }
 
-  // The file is done: its record stays a day, marked `retired`, in a file
-  // beside it, where no late store write of another session's replay takes
-  // it over, so a late copy of the file, or of one it left, is known, and so
-  // is another session's late outcome for it; the store's copy goes once that
-  // mark is written. Best effort.
-  private async retire(rewrite: Rewrite): Promise<void> {
+  // A record as writeOut weighs it: a replay's mark is no outcome.
+  private static recorded(found: Found | Pending | 'torn' | undefined): Found | 'torn' | undefined {
+    return found !== undefined && found !== 'torn' && 'pending' in found ? undefined : found
+  }
+
+  // Every file of what is left written: the mark that the file is done, its
+  // record marked `retired`, in a file of its own beside it (`doneFile`),
+  // written before the file is emptied. No write of a record goes to that
+  // file, so no late one of another session's replay takes it over: a late
+  // copy of the file, or of one it left, is known by it, and so is another
+  // session's late outcome for it. Kept a day; the store's copy of the record
+  // goes once the file is emptied. False when it could not be written.
+  private async markDone(rewrite: Rewrite): Promise<boolean> {
     rewrite.seq += 1
     const { size, waits, seq } = rewrite
     const journal: Journal = { fates: '', reasons: [], refusals: [], size, waits, seq, files: rewrite.files.map(f => f.path), written: rewrite.files.map(() => true), retired: true }
     try {
-      await this.io.writeFile(rewrite.recordFiles[(seq + 1) % 2] as string, journalText(journal))
+      await this.io.writeFile(rewrite.doneFile, journalText(journal))
+      return true
     } catch {
-      return
+      return false
     }
+  }
+
+  // Before any of a file's rows go: the mark that this writer sends them, in
+  // a file of its own beside it (`markFile`), which tells a writer that finds
+  // no outcome recorded that one may yet be (`backfillRun`). Then the record
+  // read again: another writer's outcome, mark or done mark, or the file
+  // emptied, and none of it goes from here. False when the mark cannot be
+  // written (no later writer could tell then: none goes), or another writer
+  // has the file.
+  private async markSending(path: string, source: Source, report: BackfillReport): Promise<boolean> {
     try {
-      await this.io.storeDelete(rewrite.recordKey)
-    } catch {
-      // Left; the mark beside the file stands over it.
+      await this.io.writeFile(source.markFile, sealFile(`${JSON.stringify({ size: source.size, sending: true, by: this.mark })}\n`))
+    } catch (err) {
+      report.held ??= diagnostic(`could not mark the replay of ${source.name} before sending, so none of it is sent: ${errorText(err)}`)
+      return false
     }
+    const found = Writer.recorded(await this.readJournal(source))
+    if (found !== undefined && found !== 'torn') return false
+    return (await this.markOn(source)) === this.mark && (await this.io.readFile(path)) !== ''
+  }
+
+  // The writer named by the mark beside `source`, if any.
+  private async markOn(source: Source): Promise<string | undefined> {
+    if (this.io.exists !== undefined && !(await this.io.exists(source.markFile))) return undefined
+    return markOf(await this.io.readFile(source.markFile), source.size)
   }
 
   // Replays one file; false when what it left is written out but the file
@@ -1681,6 +1787,7 @@ export class Writer {
       refusals.push(k)
     }
     let changed = false
+    let marked = false
     let index = 0
     while (index < mine.length) {
       if (report.error || this.replayStops(trigger, tally)) break
@@ -1701,6 +1808,10 @@ export class Writer {
       } catch (err) {
         report.error = diagnostic(`authentication: ${messageOf(err)}`)
         continue
+      }
+      if (!marked) {
+        if (!(await this.markSending(path, source, report))) break
+        marked = true
       }
       const body = insertAllBody(chunk.map(l => l.row))
       tally.requests += 1
@@ -1777,8 +1888,19 @@ export class Writer {
     }
     tally.waiting += mine.filter((line, n) => fates[at[n] as number] === 'W' && line.kind !== 'rejected').length
     report.rowsLeft += at.filter(i => fates[i] !== 'L').length + kept
-    // Nothing sent and nothing new to record: the file stays as it was.
-    if (!changed) return true
+    // Nothing sent and nothing new to record: the file stays as it was, and
+    // its mark goes while it is still this writer's (best effort: one left is
+    // this writer's own).
+    if (!changed) {
+      if (marked) {
+        try {
+          if ((await this.markOn(source)) === this.mark) await this.io.writeFile(source.markFile, '')
+        } catch {
+          // Left.
+        }
+      }
+      return true
+    }
     // What is left goes to new files first, each kind to files of its own (a
     // row refused here to a `rejected` file, which no replay that runs by
     // itself reads), each file ending with its completion record; only once
