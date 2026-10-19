@@ -428,15 +428,16 @@ async function pressGotIt($: Engine): Promise<void> {
   await ui.unmount()
 }
 
-test('a close made while the greeting is still being written stays closed: the greeting lands, then the close, and a reload shows no card', { options: OPTIONS }, async ($, on) => {
+test('a close made while the greeting is still being written is written at once, behind nothing: the greeting lands after it, and a reload shows no card', { options: OPTIONS }, async ($, on) => {
   const writes = holdWrites()
   on('store.set', { key: GREETED_KEY }, ($, e) => writes.hold(e, world))
   const world = setUp(on, {}, {})
   await startSession($)
   await pressGotIt($)
   await world.clock.settle()
-  // The close waits behind the greeting.
-  expect(closedMark(world)).toBeUndefined()
+  // The close is in the store while the greeting is still being written.
+  expect(closedMark(world)).toBe(true)
+  expect(greeted(world)).toBeUndefined()
   writes.release()
   await world.clock.settle()
   expect(greeted(world)).toEqual(GREETED_HERE)
@@ -568,6 +569,53 @@ test('a store read from an earlier session.start that answers while a later one 
   await world.clock.settle()
   expect(started).toBe(true)
   expect(welcomeLines(world.transcript).length).toBe(1)
+})
+
+test('session.start run again while the new card is being written: the run that showed it still writes the greeting line, once', { options: OPTIONS }, async ($, on) => {
+  // The first write of the card waits until let go.
+  let first = true
+  const waiting: (() => void)[] = []
+  on('state.set', { plugin: PLUGIN, key: 'welcome' }, ($, e, next) => {
+    if (!first) return next(e)
+    first = false
+    return new Promise(resolve => waiting.push(() => resolve(next(e))))
+  })
+  const world = setUp(on, {}, {})
+  await startSession($)
+  await world.clock.settle()
+  expect(waiting.length).toBe(1)
+  // session.start runs again before the write answers; the write lands, and
+  // the later run takes the card over from the state.
+  const again = $.session.start(START)
+  for (const go of waiting.splice(0)) go()
+  await again
+  await world.clock.settle()
+  expect(welcomeLines(world.transcript).length).toBe(1)
+  expect((await band($)).button).toBe('Got it')
+})
+
+test('a reload to another table, its takeover read still waiting: no landing is claimed there, a prompt meanwhile leaves the card open, and then it waits for rows there', { options: {} }, async ($, on) => {
+  let dataset = 'events_a'
+  on('env.get', { name: 'BQAA_DATASET' }, () => ({ value: dataset }))
+  let holding = false
+  const waiting: (() => void)[] = []
+  on('store.get', { key: CLOSED }, ($, e, next) => (holding ? new Promise(resolve => waiting.push(() => resolve(next(e)))) : next(e)))
+  const world = setUp(on, { BQAA_PROJECT_ID: 'my-gcp-project' }, {})
+  await startSession($)
+  await world.clock.advance(5000)
+  expect((await band($)).texts[4]).toBe(landed(1))
+  dataset = 'events_b'
+  holding = true
+  await $.session.start(START)
+  await world.clock.settle()
+  expect(waiting.length).toBe(1)
+  expect((await band($)).texts).toEqual(['drawn beneath'])
+  await $.prompt.submit(PROMPT)
+  await world.clock.settle()
+  holding = false
+  for (const go of waiting.splice(0)) go()
+  await world.clock.settle()
+  expect((await band($)).texts).toEqual([...INSTALLED, `Records ${WHAT} to my-gcp-project.events_b.agent_events (US).`, WAITING, 'drawn beneath'])
 })
 
 test('rows of a send still in flight across a reload to another table do not land the card there', { options: {} }, async ($, on) => {

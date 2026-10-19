@@ -220,7 +220,8 @@ session that showed the card (key `welcome:<version>`), so no later session
 shows the card; the versions noted give the next version's card the one it
 replaced. What became of the card goes to keys of its own version and
 session: when rows first landed, and where (`welcome:<version>:<session>`),
-and that it was closed (`…:closed`, a key no other write touches). No
+and that it was closed (`…:closed`, a key no other write touches, written
+at once on its own, behind no other write). No
 session writes another version's or session's keys, so a session left open
 never writes over a newer version another session greeted, and no write
 that answers late, from this load of the mod or an earlier one, undoes a
@@ -229,14 +230,20 @@ close. The card itself lives in the session's `$.state`, which a reload
 mod's own variables start over; the band draws it from there. Every change
 to it is a compare-and-set on the version read, so no load's change, early
 or late, overwrites another's, and a close always stays. A reload shows
-the card again as it was, its count included; a load whose start another
-load overtook shows nothing and greets no more; and a close the store has
-wins over an open card in the state (a close whose state write was refused
-included). If rows now go somewhere else (another table, or BigQuery after
-a dry run), the card waits again until rows land there; rows sent under the
-earlier configuration that land after the reload do not count, while rows
-an earlier load lands where the card counts them do, and the load that
-showed the card says so.
+the card again as it was, its count included (a card rebuilt from the
+store alone, with no session state, starts its count over); a load whose
+start another load overtook shows nothing and greets no more; and a close
+the store has wins over an open card in the state (a close whose state
+write was refused included). A load draws the card only once it has read
+the store's close for it, so one whose reads have not answered, or never
+do, draws none. Of two loads, the later one shows the card: a load whose
+reads answer after a later load took the card over leaves it to that one.
+Each writer's rows count once, however often or late it says so. If rows
+now go somewhere else (another table, or BigQuery after a dry run), the
+card waits again until rows land there, and a prompt closes it only once
+they have; rows sent under the earlier configuration that land after the
+reload do not count, while rows an earlier load lands where the card
+counts them do, and the load that showed the card says so.
 A `-p` run draws no band: it shows nothing and leaves the store alone.
 Nothing waits on the session's state or the store for the card, the
 session's start included; the card shows once they answer, and with no
@@ -245,7 +252,7 @@ session state it does not show. The store makes "once" a best effort:
 * if the records cannot be written, the next session shows the card again,
   and a reload in a session that keeps no `$.state` shows it as the store
   last had it;
-* if they cannot be read, no card shows;
+* if they cannot be read, no card shows, after a reload too;
 * two sessions started at the same moment can both show it;
 * reinstalling the same version shows no card while the store keeps the
   record.
@@ -1033,7 +1040,7 @@ test kit, with no session, sign-in, GCP or network: `$.http.fetch`,
 `$.process.run`, `$.fs` and `$.store` are stubbed, and `mock.clock` drives the
 timers; the `$.fs` stubs measure files in UTF-8 bytes and refuse a file over
 4 MiB, and the `$.store` stub a store over 4 MiB of JSON in all, as the host
-does. 379 tests cover the captured rows and their spans,
+does. 381 tests cover the captured rows and their spans,
 subagent runs in the order the host raises them (one invocation and one
 trace for the turn, a span per run, a SubagentStart that comes late or never),
 the session-start row raised before or during `session.start`'s setup,
@@ -1284,8 +1291,10 @@ And the welcome card:
   start included; rows that land while the store is read; a read that
   answers after `session.start` ran again, or while a later run of it is
   still setting up;
-* the writes in order: a close made while the greeting, or a landing, is
-  still being written stays closed; a reload while either is still being
+* the writes: a close made while the greeting, or a landing, is still
+  being written, written at once and staying closed; the greeting line
+  written once by the run that showed the card, when `session.start` runs
+  again before the card's state write answers; a reload while either is still being
   written showing the card as it is, its count kept, with no second line; a
   landing an earlier load is still writing landing before or after the
   close a reload's Got it writes, the card staying closed; a newer version
@@ -1298,7 +1307,9 @@ And the welcome card:
   the store's close keeping it hidden after a reload;
 * a reload to another table, or out of a dry run, waiting for rows to land
   there, rows of a send or a dry-run write still in flight across it
-  included; a reload to capture off keeping the card until Got it; the
+  included, and, while its read of the store waits, claiming no landing
+  there, a prompt then leaving the card open; a reload to capture off
+  keeping the card until Got it; the
   writer saying where rows landed, per replay request before its file is
   emptied, and for a dry run's write at session end;
 * its border only where the band has the rows for one, and a survey left
@@ -1343,9 +1354,10 @@ the same version: the welcome card greets an update by the latter.
 `tests/reload.test.mjs` loads `hooks/register.ts` afresh, as a hot reload
 does, which the test kit cannot, under node 24 with a small stand-in for
 `$` (its `$.state` held for the session, its `$.store` across loads, store
-writes answering late in either order). Its `$.state` keeps a version for each
-value and lands a conditional write only at it, as the host's does, and
-its writes can answer late or be refused. It checks that a card closed
+writes and reads held and let go in any order). Its `$.state` keeps a
+version for each value and lands a conditional write only at it, as the
+host's does, and its writes can be held or refused, its reads held. It
+checks that a card closed
 before a reload stays closed while the close is still being written; that
 a greeting still being written gives one transcript line across loads,
 also with its state write in flight; that a landing an earlier load is
@@ -1356,9 +1368,18 @@ and its late rows count on the card the later load shows, with no toast
 from the earlier load; that a close whose state write was refused, but
 which the store has, keeps the card closed, and is written back to the
 state by the next load where it can be; that state writes answering late,
-a close and then an earlier landing, leave it closed; and that a greeting
+a close and then an earlier landing, leave it closed; that a greeting
 an earlier load never got written is written by the load that reopens the
-card.
+card; that Got it, while the greeting or a landing is still being written
+and with its state close refused, puts the close in the store at once; that
+a new load draws the card only once its reads of the store answer, never
+when they do not, nor while its read of a close the store has waits; that a
+load whose reads answer after a later load took the card over for another
+destination leaves it to that load, its rows counting nowhere, and so does
+one whose read of the state answers late; that rows a new load lands while
+its reads wait count once, over repeated reloads, as do rows counted before
+the card moved away and back; and that a new load that cannot read the
+store shows no card.
 
 `tests/views.test.py` runs both views in DuckDB. It uses five dialect
 substitutions, and each must match. The fixture is a table shared by this

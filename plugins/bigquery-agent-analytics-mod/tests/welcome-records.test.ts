@@ -34,13 +34,13 @@ function heldStore(): { writes: [string, unknown][]; pending: () => number; answ
   }
 }
 
-const CARD: Welcome = { version: PLUGIN_VERSION, previous: null, sessionId: SESSION_ID, landedAt: null, landedTo: null, closed: false, sent: 0, destination: HERE, owner: 'a-load:1' }
+const CARD: Welcome = { version: PLUGIN_VERSION, previous: null, sessionId: SESSION_ID, landedAt: null, landedTo: null, closed: false, sent: 0, counted: {}, destination: HERE, owner: 'a-load:1', rank: 1 }
 
-test("a card's writes go one at a time, each with the card as it is by then, and a close is written once, never undone", async () => {
+test("a card's greeting and landing go one at a time, each with the card as it is by then; its close is not held behind them", async () => {
   const store = heldStore()
   const records = new CardRecords(store.save, CARD, true)
-  // While the greeting is written: rows land, the card is closed, and a
-  // stale copy of it, from before the close, comes after.
+  // While the greeting is written: rows land, the card is closed (its close
+  // is written on its own, by closeWelcome), and more rows land.
   records.update({ ...CARD, landedAt: 5, landedTo: HERE, sent: 1 })
   records.update({ ...CARD, landedAt: 5, landedTo: HERE, sent: 1, closed: true })
   records.update({ ...CARD, landedAt: 5, landedTo: HERE, sent: 3 })
@@ -50,18 +50,17 @@ test("a card's writes go one at a time, each with the card as it is by then, and
   expect(store.writes).toEqual([
     [`welcome:${PLUGIN_VERSION}`, { sessionId: SESSION_ID, previous: null }],
     [OWN, { landedAt: 5, landedTo: HERE }],
-    [`${OWN}:closed`, true],
   ])
-  expect(records.card.closed).toBe(true)
 })
 
-test('a resumed card writes no greeting, and only what changed', async () => {
+test('a resumed card writes no greeting, and only a landing that changed', async () => {
   const store = heldStore()
   const records = new CardRecords(store.save, { ...CARD, landedAt: 5, landedTo: HERE }, false)
   expect(store.pending()).toBe(0)
   records.update({ ...CARD, landedAt: 5, landedTo: HERE, sent: 2 })
-  expect(store.pending()).toBe(0)
   records.update({ ...CARD, landedAt: 5, landedTo: HERE, sent: 2, closed: true })
+  expect(store.pending()).toBe(0)
+  records.update({ ...CARD, landedAt: 9, landedTo: HERE, sent: 2 })
   await store.answer()
-  expect(store.writes).toEqual([[`${OWN}:closed`, true]])
+  expect(store.writes).toEqual([[OWN, { landedAt: 9, landedTo: HERE }]])
 })

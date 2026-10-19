@@ -87,38 +87,38 @@ export function openWelcome(records: WelcomeRecords, sessionId: string | null, k
     // one; a change back's newer one).
     const before = [...records.versions, greetedVersion(records.latest)].filter((v): v is string => v !== null && v !== PLUGIN_VERSION)
     const previous = before.reduce<string | null>((newest, v) => (newest === null || isNewer(v, newest) ? v : newest), null)
-    return { welcome: { version: PLUGIN_VERSION, previous, sessionId, landedAt: null, landedTo: null, closed: false, sent: 0, destination: key, owner: '' }, isNew: true }
+    return { welcome: { version: PLUGIN_VERSION, previous, sessionId, landedAt: null, landedTo: null, closed: false, sent: 0, counted: {}, destination: key, owner: '', rank: 0 }, isNew: true }
   }
   if (sessionId === null || by.sessionId !== sessionId || records.closed === true) return null
   const landing = isObject(records.landing) ? records.landing : {}
   const here = key !== null && typeof landing.landedAt === 'number' && landing.landedTo === key
-  return { welcome: { version: PLUGIN_VERSION, previous: by.previous, sessionId, landedAt: here ? (landing.landedAt as number) : null, landedTo: here ? key : null, closed: false, sent: 0, destination: key, owner: '' }, isNew: false }
+  return { welcome: { version: PLUGIN_VERSION, previous: by.previous, sessionId, landedAt: here ? (landing.landedAt as number) : null, landedTo: here ? key : null, closed: false, sent: 0, counted: {}, destination: key, owner: '', rank: 0 }, isNew: false }
 }
 
 // After a reload in the session that showed the card, from what `$.state`
 // kept of it: none once closed; else the card as it was, counting where
 // rows go now (`key`), its landing and count kept only if that is where
-// they went.
+// they went. What each writer had counted stays, so no row is counted
+// twice, should rows go back where they went.
 export function reopenWelcome(kept: Welcome, key: string | null): { welcome: Welcome; isNew: boolean } | null {
   if (kept.closed) return null
   const here = key !== null && kept.landedAt !== null && kept.landedTo === key
-  return { welcome: { ...kept, landedAt: here ? kept.landedAt : null, landedTo: here ? key : null, sent: here ? kept.sent : 0, destination: key }, isNew: false }
+  return { welcome: { ...kept, landedAt: here ? kept.landedAt : null, landedTo: here ? key : null, sent: here ? kept.sent : 0, counted: kept.counted ?? {}, destination: key }, isNew: false }
 }
 
-// One card's writes to `$.store` (register.ts passes `save`), in the
-// background, one at a time: its greeting first (for a new card), then its
-// landing and its close as they come,
-// each written with the card as it is by then, the close once. Each module
-// load writes through its own CardRecords; the keys keep them apart: no
-// write of another load, however late it answers, undoes a close. Nothing
-// waits on them; one that never answers holds up only the writes after it.
+// One card's greeting and landing writes to `$.store` (register.ts passes
+// `save`), in the background, one at a time: its greeting first (for a new
+// card), then its landing when rows first land, written with the card as it
+// is by then. Each module load writes through its own CardRecords; the keys
+// keep them apart. Nothing waits on them; one that never answers holds up
+// only the writes after it. A close is written on its own, at once
+// (register.ts `closeWelcome`), behind nothing.
 export class CardRecords {
   card: Welcome
   // Writes one value to `$.store`.
   private readonly save: (key: string, value: unknown) => Promise<void>
   private greetingDue: boolean
   private landingDue = false
-  private closeDue = false
   private writing = false
 
   constructor(save: (key: string, value: unknown) => Promise<void>, card: Welcome, greet: boolean) {
@@ -128,17 +128,11 @@ export class CardRecords {
     this.write()
   }
 
-  // The card was closed: the close follows, whatever else is known of it.
-  close(): void {
-    this.update({ ...this.card, closed: true })
-  }
-
-  // The card changed (rows landed, it was closed): what changed follows.
+  // The card changed (rows landed): its landing follows.
   update(card: Welcome): void {
     const was = this.card
-    this.card = { ...card, closed: was.closed || card.closed }
-    if (this.card.landedAt !== was.landedAt || this.card.landedTo !== was.landedTo) this.landingDue = true
-    if (this.card.closed && !was.closed) this.closeDue = true
+    this.card = card
+    if (card.landedAt !== was.landedAt || card.landedTo !== was.landedTo) this.landingDue = true
     this.write()
   }
 
@@ -150,18 +144,15 @@ export class CardRecords {
 
   private async drain(): Promise<void> {
     try {
-      while (this.greetingDue || this.landingDue || this.closeDue) {
+      while (this.greetingDue || this.landingDue) {
         const { version, previous, sessionId, landedAt, landedTo } = this.card
         try {
           if (this.greetingDue) {
             this.greetingDue = false
             await this.save(greetedKey(version), { sessionId, previous })
-          } else if (this.landingDue) {
+          } else {
             this.landingDue = false
             if (sessionId !== null) await this.save(cardKey(version, sessionId), { landedAt, landedTo })
-          } else {
-            this.closeDue = false
-            if (sessionId !== null) await this.save(closedKey(version, sessionId), true)
           }
         } catch {
           // Not recorded: the next session shows the card again, or a reload

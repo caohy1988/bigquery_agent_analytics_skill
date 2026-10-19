@@ -49,9 +49,18 @@ function host({ hold = () => false, holdState = () => false, refuseState = () =>
   return { store, state, held, write, stateSet, read, card, release: key => held.splice(held.findIndex(h => h.key === key), 1)[0].release() }
 }
 
+// Store reads that wait while `holding` says so, until `answer`.
+function heldReads(h, holding) {
+  const waiting = []
+  h.read = key => (holding(key) ? new Promise(resolve => waiting.push(() => resolve(structuredClone(h.store.get(key))))) : Promise.resolve(structuredClone(h.store.get(key))))
+  return { answer: () => waiting.splice(0).forEach(go => go()), count: () => waiting.length }
+}
+
 let loads = 0
-// One load of the code against `h`.
-async function load(h) {
+// One load of the code against `h`, with `options` over the usual ones. A
+// load begins at least a millisecond after the one before, as a reload does.
+async function load(h, options = {}) {
+  await new Promise(resolve => setTimeout(resolve, 2))
   const { register } = await import(`${REGISTER}?load=${++loads}`)
   const hooks = new Map()
   const timers = []
@@ -61,12 +70,13 @@ async function load(h) {
     hooks.set(name, args.at(-1))
     return { catch: () => undefined }
   }
-  register(on, { project: 'my-gcp-project', dataset: 'agent_analytics', dryRun: true })
+  register(on, { project: 'my-gcp-project', dataset: 'agent_analytics', dryRun: true, ...options })
   const $ = {
     env: { get: async name => ({ HOME: '/home/dev' })[name] },
     store: { get: key => (h.read ? h.read(key) : Promise.resolve(structuredClone(h.store.get(key)))), set: h.write, delete: async key => void h.store.delete(key), keys: async () => [...h.store.keys()] },
     state: {
       get: async ref => {
+        if (h.stateRead) await h.stateRead()
         const now = h.state.get(ref.key) ?? { value: undefined, version: 0 }
         return { value: structuredClone(now.value), version: now.version }
       },
@@ -313,6 +323,167 @@ const tests = {
     await starting
     await settle()
     assert.equal(a.greetings() + b.greetings(), 1)
+  },
+  async 'Got it while the greeting is still being written, its session-state close refused, puts the close in the store at once, and a new load shows no card'() {
+    const h = host({ hold: key => key === `welcome:${PLUGIN_VERSION}`, refuseState: value => value?.closed === true })
+    const a = await load(h)
+    await a.start()
+    await a.close()
+    // The close is written while the greeting still waits.
+    assert.equal(h.store.get(CLOSED), true)
+    assert.deepEqual(h.held.map(w => w.key), [`welcome:${PLUGIN_VERSION}`])
+    assert.equal(h.card()?.closed, false)
+    const b = await load(h)
+    await b.start()
+    assert.equal(await b.shown(), false)
+    h.release(`welcome:${PLUGIN_VERSION}`)
+    await settle()
+    assert.equal(await b.shown(), false)
+  },
+  async 'Got it while a landing is still being written, its session-state close refused, puts the close in the store at once, and a new load shows no card'() {
+    const h = host({ hold: key => key === OWN, refuseState: value => value?.closed === true })
+    const a = await load(h)
+    await a.start()
+    await a.land()
+    assert.deepEqual(h.held.map(w => w.key), [OWN])
+    await a.close()
+    assert.equal(h.store.get(CLOSED), true)
+    const b = await load(h)
+    await b.start()
+    assert.equal(await b.shown(), false)
+  },
+  async 'a new load draws the card only once its reads of the store have answered, and one whose reads never answer never draws it'() {
+    const h = host()
+    const a = await load(h)
+    await a.start()
+    assert.equal(await a.shown(), true)
+    let holding = true
+    const reads = heldReads(h, () => holding)
+    const b = await load(h)
+    await b.start()
+    assert.ok(reads.count() > 0)
+    assert.equal(await b.shown(), false)
+    holding = false
+    reads.answer()
+    await settle()
+    assert.equal(await b.shown(), true)
+    holding = true
+    const c = await load(h)
+    await c.start()
+    await settle()
+    assert.equal(await c.shown(), false)
+  },
+  async 'a close the store has, its session-state write refused: a new load draws no card while its read of that close waits, nor after'() {
+    const h = host({ refuseState: value => value?.closed === true })
+    const a = await load(h)
+    await a.start()
+    await a.close()
+    assert.equal(h.store.get(CLOSED), true)
+    assert.equal(h.card()?.closed, false)
+    const reads = heldReads(h, key => key === CLOSED)
+    const b = await load(h)
+    await b.start()
+    assert.equal(await b.shown(), false)
+    reads.answer()
+    await settle()
+    assert.equal(await b.shown(), false)
+  },
+  async 'a load whose reads answer after a later load took the card over for another destination leaves the card to it, and rows it lands count nowhere'() {
+    const A = { deadLetterDir: '/home/dev/a/dead-letter' }
+    const B = { deadLetterDir: '/home/dev/b/dead-letter' }
+    const h = host()
+    const a = await load(h, A)
+    await a.start()
+    let holding = true
+    const reads = heldReads(h, () => holding)
+    const b = await load(h, A)
+    await b.start()
+    holding = false
+    const c = await load(h, B)
+    await c.start()
+    assert.equal(h.card()?.destination, 'dry run: /home/dev/b/dry-run')
+    reads.answer()
+    await settle()
+    assert.equal(h.card()?.destination, 'dry run: /home/dev/b/dry-run')
+    assert.equal(await b.shown(), false)
+    await b.land()
+    assert.equal(h.card()?.sent, 0)
+    assert.ok((await c.texts()).some(t => String(t).startsWith('◌ Waiting for the first rows')))
+    // The first load, still drawing, claims no landing either.
+    await c.land()
+    assert.equal(h.card()?.sent, 1)
+    assert.ok((await c.texts()).some(t => String(t).startsWith('✓ First rows written · 1 so far')))
+    assert.ok((await a.texts()).some(t => String(t).startsWith('◌ Waiting for the first rows')))
+  },
+  async 'rows a new load lands while its reads of the store wait count once, across repeated reloads'() {
+    const h = host()
+    const a = await load(h)
+    await a.start()
+    await a.land()
+    assert.equal(h.card()?.sent, 1)
+    let holding = true
+    const reads = heldReads(h, () => holding)
+    const b = await load(h)
+    await b.start()
+    await b.land()
+    holding = false
+    reads.answer()
+    await settle()
+    assert.equal(h.card()?.sent, 2)
+    const c = await load(h)
+    await c.start()
+    await c.land()
+    assert.equal(h.card()?.sent, 3)
+    assert.ok((await c.texts()).some(t => String(t).startsWith('✓ First rows written · 3 so far')))
+  },
+  async 'a new load that cannot read the store shows no card: it cannot tell whether the card was closed'() {
+    const h = host()
+    const a = await load(h)
+    await a.start()
+    assert.equal(await a.shown(), true)
+    h.read = () => Promise.reject(new Error('the store could not be read'))
+    const b = await load(h)
+    await b.start()
+    assert.equal(await b.shown(), false)
+  },
+  async 'an earlier load whose read of the session state answers after a later load showed the card never takes it over'() {
+    const A = { deadLetterDir: '/home/dev/a/dead-letter' }
+    const B = { deadLetterDir: '/home/dev/b/dead-letter' }
+    const h = host()
+    const a = await load(h, A)
+    // The earlier load's first read of the state waits.
+    const waiting = []
+    h.stateRead = () => new Promise(resolve => waiting.push(resolve))
+    const starting = a.start()
+    await settle()
+    h.stateRead = undefined
+    const b = await load(h, B)
+    await b.start()
+    assert.equal(h.card()?.destination, 'dry run: /home/dev/b/dry-run')
+    for (const go of waiting.splice(0)) go()
+    await starting
+    await settle()
+    assert.equal(h.card()?.destination, 'dry run: /home/dev/b/dry-run')
+    assert.equal(await a.shown(), false)
+    assert.equal(await b.shown(), true)
+  },
+  async 'rows that went where the card counted them before it moved, and moved back, are not counted again'() {
+    const A = { deadLetterDir: '/home/dev/a/dead-letter' }
+    const B = { deadLetterDir: '/home/dev/b/dead-letter' }
+    const h = host()
+    const a = await load(h, A)
+    await a.start()
+    await a.land()
+    assert.equal(h.card()?.sent, 1)
+    const b = await load(h, B)
+    await b.start()
+    const c = await load(h, A)
+    await c.start()
+    assert.equal(h.card()?.sent, 0)
+    // The first load's writer lands one more row there: one, not two.
+    await a.land()
+    assert.equal(h.card()?.sent, 1)
+    assert.ok((await c.texts()).some(t => String(t).startsWith('✓ First rows written · 1 so far')))
   },
 }
 

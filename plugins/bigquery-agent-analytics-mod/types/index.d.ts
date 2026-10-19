@@ -9,14 +9,22 @@ export type WelcomeState = {
   landedAt: number | null
   landedTo: string | null
   closed: boolean
-  // Rows landed where the card says rows go, while it showed.
+  // Rows landed where the card says rows go, while it showed: the sum of
+  // `counted`.
   sent: number
+  // Each writer's rows counted (by its load's session.start run, as
+  // `owner`): that writer's total sent when last counted, so a writer that
+  // says so again, or late, is never counted twice.
+  counted: Record<string, number>
   // Where it counts rows: the `destinationKey` of the load that showed it.
   destination: string | null
   // The load of the code (and its session.start run) that showed it: the
   // one that speaks for it (a toast); rows an earlier load still sends only
   // count.
   owner: string
+  // How late that load and run came (when the load began, then the run), so
+  // a load whose reads answered late never takes the card from a later one.
+  rank: number
 }
 
 declare module 'claude-code' {

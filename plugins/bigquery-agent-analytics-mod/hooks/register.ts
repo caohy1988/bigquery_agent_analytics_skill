@@ -45,14 +45,23 @@ let clockAfter: ((ms: number, fn: () => void) => { cancel: () => void }) | null 
 // This load of the code, its session.start runs, and the writes of the card
 // it showed (`CardRecords`).
 const LOAD = Math.random().toString(36).slice(2)
+// When this load began: of two loads, the later one shows the card.
+const LOADED_AT = Date.now()
 let welcomeStarts = 0
 let records: CardRecords | null = null
-// Who speaks for the card a session.start run of this load showed.
+// Who speaks for the card a session.start run of this load showed (its
+// writer counts under the same name), and how late that run came: a run of a
+// later load, or a later run of this one, ranks higher.
 const ownerOf = (start: number): string => `${LOAD}:${start}`
+const rankOf = (start: number): number => LOADED_AT * 1000 + start
 // The card (`version:session`) this load knows to be closed, whatever the
 // session's state says: closed here, or closed in the store, a close whose
 // state write was refused included. The band never draws it.
 let closedCard: string | null = null
+// The card this load has read the store's close for and shown, or taken over
+// from the session's state: the band draws no other, so a load whose reads
+// have not answered (or never do) never draws a card the store has closed.
+let cardReady: string | null = null
 const cardId = (version: string, sessionId: string | null): string => `${version}:${sessionId}`
 const WELCOME_STATE = { plugin: 'bigquery-agent-analytics-mod', key: 'welcome' } as const
 
@@ -258,31 +267,36 @@ async function startWelcome($: EngineInterface, e: SessionStartInput, sessionId:
   const kept = held.value
   if (kept !== null && kept.version === PLUGIN_VERSION && sessionId !== null && kept.sessionId === sessionId) {
     // This session's card, as a reload left it. A close the store has, which
-    // the state may lack (its write refused, or late), wins.
+    // the state may lack (its write refused, or late), wins; where the store
+    // cannot be read there is no telling, and no card.
     let stored: { greeted: boolean; closed: unknown }
     try {
       const [latest, greeted, closed] = await Promise.all([$.store.get(WELCOME_KEY), $.store.get(greetedKey(PLUGIN_VERSION)), $.store.get(closedKey(PLUGIN_VERSION, sessionId))])
       stored = { greeted: greetedBy(latest, greeted) !== null, closed }
     } catch {
-      stored = { greeted: true, closed: undefined }
+      return
     }
-    if (start !== welcomeStarts) return
     if (stored.closed === true) {
       closedCard = cardId(PLUGIN_VERSION, sessionId)
       redrawBand($)
     }
+    if (start !== welcomeStarts) return
     const taken = await changeCard($, card => {
       if (card.sessionId !== sessionId) return null
       if (stored.closed === true) return { ...card, closed: true }
+      // A later load, or run, took the card over meanwhile: it shows it.
+      if ((card.rank ?? 0) > rankOf(start)) return null
       const reopened = reopenWelcome(card, key)
-      return reopened === null ? null : { ...reopened.welcome, owner: me }
+      return reopened === null ? null : { ...reopened.welcome, owner: me, rank: rankOf(start) }
     }).catch(() => null)
     if (taken === null || taken.closed || start !== welcomeStarts) return
     // The greeting written again where the store has none (its write was
     // lost with an earlier load): the same record, so no later session greets.
     records = new CardRecords(save, taken, !stored.greeted)
+    cardReady = cardId(PLUGIN_VERSION, sessionId)
     redrawBand($)
-    if (writer !== null && writer.counters.sent > 0) rowsLanded($, writer.counters.sent, key)
+    // Rows this writer landed while the records were read: counted once.
+    if (writer !== null) rowsLanded($, me, writer.counters.sent, key)
     return
   }
   let opened: { welcome: Welcome; isNew: boolean } | null
@@ -308,7 +322,7 @@ async function startWelcome($: EngineInterface, e: SessionStartInput, sessionId:
     return
   }
   if (start !== welcomeStarts || opened === null) return
-  const card: Welcome = { ...opened.welcome, owner: me }
+  const card: Welcome = { ...opened.welcome, owner: me, rank: rankOf(start) }
   // Shown only if the state still stands as read: no other load has shown
   // or changed a card since. The one that does shows it, and greets.
   try {
@@ -316,12 +330,8 @@ async function startWelcome($: EngineInterface, e: SessionStartInput, sessionId:
   } catch {
     return
   }
-  if (start !== welcomeStarts) return
-  records = new CardRecords(save, card, opened.isNew)
-  redrawBand($)
-  // Rows that landed while the records were read (this writer's rows go
-  // where this configuration sends them): the card says so now.
-  if (writer !== null && writer.counters.sent > 0) rowsLanded($, writer.counters.sent, key)
+  // The greeting line is this run's, which showed the card, even when a
+  // later run takes the card over from here.
   if (opened.isNew) {
     try {
       $.ui.log(clean(welcomeNotice(card, config)))
@@ -329,6 +339,13 @@ async function startWelcome($: EngineInterface, e: SessionStartInput, sessionId:
       // No transcript here: the card says it.
     }
   }
+  if (start !== welcomeStarts) return
+  records = new CardRecords(save, card, opened.isNew)
+  cardReady = cardId(card.version, card.sessionId)
+  redrawBand($)
+  // Rows that landed while the records were read (this writer's rows go
+  // where this configuration sends them): the card says so now, once.
+  if (writer !== null) rowsLanded($, me, writer.counters.sent, key)
 }
 
 // Changes the card in `$.state`: reads it, applies `change`, and writes it
@@ -358,18 +375,23 @@ function redrawBand($: EngineInterface): void {
   }
 }
 
-// `rows` landed in `to` (their destination's `destinationKey`): where the
-// card counts rows, it counts them, and the first time it says they landed,
-// and the load that showed it says so with a toast as well, as the band may
-// be collapsed. Rows a writer of an earlier configuration sent elsewhere say
-// nothing here; rows an earlier load sent where the card counts them count.
-function rowsLanded($: EngineInterface, rows: number, to: string | null): void {
-  if (to === null) return
+// The writer `by` (a load's session.start run, named as `ownerOf` names it)
+// has landed `total` rows in all, in `to` (their destination's
+// `destinationKey`): where the card counts rows, it counts each writer's
+// total once, however often or late the writer says so (at each send, and
+// once more as the card is shown or taken over). The first time, it says
+// they landed, and the load that showed it says so with a toast as well, as
+// the band may be collapsed. Rows a writer of another configuration sent
+// elsewhere say nothing here; rows an earlier load sends where the card
+// counts them count.
+function rowsLanded($: EngineInterface, by: string, total: number, to: string | null): void {
+  if (to === null || total <= 0) return
   let first = false
   void changeCard($, card => {
-    if (card.closed || card.destination !== to) return null
+    const had = card.counted?.[by] ?? 0
+    if (card.closed || card.destination !== to || total <= had) return null
     first = card.landedAt === null
-    return { ...card, sent: card.sent + rows, ...(first ? { landedAt: Date.now(), landedTo: to } : {}) }
+    return { ...card, counted: { ...card.counted, [by]: total }, sent: card.sent + total - had, ...(first ? { landedAt: Date.now(), landedTo: to } : {}) }
   })
     .then(card => {
       if (card === null || !first) return
@@ -386,22 +408,32 @@ function rowsLanded($: EngineInterface, rows: number, to: string | null): void {
     })
 }
 
-// Got it was pressed, or (`landedOnly`) a prompt came after rows landed. Got
-// it hides the card here and writes the store's close at once, whatever
-// becomes of the state's write (refused, late, or never answered); a prompt
-// closes it only once the state shows rows landed.
+// Got it was pressed, or (`landedOnly`) a prompt came after rows landed
+// where rows go now. The close goes to the store on its own, behind no other
+// write (its key only ever says true): Got it writes it as it hides the card
+// here, whatever becomes of the state's write (refused, late, or never
+// answered) and whether or not this load has taken the card over yet; a
+// prompt closes the card only once the state shows rows landed here.
 function closeWelcome($: EngineInterface, landedOnly = false): void {
-  const id = cardId(PLUGIN_VERSION, tracer.sessionId)
+  const sessionId = tracer.sessionId
+  const id = cardId(PLUGIN_VERSION, sessionId)
+  const closeInStore = (): void => {
+    if (sessionId === null) return
+    $.store.set(closedKey(PLUGIN_VERSION, sessionId), true).catch(() => {
+      internalErrors += 1
+    })
+  }
   if (!landedOnly) {
     closedCard = id
-    records?.close()
+    closeInStore()
     redrawBand($)
   }
-  void changeCard($, card => (card.closed || (landedOnly && card.landedAt === null) ? null : { ...card, closed: true }))
+  const here = destinationKey(config)
+  void changeCard($, card => (card.closed || (landedOnly && (card.landedAt === null || card.landedTo !== here)) ? null : { ...card, closed: true }))
     .then(card => {
       if (card === null || !landedOnly) return
       closedCard = id
-      records?.close()
+      closeInStore()
     })
     .catch(() => {
       internalErrors += 1
@@ -454,6 +486,7 @@ export const register: Register = (on, registered) => {
     // A read for the card by an earlier run of this load is not used from
     // here on.
     const start = ++welcomeStarts
+    cardReady = null
     try {
       config = resolveConfig(options, await readEnv($))
       clockAfter = (ms, fn) => $.clock.after(ms, fn)
@@ -487,10 +520,11 @@ export const register: Register = (on, registered) => {
         redraw: () => $.ui.invalidate('ui.render'),
         // Where setup.sh is, for the fix when BigQuery cannot find the dataset.
         pluginRoot: $.plugin.root,
-        sent: (rows, to) => rowsLanded($, rows, destinationKey(to)),
+        sent: (rows, to) => rowsLanded($, ownerOf(start), own?.counters.sent ?? rows, destinationKey(to)),
       }
       const previous = writer
-      writer = new Writer(io, () => config, () => tracer.sessionId)
+      const own: Writer = new Writer(io, () => config, () => tracer.sessionId)
+      writer = own
       // session.start can fire again without a reload (the plugin was turned
       // off and on): keep what the previous writer still held.
       if (previous) writer.adopt(previous)
@@ -618,8 +652,13 @@ export const register: Register = (on, registered) => {
       } catch {
         shown = null
       }
-      if (shown === null || shown.closed || shown.version !== PLUGIN_VERSION || shown.sessionId !== tracer.sessionId || cardId(shown.version, shown.sessionId) === closedCard) return theirs
-      const card = welcomeCard(shown, config, shown.sent)
+      if (shown === null || shown.closed || shown.version !== PLUGIN_VERSION || shown.sessionId !== tracer.sessionId) return theirs
+      const id = cardId(shown.version, shown.sessionId)
+      if (id === closedCard || id !== cardReady) return theirs
+      // Rows that landed elsewhere than this configuration sends them say
+      // nothing here: the card waits.
+      const here = shown.destination === destinationKey(config)
+      const card = welcomeCard(here ? shown : { ...shown, landedAt: null, landedTo: null }, config, here ? shown.sent : 0)
       const { Box, Button, Text } = $.ui.resolve(e)
       const title = Box({
         flexDirection: 'row',
