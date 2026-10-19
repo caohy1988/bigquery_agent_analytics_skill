@@ -779,7 +779,15 @@ claude plugin validate plugins/bigquery-agent-analytics-mod
 cd plugins/bigquery-agent-analytics-mod && claude plugin test
 bash tests/setup.test.sh
 python3 tests/views.test.py   # needs DuckDB: python3 -m pip install duckdb
+npx -p typescript tsc -p .    # once the host CLI has loaded the mod (below)
 ```
+
+`tsc -p .` type-checks `hooks/` and `tests/` (strict, with
+`noUncheckedIndexedAccess`) against the declarations the host CLI writes to
+`.claude-plugin/types/` each time it loads the mod from a folder (its
+`--plugin-dir` option, pointed at this directory once, is enough). The
+mod's `tsconfig.json` leaves out the MCP tools' declarations there, which
+depend on the servers that machine has connected.
 
 The test command runs the `tests/*.test.ts` files against the host CLI's own
 test kit, with no session, sign-in, GCP or network: `$.http.fetch`,
