@@ -251,7 +251,9 @@ nothing over, and of the loads that go on a later one ranks higher,
 whatever the clock says; no run replaces a card a later load or run
 showed, another version's included; a load whose reads answer after a later
 load took the card over leaves it to that one, and a later load whose first write of the card
-an earlier one beat takes the card over, with no second greeting. Each
+an earlier one beat takes the card over, with no second greeting; a later
+version's (an update in the session) shows its own card over the earlier
+version's, with its own greeting. Each
 writer's rows count once, however often or late it says so. If rows now go
 somewhere else (another table, or BigQuery after a dry run), the card waits
 again until rows land there, and a prompt closes it only once they have,
@@ -1388,7 +1390,8 @@ does, which the test kit cannot, under node 24 with a small stand-in for
 writes and reads held and let go in any order). Its `$.state` keeps a
 version for each value and lands a conditional write only at it, and every
 `$.state.get` of one event reads one moment until a write of its own brings
-that value up to date, as the host's does; its writes can be held or
+it up to date (a landed write, that value; a missed one, the whole moment),
+as the host's does; its writes can be held or
 refused, its reads held. Its `$.clock.sleep` answers only in the newest
 load: a hot reload cancels the waits of the load it replaces. A load may be
 of another version of the code, its config naming that version, as after
@@ -1434,8 +1437,10 @@ stands at once too; that a read of the close that never answers stops no
 read of it ten seconds on; that a Got it, a takeover's stored close or a
 prompt in a load of the
 version before an update, its write or its reads answering late, never
-closes the card of the version after it; and that draws of the card while
-its read of the close waits start no other read of it.
+closes the card of the version after it; that of the first card writes of
+the versions before and after an update, landing in either order, the
+later version's card shows, with its own greeting; and that draws of the
+card while its read of the close waits start no other read of it.
 
 `tests/views.test.py` runs both views in DuckDB. It uses five dialect
 substitutions, and each must match. The fixture is a table shared by this

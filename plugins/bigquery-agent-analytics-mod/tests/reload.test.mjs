@@ -39,8 +39,8 @@ const OWN = `welcome:${PLUGIN_VERSION}:${SESSION}`
 const CLOSED = `${OWN}:closed`
 const START = { surface: 'terminal', isInteractive: true, cwd: '/work' }
 // The event a call of `$` is made under: every `$.state.get` of one reads
-// one moment, as the host's does, until a write of its own (landed or
-// missed) brings that value up to date.
+// one moment, as the host's does, until a write of its own brings it up to
+// date: a landed one, that value; a missed one, the whole moment.
 const dispatch = new AsyncLocalStorage()
 const settle = async () => {
   for (let i = 0; i < 200; i += 1) await Promise.resolve()
@@ -117,7 +117,8 @@ async function load(h, options = {}, version = null) {
       set: async (ref, value, options) => {
         const result = await h.stateSet(ref, value, options)
         const at = dispatch.getStore()
-        if (at?.moment) at.moment.set(ref.key, structuredClone(h.state.get(ref.key)))
+        if (at?.moment && result.isSet) at.moment.set(ref.key, structuredClone(h.state.get(ref.key)))
+        else if (at?.moment) at.moment = structuredClone(h.state)
         return result
       },
     },
@@ -730,6 +731,33 @@ const tests = {
     assert.equal(h.card().closed, false)
     assert.equal(await c.shown(), true)
   },
+  ...Object.fromEntries(
+    [NEXT, '0.1.0'].map(landsFirst => [
+      `of the first card writes of the versions before and after an update, ${landsFirst === NEXT ? 'the later one\'s landing first' : 'the earlier one\'s landing first'}, the later version's card shows, with its own greeting`,
+      async () => {
+        let holding = true
+        const h = host({ holdState: value => holding && typeof value === 'object' && value !== null && 'owner' in value })
+        const a = await load(h)
+        await a.start()
+        const b = await load(h, {}, NEXT)
+        await b.start()
+        holding = false
+        const release = version => {
+          const w = h.held.find(x => x.key === 'state' && x.value?.version === version)
+          h.held.splice(h.held.indexOf(w), 1)
+          w.release()
+        }
+        release(landsFirst)
+        await settle()
+        release(landsFirst === NEXT ? '0.1.0' : NEXT)
+        await settle()
+        assert.equal(h.card().version, NEXT)
+        assert.equal(await b.shown(), true)
+        assert.equal(b.greetings(), 1)
+        assert.equal(h.store.get(`welcome:${NEXT}`)?.sessionId, SESSION)
+      },
+    ]),
+  ),
   async 'a prompt in a load of the version before an update never closes the card of the version after it'() {
     const h = host()
     const a = await load(h)

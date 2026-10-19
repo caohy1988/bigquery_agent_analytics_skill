@@ -319,27 +319,34 @@ async function startWelcome($: EngineInterface, e: SessionStartInput, sessionId:
   if (start !== welcomeStarts || opened === null) return
   const card: Welcome = { ...opened.welcome, owner: me, rank }
   // Shown only if the state still stands as read: no other load has shown
-  // or changed a card since. The one that does shows it, and greets.
-  let isSet: boolean
-  try {
-    isSet = (await $.state.set(WELCOME_STATE, card, { ifVersion: held.version })).isSet
-  } catch {
-    return
-  }
-  if (!isSet) {
-    // Another load showed this session's card first (an earlier one whose
-    // write answered first, say): this run takes it over from there, with
-    // no greeting of its own.
-    if (start !== welcomeStarts) return
-    let now: Welcome | null
+  // or changed a card since. The one that does shows it, and greets. Where
+  // another has: this version's card (an earlier load's whose write answered
+  // first, say), which this run takes over from there, with no greeting of
+  // its own; a card a later load or run showed, left to it; or an earlier
+  // one's of another version (an update in the session), which this run's
+  // card replaces, tried again at the state as it stands now.
+  let version = held.version
+  let isSet = false
+  for (let i = 0; i < 8 && !isSet; i += 1) {
     try {
-      now = (await $.state.get(WELCOME_STATE)).value ?? null
+      isSet = (await $.state.set(WELCOME_STATE, card, { ifVersion: version })).isSet
     } catch {
       return
     }
-    if (isOurs(now)) await takeOver($, sessionId as string, start, rank)
-    return
+    if (isSet) break
+    if (start !== welcomeStarts) return
+    let now: { value: Welcome | null; version: number }
+    try {
+      const read = await $.state.get(WELCOME_STATE)
+      now = { value: read.value ?? null, version: read.version }
+    } catch {
+      return
+    }
+    if (isOurs(now.value)) return takeOver($, sessionId as string, start, rank)
+    if (now.value !== null && (now.value.rank ?? 0) > rank) return
+    version = now.version
   }
+  if (!isSet) return
   // The greeting line is this run's, which showed the card, even when a
   // later run takes the card over from here.
   if (opened.isNew) {
