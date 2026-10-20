@@ -38,7 +38,6 @@ const TABLE_CREATED = { status: 200, text: '{"kind":"bigquery#table"}' }
 // again; and insertAll refused the first row.
 const FIRST_AGAIN = { status: 200, text: JSON.stringify({ insertErrors: [{ index: 0, errors: [{ reason: 'backendError', message: 'try again' }] }] }) }
 const FIRST_REFUSED = { status: 200, text: JSON.stringify({ insertErrors: [{ index: 0, errors: [{ reason: 'invalid', message: 'no such field: extra' }] }] }) }
-const FIRST_RETRY = { status: 200, text: JSON.stringify({ insertErrors: [{ index: 0, errors: [{ reason: 'backendError', message: 'try again' }] }] }) }
 const DENIED = {
   status: 403,
   text: '{"error":{"code":403,"message":"Access Denied: Table my-gcp-project:agent_analytics.agent_events: Permission bigquery.tables.updateData denied","errors":[{"reason":"accessDenied"}],"status":"PERMISSION_DENIED"}}',
@@ -1015,13 +1014,26 @@ function twoWriters(answer: (ids: string[]) => { status: number; text: string })
   // When files were last written, for the listing (none: not said).
   const mtimes = new Map<string, number>()
   const statuses: (string | undefined)[] = []
+  // The status lines the surface does not take (it throws), and whether it
+  // takes debug lines.
+  let statusFails: ((text: string | undefined) => boolean) | null = null
+  let debugFails = false
   // `from`: the store takes that many of a replay's records, then no more.
   // `get` may name the keys whose reads fail.
   let storeFails: { get?: boolean | ((key: string) => boolean); set?: boolean | ((key: string) => boolean); from?: number } = {}
   let records = 0
+  // The sessions whose process has ended: a write of theirs not done by then
+  // never lands.
+  const ended = new Set<string>()
+  // The timers set: one goes off only when a test sets it off (`fire`).
+  const timers: { ms: number; fn: () => void; done: boolean }[] = []
   const io = (session: string): Io => ({
     now: () => 0,
-    after: () => ({ cancel: () => undefined }),
+    after: (ms, fn) => {
+      const timer = { ms, fn, done: false }
+      timers.push(timer)
+      return { cancel: () => void (timer.done = true) }
+    },
     fetch: async (url, init) => {
       const ids = idsOf(init.body ?? '{"rows":[]}')
       sent.push(...ids)
@@ -1032,6 +1044,7 @@ function twoWriters(answer: (ids: string[]) => { status: number; text: string })
     envToken: async () => undefined,
     writeFile: async (path, text) => {
       await writeGate?.(session, path, text)
+      if (ended.has(session)) return new Promise<void>(() => undefined)
       if (refuseWrite?.(path, text)) throw new Error(`EACCES: ${path} (${session})`)
       if (tearWrite?.(path, text)) {
         files.set(path, text.slice(0, Math.floor(text.length * tornAt)))
@@ -1059,8 +1072,13 @@ function twoWriters(answer: (ids: string[]) => { status: number; text: string })
       store.set(key, json)
     },
     storeDelete: async key => void store.delete(key),
-    status: text => void statuses.push(text),
-    debug: () => undefined,
+    status: text => {
+      if (statusFails?.(text)) throw new Error('no status line here')
+      statuses.push(text)
+    },
+    debug: () => {
+      if (debugFails) throw new Error('no debug log here')
+    },
   })
   return {
     config,
@@ -1084,6 +1102,18 @@ function twoWriters(answer: (ids: string[]) => { status: number; text: string })
     holdGets: (f: ((session: string, key: string) => Promise<void> | undefined) | null) => (getGate = f),
     holdReads: (f: ((session: string, path: string) => Promise<void> | undefined) | null) => (readGate = f),
     holdSets: (f: ((session: string, key: string) => Promise<void> | undefined) | null) => (setGate = f),
+    failStatus: (f: ((text: string | undefined) => boolean) | null) => (statusFails = f),
+    failDebug: (fails: boolean) => (debugFails = fails),
+    // Ends the session's process, as the host does once session.end returns.
+    exit: (session: string) => void ended.add(session),
+    // Sets off the timers set for `ms` or less.
+    fire: (ms: number) => {
+      for (const timer of timers) {
+        if (timer.done || timer.ms > ms) continue
+        timer.done = true
+        timer.fn()
+      }
+    },
     mtimes,
     sentOf: (id: string) => sent.filter(x => x === id).length,
     copiesOf: (id: string) => [...files].filter(([path, text]) => path.includes('/rejected-') && text !== '').flatMap(([, text]) => parseFile(text).lines).filter(l => l.row.event_id === id).length,
@@ -2043,9 +2073,41 @@ test('the exit spill after a takeover takes the batch the writer before still ha
   expect([w.sentOf(a), w.sentOf(d)]).toEqual([1, 0])
 })
 
+// The host ends the process as soon as session.end returns: `exiting` ends
+// the session's process once the exit returns, and the yields give an exit
+// that does not wait the chance to return before the held write is let go.
+const exitOf = (w: ReturnType<typeof twoWriters>, writer: Writer, session = 'a-session') => {
+  let returned = false
+  const exiting = writer.spillForExit(1000).then(result => {
+    returned = true
+    w.exit(session)
+    return result
+  })
+  return { exiting, returned: () => returned }
+}
+const yields = async (): Promise<void> => {
+  for (let i = 0; i < 100; i += 1) await Promise.resolve()
+}
+// Writes to the files `f` picks wait, until `release()`.
+const holdFile = (w: ReturnType<typeof twoWriters>, f: (path: string) => boolean) => {
+  let reached = (): void => undefined
+  let release = (): void => undefined
+  const atWrite = new Promise<void>(resolve => (reached = resolve))
+  const held = new Promise<void>(resolve => (release = resolve))
+  w.holdWrites((_, path, text) => {
+    if (!f(path) || text === '') return undefined
+    w.holdWrites(null)
+    reached()
+    return held
+  })
+  return { atWrite, release }
+}
+const linesIn = (w: ReturnType<typeof twoWriters>, kind: 'spill' | 'retry' | 'rejected', id: string): number =>
+  [...w.files].filter(([path, text]) => path.includes(`/${kind}-`) && text !== '').flatMap(([, text]) => parseFile(text).lines).filter(l => l.row.event_id === id).length
+
 for (const kind of ['refused', 'parked after their retries'] as const) {
-  test(`the exit spill after a takeover, rows the batch out had ${kind} still being written, makes no second copy of them`, async () => {
-    const w = twoWriters(() => (kind === 'refused' ? FIRST_REFUSED : FIRST_RETRY))
+  test(`the exit after a takeover, with nothing left to spill, waits for the file the batch out's rows ${kind} are being written to, and makes no second copy of them`, async () => {
+    const w = twoWriters(() => (kind === 'refused' ? FIRST_REFUSED : FIRST_AGAIN))
     const a = 'a'.repeat(32)
     const rowOf = (id: string) => (JSON.parse(line(id, 'retry')) as { row: Parameters<Writer['enqueue']>[0] }).row
     const before = w.writer('a-session')
@@ -2056,31 +2118,93 @@ for (const kind of ['refused', 'parked after their retries'] as const) {
       before.queue.unshift(queued)
     }
     // The file the answer sends the row to: its write waits.
-    let reached = (): void => undefined
-    let release = (): void => undefined
-    const atWrite = new Promise<void>(resolve => (reached = resolve))
-    const held = new Promise<void>(resolve => (release = resolve))
-    w.holdWrites((_, path, text) => {
-      if (!path.includes(kind === 'refused' ? '/rejected-' : '/retry-') || text === '') return undefined
-      w.holdWrites(null)
-      reached()
-      return held
-    })
-    const flushing = before.flush()
-    await atWrite
+    const file = holdFile(w, path => path.includes(kind === 'refused' ? '/rejected-' : '/retry-'))
+    void before.flush()
+    await file.atWrite
     const after = w.writer('a-session')
     after.adopt(before)
-    expect(await after.spillForExit(1000)).toEqual({ spilled: 0 })
-    release()
-    await flushing
-    await w.writer('next-session').backfill(['spill', 'retry'], 'auto')
-    const copies = (dir: 'spill' | 'retry'): number => [...w.files].filter(([path, text]) => path.includes(`/${dir}-`) && text !== '').flatMap(([, text]) => parseFile(text).lines).filter(l => l.row.event_id === a).length
-    if (kind === 'refused') expect([w.sentOf(a), w.copiesOf(a), copies('spill')]).toEqual([1, 1, 0])
-    else expect([copies('spill'), w.sentOf(a)]).toEqual([0, 2])
+    const exit = exitOf(w, after)
+    await yields()
+    expect(exit.returned()).toBe(false)
+    file.release()
+    expect(await exit.exiting).toEqual({ spilled: 0 })
+    if (kind === 'refused') expect([linesIn(w, 'rejected', a), linesIn(w, 'spill', a), linesIn(w, 'retry', a)]).toEqual([1, 0, 0])
+    else expect([linesIn(w, 'retry', a), linesIn(w, 'spill', a)]).toEqual([1, 0])
   })
 }
 
-test('the exit spill while a batch\'s refused rows are still being written takes those its answer asked for again, and none it landed or refused', async () => {
+test('the exit after a takeover waits for a file of refused rows the writer before began after the takeover', async () => {
+  const w = twoWriters(() => FIRST_REFUSED)
+  const a = 'a'.repeat(32)
+  const rowOf = (id: string) => (JSON.parse(line(id, 'retry')) as { row: Parameters<Writer['enqueue']>[0] }).row
+  const before = w.writer('a-session')
+  before.enqueue(rowOf(a), 0)
+  let asked = (): void => undefined
+  let answer = (): void => undefined
+  const atRequest = new Promise<void>(resolve => (asked = resolve))
+  const answered = new Promise<void>(resolve => (answer = resolve))
+  w.hold(() => {
+    w.hold(null)
+    asked()
+    return answered
+  })
+  void before.flush()
+  await atRequest
+  const after = w.writer('a-session')
+  after.adopt(before)
+  // The answer comes after the takeover: its refused row's write waits.
+  const file = holdFile(w, path => path.includes('/rejected-'))
+  answer()
+  await file.atWrite
+  const exit = exitOf(w, after)
+  await yields()
+  expect(exit.returned()).toBe(false)
+  file.release()
+  expect(await exit.exiting).toEqual({ spilled: 0 })
+  expect([linesIn(w, 'rejected', a), linesIn(w, 'spill', a)]).toEqual([1, 0])
+})
+
+test('the exit waits for a file of refused rows a writer began before it took over', async () => {
+  const w = twoWriters(() => FIRST_REFUSED)
+  const b = 'b'.repeat(32)
+  const rowOf = (id: string) => (JSON.parse(line(id, 'retry')) as { row: Parameters<Writer['enqueue']>[0] }).row
+  const before = w.writer('a-session')
+  const after = w.writer('a-session')
+  after.enqueue(rowOf(b), 0)
+  const file = holdFile(w, path => path.includes('/rejected-'))
+  void after.flush()
+  await file.atWrite
+  after.adopt(before)
+  const exit = exitOf(w, after)
+  await yields()
+  expect(exit.returned()).toBe(false)
+  file.release()
+  expect(await exit.exiting).toEqual({ spilled: 0 })
+  expect([linesIn(w, 'rejected', b), linesIn(w, 'spill', b)]).toEqual([1, 0])
+})
+
+test('with nothing to spill, the exit waits for a file of refused rows still being written no longer than its bound', async () => {
+  const w = twoWriters(() => FIRST_REFUSED)
+  const a = 'a'.repeat(32)
+  const rowOf = (id: string) => (JSON.parse(line(id, 'retry')) as { row: Parameters<Writer['enqueue']>[0] }).row
+  const writer = w.writer('a-session')
+  writer.enqueue(rowOf(a), 0)
+  const file = holdFile(w, path => path.includes('/rejected-'))
+  void writer.flush()
+  await file.atWrite
+  const exit = exitOf(w, writer)
+  w.fire(999)
+  await yields()
+  expect(exit.returned()).toBe(false)
+  w.fire(1000)
+  expect(await exit.exiting).toEqual({ spilled: 0 })
+  // The process has ended: the write lands nowhere.
+  file.release()
+  await yields()
+  expect(linesIn(w, 'rejected', a)).toBe(0)
+})
+
+test('the exit while a batch\'s refused rows are still being written spills those its answer asked for again, none it landed or refused, and waits for the refused rows\' file', async () => {
   const [l, r, x] = ['1'.repeat(32), '2'.repeat(32), '3'.repeat(32)]
   const mixed = { status: 200, text: JSON.stringify({ insertErrors: [{ index: 1, errors: [{ reason: 'invalid', message: 'no such field: extra' }] }, { index: 2, errors: [{ reason: 'backendError', message: 'try again' }] }] }) }
   let calls = 0
@@ -2088,21 +2212,15 @@ test('the exit spill while a batch\'s refused rows are still being written takes
   const rowOf = (id: string) => (JSON.parse(line(id, 'retry')) as { row: Parameters<Writer['enqueue']>[0] }).row
   const writer = w.writer('a-session')
   for (const id of [l, r, x]) writer.enqueue(rowOf(id), 0)
-  let reached = (): void => undefined
-  let release = (): void => undefined
-  const atWrite = new Promise<void>(resolve => (reached = resolve))
-  const held = new Promise<void>(resolve => (release = resolve))
-  w.holdWrites((_, path, text) => {
-    if (!path.includes('/rejected-') || text === '') return undefined
-    w.holdWrites(null)
-    reached()
-    return held
-  })
-  const flushing = writer.flush()
-  await atWrite
-  expect(await writer.spillForExit(1000)).toEqual({ spilled: 1 })
-  release()
-  await flushing
+  const file = holdFile(w, path => path.includes('/rejected-'))
+  void writer.flush()
+  await file.atWrite
+  const exit = exitOf(w, writer)
+  await yields()
+  expect(exit.returned()).toBe(false)
+  file.release()
+  expect(await exit.exiting).toEqual({ spilled: 1 })
+  expect([l, r, x].map(id => [linesIn(w, 'spill', id), linesIn(w, 'rejected', id)])).toEqual([[0, 0], [0, 1], [1, 0]])
   await w.writer('next-session').backfill(['spill', 'retry'], 'auto')
   expect([w.sentOf(l), w.sentOf(r), w.sentOf(x), w.copiesOf(r)]).toEqual([1, 1, 2, 1])
 })
@@ -2127,6 +2245,7 @@ test('a status line the writer before sets after the next one took over is clear
   await atRequest
   const after = w.writer('a-session')
   after.adopt(before)
+  after.clearStatus()
   // The writer before learns of the missing dataset now, and says so.
   answer()
   await flushing
@@ -2144,12 +2263,49 @@ test('a status line the writer before set, cleared at session.start, is said aga
   await before.flush()
   const said = w.statuses.at(-1)
   expect(said ?? '').toMatch(/cannot find the dataset/)
-  // session.start clears the host's line (register.ts), then its writer takes over.
-  w.statuses.push(undefined)
+  // session.start's writer takes over, then clears the host's line (register.ts).
   const after = w.writer('a-session')
   after.adopt(before)
+  after.clearStatus()
+  expect(w.statuses.at(-1)).toBeUndefined()
   await after.flush()
   expect([w.sentOf(a), w.statuses.at(-1)]).toEqual([2, said])
+})
+
+test('a status line the surface does not take leaves the flush going, and the same line is written at the next try', async () => {
+  const w = twoWriters(() => DATASET_MISSING)
+  const a = 'a'.repeat(32)
+  const writer = w.writer('a-session')
+  writer.enqueue((JSON.parse(line(a, 'retry')) as { row: Parameters<Writer['enqueue']>[0] }).row, 0)
+  w.failStatus(() => true)
+  await writer.flush()
+  expect([w.sentOf(a), w.statuses, writer.lastError?.message ?? '']).toEqual([1, [], expect.stringMatching(/cannot find the dataset|Not found: Dataset/)])
+  w.failStatus(null)
+  writer.retrySoon()
+  await writer.flush()
+  expect([w.sentOf(a), w.statuses.at(-1) ?? '']).toEqual([2, expect.stringMatching(/cannot find the dataset/)])
+})
+
+test('a debug line the surface does not take leaves the flush going: the rows asked for again stay queued', async () => {
+  const w = twoWriters(() => DATASET_MISSING)
+  const a = 'a'.repeat(32)
+  const writer = w.writer('a-session')
+  writer.enqueue((JSON.parse(line(a, 'retry')) as { row: Parameters<Writer['enqueue']>[0] }).row, 0)
+  w.failDebug(true)
+  await writer.flush()
+  expect([w.sentOf(a), writer.queue.length, w.statuses.at(-1) ?? '']).toEqual([1, 1, expect.stringMatching(/cannot find the dataset/)])
+})
+
+test('a status line clear at session.start that the surface does not take is made by the next landing', async () => {
+  const w = twoWriters(() => OK_INSERT)
+  const a = 'a'.repeat(32)
+  const writer = w.writer('a-session')
+  w.failStatus(text => text === undefined)
+  writer.clearStatus()
+  w.failStatus(null)
+  writer.enqueue((JSON.parse(line(a, 'retry')) as { row: Parameters<Writer['enqueue']>[0] }).row, 0)
+  await writer.flush()
+  expect([w.sentOf(a), w.statuses]).toEqual([1, [undefined]])
 })
 
 test('rows a writer queued before it took over, behind a queue under smaller bounds, are held to its own larger bounds', async () => {

@@ -42,8 +42,9 @@ host CLI, which lets this one keep a hard rule:
   `$.clock` timers does that. Two lifecycle hooks do bounded work of their own
   before passing their event on: `session.start` sets the writer up and
   registers the three commands, and `session.end` writes what is still queued
-  to a spill file, waiting at most `BQAA_EXIT_FLUSH_MS` (800 ms) inside the
-  host's end-of-session bound. That write is the only wait on the disk.
+  to a spill file, waiting at most `BQAA_EXIT_FLUSH_MS` (800 ms), inside the
+  host's end-of-session bound, for that write and for any dead-letter file
+  still being written. Those writes are the only wait on the disk.
 * If the mod's own code throws, the event goes on as if the mod were not
   installed (fail open). The six observers the validator lists as gating
   hooks (`classic.SessionStart`, `classic.SubagentStart`,
@@ -105,10 +106,12 @@ is what a person would have seen as the CLI hanging.
 At `session.end` (the process is exiting) the mod starts no request: the
 rows still queued, and any whose request has not answered yet, go to a spill
 file in the table's dead-letter subdirectory, and the hook waits at most
-`BQAA_EXIT_FLUSH_MS` for that write. The next session sends the file 15
-seconds after it starts (or `/bqaa-backfill` does). A row whose request was
-still in flight can arrive twice; `event_id` dedups it. `/clear` and
-`/resume` keep sending as usual.
+`BQAA_EXIT_FLUSH_MS` for that write and for the files of refused or parked
+rows still being written (it never waits for a request). A write not done
+by then may end with the process, and its rows with it. The next session
+sends the file 15 seconds after it starts (or `/bqaa-backfill` does). A row
+whose request was still in flight can arrive twice; `event_id` dedups it.
+`/clear` and `/resume` keep sending as usual.
 
 ## Install
 
@@ -207,7 +210,7 @@ Advanced, environment only:
 | `BQAA_USER_ID` | `$USER` / `$USERNAME` | `user_id` column (with `userIdFromCredentials` on, the token's account takes its place once known) |
 | `BQAA_REQUEST_TIMEOUT_MS` | `10000` (1000 to 30000) | Client-side timeout per insertAll request |
 | `BQAA_MAX_QUEUE_ROWS` | `5000` (10 to 100000) | Queue bound in rows (the byte bound is 8 MiB of UTF-8) |
-| `BQAA_EXIT_FLUSH_MS` | `800` (0 to 1200) | How long session end may wait for its spill file to be written; `0` starts the write without waiting |
+| `BQAA_EXIT_FLUSH_MS` | `800` (0 to 1200) | How long session end may wait for its spill file, and any dead-letter file still being written, to be written; `0` starts the write without waiting |
 | `BQAA_AUTO_CREATE_TABLE` | `true` | Create the table (BQAA schema v2, partitioned and clustered) when insertAll answers 404 for it |
 | `BQAA_AUTO_BACKFILL` | `true` | Replay the table's `spill` and `retry` files at session start and after BigQuery recovers |
 
@@ -691,9 +694,12 @@ GROUP BY model
   this writer's paced replays going, the status line is one for them all
   (a line one sets late is cleared by the next landing), and the exit spill
   takes a batch one still has out, its answer not come (rows an answer
-  refused or parks are in a file being written already, which is left to
-  finish, and get no second copy); after it they start no batch (a replay
-  one has under way goes on, its rows on disk and fenced by their records).
+  refused or parks are in a file being written already: the exit waits for
+  that write, within the same bound, and makes no second copy); after it
+  they start no batch (a replay one has under way goes on, its rows on disk
+  and fenced by their records). The counts `/bqaa-status` gives, a standing
+  notice and the refused count on the status line are each writer's own:
+  they start over at the takeover.
   A reload of the
   mod's code is a load afresh, which holds none of that (see the limits
   below). Before
@@ -801,7 +807,8 @@ All three run immediately, even while the agent is working, and print counts,
 never payloads or tokens (the agent reads a command's output too).
 
 * `/bqaa-status`: target table, queue depth, rows captured / sent /
-  dead-lettered / refused / spilled / dropped this session, retries, backoff,
+  dead-lettered / refused / spilled / dropped since `session.start` (they
+  start over where the plugin is turned off and on), retries, backoff,
   the notice if rows cannot be written (with the `setup.sh` command when
   BigQuery cannot find the dataset),
   the last error (redacted), the configured table's dead-letter files, how
@@ -817,8 +824,10 @@ never payloads or tokens (the agent reads a command's output too).
 
 When BigQuery refuses rows or retries run out, the mod also sets a status line
 under the prompt (`⚠ bigquery-agent-analytics-mod: …`) until rows land
-again, sent or replayed; its count of refused rows covers every row refused
-since rows last landed. While no credentials work, a permission is missing or
+again, sent or replayed; its count of refused rows covers every row refused,
+and written to a dead-letter file, since rows last landed. Rows whose file
+could not be written are lost, and the line says so instead of pointing at
+`/bqaa-backfill`. While no credentials work, a permission is missing or
 BigQuery cannot find the dataset, that line, the band above the prompt and
 `/bqaa-status` give the fix (see
 [If rows cannot be written](#if-rows-cannot-be-written)). The host keeps a
@@ -952,7 +961,7 @@ test kit, with no session, sign-in, GCP or network: `$.http.fetch`,
 `$.process.run`, `$.fs` and `$.store` are stubbed, and `mock.clock` drives the
 timers; the `$.fs` stubs measure files in UTF-8 bytes and refuse a file over
 4 MiB, and the `$.store` stub a store over 4 MiB of JSON in all, as the host
-does. 325 tests cover the captured rows and their spans,
+does. 336 tests cover the captured rows and their spans,
 subagent runs in the order the host raises them (one invocation and one
 trace for the turn, a span per run, a SubagentStart that comes late or never),
 the session-start row raised before or during `session.start`'s setup,
@@ -1023,7 +1032,13 @@ And when BigQuery cannot find the dataset or table:
 * a 400 after the notice, the access-denied one included: the notice clears,
   and the rows are refused;
 * a reload clearing the status line the previous load set, and the refused
-  count on the status line covering every row since rows last landed.
+  count on the status line covering every row since rows last landed;
+  session.start fired again in the same load clearing the line, and the
+  writer that takes over saying the same line again; a status or debug line
+  the surface does not take leaving the flush going (the line written at the
+  next try, a clear at session.start included); refused rows, and rows out
+  of retries, whose file cannot be written said to be lost, and left out of
+  the refused count.
 
 And the replay that runs by itself while nothing is queued:
 
@@ -1102,7 +1117,11 @@ And the replay that runs by itself while nothing is queued:
   takeover taking the batch the writer before still had out, that writer
   starting nothing more, and no second copy of rows an answer refused or
   parked whose write is still under way, while it takes the rows a mixed
-  answer asked for again; a status line the writer before sets after a
+  answer asked for again; the exit waiting, the process ending once it
+  returns, for the files those rows are being written to (with nothing left
+  to spill, and for writes the writer before began after the takeover, or
+  the writer that took over began before it) and no longer than its bound,
+  through session.end too; a status line the writer before sets after a
   takeover cleared by the next landing, and one session.start cleared said
   again by the writer that takes over; rows queued before a takeover held
   to the new writer's own, larger, bounds; records of files emptied more than a day ago emptied;

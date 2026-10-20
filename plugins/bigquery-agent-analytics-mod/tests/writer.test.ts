@@ -369,6 +369,54 @@ test('a spill write that hangs holds session end no longer than its budget', { o
   world.releaseWrites()
 })
 
+// The event types of the rows in this table's files of one kind.
+const typesIn = (world: World, kind: 'spill' | 'rejected'): string[] =>
+  deadLetterFiles(world)
+    .filter(([path, text]) => path.startsWith(`${PARTITION_DIR}/${kind}-`) && text !== '')
+    .flatMap(([, text]) => parseFile(text).lines.map(l => l.row.event_type))
+
+// A send whose second row BigQuery refuses, while the file that row goes to
+// is still being written when the session ends.
+async function refusedWhileEnding($: Engine, on: Parameters<typeof setUp>[0]): Promise<{ world: World; ended: () => boolean; ending: Promise<void> }> {
+  const world = setUp(on)
+  world.replies = [
+    {
+      status: 200,
+      text: JSON.stringify({ kind: 'bigquery#tableDataInsertAllResponse', insertErrors: [{ index: 1, errors: [{ reason: 'invalid', message: 'no such field: foo.' }] }] }),
+    },
+  ]
+  world.hangWrite = path => path.includes('/rejected-')
+  await startSession($)
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
+  await world.clock.advance(5000)
+  expect(world.insertCalls().length).toBe(1)
+  let ended = false
+  const ending = $.session.end(END).then(() => {
+    ended = true
+  })
+  return { world, ended: () => ended, ending }
+}
+
+test('session end waits, inside its budget, for a file of refused rows still being written, and spills its own row apart', { options: OPTIONS }, async ($, on) => {
+  const { world, ended, ending } = await refusedWhileEnding($, on)
+  await world.clock.advance(500)
+  // Its own row is on disk; the refused row is not yet.
+  expect([ended(), typesIn(world, 'spill'), typesIn(world, 'rejected')]).toEqual([false, ['STATE_DELTA'], []])
+  world.releaseWrites()
+  await ending
+  expect([typesIn(world, 'spill'), typesIn(world, 'rejected'), world.insertCalls().length]).toEqual([['STATE_DELTA'], ['TOOL_STARTING'], 1])
+})
+
+test('a file of refused rows whose write hangs holds session end no longer than its budget', { options: OPTIONS }, async ($, on) => {
+  const { world, ended, ending } = await refusedWhileEnding($, on)
+  await world.clock.advance(500)
+  expect(ended()).toBe(false)
+  await world.clock.advance(400)
+  await ending
+  expect([ended(), typesIn(world, 'spill'), typesIn(world, 'rejected')]).toEqual([true, ['STATE_DELTA'], []])
+  world.releaseWrites()
+})
+
 test('with BQAA_EXIT_FLUSH_MS=0 session end does not wait for its spill write', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on, { BQAA_EXIT_FLUSH_MS: '0' })
   await startSession($)
@@ -554,6 +602,45 @@ test('a dead-letter write that fails is counted as dropped, not thrown', { optio
   const status = await statusText($)
   expect(status).toMatch(/dropped 1/)
   expect(status).toMatch(/dead-letter write failed \(1 rows lost\)/)
+})
+
+test('refused rows whose dead-letter file cannot be written are said to be lost, and not counted among the rows /bqaa-backfill sends', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  world.replies = [{ status: 400, text: '{"error":{"code":400,"message":"Invalid value for the table schema","errors":[{"reason":"invalid"}],"status":"INVALID_ARGUMENT"}}' }]
+  world.failWrites = true
+  await startSession($)
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
+  await world.clock.advance(5000)
+  expect(world.statusLines.at(-1)).toBe('BQAA: 3 refused row(s) lost: their dead-letter file could not be written (HTTP 400: Invalid value for the table schema); see /bqaa-status')
+  // Writes work again: the next refused rows are the only ones counted.
+  world.failWrites = false
+  await $.tool.call({ tool: 'Read', file_path: 'b.ts' })
+  for (let t = 0; t < 4; t += 1) await world.clock.advance(5000)
+  expect(world.statusLines.at(-1)).toBe('BQAA: 2 row(s) refused (HTTP 400: Invalid value for the table schema); fix, then /bqaa-backfill')
+})
+
+test('session.start fired again clears the status line, and the writer that takes over says the same line again', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  world.replies = [{ status: 400, text: '{"error":{"code":400,"message":"Invalid value for the table schema","errors":[{"reason":"invalid"}],"status":"INVALID_ARGUMENT"}}' }]
+  await startSession($)
+  await world.clock.advance(5000)
+  const said = 'BQAA: 1 row(s) refused (HTTP 400: Invalid value for the table schema); fix, then /bqaa-backfill'
+  expect(world.statusLines.at(-1)).toBe(said)
+  // The plugin turned off and on: session.start fires again in the same
+  // load, and its own row is refused the same way.
+  await startSession($)
+  expect(world.statusLines.at(-1)).toBeUndefined()
+  await world.clock.advance(5000)
+  expect(world.statusLines.at(-1)).toBe(said)
+})
+
+test('rows out of retries whose dead-letter file cannot be written are said to be lost', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  world.replies = [UNAVAILABLE]
+  world.failWrites = true
+  await startSession($)
+  for (let t = 0; t < 6; t += 1) await world.clock.advance(5000)
+  expect(world.statusLines.at(-1) ?? '').toMatch(/^BQAA: 1 row\(s\) out of retries lost: their dead-letter file could not be written \(HTTP 503: .*\); see \/bqaa-status$/)
 })
 
 test('dry run writes the rows locally and sends nothing', { options: { dryRun: true } }, async ($, on) => {

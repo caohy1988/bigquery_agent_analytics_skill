@@ -170,7 +170,7 @@ test('a missing permission is a notice with the role to ask for; /bqaa-backfill 
   expect(world.transcript).toContain('bqaa: rows are being written again; /bqaa-backfill sends the 3 row(s) parked while they could not be.')
 })
 
-test('while credentials fail, the wait before a retry is capped at 30 s', { options: OPTIONS }, async ($, on) => {
+test('while credentials fail, the backoff before the next retry is capped at 30 s', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on)
   world.processReply = GCLOUD_FAILS
   await startSession($)

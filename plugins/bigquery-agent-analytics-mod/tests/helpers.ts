@@ -46,8 +46,10 @@ export type World = {
   refuseWrite: ((path: string, text: string) => boolean) | null
   // When files were last written, as the listing says (none: 0).
   mtimes: Map<string, number>
-  // Makes `$.fs.write` wait until `releaseWrites` is called.
+  // Makes `$.fs.write` wait until `releaseWrites` is called: every write,
+  // or the writes this picks.
   hangWrites: boolean
+  hangWrite: ((path: string, text: string) => boolean) | null
   releaseWrites: () => void
   // Rows from insertAll calls BigQuery answered 200 to, oldest first.
   acceptedRows: () => Row[]
@@ -145,6 +147,7 @@ export function setUp(on: On, env: Record<string, string> = {}, store: Record<st
     refuseWrite: null,
     mtimes: new Map(),
     hangWrites: false,
+    hangWrite: null,
     releaseWrites: () => {
       for (const held of heldWrites.splice(0)) {
         world.files.set(held.path, held.text)
@@ -222,7 +225,7 @@ export function setUp(on: On, env: Record<string, string> = {}, store: Record<st
   on('fs.write', ($, e) => {
     if (world.failWrites || world.refuseWrite?.(e.path, e.text)) return { deny: `EACCES: ${e.path}` }
     if (utf8Bytes(e.text) > HOST_FILE_BYTES) return { deny: `${e.path}: over the 4 MiB file limit` }
-    if (world.hangWrites) return new Promise(resolve => heldWrites.push({ path: e.path, text: e.text, resolve }))
+    if (world.hangWrites || world.hangWrite?.(e.path, e.text)) return new Promise(resolve => heldWrites.push({ path: e.path, text: e.text, resolve }))
     world.files.set(e.path, e.text)
     return { value: undefined }
   })

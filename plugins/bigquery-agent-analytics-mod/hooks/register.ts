@@ -291,16 +291,12 @@ export const register: Register = (on, registered) => {
       }
       const previous = writer
       writer = new Writer(io, () => config, () => tracer.sessionId)
-      // The host keeps one status line per plugin until it is replaced, a
-      // reload included: this writer starts with none, as it holds no notice.
-      try {
-        $.ui.status(undefined)
-      } catch {
-        // No status line on this surface: nothing to clear.
-      }
       // session.start can fire again without a reload (the plugin was turned
       // off and on): keep what the previous writer still held.
       if (previous) writer.adopt(previous)
+      // The host keeps one status line per plugin until it is replaced, a
+      // reload included: this writer starts with none, as it holds no notice.
+      writer.clearStatus()
       for (const held of early.splice(0)) writer.enqueue(held.row, held.redactions)
       const [sessionId, version] = await Promise.all([$.session.id().catch(() => null), $.session.version().catch(() => null)])
       tracer.setSession({ sessionId, cwd: e.cwd, engineVersion: version?.version ?? null })

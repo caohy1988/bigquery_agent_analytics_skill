@@ -18,6 +18,7 @@
 import { type Config, canDeliver, deadLetterPartition, destinationDir, joinPath, tableRef } from './config.ts'
 import { type HttpAnswer, TOKEN_INFO_URL, classifyInsert, createTableBody, insertAllBody, insertAllUrl, isDatasetMissing, tablesUrl } from './bigquery.ts'
 import { type DeadLetterKind, type DeadLetterLine, HOST_FILE_BYTES, MAX_FILE_BYTES, type ParsedFile, fileName, isDeadLetterKind, kindOf, lineText, packBodies, packFiles, packLines, parseFile, sealFile } from './deadletter.ts'
+import { randomHex } from './ids.ts'
 import { BoundedQueue, type Queued } from './queue.ts'
 import { type BqaaRow, fitRow, rowBytes, utf8Length } from './rows.ts'
 import { redactDiagnostic } from './sanitize.ts'
@@ -399,6 +400,10 @@ export class Writer {
   // The writers this one took over from (`adopt`), oldest first: a batch one
   // still has out goes to the exit spill with this writer's rows.
   private before: Writer[] = []
+  // The dead-letter writes not ended yet, of every writer that takes over in
+  // turn (`adopt`): their rows are on no queue and in no batch out, so the
+  // exit waits for them as for its own spill.
+  private persisting = new Set<Promise<void>>()
   // True from when a batch is taken until its answer hands its rows on (to
   // BigQuery, back to the queue, or to disk): only then are they counted as
   // in flight among the rows waiting.
@@ -424,9 +429,10 @@ export class Writer {
   // not have read its rows), and whether rows were parked since the last
   // replay that rows landing set going (`succeeded`).
   private parked = { seq: 0, recoverable: false }
-  // The host's status line as the writers of this load last set it: one
-  // line for the plugin, so every writer that takes over shares it (`adopt`).
-  private status: { text: string | undefined } = { text: undefined }
+  // The host's status line as the writers of this load last set it (null:
+  // not known, a clear that did not land): one line for the plugin, so every
+  // writer that takes over shares it (`adopt`).
+  private status: { text: string | undefined | null } = { text: undefined }
   // Set once the session is ending: no new batch starts after that.
   private closing = false
   // Why rows cannot be written now, if credentials or permission stop them.
@@ -446,10 +452,10 @@ export class Writer {
   // Replays whose outcome is not all written out yet, by the file's path: a
   // later replay finishes writing it and sends none of the file again.
   private rewrites = new Map<string, Rewrite>()
-  // The name this writer leaves in its marks (`markSending`), ten base-36
-  // characters: a mark of its own is one whose outcome it would hold, if it
-  // had one.
-  private readonly mark = Math.random().toString(36).slice(2, 12).padEnd(10, '0')
+  // The name this writer leaves in its marks (`markSending`), ten hex
+  // characters from the same source as the row ids: a mark of its own is one
+  // whose outcome it would hold, if it had one.
+  private readonly mark = randomHex(5)
   // When this writer first saw each dead-letter file empty or not whole, by
   // path: how long a write may still be under way where the listing gives no
   // time (`writtenSince`).
@@ -504,10 +510,9 @@ export class Writer {
     previous.queue.limit(c.maxQueueRows, c.maxQueueBytes)
     previous.queue.append(this.queue.takeAll())
     this.queue = previous.queue
-    // The status line too, which session.start cleared before the takeover:
-    // a line the writer before sets late is then one this writer's next
-    // landing clears.
-    previous.status.text = undefined
+    // The status line too (session.start clears it after the takeover,
+    // `clearStatus`): a line the writer before sets late is then one this
+    // writer's next landing clears.
     this.status = previous.status
     for (const dir of this.replayDue) previous.replayDue.add(dir)
     this.replayDue = previous.replayDue
@@ -515,6 +520,10 @@ export class Writer {
     previous.parked.recoverable ||= this.parked.recoverable
     this.parked = previous.parked
     this.before = [...previous.before, previous]
+    // The dead-letter writes under way too, so the exit waits for those any
+    // of them began, before or after the takeover.
+    for (const write of this.persisting) previous.persisting.add(write)
+    this.persisting = previous.persisting
     // And the outcomes it holds, one whose record no store or file took
     // included: the same map, so an outcome a replay still under way there
     // comes to is held here too. Its marks stay its own: one with no
@@ -773,8 +782,11 @@ export class Writer {
     this.queue.unshift(keep)
     if (exhausted.length > 0) {
       this.counters.failed += exhausted.length
-      await this.deadLetter('retry', exhausted, reason)
-      if (this.problem === null) this.setStatus(`BQAA: ${exhausted.length} row(s) parked after retries (${reason.slice(0, 80)}); ${c.autoBackfill ? 'they are replayed on their own' : '/bqaa-backfill sends them'}`)
+      const lost = await this.deadLetter('retry', exhausted, reason)
+      if (this.problem !== null) {
+        // The notice says what stops them.
+      } else if (lost > 0) this.setStatus(`BQAA: ${lost} row(s) out of retries lost: their dead-letter file could not be written (${reason.slice(0, 80)}); see /bqaa-status`)
+      else this.setStatus(`BQAA: ${exhausted.length} row(s) parked after retries (${reason.slice(0, 80)}); ${c.autoBackfill ? 'they are replayed on their own' : '/bqaa-backfill sends them'}`)
     }
     if (this.problem !== null) this.showProblem()
   }
@@ -787,10 +799,12 @@ export class Writer {
     this.pause()
     this.counters.failed += batch.length
     this.counters.rejected += batch.length
-    this.countRefused(batch.map(q => q.row.event_id))
     this.recordError(reason)
-    await this.deadLetter('rejected', batch, reason)
+    // Counted once in a file (`writeDeadLetter`): /bqaa-backfill can send
+    // only those.
+    const lost = await this.deadLetter('rejected', batch, reason)
     if (this.problem !== null) this.showProblem()
+    else if (lost > 0) this.setStatus(`BQAA: ${lost} refused row(s) lost: their dead-letter file could not be written (${reason.slice(0, 80)}); see /bqaa-status`)
     else this.setStatus(`BQAA: ${this.refusedText()} row(s) refused (${reason.slice(0, 80)}); fix, then /bqaa-backfill`)
   }
 
@@ -808,14 +822,27 @@ export class Writer {
   private recordError(message: string): void {
     const clean = diagnostic(message)
     this.lastError = { message: clean, at: this.io.now() }
-    this.io.debug(`bqaa: ${clean}`)
+    this.call(() => this.io.debug(`bqaa: ${clean}`))
   }
 
+  // A line the surface does not take leaves the one shown as it was, and the
+  // next status is written again.
   private setStatus(text: string | undefined): void {
     const clean = text === undefined ? undefined : diagnostic(text, 300)
     if (clean === this.status.text) return
-    this.status.text = clean
-    this.io.status(clean)
+    this.call(() => {
+      this.io.status(clean)
+      this.status.text = clean
+    })
+  }
+
+  // At session.start, after any takeover: the host keeps the plugin's status
+  // line until it is replaced, a reload included, and this writer holds no
+  // notice yet. A clear that does not land leaves the line not known, so the
+  // next status the writers set is written whatever it is.
+  clearStatus(): void {
+    this.status.text = null
+    this.setStatus(undefined)
   }
 
   // ---- credentials and permission ----------------------------------------
@@ -1155,9 +1182,23 @@ export class Writer {
     }
   }
 
-  // Into this table's own subdirectory, each line naming the table.
-  private async deadLetter(kind: DeadLetterKind, rows: Queued[], reason: string): Promise<void> {
-    if (rows.length === 0) return
+  // A dead-letter write, held among those under way until it ends: how many
+  // of the rows no file took.
+  private deadLetter(kind: DeadLetterKind, rows: Queued[], reason: string): Promise<number> {
+    const write = this.writeDeadLetter(kind, rows, reason)
+    const ended = write.then(
+      () => undefined,
+      () => undefined,
+    )
+    this.persisting.add(ended)
+    void ended.then(() => this.persisting.delete(ended))
+    return write
+  }
+
+  // Into this table's own subdirectory, each line naming the table: how many
+  // of the rows no file took.
+  private async writeDeadLetter(kind: DeadLetterKind, rows: Queued[], reason: string): Promise<number> {
+    if (rows.length === 0) return 0
     const c = this.config()
     // The rows are this process's: they are parked with the account of the
     // token in use now, and keep it when they are replayed.
@@ -1167,6 +1208,7 @@ export class Writer {
     const dir = deadLetterPartition(c)
     const lines: DeadLetterLine[] = rows.map(q => ({ v: 1, kind, reason, attempts: q.attempts, failed_at: failedAt, table: tableRef(c), row: q.row }))
     let first = 0
+    let lost = 0
     for (const body of packBodies(lines.map(lineText))) {
       const count = body.split('\n').length - 1
       const ids = rows.slice(first, first + count).map(q => q.row.event_id)
@@ -1183,12 +1225,15 @@ export class Writer {
           this.replayDue.add(dir)
           this.parked.seq += 1
         }
+        if (kind === 'rejected') this.countRefused(ids)
         if (this.problem !== null) this.countParked(ids)
       } catch (err) {
+        lost += count
         this.counters.dropped += count
         this.recordError(`dead-letter write failed (${count} rows lost): ${errorText(err)}`)
       }
     }
+    return lost
   }
 
   // ---- session end -------------------------------------------------------
@@ -1197,23 +1242,30 @@ export class Writer {
   // short end-of-session bound. Starts no request: the rows still queued, and
   // rows whose request has not answered (it may yet land; event_id dedups),
   // go to a spill file the next session sends, or in a dry run to the dry-run
-  // files. Waits at most `budgetMs` for those writes. Never throws.
+  // files. Waits at most `budgetMs` for those writes, and for the dead-letter
+  // writes already under way. Never throws.
   async spillForExit(budgetMs: number): Promise<{ spilled: number }> {
     const c = this.config()
+    const until = this.io.now() + budgetMs
     this.closing = true
     this.soon?.cancel()
     this.soon = null
     // The writers this one took over from start nothing more either, and a
     // batch one still has out, its answer not come, goes with the rest. Rows
     // an answer refused, or parks after their retries, are in a file being
-    // written already: a copy here would send them again.
+    // written already: a copy here would send them again, so the exit waits
+    // for that write instead, within the same bound.
     const out: Queued[] = []
     for (const writer of [...this.before, this]) {
       writer.closing = true
       out.push(...writer.inFlightRows)
     }
+    const pending = [...this.persisting]
     const rows = [...out, ...this.queue.takeAll()]
-    if (rows.length === 0) return { spilled: 0 }
+    if (rows.length === 0) {
+      if (pending.length > 0) await this.raceUntil(Promise.all(pending), until)
+      return { spilled: 0 }
+    }
     const toDryRun = c.dryRun && c.dryRunDir !== ''
     const write = (async (): Promise<void> => {
       if (!toDryRun) {
@@ -1229,7 +1281,7 @@ export class Writer {
         this.recordError(`dry run write at exit failed (${rows.length} rows lost): ${errorText(err)}`)
       }
     })()
-    await this.raceUntil(write, this.io.now() + budgetMs)
+    await this.raceUntil(Promise.all([write, ...pending]), until)
     return { spilled: toDryRun ? 0 : rows.length }
   }
 
