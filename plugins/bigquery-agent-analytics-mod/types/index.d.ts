@@ -25,12 +25,33 @@ export type WelcomeState = {
   // now: the card counts that run's rows and every later run's there, and no
   // earlier run's, whenever they land.
   since: number
+  // The lifetime of the count that rank is of (`loads`): runs of another,
+  // from before the session's state was reset, never count on the card.
+  lifetime: string
+}
+
+// The session's count of session.start runs, each run's rank, and the
+// lifetime it counts in: a name the first run to count gives it, so a count
+// that starts over (/clear, /resume and /branch reset every value of the
+// session's state, and fire no session.start) is told from the one before.
+export type LoadsState = {
+  count: number
+  lifetime: string
+}
+
+// A session.start run, as `loads` numbered it: its rank and the lifetime it
+// took it in.
+export type Run = {
+  rank: number
+  lifetime: string
 }
 
 // What one session.start run has landed in one destination so far: the
-// run's rank, the destination (`destinationKey`), and its rows in all.
+// run's rank and lifetime, the destination (`destinationKey`), and its rows
+// in all.
 export type DeliveredRows = {
   rank: number
+  lifetime: string
   to: string
   rows: number
 }
@@ -45,8 +66,9 @@ declare module 'claude-code' {
     'bigquery-agent-analytics-mod': {
       welcome: WelcomeState | null
       // How many session.start runs, of every load of the code, the session
-      // has seen: each run's rank (register.ts `nextLoad`).
-      loads: number
+      // has seen, and in what lifetime: each run's rank (register.ts
+      // `nextLoad`).
+      loads: LoadsState
       // Each run's rows landed so far in the session (DeliveredState).
       delivered: DeliveredState
     }

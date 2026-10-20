@@ -266,7 +266,12 @@ from the session's state after its rows landed could be held past the
 card's opening, by holding that read or the write before it). A run counts
 only once it is past the tick of the clock that a reload cancels for the
 load it replaces, so a load whose rank came back after a later load's
-counts nothing. The session's state keeps each run's rows landed so far in
+counts nothing. The count of runs starts over with the session's state
+(`/clear`, `/resume` and `/branch` reset it, and fire no session start, while
+a run from before goes on sending): the first run to count afresh names a
+new lifetime for the count, and a card counts only runs of its own, so rows
+a run from before the reset lands never count on a card opened after it.
+The session's state keeps each run's rows landed so far in
 each place, with its rank, whatever the card shows (none, closed, or
 counting elsewhere), only ever up; the card sums them, so a run that says
 so again, or late, counts once, and no run's total stands for another's
@@ -1482,7 +1487,11 @@ or missed; that no row of the version before an update counts on the
 updated version's card, whenever it lands or is recorded: after the card
 opened, after the earlier card was closed, while the session showed no
 card, while the update read the store, recorded late, or with a later total
-of its recorded first; that the updated version's own rows count once,
+of its recorded first, also across a reset of the session's state, with
+no session start, between the earlier load's rows and the update, its
+record's write held from before or after the reset until the update's card
+opened; that the
+updated version's own rows count once,
 whatever order their records land in, also one that landed while its
 card's first write waited, its first landing and toast its own when a row
 of the version before lands meanwhile; that a load whose rank came back

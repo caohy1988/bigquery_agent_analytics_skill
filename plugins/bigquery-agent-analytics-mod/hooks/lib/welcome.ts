@@ -87,12 +87,12 @@ export function openWelcome(records: WelcomeRecords, sessionId: string | null, k
     // one; a change back's newer one).
     const before = [...records.versions, greetedVersion(records.latest)].filter((v): v is string => v !== null && v !== PLUGIN_VERSION)
     const previous = before.reduce<string | null>((newest, v) => (newest === null || isNewer(v, newest) ? v : newest), null)
-    return { welcome: { version: PLUGIN_VERSION, previous, sessionId, landedAt: null, landedTo: null, closed: false, sent: 0, destination: key, owner: '', rank: 0, since: 0 }, isNew: true }
+    return { welcome: { version: PLUGIN_VERSION, previous, sessionId, landedAt: null, landedTo: null, closed: false, sent: 0, destination: key, owner: '', rank: 0, since: 0, lifetime: '' }, isNew: true }
   }
   if (sessionId === null || by.sessionId !== sessionId || records.closed === true) return null
   const landing = isObject(records.landing) ? records.landing : {}
   const here = key !== null && typeof landing.landedAt === 'number' && landing.landedTo === key
-  return { welcome: { version: PLUGIN_VERSION, previous: by.previous, sessionId, landedAt: here ? (landing.landedAt as number) : null, landedTo: here ? key : null, closed: false, sent: 0, destination: key, owner: '', rank: 0, since: 0 }, isNew: false }
+  return { welcome: { version: PLUGIN_VERSION, previous: by.previous, sessionId, landedAt: here ? (landing.landedAt as number) : null, landedTo: here ? key : null, closed: false, sent: 0, destination: key, owner: '', rank: 0, since: 0, lifetime: '' }, isNew: false }
 }
 
 // After a reload in the session that showed the card, from what `$.state`

@@ -20,7 +20,7 @@
 
 import type { EngineInterface, Register, SessionStartInput } from 'claude-code'
 
-import type { DeliveredRows, DeliveredState } from '../types'
+import type { DeliveredRows, DeliveredState, Run } from '../types'
 
 import { type Config, type EnvSnapshot, type Options, PLUGIN_VERSION, canDeliver, deadLetterPartition, destinationDir, joinPath, resolveConfig, tableRef } from './lib/config.ts'
 import { HOST_FILE_BYTES, kindOf } from './lib/deadletter.ts'
@@ -65,15 +65,18 @@ const WELCOME_STATE = { plugin: 'bigquery-agent-analytics-mod', key: 'welcome' }
 // How many session.start runs, of every load of this code, the session has
 // seen: each takes the next number, its rank, so a later load or run ranks
 // above every earlier one that shows the card (`startWelcome` stops a load
-// replaced before its number came back), whatever the clock says.
+// replaced before its number came back), whatever the clock says. With the
+// lifetime of that count, which starts over with the session's state.
 const LOADS_STATE = { plugin: 'bigquery-agent-analytics-mod', key: 'loads' } as const
 // Each session.start run's rows landed so far in the session, by run and
-// destination (`countKey`), with the run's rank, whatever the card shows. A
-// card counts the rows of the run it counts from (`since`: the one that
-// opened it, or last moved it where rows go now) and of every later run,
-// where it counts rows, and never an earlier run's. A run knows its own rank
-// with nothing to read, so no read or write that answers late, before or
-// after an update, moves a delivery from one card to another.
+// destination (`countKey`), with the run's rank and lifetime, whatever the
+// card shows. A card counts the rows of the run it counts from (`since`: the
+// one that opened it, or last moved it where rows go now) and of every later
+// run of its lifetime, where it counts rows, and never an earlier run's, nor
+// a run's of the lifetime before the state was reset (`counts`). A run knows
+// its own rank and lifetime with nothing to read, so no read or write that
+// answers late, before or after an update, moves a delivery from one card to
+// another.
 const DELIVERED_STATE = { plugin: 'bigquery-agent-analytics-mod', key: 'delivered' } as const
 // A run's rows landed in one destination: the key of `delivered`.
 const countKey = (by: string, to: string): string => `${by}@${to}`
@@ -261,13 +264,18 @@ async function lookUpHostname($: EngineInterface): Promise<void> {
 }
 
 // This session.start run's rank: the next number of the session's count of
-// runs (`LOADS_STATE`), taken first thing. Null where the session keeps no
+// runs (`LOADS_STATE`), taken first thing, and the count's lifetime. /clear,
+// /resume and /branch reset every value of the session's state, the count
+// included, and fire no session.start, while a run from before goes on
+// sending: the first run to count afresh names a new lifetime, so ranks that
+// start over are told from the ones before. Null where the session keeps no
 // state.
-async function nextLoad($: EngineInterface): Promise<number | null> {
+async function nextLoad($: EngineInterface): Promise<Run | null> {
   for (let i = 0; i < 8; i += 1) {
     const held = await $.state.get(LOADS_STATE)
-    const next = (held.value ?? 0) + 1
-    if ((await $.state.set(LOADS_STATE, next, { ifVersion: held.version })).isSet) return next
+    const now = held.value ?? { count: 0, lifetime: Math.random().toString(36).slice(2) }
+    const next = { count: now.count + 1, lifetime: now.lifetime }
+    if ((await $.state.set(LOADS_STATE, next, { ifVersion: held.version })).isSet) return { rank: next.count, lifetime: next.lifetime }
   }
   return null
 }
@@ -279,15 +287,15 @@ async function nextLoad($: EngineInterface): Promise<number | null> {
 // load, before any later load took one: every later run ranks above it. Null
 // where the session keeps no state, or the wait is refused. The card waits
 // on it, and so does each delivery's count.
-async function admit($: EngineInterface, ranked: Promise<number | null>): Promise<number | null> {
-  const rank = await ranked
-  if (rank === null) return null
+async function admit($: EngineInterface, ranked: Promise<Run | null>): Promise<Run | null> {
+  const run = await ranked
+  if (run === null) return null
   try {
     await $.clock.sleep(0)
   } catch {
     return null
   }
-  return rank
+  return run
 }
 
 // In a session a person sees (a `-p` run draws no band): the welcome card
@@ -299,7 +307,7 @@ async function admit($: EngineInterface, ranked: Promise<number | null>): Promis
 // earlier one's that answered late) shows no card of its own: its writes are
 // conditional on the version it read, and it takes over the card shown
 // instead, where it ranks above the run that has it.
-async function startWelcome($: EngineInterface, e: SessionStartInput, sessionId: string | null, start: number, admitted: Promise<number | null>): Promise<void> {
+async function startWelcome($: EngineInterface, e: SessionStartInput, sessionId: string | null, start: number, admitted: Promise<Run | null>): Promise<void> {
   if (!e.isInteractive || e.surface === null) return
   // Nor where the session's id cannot be read: its landing and its close
   // are kept under it, so Got it could not keep the card closed.
@@ -309,8 +317,9 @@ async function startWelcome($: EngineInterface, e: SessionStartInput, sessionId:
   const save = (key: string, value: unknown): Promise<void> => $.store.set(key, value)
   // Where the session keeps no state, there is no card: the band draws from
   // it. Nor in a load replaced before its rank came back (`admit`).
-  const rank = await admitted
-  if (rank === null) return
+  const run = await admitted
+  if (run === null) return
+  const { rank } = run
   let held: { value: Welcome | null; version: number }
   try {
     const read = await $.state.get(WELCOME_STATE)
@@ -320,7 +329,7 @@ async function startWelcome($: EngineInterface, e: SessionStartInput, sessionId:
   }
   if (start !== welcomeStarts) return
   const isOurs = (card: Welcome | null): boolean => card !== null && card.version === PLUGIN_VERSION && sessionId !== null && card.sessionId === sessionId
-  if (isOurs(held.value)) return takeOver($, sessionId as string, start, rank)
+  if (isOurs(held.value)) return takeOver($, sessionId as string, start, run)
   // A card a later load or run showed (another version's, after an update in
   // the session) is left alone.
   if (held.value !== null && (held.value.rank ?? 0) > rank) return
@@ -346,7 +355,7 @@ async function startWelcome($: EngineInterface, e: SessionStartInput, sessionId:
     return
   }
   if (start !== welcomeStarts || opened === null) return
-  const shown: Welcome = { ...opened.welcome, owner: me, rank, since: rank }
+  const shown: Welcome = { ...opened.welcome, owner: me, rank, since: rank, lifetime: run.lifetime }
   // Shown only if the state still stands as read: no other load has shown
   // or changed a card since. The one that does shows it, and greets. Where
   // another has: this version's card (an earlier load's whose write answered
@@ -375,7 +384,7 @@ async function startWelcome($: EngineInterface, e: SessionStartInput, sessionId:
     } catch {
       return
     }
-    if (isOurs(now.value)) return takeOver($, sessionId as string, start, rank)
+    if (isOurs(now.value)) return takeOver($, sessionId as string, start, run)
     if (now.value !== null && (now.value.rank ?? 0) > rank) return
     version = now.version
   }
@@ -395,7 +404,7 @@ async function startWelcome($: EngineInterface, e: SessionStartInput, sessionId:
   redrawBand($)
   // Rows that landed while the records were read, and while the card was
   // written, recorded before it was: the card says so now, once.
-  recount($, rank)
+  recount($, run)
 }
 
 // This session's card as the session's state has it (after a reload, or
@@ -403,7 +412,8 @@ async function startWelcome($: EngineInterface, e: SessionStartInput, sessionId:
 // unless a later load or run has it. A close the store has, which the state
 // may lack (its write refused, or late), wins; where the store cannot be read
 // there is no telling, and no card.
-async function takeOver($: EngineInterface, sessionId: string, start: number, rank: number): Promise<void> {
+async function takeOver($: EngineInterface, sessionId: string, start: number, run: Run): Promise<void> {
+  const { rank } = run
   const key = destinationKey(config)
   const me = ownerOf(start)
   let stored: { greeted: boolean; closed: unknown }
@@ -429,8 +439,8 @@ async function takeOver($: EngineInterface, sessionId: string, start: number, ra
     if (reopened === null) return null
     // Moved where rows go now: it counts from this run on there, so rows that
     // went there before it moved never count again.
-    const since = reopened.welcome.destination === card.destination ? (card.since ?? rank) : rank
-    return { ...reopened.welcome, owner: me, rank, since }
+    const moved = reopened.welcome.destination !== card.destination
+    return { ...reopened.welcome, owner: me, rank, since: moved ? rank : (card.since ?? rank), lifetime: moved ? run.lifetime : (card.lifetime ?? run.lifetime) }
   }).catch(() => null)
   if (taken === null || taken.closed || start !== welcomeStarts) return
   // The greeting written again where the store has none (its write was
@@ -441,7 +451,7 @@ async function takeOver($: EngineInterface, sessionId: string, start: number, ra
   redrawBand($)
   // Rows this run landed while the records were read (where the card counts
   // rows now, if it moved here): counted once.
-  recount($, rank)
+  recount($, run)
 }
 
 // Whether the store has no close for this session's card, read once more
@@ -524,13 +534,13 @@ function redrawBand($: EngineInterface): void {
 // A run never admitted (a load replaced before its rank came back) records
 // nothing. Rows a run of another configuration sent elsewhere say nothing
 // here.
-function rowsLanded($: EngineInterface, id: string, total: number, to: string | null, admitted: Promise<number | null>): void {
+function rowsLanded($: EngineInterface, id: string, total: number, to: string | null, admitted: Promise<Run | null>): void {
   if (to === null || total <= 0) return
   void admitted
-    .then(async rank => {
-      if (rank === null) return
-      await noteDelivered($, id, { rank, to, rows: total })
-      recount($, rank)
+    .then(async run => {
+      if (run === null) return
+      await noteDelivered($, id, { ...run, to, rows: total })
+      recount($, run)
     })
     .catch(() => {
       internalErrors += 1
@@ -556,32 +566,37 @@ async function noteDelivered($: EngineInterface, id: string, entry: DeliveredRow
   }
 }
 
-// The rows `delivered` has landed where `card` counts rows, from the run it
-// counts from on: each run's total once, so none stands for another's.
+// Whether `card` counts the rows of `run`: one of the lifetime it counts in,
+// from the run it counts from on.
+const counts = (card: Welcome, run: Run): boolean => run.lifetime === card.lifetime && run.rank >= card.since
+
+// The rows `delivered` has landed where `card` counts rows, of the runs it
+// counts: each run's total once, so none stands for another's.
 function landedFor(card: Welcome, delivered: DeliveredState | undefined): number {
   let rows = 0
   for (const entry of Object.values(delivered ?? {})) {
     if (typeof entry !== 'object' || entry === null || entry.to !== card.destination) continue
-    if (typeof entry.rank === 'number' && entry.rank >= card.since && typeof entry.rows === 'number' && entry.rows > 0) rows += entry.rows
+    if (typeof entry.rank === 'number' && typeof entry.lifetime === 'string' && counts(card, entry) && typeof entry.rows === 'number' && entry.rows > 0) rows += entry.rows
   }
   return rows
 }
 
 // The card's count, read again from `delivered`, as one moment of the
-// session's state has both, by a run of rank `rank`: only where the card
-// counts that run's rows, so the card is left to the runs it counts (never
-// another version's card, say, that replaced this run's). Written only while
+// session's state has both, by the run `run`: only where the card counts
+// that run's rows, so the card is left to the runs it counts (never another
+// version's card, say, that replaced this run's, nor one opened after the
+// state was reset). Written only while
 // the card stands as read, read again on a miss, and only ever up; a closed
 // card counts no more. The first time rows count, the card says they landed,
 // and the load whose run holds the card says so with a toast as well, as the
 // band may be collapsed.
-function recount($: EngineInterface, rank: number): void {
+function recount($: EngineInterface, run: Run): void {
   let first = false
   void (async (): Promise<Welcome | null> => {
     for (let i = 0; i < 8; i += 1) {
       const held = await $.state.get(WELCOME_STATE)
       const card = held.value ?? null
-      if (card === null || card.closed || card.destination === null || rank < card.since) return null
+      if (card === null || card.closed || card.destination === null || !counts(card, run)) return null
       const landed = landedFor(card, (await $.state.get(DELIVERED_STATE)).value)
       if (landed <= card.sent) return null
       first = card.landedAt === null

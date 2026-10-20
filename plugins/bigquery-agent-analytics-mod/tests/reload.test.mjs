@@ -641,7 +641,7 @@ const tests = {
         // B's cancelled wait never answers, or is refused.
         for (const refuseWaits of [false, true]) {
           let holding = false
-          const h = host({ holdState: value => holding && typeof value === 'number' })
+          const h = host({ holdState: (value, key) => holding && key === 'loads' })
           h.refuseWaits = refuseWaits
           const a = await load(h, A)
           await a.start()
@@ -659,7 +659,7 @@ const tests = {
           if (step === 'write') h.release('state')
           else reads[0]()
           await settle()
-          assert.equal(h.state.get('loads').value, 3)
+          assert.equal(h.state.get('loads').value.count, 3)
           assert.equal(h.card().destination, 'dry run: /home/dev/b/dry-run')
           assert.equal(await b.shown(), false)
           await c.land()
@@ -1109,10 +1109,10 @@ const tests = {
     assert.equal(h.held.length, 1)
     const b = await load(h)
     await b.start()
-    assert.equal(h.state.get('loads').value, 1)
+    assert.equal(h.state.get('loads').value.count, 1)
     h.release('state')
     await settle()
-    assert.equal(h.state.get('loads').value, 2)
+    assert.equal(h.state.get('loads').value.count, 2)
     await a.land()
     assert.equal(await a.shown(), false)
     assert.deepEqual([h.card().sent, h.card().landedAt], [0, null])
@@ -1168,6 +1168,65 @@ const tests = {
     assert.deepEqual([h.card().destination, h.card().sent], ['dry run: /home/dev/b/dry-run', 1])
     assert.ok((await b.texts()).some(t => String(t).startsWith('✓ First rows written · 1 so far')))
   },
+  async 'rows a load lands before and after the session\'s state is reset (/clear, /resume or /branch, which fire no session start) never count on the card an update opens after it: the count\'s new lifetime starts over'() {
+    const h = host()
+    const a = await load(h)
+    await a.start()
+    await a.land()
+    await a.close()
+    assert.equal(a.toasts(), 1)
+    // The reset: every value of the session's state back to its default. The
+    // load goes on sending.
+    h.state.clear()
+    await a.land()
+    await a.land()
+    assert.ok(recordsRows(h.state.get('delivered').value, rows => rows === 3))
+    const b = await load(h, {}, NEXT)
+    await b.start()
+    assert.deepEqual([h.card().version, h.card().sent, h.card().landedAt], [NEXT, 0, null])
+    assert.equal(h.state.get('loads').value.count, 1)
+    await a.land()
+    assert.deepEqual([h.card().sent, h.card().landedAt], [0, null])
+    await b.land()
+    assert.equal(h.card().sent, 1)
+    assert.ok((await b.texts()).some(t => String(t).startsWith('✓ First rows written · 1 so far')))
+    assert.deepEqual([a.toasts(), b.toasts()], [1, 1])
+  },
+  ...Object.fromEntries(
+    ['after the reset', 'before the reset'].map(when => [
+      `a record of a load's rows, its write held from ${when} until after an update's card opened, never counts on that card: it is of the lifetime before the reset`,
+      async () => {
+        let holding = false
+        const h = host({ holdState: (value, key) => holding && key === 'delivered' })
+        const a = await load(h)
+        await a.start()
+        await a.land()
+        await a.close()
+        if (when === 'before the reset') holding = true
+        else h.state.clear()
+        await a.land()
+        holding = false
+        if (when === 'before the reset') {
+          assert.equal(h.held.length, 1)
+          h.state.clear()
+        } else {
+          holding = true
+          await a.land()
+          holding = false
+          assert.equal(h.held.length, 1)
+        }
+        const b = await load(h, {}, NEXT)
+        await b.start()
+        assert.deepEqual([h.card().version, h.card().sent, h.card().landedAt], [NEXT, 0, null])
+        h.release('state')
+        await settle()
+        assert.ok(recordsRows(h.state.get('delivered').value, rows => rows >= 2))
+        assert.deepEqual([h.card().sent, h.card().landedAt], [0, null])
+        await b.land()
+        assert.equal(h.card().sent, 1)
+      },
+    ]),
+  ),
   async 'where the session id cannot be read no card shows and no one is greeted, after a reload too: Got it could keep no close'() {
     const h = host({ hold: key => key.startsWith('welcome') })
     h.noSessionId = true
