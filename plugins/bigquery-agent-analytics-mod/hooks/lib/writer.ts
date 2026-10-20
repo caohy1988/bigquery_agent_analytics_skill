@@ -393,6 +393,9 @@ export class Writer {
   private sessionId: () => string | null
   private inFlight: Promise<void> | null = null
   private inFlightRows: Queued[] = []
+  // The writers this one took over from (`adopt`), oldest first: a batch one
+  // still has out goes to the exit spill with this writer's rows.
+  private before: Writer[] = []
   // True from when a batch is taken until its answer hands its rows on (to
   // BigQuery, back to the queue, or to disk): only then are they counted as
   // in flight among the rows waiting.
@@ -491,12 +494,16 @@ export class Writer {
   // writer's paced replays going. Every writer that takes over shares them.
   adopt(previous: Writer): void {
     const c = this.config()
-    previous.queue.unshift(this.queue.takeAll())
+    // Any rows this writer queued already are newer: they go behind.
+    previous.queue.append(this.queue.takeAll())
     previous.queue.limit(c.maxQueueRows, c.maxQueueBytes)
     this.queue = previous.queue
     for (const dir of this.replayDue) previous.replayDue.add(dir)
     this.replayDue = previous.replayDue
+    previous.parked.seq += this.parked.seq
+    previous.parked.recoverable ||= this.parked.recoverable
     this.parked = previous.parked
+    this.before = [...previous.before, previous]
     // And the outcomes it holds, one whose record no store or file took
     // included: the same map, so an outcome a replay still under way there
     // comes to is held here too. Its marks stay its own: one with no
@@ -1182,7 +1189,14 @@ export class Writer {
     this.closing = true
     this.soon?.cancel()
     this.soon = null
-    const rows = [...(this.inFlight ? this.inFlightRows : []), ...this.queue.takeAll()]
+    // The writers this one took over from start nothing more either, and a
+    // batch one still has out goes with the rest.
+    const out: Queued[] = []
+    for (const writer of [...this.before, this]) {
+      writer.closing = true
+      if (writer.inFlight) out.push(...writer.inFlightRows)
+    }
+    const rows = [...out, ...this.queue.takeAll()]
     if (rows.length === 0) return { spilled: 0 }
     const toDryRun = c.dryRun && c.dryRunDir !== ''
     const write = (async (): Promise<void> => {

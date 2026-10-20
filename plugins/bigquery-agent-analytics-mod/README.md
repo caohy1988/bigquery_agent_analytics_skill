@@ -580,7 +580,8 @@ GROUP BY model
   the queue passes 80%, the writer moves the oldest half to a `spill` file
   instead of letting rows drop.
 * **Flush:** every `flushIntervalMs`, and right after each main-loop turn; one
-  request at a time; batches of at most 500 rows and 3 MiB of UTF-8
+  flush request at a time (a replay of parked rows, at session start or by
+  `/bqaa-backfill`, can run beside it); batches of at most 500 rows and 3 MiB of UTF-8
   (`$.http.fetch` refuses bodies over 4 MiB, counted in characters, and UTF-8
   bytes are never fewer).
 * **Timeouts:** each insertAll is raced against `BQAA_REQUEST_TIMEOUT_MS`
@@ -681,8 +682,10 @@ GROUP BY model
   it from sending the file, as another session's does. It shares that
   one's queue, and what waits for a replay, with every writer before and
   after it, so the rows of a batch any writer before still had out, asked
-  for again, go with this writer's own, and rows one parks late, a batch
-  out of retries, set this writer's paced replays going. A reload of the
+  for again, go with this writer's own (rows it had queued itself go
+  behind the older ones), rows one parks late, a batch out of retries, set
+  this writer's paced replays going, and the exit spill takes a batch one
+  still has out. A reload of the
   mod's code is a load afresh, which holds none of that (see the limits
   below). Before
   it writes what is left, a replay records its outcome: one record per
@@ -940,7 +943,7 @@ test kit, with no session, sign-in, GCP or network: `$.http.fetch`,
 `$.process.run`, `$.fs` and `$.store` are stubbed, and `mock.clock` drives the
 timers; the `$.fs` stubs measure files in UTF-8 bytes and refuse a file over
 4 MiB, and the `$.store` stub a store over 4 MiB of JSON in all, as the host
-does. 317 tests cover the captured rows and their spans,
+does. 319 tests cover the captured rows and their spans,
 subagent runs in the order the host raises them (one invocation and one
 trace for the turn, a span per run, a SubagentStart that comes late or never),
 the session-start row raised before or during `session.start`'s setup,
@@ -1084,7 +1087,10 @@ And the replay that runs by itself while nothing is queued:
   batch the one before still had out, asked for again, also through two
   takeovers, under its own queue's bounds; rows a writer parks after the
   next one took over setting that writer's paced replays going, also
-  while that writer's own replay is under way; records of files emptied more than a day ago emptied;
+  while that writer's own replay is under way; rows a writer had queued
+  when it took over going behind the older ones; the exit spill after a
+  takeover taking the batch the writer before still had out, that writer
+  starting nothing more; records of files emptied more than a day ago emptied;
   a record another session writes late, beside a file finished meanwhile,
   never standing over its done mark, and a replay with nothing left to
   write never writing its done mark over another's; a replay whose mark

@@ -2000,6 +2000,48 @@ test('a writer that takes over holds the queue it takes to its own bounds', asyn
   expect(ids.map(id => w.sentOf(id))).toEqual([0, 0, ...ids.slice(2).map(() => 1)])
 })
 
+test('rows the next writer had queued when it took over go behind the older rows it takes', async () => {
+  const w = twoWriters(() => OK_INSERT)
+  const [a, b] = ['a'.repeat(32), 'b'.repeat(32)]
+  const rowOf = (id: string) => (JSON.parse(line(id, 'retry')) as { row: Parameters<Writer['enqueue']>[0] }).row
+  const before = w.writer('a-session')
+  before.enqueue(rowOf(a), 0)
+  const after = w.writer('a-session')
+  after.enqueue(rowOf(b), 0)
+  after.adopt(before)
+  await after.flush()
+  expect(w.sent.filter(id => id === a || id === b)).toEqual([a, b])
+})
+
+test('the exit spill after a takeover takes the batch the writer before still has out, and that writer starts nothing more', async () => {
+  const w = twoWriters(() => OK_INSERT)
+  const [a, d] = ['a'.repeat(32), 'd'.repeat(32)]
+  const rowOf = (id: string) => (JSON.parse(line(id, 'retry')) as { row: Parameters<Writer['enqueue']>[0] }).row
+  const before = w.writer('a-session')
+  before.enqueue(rowOf(a), 0)
+  let asked = (): void => undefined
+  let answer = (): void => undefined
+  const atRequest = new Promise<void>(resolve => (asked = resolve))
+  const answered = new Promise<void>(resolve => (answer = resolve))
+  w.hold(() => {
+    w.hold(null)
+    asked()
+    return answered
+  })
+  const flushing = before.flush()
+  await atRequest
+  const after = w.writer('a-session')
+  after.adopt(before)
+  expect(await after.spillForExit(1000)).toEqual({ spilled: 1 })
+  const spilled = (id: string): number => [...w.files].filter(([path, text]) => path.includes('/spill-') && text !== '').flatMap(([, text]) => parseFile(text).lines).filter(l => l.row.event_id === id).length
+  expect(spilled(a)).toBe(1)
+  // A row captured after: neither writer sends it.
+  after.queue.push(rowOf(d))
+  answer()
+  await flushing
+  expect([w.sentOf(a), w.sentOf(d)]).toEqual([1, 0])
+})
+
 test('rows with no id alike in two files count as two refused', async () => {
   const w = twoWriters(() => FIRST_REFUSED)
   const noId = JSON.parse(line('c'.repeat(32), 'retry')) as { row: { event_id?: string } }

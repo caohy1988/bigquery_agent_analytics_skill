@@ -39,6 +39,15 @@ export class BoundedQueue {
     this.enforce()
   }
 
+  // Puts rows at the back, behind every row queued (another queue's rows,
+  // newer than these).
+  append(items: Queued[]): void {
+    if (items.length === 0) return
+    this.items.push(...items)
+    for (const item of items) this.bytes += item.bytes
+    this.enforce()
+  }
+
   // Takes up to `maxRows` rows and `maxBytes` bytes from the front; always at
   // least one row when any is queued.
   take(maxRows: number, maxBytes: number): Queued[] {
