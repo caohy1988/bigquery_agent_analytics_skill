@@ -87,23 +87,24 @@ export function openWelcome(records: WelcomeRecords, sessionId: string | null, k
     // one; a change back's newer one).
     const before = [...records.versions, greetedVersion(records.latest)].filter((v): v is string => v !== null && v !== PLUGIN_VERSION)
     const previous = before.reduce<string | null>((newest, v) => (newest === null || isNewer(v, newest) ? v : newest), null)
-    return { welcome: { version: PLUGIN_VERSION, previous, sessionId, landedAt: null, landedTo: null, closed: false, sent: 0, counted: {}, destination: key, owner: '', rank: 0 }, isNew: true }
+    return { welcome: { version: PLUGIN_VERSION, previous, sessionId, landedAt: null, landedTo: null, closed: false, sent: 0, destination: key, owner: '', rank: 0, since: 0 }, isNew: true }
   }
   if (sessionId === null || by.sessionId !== sessionId || records.closed === true) return null
   const landing = isObject(records.landing) ? records.landing : {}
   const here = key !== null && typeof landing.landedAt === 'number' && landing.landedTo === key
-  return { welcome: { version: PLUGIN_VERSION, previous: by.previous, sessionId, landedAt: here ? (landing.landedAt as number) : null, landedTo: here ? key : null, closed: false, sent: 0, counted: {}, destination: key, owner: '', rank: 0 }, isNew: false }
+  return { welcome: { version: PLUGIN_VERSION, previous: by.previous, sessionId, landedAt: here ? (landing.landedAt as number) : null, landedTo: here ? key : null, closed: false, sent: 0, destination: key, owner: '', rank: 0, since: 0 }, isNew: false }
 }
 
 // After a reload in the session that showed the card, from what `$.state`
 // kept of it: none once closed; else the card as it was, counting where
 // rows go now (`key`), its landing and count kept only if that is where
-// they went. What each writer had counted stays, so no row is counted
-// twice, should rows go back where they went.
+// they went. A card moved elsewhere counts from the run that moved it
+// (register.ts), so no row is counted twice, should rows go back where they
+// went.
 export function reopenWelcome(kept: Welcome, key: string | null): { welcome: Welcome; isNew: boolean } | null {
   if (kept.closed) return null
   const here = key !== null && kept.landedAt !== null && kept.landedTo === key
-  return { welcome: { ...kept, landedAt: here ? kept.landedAt : null, landedTo: here ? key : null, sent: here ? kept.sent : 0, counted: kept.counted ?? {}, destination: key }, isNew: false }
+  return { welcome: { ...kept, landedAt: here ? kept.landedAt : null, landedTo: here ? key : null, sent: here ? kept.sent : 0, destination: key }, isNew: false }
 }
 
 // One card's greeting and landing writes to `$.store` (register.ts passes

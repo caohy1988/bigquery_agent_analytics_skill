@@ -50,7 +50,8 @@ const settle = async () => {
 // value with a version, a write with `ifVersion` landing only while the
 // value stands at it, as the host's), and the writes still to answer.
 // `hold` picks the store keys whose writes wait; `holdState` the state
-// writes that wait, `refuseState` those refused; `read` may hold store reads.
+// writes that wait, `refuseState` those refused (each given the value and
+// its key); `read` may hold store reads.
 function host({ hold = () => false, holdState = () => false, refuseState = () => false, read, liveReads = false } = {}) {
   const store = new Map()
   const state = new Map()
@@ -66,7 +67,7 @@ function host({ hold = () => false, holdState = () => false, refuseState = () =>
   // alike at times, so nothing here asks more of the numbers than that.
   let stamp = 0
   const stateSet = (ref, value, options) => {
-    if (refuseState(value)) return Promise.reject(new Error('refused by policy'))
+    if (refuseState(value, ref.key)) return Promise.reject(new Error('refused by policy'))
     const land = () => {
       const now = state.get(ref.key) ?? { value: undefined, version: 0 }
       if (options?.ifVersion !== undefined && options.ifVersion !== now.version) return { isSet: false, version: now.version }
@@ -74,7 +75,7 @@ function host({ hold = () => false, holdState = () => false, refuseState = () =>
       state.set(ref.key, { value: structuredClone(value), version: stamp })
       return { isSet: true, version: stamp }
     }
-    if (!holdState(value)) return Promise.resolve(land())
+    if (!holdState(value, ref.key)) return Promise.resolve(land())
     return new Promise(resolve => held.push({ key: 'state', value, release: () => resolve(land()) }))
   }
   const card = () => state.get('welcome')?.value
@@ -87,6 +88,10 @@ function heldReads(h, holding) {
   h.read = key => (holding(key) ? new Promise(resolve => waiting.push(() => resolve(structuredClone(h.store.get(key))))) : Promise.resolve(structuredClone(h.store.get(key))))
   return { answer: () => waiting.splice(0).forEach(go => go()), count: () => waiting.length }
 }
+
+// Whether a value of the session's `delivered` records a run's rows that
+// `matches` takes.
+const recordsRows = (value, matches) => typeof value === 'object' && value !== null && Object.values(value).some(entry => typeof entry?.rows === 'number' && matches(entry.rows))
 
 let loads = 0
 // One load of the code against `h`, with `options` over the usual ones. The
@@ -534,7 +539,7 @@ const tests = {
     assert.equal(await a.shown(), false)
     assert.equal(await b.shown(), true)
   },
-  async 'rows that went where the card counted them before it moved, and moved back, are not counted again'() {
+  async 'a card moved elsewhere and back counts from the load that moved it back: rows of a load before it count there no more, those it counted before included'() {
     const A = { deadLetterDir: '/home/dev/a/dead-letter' }
     const B = { deadLetterDir: '/home/dev/b/dead-letter' }
     const h = host()
@@ -547,8 +552,11 @@ const tests = {
     const c = await load(h, A)
     await c.start()
     assert.equal(h.card()?.sent, 0)
-    // The first load's writer lands one more row there: one, not two.
+    // The first load's writer lands one more row there: it ran before the
+    // card moved back, so none of its rows count.
     await a.land()
+    assert.equal(h.card()?.sent, 0)
+    await c.land()
     assert.equal(h.card()?.sent, 1)
     assert.ok((await c.texts()).some(t => String(t).startsWith('✓ First rows written · 1 so far')))
   },
@@ -863,7 +871,7 @@ const tests = {
     assert.equal(seen.landed.isSet, true)
     assert.deepEqual([seen.kept.value, seen.y.value, seen.y.version], [undefined, { probe: true }, wrote.version])
   },
-  async 'rows the version before an update lands after the updated version showed its card count once there: that card keeps what the one it replaced had counted'() {
+  async 'rows the version before an update lands after the updated version showed its card never count there: the card counts the updated version\'s rows'() {
     let holding = false
     const writes = []
     const h = host()
@@ -883,10 +891,12 @@ const tests = {
     assert.equal(h.card().sent, 0)
     writes.splice(0).forEach(go => go())
     await settle()
+    assert.deepEqual([h.card().sent, h.card().landedAt], [0, null])
+    await b.land()
     assert.equal(h.card().sent, 1)
     assert.ok((await b.texts()).some(t => String(t).startsWith('✓ First rows written · 1 so far')))
   },
-  async 'rows the version before an update lands after its card was closed, before the update, never count on the updated version\'s card'() {
+  async 'rows the version before an update lands after its card was closed, before the update or after it, never count on the updated version\'s card'() {
     let holding = false
     const writes = []
     const h = host()
@@ -908,10 +918,12 @@ const tests = {
     assert.deepEqual([h.card().version, h.card().sent], [NEXT, 0])
     writes.splice(0).forEach(go => go())
     await settle()
+    assert.equal(h.card().sent, 0)
+    await b.land()
     assert.equal(h.card().sent, 1)
     assert.ok((await b.texts()).some(t => String(t).startsWith('✓ First rows written · 1 so far')))
   },
-  async 'rows landed while the session showed no card (another session greeted this version) never count on the updated version\'s card'() {
+  async 'rows landed while the session showed no card (another session greeted this version) never count on the updated version\'s card, nor rows that land after it opened'() {
     let holding = false
     const writes = []
     const h = host()
@@ -931,9 +943,11 @@ const tests = {
     assert.deepEqual([h.card().version, h.card().sent], [NEXT, 0])
     writes.splice(0).forEach(go => go())
     await settle()
+    assert.equal(h.card().sent, 0)
+    await b.land()
     assert.equal(h.card().sent, 1)
   },
-  async 'a delivery of the version before an update that lands after the updated version\'s card opened counts on it'() {
+  async 'a delivery of the version before an update that lands after the updated version\'s card opened never counts on it: the card counts from the run that opened it'() {
     const h = host()
     const a = await load(h)
     await a.start()
@@ -946,12 +960,15 @@ const tests = {
     await b.start()
     writes.shift()()
     await settle()
+    assert.deepEqual([h.card().sent, h.card().landedAt], [0, null])
+    h.writeFile = undefined
+    await b.land()
     assert.equal(h.card().sent, 1)
   },
   async 'a delivery that landed before an update, recorded only after the updated version\'s card opened, never counts on it'() {
     let holding = false
     // The write that records the second row's total waits.
-    const h = host({ holdState: value => holding && typeof value === 'object' && value !== null && 'totals' in value && Object.values(value.totals).some(total => total >= 2) })
+    const h = host({ holdState: (value, key) => holding && key === 'delivered' && recordsRows(value, rows => rows >= 2) })
     const a = await load(h)
     await a.start()
     await a.land()
@@ -967,7 +984,7 @@ const tests = {
     await settle()
     assert.deepEqual([h.card().sent, h.card().landedAt], [0, null])
   },
-  async 'rows the version before an update lands while the updated version reads the store are in the card\'s start: only a later row counts'() {
+  async 'rows the version before an update lands while the updated version reads the store, and after, never count on its card'() {
     const h = host()
     h.store.set(`welcome:${PLUGIN_VERSION}`, { version: PLUGIN_VERSION, sessionId: 'another-session', previous: null })
     const a = await load(h)
@@ -988,14 +1005,168 @@ const tests = {
     writes.shift()()
     await settle()
     assert.equal(writes.length, 1)
-    assert.equal(Object.values(h.state.get('delivered').value.totals)[0], 501)
+    assert.ok(recordsRows(h.state.get('delivered').value, rows => rows === 501))
     holding = false
     reads.answer()
     await settle()
     assert.equal(h.card().sent, 0)
     writes.shift()()
     await settle()
+    assert.ok(recordsRows(h.state.get('delivered').value, rows => rows === 502))
+    assert.equal(h.card().sent, 0)
+    h.writeFile = undefined
+    await b.land()
     assert.equal(h.card().sent, 1)
+  },
+  async 'an earlier load\'s rows recorded late across an update, a later total of its recorded first, never count on the updated card; the updated version\'s own row counts once'() {
+    let holding = false
+    // The write that records the 500 rows' total (501 with the first row) waits.
+    const h = host({ holdState: (value, key) => holding && key === 'delivered' && recordsRows(value, rows => rows === 501) })
+    const a = await load(h)
+    await a.start()
+    await a.land()
+    await a.close()
+    // One flush sends 500 rows now, then waits on the last row's write.
+    const files = []
+    let calls = 0
+    h.writeFile = () => (++calls === 1 ? Promise.resolve() : new Promise(resolve => files.push(resolve)))
+    holding = true
+    await a.queue(501)
+    await a.flush()
+    holding = false
+    assert.deepEqual([h.held.length, files.length], [1, 1])
+    const b = await load(h, {}, NEXT)
+    await b.start()
+    assert.equal(h.card().sent, 0)
+    files.shift()()
+    await settle()
+    assert.ok(recordsRows(h.state.get('delivered').value, rows => rows === 502))
+    assert.equal(h.card().sent, 0)
+    h.release('state')
+    await settle()
+    assert.ok(recordsRows(h.state.get('delivered').value, rows => rows === 502))
+    assert.deepEqual([h.card().sent, h.card().landedAt], [0, null])
+    h.writeFile = undefined
+    await b.land()
+    assert.equal(h.card().sent, 1)
+  },
+  async 'a row the updated version lands while its card\'s first write waits counts once that write lands, with one toast; one the version before lands then never counts'() {
+    let holding = false
+    const h = host({ holdState: (value, key) => holding && key === 'welcome' && value?.version === NEXT })
+    const a = await load(h)
+    await a.start()
+    await a.land()
+    await a.close()
+    const files = []
+    h.writeFile = () => new Promise(resolve => files.push(resolve))
+    await a.land()
+    holding = true
+    const b = await load(h, {}, NEXT)
+    await b.start()
+    assert.equal(h.held.length, 1)
+    // Both land while the card's write waits.
+    files.shift()()
+    await settle()
+    h.writeFile = undefined
+    await b.land()
+    assert.equal(h.card().version, PLUGIN_VERSION)
+    holding = false
+    h.release('state')
+    await settle()
+    assert.deepEqual([h.card().version, h.card().sent], [NEXT, 1])
+    assert.ok((await b.texts()).some(t => String(t).startsWith('✓ First rows written · 1 so far')))
+    assert.equal(b.toasts(), 1)
+  },
+  async 'the updated version\'s rows count once whatever order its records land in: a later total recorded first stands, and the earlier one changes nothing'() {
+    let holding = false
+    const h = host({ holdState: (value, key) => holding && key === 'delivered' && recordsRows(value, rows => rows === 500) })
+    const a = await load(h)
+    await a.start()
+    await a.land()
+    await a.close()
+    const b = await load(h, {}, NEXT)
+    await b.start()
+    // One flush of the updated version: 500 rows, their record held, then the last row.
+    holding = true
+    await b.queue(501)
+    await b.flush()
+    holding = false
+    assert.equal(h.held.length, 1)
+    assert.equal(h.card().sent, 501)
+    h.release('state')
+    await settle()
+    assert.equal(h.card().sent, 501)
+    assert.ok((await b.texts()).some(t => String(t).startsWith('✓ First rows written · 501 so far')))
+  },
+  async 'an earlier load whose rank comes back after a later load took one counts none of its rows, also those landing after the later load\'s card opened'() {
+    let holding = false
+    // The first load's write of the session's count of runs waits.
+    const h = host({ holdState: (value, key) => holding && key === 'loads' })
+    holding = true
+    const a = await load(h)
+    await a.start()
+    holding = false
+    assert.equal(h.held.length, 1)
+    const b = await load(h)
+    await b.start()
+    assert.equal(h.state.get('loads').value, 1)
+    h.release('state')
+    await settle()
+    assert.equal(h.state.get('loads').value, 2)
+    await a.land()
+    assert.equal(await a.shown(), false)
+    assert.deepEqual([h.card().sent, h.card().landedAt], [0, null])
+    await b.land()
+    assert.equal(h.card().sent, 1)
+    assert.ok((await b.texts()).some(t => String(t).startsWith('✓ First rows written · 1 so far')))
+  },
+  async 'a row of the version before an update, landing while the updated version counts its own first row, leaves that landing, and its toast, to the updated version'() {
+    const h = host()
+    const a = await load(h)
+    await a.start()
+    await a.land()
+    await a.close()
+    const files = []
+    h.writeFile = () => new Promise(resolve => files.push(resolve))
+    await a.land()
+    const b = await load(h, {}, NEXT)
+    await b.start()
+    // The first load's toast for its own card's landing.
+    assert.equal(a.toasts(), 1)
+    // The updated version's first row lands; its read of the card waits.
+    let holding = true
+    let release = () => undefined
+    const waiting = new Promise(resolve => (release = resolve))
+    h.stateRead = key => (holding && key === 'welcome' ? waiting : undefined)
+    h.writeFile = undefined
+    await b.land()
+    holding = false
+    // The version before lands its row meanwhile.
+    files.shift()()
+    await settle()
+    release()
+    await settle()
+    assert.deepEqual([h.card().sent, b.toasts(), a.toasts()], [1, 1, 1])
+  },
+  async 'rows a reload lands where it sends them while its reads of the store wait count once it takes the card over and moves it there'() {
+    const A = { deadLetterDir: '/home/dev/a/dead-letter' }
+    const B = { deadLetterDir: '/home/dev/b/dead-letter' }
+    const h = host()
+    const a = await load(h, A)
+    await a.start()
+    await a.land()
+    assert.equal(h.card()?.sent, 1)
+    let holding = true
+    const reads = heldReads(h, () => holding)
+    const b = await load(h, B)
+    await b.start()
+    await b.land()
+    assert.deepEqual([h.card().destination, h.card().sent], ['dry run: /home/dev/a/dry-run', 1])
+    holding = false
+    reads.answer()
+    await settle()
+    assert.deepEqual([h.card().destination, h.card().sent], ['dry run: /home/dev/b/dry-run', 1])
+    assert.ok((await b.texts()).some(t => String(t).startsWith('✓ First rows written · 1 so far')))
   },
   async 'where the session id cannot be read no card shows and no one is greeted, after a reload too: Got it could keep no close'() {
     const h = host({ hold: key => key.startsWith('welcome') })

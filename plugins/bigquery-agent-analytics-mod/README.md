@@ -256,23 +256,32 @@ showed, another version's included; a load whose reads answer after a later
 load took the card over leaves it to that one, and a later load whose first write of the card
 an earlier one beat takes the card over, with no second greeting; a later
 version's (an update in the session) shows its own card over the earlier
-version's, with its own greeting. Each
-writer's rows count once, however often or late it says so, counted apart
-for each place they land. The session's state also keeps each writer's
-rows landed so far, whatever the card shows (none, closed, or counting
-elsewhere), with a generation that a card opening moves on, at the version
-read, taking its start from the totals it moved on from: each delivery
-reads the generation it began at before it is recorded (after a write of
-its own to a key of its own, `refresh`, brings its view of the state up to
-date), and one that began before the card opened never counts on it,
-however late it is recorded, while one that began after counts. Rows its
-own session start landed as it read the store count at once. If rows now go
-somewhere else (another table or location, or BigQuery after a dry run), the card waits
-again until rows land there, and a prompt closes it only once they have,
-hiding it and writing the store's close at once, as Got it does; rows sent
-under the earlier configuration that land after the reload do not count,
-while rows an earlier load lands where the card counts them do, and the
-load that showed the card says so. A close, or a stored close a takeover
+version's, with its own greeting. The card
+counts the rows of the session start that opened it, or last moved it
+where rows go now, and of every later one, where it counts rows, and never
+an earlier one's, whenever they land: a run knows its own rank with nothing
+to read, so no read or write that answers late, before or after an update,
+moves rows from one card to another (a rule that took a delivery's place
+from the session's state after its rows landed could be held past the
+card's opening, by holding that read or the write before it). A run counts
+only once it is past the tick of the clock that a reload cancels for the
+load it replaces, so a load whose rank came back after a later load's
+counts nothing. The session's state keeps each run's rows landed so far in
+each place, with its rank, whatever the card shows (none, closed, or
+counting elsewhere), only ever up; the card sums them, so a run that says
+so again, or late, counts once, and no run's total stands for another's
+rows. The card reads them again when it opens, once its write lands, and
+at each delivery: rows its own session start landed as it read the store
+count at once. Rows of the version before an update never count on the
+updated version's card; in the host a reload stops the load it replaces,
+so they cannot land after it anyway. If rows now go somewhere else (another
+table or location, or BigQuery after a dry run), the card waits again until
+rows land there, counting from the run that moved it, and a prompt closes
+it only once they have, hiding it and writing the store's close at once, as
+Got it does; rows sent under the earlier configuration that land after the
+reload do not count, while rows of an earlier load the card counts (the one
+that opened it, after a reload took it over) do, and the load that showed
+the card says so. A close, or a stored close a takeover
 applies, is for the card of its own version and session alone, however
 often its write is tried again: a card an update put in its place in the
 session stays.
@@ -1444,8 +1453,10 @@ when they do not, nor while its read of a close the store has waits; that a
 load whose reads answer after a later load took the card over for another
 destination leaves it to that load, its rows counting nowhere, and so does
 one whose read of the state answers late; that rows a new load lands while
-its reads wait count once, over repeated reloads, as do rows counted before
-the card moved away and back; that a new load that cannot read the store
+its reads wait count once, over repeated reloads, and once it takes the card
+over and moves it where it sends them; that a card moved away and back
+counts from the load that moved it back, no row of an earlier load counting
+there again; that a new load that cannot read the store
 shows no card; that a reload whose takeover write answers after another
 load's Got it (its state close refused) shows no card; that of two loads
 whose first card writes wait, the later takes the card over when the
@@ -1465,12 +1476,15 @@ stands at once too; that a read of the close that never answers stops no
 read of it ten seconds on, and one that answers after the next began
 leaves that one's turn alone; that its own `$.state` reads one moment an
 event, brought up to date whole by a conditional write of its own, landed
-or missed; that rows the version before an update lands after the updated
-version showed its card count once there, and so do its rows landed after
-its own card was closed, or while the session showed no card, before the
-update: none of those count, nor a delivery that landed before the update
-and was recorded after the card opened, nor rows an earlier load landed
-while the update read the store, while a later row of that load counts; that where no session id is
+or missed; that no row of the version before an update counts on the
+updated version's card, whenever it lands or is recorded: after the card
+opened, after the earlier card was closed, while the session showed no
+card, while the update read the store, recorded late, or with a later total
+of its recorded first; that the updated version's own rows count once,
+whatever order their records land in, also one that landed while its
+card's first write waited, its first landing and toast its own when a row
+of the version before lands meanwhile; that a load whose rank came back
+after a later load took one counts none of its rows; that where no session id is
 known no card shows and no one is greeted, after a reload too;
 that a Got it, a takeover's stored close or a
 prompt in a load of the
@@ -1558,7 +1572,7 @@ hooks/lib/bigquery.ts        insertAll / tables.insert requests, answer classifi
 hooks/lib/deadletter.ts      dead-letter file format, files sized in UTF-8 bytes
 hooks/lib/config.ts          options and environment
 hooks/lib/status.ts          /bqaa-status text
-hooks/lib/welcome.ts         the welcome card's text, and its records: the version greeted, and the card's own
+hooks/lib/welcome.ts         the welcome card's text, and its records in the store: the version greeted, the card's landing, its close
 setup.sh                     creates the dataset, table, views dataset and views (bq CLI)
 sql/                         DDL and sample queries
 sql/views/                   the usage views setup.sh makes

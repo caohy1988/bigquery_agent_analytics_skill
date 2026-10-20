@@ -20,6 +20,8 @@
 
 import type { EngineInterface, Register, SessionStartInput } from 'claude-code'
 
+import type { DeliveredRows, DeliveredState } from '../types'
+
 import { type Config, type EnvSnapshot, type Options, PLUGIN_VERSION, canDeliver, deadLetterPartition, destinationDir, joinPath, resolveConfig, tableRef } from './lib/config.ts'
 import { HOST_FILE_BYTES, kindOf } from './lib/deadletter.ts'
 import { randomIds } from './lib/ids.ts'
@@ -65,19 +67,17 @@ const WELCOME_STATE = { plugin: 'bigquery-agent-analytics-mod', key: 'welcome' }
 // above every earlier one that shows the card (`startWelcome` stops a load
 // replaced before its number came back), whatever the clock says.
 const LOADS_STATE = { plugin: 'bigquery-agent-analytics-mod', key: 'loads' } as const
-// Each writer's rows landed so far in the session, by writer and destination
-// (`countKey`), whatever the card shows, and the generation, which a card
-// that opens moves on at the version read, taking its start from the totals
-// it moved on from (`startWelcome`): a delivery that began at an earlier
-// generation never counts on it, however late it is recorded.
+// Each session.start run's rows landed so far in the session, by run and
+// destination (`countKey`), with the run's rank, whatever the card shows. A
+// card counts the rows of the run it counts from (`since`: the one that
+// opened it, or last moved it where rows go now) and of every later run,
+// where it counts rows, and never an earlier run's. A run knows its own rank
+// with nothing to read, so no read or write that answers late, before or
+// after an update, moves a delivery from one card to another.
 const DELIVERED_STATE = { plugin: 'bigquery-agent-analytics-mod', key: 'delivered' } as const
-// Written only to bring a dispatch's view of the session's state up to date
-// (`deliveryGeneration`), a key no other write goes to.
-const REFRESH_STATE = { plugin: 'bigquery-agent-analytics-mod', key: 'refresh' } as const
-// A writer's rows landed in one destination: the key of `counted` and of
-// `delivered`.
+// A run's rows landed in one destination: the key of `delivered`.
 const countKey = (by: string, to: string): string => `${by}@${to}`
-// What this load's writers have landed, by `countKey`.
+// What this load's runs have landed, by `countKey`.
 const landedByWriter = new Map<string, number>()
 // Whether this session shows a card (a person at the prompt): only then is
 // `delivered` kept.
@@ -272,16 +272,34 @@ async function nextLoad($: EngineInterface): Promise<number | null> {
   return null
 }
 
+// This run's rank (`nextLoad`), once one tick of the host's clock answers
+// after it: a hot reload cancels the waits of the load it replaces, so a load
+// replaced before its rank came back (its read or write answered late) never
+// gets past it, and a run that does took its rank while still the current
+// load, before any later load took one: every later run ranks above it. Null
+// where the session keeps no state, or the wait is refused. The card waits
+// on it, and so does each delivery's count.
+async function admit($: EngineInterface, ranked: Promise<number | null>): Promise<number | null> {
+  const rank = await ranked
+  if (rank === null) return null
+  try {
+    await $.clock.sleep(0)
+  } catch {
+    return null
+  }
+  return rank
+}
+
 // In a session a person sees (a `-p` run draws no band): the welcome card
 // for a version not greeted yet, recorded at once so that no later session
 // shows it, or the card this session showed, as a reload left it. Runs in
 // the background: nothing waits on the state or the store for it. `start`
-// is the session.start run it belongs to, `ranked` its rank. A run whose
+// is the session.start run it belongs to, `admitted` its rank. A run whose
 // reads another load's change has overtaken (a later reload's, or an
 // earlier one's that answered late) shows no card of its own: its writes are
 // conditional on the version it read, and it takes over the card shown
 // instead, where it ranks above the run that has it.
-async function startWelcome($: EngineInterface, e: SessionStartInput, sessionId: string | null, start: number, ranked: Promise<number | null>): Promise<void> {
+async function startWelcome($: EngineInterface, e: SessionStartInput, sessionId: string | null, start: number, admitted: Promise<number | null>): Promise<void> {
   if (!e.isInteractive || e.surface === null) return
   // Nor where the session's id cannot be read: its landing and its close
   // are kept under it, so Got it could not keep the card closed.
@@ -289,19 +307,10 @@ async function startWelcome($: EngineInterface, e: SessionStartInput, sessionId:
   const key = destinationKey(config)
   const me = ownerOf(start)
   const save = (key: string, value: unknown): Promise<void> => $.store.set(key, value)
-  // Where the session keeps no state, there is no card: the band draws from it.
-  const rank = await ranked
+  // Where the session keeps no state, there is no card: the band draws from
+  // it. Nor in a load replaced before its rank came back (`admit`).
+  const rank = await admitted
   if (rank === null) return
-  // Then only while the host still runs this load: a hot reload cancels the
-  // waits of the load it replaces, so this one never answers in a load
-  // replaced before its rank came back (its read or write answered late). A
-  // run that gets past it took its rank while still the current load, before
-  // any later load took one: every later run ranks above it.
-  try {
-    await $.clock.sleep(0)
-  } catch {
-    return
-  }
   let held: { value: Welcome | null; version: number }
   try {
     const read = await $.state.get(WELCOME_STATE)
@@ -337,23 +346,20 @@ async function startWelcome($: EngineInterface, e: SessionStartInput, sessionId:
     return
   }
   if (start !== welcomeStarts || opened === null) return
-  const shown: Welcome = { ...opened.welcome, owner: me, rank }
+  const shown: Welcome = { ...opened.welcome, owner: me, rank, since: rank }
   // Shown only if the state still stands as read: no other load has shown
   // or changed a card since. The one that does shows it, and greets. Where
   // another has: this version's card (an earlier load's whose write answered
   // first, say), which this run takes over from there, with no greeting of
   // its own; a card a later load or run showed, left to it; or an earlier
   // one's of another version (an update in the session), which this run's
-  // card replaces, tried again at the state as it stands now. Its count
-  // starts where the session's deliveries stand as it moves their generation
-  // on (`openGeneration`): an earlier load's rows landed before, or in a
-  // delivery that began before, never count on it; this run's own rows,
-  // landed while the records were read, it counts at once.
-  const opening = await openGeneration($)
-  const others = Object.fromEntries(Object.entries(opening.totals).filter(([id]) => !id.startsWith(`${me}@`)))
+  // card replaces, tried again at the state as it stands now. It counts the
+  // rows of this run and of every later one (`since`): this run's own rows,
+  // landed while the records were read, count at once; an earlier load's,
+  // the version before an update's included, never do, whenever they land.
   let version = held.version
   let isSet = false
-  const card: Welcome = { ...shown, counted: others, generation: opening.generation }
+  const card: Welcome = shown
   for (let i = 0; i < 8 && !isSet; i += 1) {
     try {
       isSet = (await $.state.set(WELCOME_STATE, card, { ifVersion: version })).isSet
@@ -387,9 +393,9 @@ async function startWelcome($: EngineInterface, e: SessionStartInput, sessionId:
   records = new CardRecords(save, card, opened.isNew)
   cardReady = cardId(card.version, card.sessionId)
   redrawBand($)
-  // Rows that landed while the records were read (this writer's rows go
-  // where this configuration sends them): the card says so now, once.
-  if (key !== null) rowsLanded($, countKey(me, key), landedByWriter.get(countKey(me, key)) ?? 0, key)
+  // Rows that landed while the records were read, and while the card was
+  // written, recorded before it was: the card says so now, once.
+  recount($, rank)
 }
 
 // This session's card as the session's state has it (after a reload, or
@@ -420,7 +426,11 @@ async function takeOver($: EngineInterface, sessionId: string, start: number, ra
     // A later load, or run, took the card over meanwhile: it shows it.
     if ((card.rank ?? 0) > rank) return null
     const reopened = reopenWelcome(card, key)
-    return reopened === null ? null : { ...reopened.welcome, owner: me, rank }
+    if (reopened === null) return null
+    // Moved where rows go now: it counts from this run on there, so rows that
+    // went there before it moved never count again.
+    const since = reopened.welcome.destination === card.destination ? (card.since ?? rank) : rank
+    return { ...reopened.welcome, owner: me, rank, since }
   }).catch(() => null)
   if (taken === null || taken.closed || start !== welcomeStarts) return
   // The greeting written again where the store has none (its write was
@@ -429,8 +439,9 @@ async function takeOver($: EngineInterface, sessionId: string, start: number, ra
   if (!(await stillOpen($, sessionId)) || start !== welcomeStarts) return
   cardReady = cardId(PLUGIN_VERSION, sessionId)
   redrawBand($)
-  // Rows this writer landed while the records were read: counted once.
-  if (key !== null) rowsLanded($, countKey(me, key), landedByWriter.get(countKey(me, key)) ?? 0, key)
+  // Rows this run landed while the records were read (where the card counts
+  // rows now, if it moved here): counted once.
+  recount($, rank)
 }
 
 // Whether the store has no close for this session's card, read once more
@@ -505,34 +516,80 @@ function redrawBand($: EngineInterface): void {
   }
 }
 
-// The writer `by` (a load's session.start run, named as `ownerOf` names it)
-// has landed `total` rows in all, in `to` (their destination's
-// `destinationKey`): where the card counts rows, it counts each writer's
-// total once, however often or late the writer says so (at each send, and
-// once more as the card is shown or taken over). The first time, it says
-// they landed, and the load that showed it says so with a toast as well, as
-// the band may be collapsed. Rows a writer of another configuration sent
-// elsewhere say nothing here; rows an earlier load sends where the card
-// counts them count.
-function rowsLanded($: EngineInterface, id: string, total: number, to: string | null): void {
+// The run `id` names (a load's session.start run and the place its rows land,
+// `countKey`) has landed `total` rows in all in `to` (their destination's
+// `destinationKey`): once the run is admitted (`admit`), the session's
+// `delivered` says so, at its rank, and the card counts it where it counts
+// rows from that run on (`recount`), however often or late the run says so.
+// A run never admitted (a load replaced before its rank came back) records
+// nothing. Rows a run of another configuration sent elsewhere say nothing
+// here.
+function rowsLanded($: EngineInterface, id: string, total: number, to: string | null, admitted: Promise<number | null>): void {
   if (to === null || total <= 0) return
-  let first = false
-  void (async () => {
-    // The generation this delivery began at, read up to date, before it is
-    // recorded: one recorded late still counts only where it began.
-    const began = await deliveryGeneration($)
-    await noteDelivered($, id, total)
-    return changeCard($, card => {
-      const had = card.counted?.[id] ?? 0
-      if (card.closed || card.destination !== to || total <= had) return null
-      // Begun before the card opened: taken into its start, never counted
-      // on it. (The rows of the run that showed it, landed as it read the
-      // store, count at once: it says so once the card shows, a delivery
-      // begun then.)
-      if ((card.generation ?? 0) > began) return { ...card, counted: { ...card.counted, [id]: total } }
-      first = card.landedAt === null
-      return { ...card, counted: { ...card.counted, [id]: total }, sent: card.sent + total - had, ...(first ? { landedAt: Date.now(), landedTo: to } : {}) }
+  void admitted
+    .then(async rank => {
+      if (rank === null) return
+      await noteDelivered($, id, { rank, to, rows: total })
+      recount($, rank)
     })
+    .catch(() => {
+      internalErrors += 1
+    })
+}
+
+// The run and destination `id` has landed `entry.rows` rows in all: the
+// session's `delivered` says so, with the run's rank, whatever the card
+// shows, in a session that shows cards. Only ever up, at the version read,
+// read again on a miss; one that cannot be written leaves the card to count
+// what it knows.
+async function noteDelivered($: EngineInterface, id: string, entry: DeliveredRows): Promise<void> {
+  if (!cardSession) return
+  try {
+    for (let i = 0; i < 8; i += 1) {
+      const held = await $.state.get(DELIVERED_STATE)
+      const now = held.value ?? {}
+      if ((now[id]?.rows ?? 0) >= entry.rows) return
+      if ((await $.state.set(DELIVERED_STATE, { ...now, [id]: entry }, { ifVersion: held.version })).isSet) return
+    }
+  } catch {
+    // No session state here, or refused: no card counts from it.
+  }
+}
+
+// The rows `delivered` has landed where `card` counts rows, from the run it
+// counts from on: each run's total once, so none stands for another's.
+function landedFor(card: Welcome, delivered: DeliveredState | undefined): number {
+  let rows = 0
+  for (const entry of Object.values(delivered ?? {})) {
+    if (typeof entry !== 'object' || entry === null || entry.to !== card.destination) continue
+    if (typeof entry.rank === 'number' && entry.rank >= card.since && typeof entry.rows === 'number' && entry.rows > 0) rows += entry.rows
+  }
+  return rows
+}
+
+// The card's count, read again from `delivered`, as one moment of the
+// session's state has both, by a run of rank `rank`: only where the card
+// counts that run's rows, so the card is left to the runs it counts (never
+// another version's card, say, that replaced this run's). Written only while
+// the card stands as read, read again on a miss, and only ever up; a closed
+// card counts no more. The first time rows count, the card says they landed,
+// and the load whose run holds the card says so with a toast as well, as the
+// band may be collapsed.
+function recount($: EngineInterface, rank: number): void {
+  let first = false
+  void (async (): Promise<Welcome | null> => {
+    for (let i = 0; i < 8; i += 1) {
+      const held = await $.state.get(WELCOME_STATE)
+      const card = held.value ?? null
+      if (card === null || card.closed || card.destination === null || rank < card.since) return null
+      const landed = landedFor(card, (await $.state.get(DELIVERED_STATE)).value)
+      if (landed <= card.sent) return null
+      first = card.landedAt === null
+      const next: Welcome = { ...card, sent: landed, ...(first ? { landedAt: Date.now(), landedTo: card.destination } : {}) }
+      if ((await $.state.set(WELCOME_STATE, next, { ifVersion: held.version })).isSet) return next
+      first = false
+    }
+    return null
   })()
     .then(card => {
       if (card === null) return
@@ -548,58 +605,6 @@ function rowsLanded($: EngineInterface, id: string, total: number, to: string | 
     .catch(() => {
       internalErrors += 1
     })
-}
-
-// The writer and destination `id` has landed `total` rows in all: the
-// session's `delivered` says so, whatever the card shows, in a session that
-// shows cards. Only ever up, at the version read, read again on a miss; one
-// that cannot be written leaves a later card to count from what it knows.
-async function noteDelivered($: EngineInterface, id: string, total: number): Promise<void> {
-  if (!cardSession) return
-  try {
-    for (let i = 0; i < 8; i += 1) {
-      const held = await $.state.get(DELIVERED_STATE)
-      const now = held.value ?? { generation: 0, totals: {} }
-      if ((now.totals[id] ?? 0) >= total) return
-      if ((await $.state.set(DELIVERED_STATE, { generation: now.generation, totals: { ...now.totals, [id]: total } }, { ifVersion: held.version })).isSet) return
-    }
-  } catch {
-    // No session state here, or refused: no card counts from it.
-  }
-}
-
-// The session's delivery generation now. A dispatch reads one moment of the
-// session's state until a write of its own brings it up to date: one to a
-// key of its own (`refresh`) does, so a flush that runs on through an update
-// reads where things stand, and no write of the deliveries' record, early
-// or late, comes before the read.
-async function deliveryGeneration($: EngineInterface): Promise<number> {
-  if (!cardSession) return 0
-  try {
-    await $.state.set(REFRESH_STATE, 0)
-    return (await $.state.get(DELIVERED_STATE)).value?.generation ?? 0
-  } catch {
-    return 0
-  }
-}
-
-// A card opens: the session's delivery generation moves on, at the version
-// read (read again on a miss), and the card starts from the totals it moved
-// on from, so every delivery recorded before is in its start and every one
-// that begins after is counted on it. Where the state cannot be written,
-// generation 0 and no totals: a delivery of any generation counts.
-async function openGeneration($: EngineInterface): Promise<{ generation: number; totals: Record<string, number> }> {
-  try {
-    for (let i = 0; i < 8; i += 1) {
-      const held = await $.state.get(DELIVERED_STATE)
-      const now = held.value ?? { generation: 0, totals: {} }
-      const next = { generation: now.generation + 1, totals: now.totals }
-      if ((await $.state.set(DELIVERED_STATE, next, { ifVersion: held.version })).isSet) return next
-    }
-  } catch {
-    // No session state here, or refused.
-  }
-  return { generation: 0, totals: {} }
 }
 
 // Got it was pressed, or (`landedOnly`) a prompt came after rows landed
@@ -688,6 +693,7 @@ export const register: Register = (on, registered) => {
     // Its rank, in a session a person sees (a `-p` run draws no card).
     cardSession = e.isInteractive && e.surface !== null
     const ranked = cardSession ? nextLoad($).catch(() => null) : Promise.resolve(null)
+    const admitted = admit($, ranked).catch(() => null)
     try {
       config = resolveConfig(options, await readEnv($))
       clockAfter = (ms, fn) => $.clock.after(ms, fn)
@@ -727,7 +733,7 @@ export const register: Register = (on, registered) => {
           const id = countKey(ownerOf(start), key)
           const total = (landedByWriter.get(id) ?? 0) + rows
           landedByWriter.set(id, total)
-          rowsLanded($, id, total, key)
+          rowsLanded($, id, total, key, admitted)
         },
       }
       const previous = writer
@@ -781,7 +787,7 @@ export const register: Register = (on, registered) => {
     }
     // In the background: neither the first prompt nor anything above waits
     // on the store for the welcome card.
-    void startWelcome($, e, tracer.sessionId, start, ranked).catch(() => {
+    void startWelcome($, e, tracer.sessionId, start, admitted).catch(() => {
       internalErrors += 1
     })
     return next(e)

@@ -35,7 +35,7 @@ function heldStore(): { writes: [string, unknown][]; pending: () => number; answ
   }
 }
 
-const CARD: Welcome = { version: PLUGIN_VERSION, previous: null, sessionId: SESSION_ID, landedAt: null, landedTo: null, closed: false, sent: 0, counted: {}, destination: HERE, owner: 'a-load:1', rank: 1 }
+const CARD: Welcome = { version: PLUGIN_VERSION, previous: null, sessionId: SESSION_ID, landedAt: null, landedTo: null, closed: false, sent: 0, destination: HERE, owner: 'a-load:1', rank: 1, since: 1 }
 
 for (const what of ['greeting', 'landing'] as const) {
   test(`a ${what} whose write fails goes again at the card's next change`, async () => {
