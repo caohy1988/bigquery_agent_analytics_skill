@@ -180,6 +180,149 @@ session wait for it. A dataset or table made moments ago can still answer
 "Not found" to streaming inserts for a few minutes; rows wait through that
 too, and land on their own.
 
+### Once it is installed
+
+The first session after an install, or after an update to a new version,
+shows a card above the prompt (terminal and desktop): the mod is on, what it
+records, and the table it writes to.
+
+```
+╭──────────────────────────────────────────────────────────────────────────╮
+│ ✓ BigQuery Agent Analytics mod installed 0.1.0                [ Got it ] │
+│ Records sessions, turns, model requests and tool calls to                │
+│ my-gcp-project.agent_analytics.agent_events (US).                        │
+│ ✓ First rows landed in BigQuery · 1 sent · /bqaa-status shows the counts │
+╰──────────────────────────────────────────────────────────────────────────╯
+```
+
+Until BigQuery takes the first rows, its last line reads `◌ Waiting for the
+first rows, sent every 5 s while you work`. They usually land at the first
+send, a few seconds in, and then a toast says so as well, and the count goes
+up with each send. The next prompt you type at the terminal after that
+closes the card (one from elsewhere, such as a task's notification, leaves
+it), and so does **Got it** (ctrl+x tab, then Enter). A transcript line,
+which the model does not read, keeps what it said. The card says "updated
+to" only for a version known to be newer than the one before it (by its
+numbers, a release after its own pre-release); otherwise, back to an older
+version or between versions that do not compare, it says "changed to".
+
+* With no project or dataset set, the card says that nothing is recorded
+  until they are set in `/config` (or `BQAA_PROJECT_ID` and `BQAA_DATASET`).
+  No rows can land, so it stays until Got it.
+* In a dry run, or with capture turned off, the card says so. Turned off
+  after rows landed, it stays until Got it too.
+* While a problem stops rows (see
+  [If rows cannot be written](#if-rows-cannot-be-written)), its notice has
+  the band. The card comes back once the problem clears (rows land, or
+  BigQuery takes a request, whatever it makes of its rows).
+
+The mod notes in its own store (`$.store`) the version it greeted and the
+session that showed the card (key `welcome:<version>`), so no later session
+shows the card; the versions noted give the next version's card the one it
+replaced. What became of the card goes to keys of its own version and
+session: when rows first landed, and where (`welcome:<version>:<session>`),
+and that it was closed (`…:closed`, a key no other write touches, written
+at once on its own, behind no other write). A
+session writes only its own landing and close keys, and the greeting key of
+the version it greets (a load that reopens the card writes it again where
+the store has none), so a session left open never writes over a newer
+version another session greeted, and no write
+that answers late, from this load of the mod or an earlier one, undoes a
+close. The card itself lives in the session's `$.state`, which a reload
+(`/reload-plugins`, or an option changed in `/config`) keeps while the
+mod's own variables start over; the band draws it from there. Every change
+to it is a compare-and-set on the version read, so no load's change, early
+or late, overwrites another's, and a close always stays. A reload shows
+the card again as it was, its count included (a card rebuilt from the
+store alone, with no session state, starts its count over); a load whose
+start another load overtook shows nothing and greets no more; and a close
+the store has wins over an open card in the state (a close whose state
+write was refused included). A load draws the card only once it has read
+the store's close for it, once more after taking the card over, so one
+whose reads have not answered, or never do, draws none, and a Got it in
+another load while it took the card over hides it. That close is read
+whether or not the store has the greeting: a session resumed after Got it,
+its greeting's write lost, shows no card and greets no more. Each draw reads the
+store's close again in the background (one read at a time; one that has
+not answered in 10 s stops no other), so a close another load wrote late
+(its state write refused) hides the card once it lands, with no reload and
+no press. Of two loads, the later one shows the card: each session start
+takes the next number of a count the session's state keeps, then waits one
+tick of the host's clock, a wait a hot reload cancels for the load it
+replaces. A load whose number came back after a later load started takes
+nothing over, and of the loads that go on a later one ranks higher,
+whatever the clock says; no run replaces a card a later load or run
+showed, another version's included; a load whose reads answer after a later
+load took the card over leaves it to that one, and a later load whose first write of the card
+an earlier one beat takes the card over, with no second greeting; a later
+version's (an update in the session) shows its own card over the earlier
+version's, with its own greeting. The card
+counts the rows of the session start that opened it, or last moved it
+where rows go now, and of every one ranked above it, where it counts rows,
+and never one's ranked below it, whenever they land (ranks go by when each
+run's count write landed: within one load, a run's that landed after the
+next run's ranks above it): a run knows its own rank with nothing
+to read, so no read or write that answers late, before or after an update,
+moves rows from one card to another (a rule that took a delivery's place
+from the session's state after its rows landed could be held past the
+card's opening, by holding that read or the write before it). A run counts
+only once it is past the tick of the clock that a reload cancels for the
+load it replaces, so a load whose rank came back after a later load's
+counts nothing. The count of runs starts over with the session's state
+(`/clear`, `/resume` and `/branch` reset it, and fire no session start, while
+a run from before goes on sending): the first run to count afresh names a
+new lifetime for the count, and a card counts only runs of its own, so rows
+a run from before the reset lands never count on a card opened after it.
+The session's state keeps each run's rows landed so far in
+each place, with its rank, whatever the card shows (none, closed, or
+counting elsewhere), only ever up; the card sums them, so a run that says
+so again, or late, counts once, and no run's total stands for another's
+rows. The card reads them again when it opens, once its write lands, and
+at each delivery: rows its own session start landed as it read the store
+count at once. Rows of the version before an update never count on the
+updated version's card, whenever they land: the card counts only the runs
+from the one it counts from. (In the host a reload stops the load it
+replaces, so that load reports no more landings; rows it had already sent
+may still reach the table.) If rows now go somewhere else (another
+table or location, or BigQuery after a dry run), the card waits again until
+rows land there, counting from the run that moved it, and a prompt closes
+it only once they have, hiding it and writing the store's close at once, as
+Got it does; rows sent under the earlier configuration that land after the
+reload do not count, while rows of an earlier load the card counts (the one
+that opened it, after a reload took it over) do, and the load that showed
+the card says so. A close, or a stored close a takeover
+applies, is for the card of its own version and session alone, however
+often its write is tried again: a card an update put in its place in the
+session stays.
+A `-p` run draws no band: it shows nothing and leaves the store and the
+session's state alone.
+Neither the session's start, a prompt nor the writer waits on the
+session's state or the store for the card (the band, drawing it, reads the
+state); the card shows once they answer, and with no session state it does
+not show. The store makes "once" a best effort:
+
+* if the records cannot be written, the next session shows the card again,
+  and a reload in a session that keeps no `$.state` shows it as the store
+  last had it (a write that fails goes again when more rows land, a
+  landing also when a reload takes the card over, and a close at each of
+  that load's flushes until it lands: a reload before it does, the state's
+  close refused too, can show the card again);
+* if they cannot be read, or the versions greeted before cannot be listed,
+  no card shows, after a reload too, nor where no session id is known when
+  the session starts (the card's landing and close are kept under it);
+* two sessions started at the same moment can both show it;
+* a reload in the moment between Got it and its store write landing (its
+  state write refused) shows the card again, until the write lands and the
+  band draws again (a refused store close is written again at each flush
+  of the load that wrote it); a new process in that session, the greeting's write
+  lost too, can also write the greeting line once more;
+* `/clear`, `/resume` or `/branch` in the session that shows the card ends
+  it there (the session's state starts over, and no session start brings
+  it back); the version stays greeted; a card still being set up then is
+  not shown, and its version not greeted, so a later session shows it;
+* reinstalling the same version shows no card while the store keeps the
+  record.
+
 ## Configure
 
 Options are the plugin's `userConfig` (the install dialog, `/plugin configure`,
@@ -944,6 +1087,9 @@ column. Treat the dataset like the transcripts it mirrors.
 claude plugin validate plugins/bigquery-agent-analytics-mod
 cd plugins/bigquery-agent-analytics-mod && claude plugin test
 bash tests/setup.test.sh
+bash tests/version.test.sh    # plugin.json and PLUGIN_VERSION agree
+node tests/reload.test.mjs    # node 24: the welcome card across a fresh load
+bash tests/state-contract.test.sh   # the host's $.state, as the reload test models it
 python3 tests/views.test.py   # needs DuckDB: python3 -m pip install duckdb
 npx -p typescript tsc -p .    # once the host CLI has loaded the mod (below)
 ```
@@ -961,7 +1107,7 @@ test kit, with no session, sign-in, GCP or network: `$.http.fetch`,
 `$.process.run`, `$.fs` and `$.store` are stubbed, and `mock.clock` drives the
 timers; the `$.fs` stubs measure files in UTF-8 bytes and refuse a file over
 4 MiB, and the `$.store` stub a store over 4 MiB of JSON in all, as the host
-does. 336 tests cover the captured rows and their spans,
+does. 389 tests cover the captured rows and their spans,
 subagent runs in the order the host raises them (one invocation and one
 trace for the turn, a span per run, a SubagentStart that comes late or never),
 the session-start row raised before or during `session.start`'s setup,
@@ -1196,6 +1342,54 @@ And the replay that runs by itself while nothing is queued:
 * the status line for rows parked after retries, with automatic replay on
   and off.
 
+And the welcome card:
+
+* its lines for a fresh install, an update, a dry run, capture off and no
+  project or dataset, drawn through `$.ui.mount`, in a band drawn before the
+  session started too, with its transcript line;
+* the first rows landing, from a send or from a replay, with one toast and
+  the count going up; a problem notice holding the band until then;
+* the next prompt typed at the terminal after rows land, or Got it, closing
+  it (a prompt from elsewhere leaves it), and the records that keep later
+  sessions from showing it; a reload in its session showing it again as it
+  was; no card, line, record or session state in a run with no one at the
+  prompt; no card and no line for a session whose id is not known when it
+  starts; no card and no line for a session the store has closed, its
+  greeting never written, its read of that close answering or not; no card
+  and no line while the store cannot list the versions greeted before, and
+  the card naming the one it replaced once it can; a landing whose store
+  write is refused written once more rows land; a flush interval of no
+  whole number of seconds said in milliseconds; an
+  update back to an older version greeted as a change;
+* a store read or write that never answers holding up nothing, the session's
+  start included; rows that land while the store is read; a read that
+  answers after `session.start` ran again, or while a later run of it is
+  still setting up;
+* the writes: a close made while the greeting, or a landing, is still
+  being written, written at once and staying closed; the greeting line
+  written once by the run that showed the card, when `session.start` runs
+  again before the card's state write answers; a reload while either is still being
+  written showing the card as it is, its count kept, with no second line; a
+  landing an earlier load is still writing landing before or after the
+  close a reload's Got it writes, the card staying closed; a newer version
+  another session greets, before or while this card writes, kept, and a
+  late write of an older version's never greeting this one again; the
+  version it replaced, the newest greeted before; "updated" only for a
+  newer version, pre-releases part by part; the card's write queue on its
+  own, a greeting or landing whose write fails going again at the card's
+  next change; rows the writer before a reload lands counting on the card after
+  it; a close whose session-state write is refused hiding the card, and
+  the store's close keeping it hidden after a reload;
+* a reload to another table, or out of a dry run, waiting for rows to land
+  there, rows of a send or a dry-run write still in flight across it
+  included, and, while its read of the store waits, claiming no landing
+  there, a prompt then leaving the card open; a reload to capture off
+  keeping the card until Got it; the
+  writer saying where rows landed, per replay request before its file is
+  emptied, and for a dry run's write at session end;
+* its border only where the band has the rows for one, and a survey left
+  alone.
+
 And the other additions:
 
 * permission decisions: an accept during the call, a rejection after it, a
@@ -1228,6 +1422,106 @@ calls. It checks:
 * that the command the mod prints for a missing dataset makes the views in
   `<dataset>_reporting` even when the shell already sets `BQAA_VIEWS_DATASET`
   (valid or not), or another project, dataset or table.
+
+`tests/state-contract.test.sh` checks, with the host CLI's own test runtime,
+what `tests/reload.test.mjs` models of the host's `$.state`, so its stand-in
+never sets its own rules: a small mod of its own (`tests/state-contract`,
+its check kept as `state.contract.ts`, a name this mod's tests leave alone)
+reads one value, waits while another dispatch writes, then writes at the
+version it read: the other write is not seen until a write of its own,
+landed or missed, brings the whole moment up to date.
+
+`tests/version.test.sh` checks that `plugin.json` and `PLUGIN_VERSION` name
+the same version: the welcome card greets an update by the latter.
+
+`tests/reload.test.mjs` loads `hooks/register.ts` afresh, as a hot reload
+does, which the test kit cannot, under node 24 with a small stand-in for
+`$` (its `$.state` held for the session, its `$.store` across loads, store
+writes and reads held and let go in any order). Its `$.state` keeps a
+version for each value and lands a conditional write only at it, and every
+`$.state.get` of one event reads one moment until a write of its own, landed
+or missed, brings the whole moment up to date (a new version for each
+write that lands; the code compares a value's version only with that
+value's own, as the host's test runtime gives no more); its writes can be held or
+refused, its reads held. Its `$.clock.sleep` answers only in the newest
+load: a hot reload cancels the waits of the load it replaces. A load may be
+of another version of the code, its config naming that version, as after
+an update in the session (node's module hooks; no file is written). It
+checks that a card closed
+before a reload stays closed while the close is still being written; that
+a greeting still being written gives one transcript line across loads,
+also with its state write in flight; that a landing an earlier load is
+still writing never undoes the close a later load writes, before or after
+it, nor in a new process with no `$.state`; that an earlier load's late
+store read or late dry-run write leaves a later load's close standing,
+and its late rows count on the card the later load shows, with no toast
+from the earlier load; that a close whose state write was refused, but
+which the store has, keeps the card closed, and is written back to the
+state by the next load where it can be; that state writes answering late,
+a close and then an earlier landing, leave it closed; that a greeting
+an earlier load never got written is written by the load that reopens the
+card; that Got it, while the greeting or a landing is still being written
+and with its state close refused, puts the close in the store at once; that
+a new load draws the card only once its reads of the store answer, never
+when they do not, nor while its read of a close the store has waits; that a
+load whose reads answer after a later load took the card over for another
+destination leaves it to that load, its rows counting nowhere, and so does
+one whose read of the state answers late; that rows a new load lands while
+its reads wait count once, over repeated reloads, and once it takes the card
+over and moves it where it sends them; that a card moved away and back
+counts from the load that moved it back, no row of an earlier load counting
+there again; that a new load that cannot read the store
+shows no card; that a reload whose takeover write answers after another
+load's Got it (its state close refused) shows no card; that of two loads
+whose first card writes wait, the later takes the card over when the
+earlier's lands first, with one greeting; that a prompt after rows landed,
+its state close refused, closes the card here and in the store; that
+loads in the same millisecond, or with the clock set back, rank by when
+they started; that a load replaced while its read or write of the count is
+still out (its cancelled wait never answering, or refused) takes nothing
+over, the later load keeping its destination, counting its rows and closing
+on the next prompt; that a close an earlier load writes late, its state
+close refused, hides the card a later load took over once it lands; that
+a session resumed with no state after Got it, the greeting's write lost,
+shows no card and greets no more, its read of the close answering or not;
+that a run whose read of the state answers after a later load showed
+another version's card leaves that card alone, with reads that see what
+stands at once too; that a read of the close that never answers stops no
+read of it ten seconds on, and one that answers after the next began
+leaves that one's turn alone; that its own `$.state` reads one moment an
+event, brought up to date whole by a conditional write of its own, landed
+or missed; that no row of the version before an update counts on the
+updated version's card, whenever it lands or is recorded: after the card
+opened, after the earlier card was closed, while the session showed no
+card, while the update read the store, recorded late, or with a later total
+of its recorded first, also across a reset of the session's state, with
+no session start, between the earlier load's rows and the update, its
+record's write held from before or after the reset until the update's card
+opened; that the
+updated version's own rows count once,
+whatever order their records land in, also one that landed while its
+card's first write waited, its first landing and toast its own when a row
+of the version before lands meanwhile; that a load whose rank came back
+after a later load took one counts none of its rows; that a run whose card
+the session's state was reset under (`/clear`) shows none after it, a card
+it was writing then going again, also in a load that never hears of the
+reset (its write shows it), which leaves the next update's card, and a card
+of this session the next run showed again, as they are; that a card of the
+lifetime before a reset, of whatever rank, keeps no update from showing its
+card, and is taken over, with no count and no landing of its own lifetime,
+by the session's next run; that a card a run wrote as a reset came goes
+again even when that run's own rows counted on it meanwhile; that a landing an
+earlier load never got written is written by the load that takes the card
+over, and a store close whose write was refused goes again at the next
+flush; that where no session id is
+known no card shows and no one is greeted, after a reload too;
+that a Got it, a takeover's stored close or a
+prompt in a load of the
+version before an update, its write or its reads answering late, never
+closes the card of the version after it; that of the first card writes of
+the versions before and after an update, landing in either order, the
+later version's card shows, with its own greeting; and that draws of the
+card while its read of the close waits start no other read of it.
 
 `tests/views.test.py` runs both views in DuckDB. It uses five dialect
 substitutions, and each must match. The fixture is a table shared by this
@@ -1307,11 +1601,13 @@ hooks/lib/bigquery.ts        insertAll / tables.insert requests, answer classifi
 hooks/lib/deadletter.ts      dead-letter file format, files sized in UTF-8 bytes
 hooks/lib/config.ts          options and environment
 hooks/lib/status.ts          /bqaa-status text
+hooks/lib/welcome.ts         the welcome card's text, and its records in the store: the version greeted, the card's landing, its close
 setup.sh                     creates the dataset, table, views dataset and views (bq CLI)
 sql/                         DDL and sample queries
 sql/views/                   the usage views setup.sh makes
 examples/sample-rows.jsonl   fixture output
-tests/                       plugin-test suites, and setup.test.sh for setup.sh
+tests/                       plugin-test suites, setup.test.sh for setup.sh, version.test.sh, and reload.test.mjs
+types/index.d.ts             the values the mod keeps in the session's $.state
 ```
 
 The credential notice, the identity options, the permission decisions,

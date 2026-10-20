@@ -8,6 +8,8 @@
 import { type Engine, type MockClock, mock } from 'claude-code/testing'
 import type { On, TurnStepChunk, TurnStepResult } from 'claude-code'
 
+import { PLUGIN_VERSION } from '../hooks/lib/config.ts'
+
 export type FetchCall = { url: string; method: string; headers: Record<string, string>; body: string; answered: number | 'reject' | 'hang' }
 export type FetchReply = { status: number; text: string } | { reject: string } | { hang: true }
 export type StepReply = { chunks?: TurnStepChunk[]; result: Partial<TurnStepResult> }
@@ -43,6 +45,8 @@ export type World = {
   sessionIdRefused: boolean
   // Makes `$.fs.write` refuse every write, or the writes this picks.
   failWrites: boolean
+  // `$.store.keys` refused.
+  refuseKeys: boolean
   refuseWrite: ((path: string, text: string) => boolean) | null
   // When files were last written, as the listing says (none: 0).
   mtimes: Map<string, number>
@@ -67,6 +71,8 @@ export type World = {
   releaseHung: (status: number, text: string) => void
   // The mod's `$.store`, each value read back as JSON, as the host keeps it.
   store: Map<string, unknown>
+  // The slash commands the mod registered.
+  registered: string[]
 }
 
 export type Row = {
@@ -118,7 +124,14 @@ export const USAGE = {
   model: 'example-model',
 }
 
-export function setUp(on: On, env: Record<string, string> = {}, store: Record<string, unknown> = {}): World {
+// The store once an earlier session greeted this version: the tests start
+// from that, but the welcome card's own.
+export const GREETED = {
+  welcome: { version: PLUGIN_VERSION, previous: null, sessionId: 'an-earlier-session' },
+  [`welcome:${PLUGIN_VERSION}`]: { sessionId: 'an-earlier-session', previous: null },
+} as const
+
+export function setUp(on: On, env: Record<string, string> = {}, store: Record<string, unknown> = GREETED): World {
   const clock = mock.clock(on, { now: 0 })
   mock.env(on, { HOME, USER: 'dev', ...env })
   const asJson = (value: unknown): unknown => JSON.parse(JSON.stringify(value)) as unknown
@@ -144,6 +157,7 @@ export function setUp(on: On, env: Record<string, string> = {}, store: Record<st
     sessionId: SESSION_ID,
     sessionIdRefused: false,
     failWrites: false,
+    refuseKeys: false,
     refuseWrite: null,
     mtimes: new Map(),
     hangWrites: false,
@@ -169,6 +183,7 @@ export function setUp(on: On, env: Record<string, string> = {}, store: Record<st
       for (const resolve of hung.splice(0)) resolve({ value: { status, ok: status >= 200 && status < 300, headers: {}, text } })
     },
     store: new Map(Object.entries(store).map(([key, value]) => [key, asJson(value)])),
+    registered: [],
   }
 
   on('store.get', ($, e) => ({ value: world.store.get(e.key) }))
@@ -183,12 +198,15 @@ export function setUp(on: On, env: Record<string, string> = {}, store: Record<st
     world.store.delete(e.key)
     return { value: undefined }
   })
-  on('store.keys', () => ({ value: [...world.store.keys()] }))
+  on('store.keys', () => (world.refuseKeys ? { deny: 'the store could not be listed' } : { value: [...world.store.keys()] }))
   on('session.start', () => ({ cwd: '/work/my-repo' }))
   on('session.end', ($, e) => ({ sessionId: e.sessionId }))
   on('session.id', () => (world.sessionIdRefused ? { deny: 'refused by policy' } : { value: world.sessionId }))
   on('session.version', () => ({ value: { version: '2.1.296', base: '2.1.296' } }))
-  on('command.register', ($, e) => ({ value: { command: e.name } }))
+  on('command.register', ($, e) => {
+    world.registered.push(e.name)
+    return { value: { command: e.name } }
+  })
   on('ui.status', ($, e) => {
     world.statusLines.push(e.text)
     return { value: undefined }
