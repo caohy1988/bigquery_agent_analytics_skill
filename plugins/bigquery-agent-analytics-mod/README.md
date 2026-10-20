@@ -669,16 +669,25 @@ GROUP BY model
   mid-replay, once no other session's lease on the file stands (a lease
   lasts ten minutes; force passes the mark, not the lease); run while that
   session is in fact still replaying the file, it can send a refused row
-  once more, as two replays of one file each keep what they learned. The writer that takes over when the
+  once more, as two replays of one file each keep what they learned.
+  Likewise a file of what is left of each of two outcomes of one file
+  recorded at once can go, and so can one first replayed more than a day
+  after its parent was done (its parent's records swept): a row can arrive
+  twice, and `event_id` dedups it. The writer that takes over when the
   mod reloads in a session holds the outcomes the one before it held, an
   outcome that one's replay comes to after the reload included, but not
   its marks: a mark of the one before whose outcome it does not hold keeps
-  it from sending the file, as another session's does. Before
+  it from sending the file, as another session's does. It takes that
+  one's queue too, so the rows of a batch the one before still had out,
+  asked for again, go with this writer's own. Before
   it writes what is left, a replay records its outcome: one record per
   file, with what became of each row (a letter each, and for a refused row
   a number naming its reason), the refusals' reasons (16 at most: rows
   refused for any reason past the first 15 share one that says so), and
-  the names of the files of what is left, each marked once written. The
+  the names of the files of what is left, each marked once written. A
+  writer that resumes an outcome reads the file again first: read
+  part-written, or other than as listed, it keeps its record and waits
+  until it reads whole, as a file with no record does. The
   record goes to `$.store`, which holds 4 MiB of JSON in all; one over
   64 KiB, or one the store does not take, goes to the files beside the
   replayed one (`outcome-` and its name, then `outcome-b-` and it, which no
@@ -926,7 +935,7 @@ test kit, with no session, sign-in, GCP or network: `$.http.fetch`,
 `$.process.run`, `$.fs` and `$.store` are stubbed, and `mock.clock` drives the
 timers; the `$.fs` stubs measure files in UTF-8 bytes and refuse a file over
 4 MiB, and the `$.store` stub a store over 4 MiB of JSON in all, as the host
-does. 309 tests cover the captured rows and their spans,
+does. 313 tests cover the captured rows and their spans,
 subagent runs in the order the host raises them (one invocation and one
 trace for the turn, a span per run, a SubagentStart that comes late or never),
 the session-start row raised before or during `session.start`'s setup,
@@ -1024,7 +1033,9 @@ And the replay that runs by itself while nothing is queued:
   outcome recorded before any of what is left was written, written whole
   by the next writer; a file of what is left that `/bqaa-backfill` sent and
   emptied meanwhile never written again; a record that does not fit the
-  file (another size, or fewer lines) never trusted; the writer that
+  file (another size, or fewer lines) never trusted, and a file with a
+  record read part-written, written again longer or changed in place
+  keeping its record and waiting until it reads whole; the writer that
   recorded an outcome, back after another writer finished it and replayed
   what it left, writing none of it again; two writers replaying one file
   at once writing what it left once; a record that cannot be read leaving
@@ -1064,7 +1075,8 @@ And the replay that runs by itself while nothing is queued:
   or beside the file; no record written again when it already holds the
   outcome; a writer that takes over in the same session holding what the
   one before held, and an outcome that one's replay comes to after the
-  takeover, sending none of the file again; records of files emptied more than a day ago emptied;
+  takeover, sending none of the file again, and sending the rows of a
+  batch the one before still had out, asked for again; records of files emptied more than a day ago emptied;
   a record another session writes late, beside a file finished meanwhile,
   never standing over its done mark, and a replay with nothing left to
   write never writing its done mark over another's; a replay whose mark

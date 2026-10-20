@@ -369,7 +369,7 @@ function leftoverFiles(file: ParsedFile, fileKind: DeadLetterKind, outcome: Outc
 }
 
 export class Writer {
-  readonly queue: BoundedQueue
+  queue: BoundedQueue
   readonly counters: Counters = {
     captured: 0,
     sent: 0,
@@ -483,9 +483,12 @@ export class Writer {
 
   // ---- background --------------------------------------------------------
 
-  // Takes over the rows another writer still queues (oldest first).
+  // Takes over the rows another writer still queues (oldest first), and
+  // the queue itself: a batch it still has out, asked for again, comes back
+  // to this writer's queue, which this writer sends.
   adopt(previous: Writer): void {
     this.queue.unshift(previous.queue.takeAll())
+    previous.queue = this.queue
     // And the outcomes it holds, one whose record no store or file took
     // included: the same map, so an outcome a replay still under way there
     // comes to is held here too. Its marks stay its own: one with no
@@ -1740,6 +1743,10 @@ export class Writer {
     // its record is left as that writer left it.
     if (text === '') return undefined
     const lines = parseFile(text)
+    // Not whole, or not as long as it was listed (a write still under way, or
+    // one since): the record is kept, and the file waits, as one with no
+    // record does, until it reads whole.
+    if (!lines.complete || (source.size >= 0 && utf8Length(text) !== source.size)) return undefined
     const texts = fitsLines(lines, outcome) ? leftoverFiles(lines, fileKind, outcome, source.name) : null
     if (texts === null || texts.length !== paths.length) {
       // Not this file's outcome after all: replay it afresh.

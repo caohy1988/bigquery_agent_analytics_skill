@@ -1816,6 +1816,63 @@ test('a writer that takes over from the one before it in the same session holds 
   expect([w.sentOf(a), w.copiesOf(a)]).toEqual([1, 1])
 })
 
+for (const read of ['part-written', 'written again, longer', 'changed in place, its seal not matching'] as const) {
+  test(`a file whose outcome is recorded, read ${read} after the listing, keeps its record and waits: once it reads whole, the next replay resumes it, sending none of it`, async () => {
+    const w = twoWriters(() => OK_INSERT)
+    const name = 'retry-20261013T200102003Z-earlier-1.jsonl'
+    const source = `/dl/${TABLE_REF}/${name}`
+    const a = 'a'.repeat(32)
+    const text = packFiles([line(a, 'retry')])[0] as string
+    w.files.set(source, text)
+    // A replay's outcome: the row refused, its rejected copy not written yet.
+    const rejected = `/dl/${TABLE_REF}/rejected-20261013T200103003Z-earlier-2.jsonl`
+    w.store.set(`replayed:${TABLE_REF}/${name}`, { size: new TextEncoder().encode(text).length, fates: 'R', reasons: ['invalid: no such field: extra'], refusals: [0], files: [rejected], written: [false], waits: false, seq: 1 })
+    // Its first read after the listing finds a write under way over it.
+    const other = read === 'part-written' ? text.slice(0, Math.floor(text.length / 2)) : read === 'written again, longer' ? (packFiles([line(a, 'retry'), line('c'.repeat(32), 'retry')])[0] as string) : text.replace(a, 'b'.repeat(32))
+    expect(other === text).toBe(false)
+    let swapped = false
+    w.holdReads((_, path) => {
+      if (path !== source || swapped) return undefined
+      swapped = true
+      w.files.set(source, other)
+      return undefined
+    })
+    await w.writer('a-session').backfill(['spill', 'retry'], 'auto')
+    expect([w.sentOf(a), w.store.has(`replayed:${TABLE_REF}/${name}`), w.files.get(rejected) ?? '']).toEqual([0, true, ''])
+    w.files.set(source, text)
+    await w.writer('a-session').backfill(['spill', 'retry'], 'auto')
+    expect([w.sentOf(a), w.copiesOf(a), w.files.get(source)]).toEqual([0, 1, ''])
+  })
+}
+
+test('a batch the writer before had out when the next writer took over, asked for again, goes with the next writer\'s rows', async () => {
+  let calls = 0
+  const w = twoWriters(() => (++calls === 1 ? { status: 503, text: 'backend error' } : OK_INSERT))
+  const a = 'a'.repeat(32)
+  const before = w.writer('a-session')
+  before.enqueue((JSON.parse(line(a, 'retry')) as { row: Parameters<Writer['enqueue']>[0] }).row, 0)
+  let asked = (): void => undefined
+  let answer = (): void => undefined
+  const atRequest = new Promise<void>(resolve => (asked = resolve))
+  const answered = new Promise<void>(resolve => (answer = resolve))
+  let held = false
+  w.hold(() => {
+    if (held) return undefined
+    held = true
+    asked()
+    return answered
+  })
+  const flushing = before.flush()
+  await atRequest
+  const after = w.writer('a-session')
+  after.adopt(before)
+  answer()
+  await flushing
+  expect(w.sentOf(a)).toBe(1)
+  await after.flush()
+  expect(w.sentOf(a)).toBe(2)
+})
+
 test('rows with no id alike in two files count as two refused', async () => {
   const w = twoWriters(() => FIRST_REFUSED)
   const noId = JSON.parse(line('c'.repeat(32), 'retry')) as { row: { event_id?: string } }
