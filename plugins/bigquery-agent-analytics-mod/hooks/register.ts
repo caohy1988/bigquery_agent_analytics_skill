@@ -392,7 +392,7 @@ async function startWelcome($: EngineInterface, e: SessionStartInput, sessionId:
     // shows no card, and a card it wrote as the reset came goes again,
     // unless a later run wrote since.
     if (resets !== resetAt || !(await inLifetime($, run))) {
-      if (wrote.isSet) await $.state.set(WELCOME_STATE, null, { ifVersion: wrote.version }).catch(() => undefined)
+      if (wrote.isSet) await takeBack($, me, run, null).catch(() => undefined)
       return
     }
     isSet = wrote.isSet
@@ -460,8 +460,11 @@ async function takeOver($: EngineInterface, sessionId: string, start: number, ru
     if (reopened === null) return null
     // Moved where rows go now, or of the lifetime before a reset: it counts
     // from this run on, so rows that went there before never count again.
-    const anew = reopened.welcome.destination !== card.destination || card.lifetime !== run.lifetime
-    return { ...reopened.welcome, owner: me, rank, since: anew ? rank : card.since, lifetime: run.lifetime }
+    // Of the lifetime before, its count and landing go too: none is this
+    // lifetime's.
+    const stale = card.lifetime !== run.lifetime
+    const anew = reopened.welcome.destination !== card.destination || stale
+    return { ...reopened.welcome, ...(stale ? { sent: 0, landedAt: null, landedTo: null } : {}), owner: me, rank, since: anew ? rank : card.since, lifetime: run.lifetime }
   }
   // As `changeCard`, but a run of the lifetime before a reset of the
   // session's state (as its write, landed or missed, shows) takes over
@@ -476,7 +479,7 @@ async function takeOver($: EngineInterface, sessionId: string, start: number, ru
       const written = { ...next, closed: card.closed || next.closed }
       const wrote = await $.state.set(WELCOME_STATE, written, { ifVersion: held.version })
       if (!(await inLifetime($, run))) {
-        if (wrote.isSet) await $.state.set(WELCOME_STATE, card, { ifVersion: wrote.version }).catch(() => undefined)
+        if (wrote.isSet) await takeBack($, me, run, card).catch(() => undefined)
         return
       }
       if (wrote.isSet) {
@@ -621,6 +624,19 @@ async function inLifetime($: EngineInterface, run: Run): Promise<boolean> {
     return (await $.state.get(LOADS_STATE)).value?.lifetime === run.lifetime
   } catch {
     return false
+  }
+}
+
+// Puts `value` (null: no card) back over the card the run `owner` names, of
+// lifetime `run`, wrote as a reset of the session's state came: while the
+// state still holds that card, however often that run's own counts changed
+// it since, and never over one a later run wrote.
+async function takeBack($: EngineInterface, owner: string, run: Run, value: Welcome | null): Promise<void> {
+  for (let i = 0; i < 8; i += 1) {
+    const held = await $.state.get(WELCOME_STATE)
+    const card = held.value ?? null
+    if (card === null || card.owner !== owner || card.lifetime !== run.lifetime) return
+    if ((await $.state.set(WELCOME_STATE, value, { ifVersion: held.version })).isSet) return
   }
 }
 

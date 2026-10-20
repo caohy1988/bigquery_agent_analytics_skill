@@ -1376,6 +1376,62 @@ const tests = {
     await c.land()
     assert.equal(h.card().sent, 1)
   },
+  ...Object.fromEntries(
+    [false, true].flatMap(liveReads => [false, true].map(dryRun => [liveReads, dryRun])).map(([liveReads, dryRun]) => [
+      `a card a run wrote as the session's state was reset, its own rows counted on it while it is taken back, goes all the same (${liveReads ? 'reads that see what stands' : 'one moment an event'}, ${dryRun ? 'a dry run' : 'BigQuery'}): the next load counts from itself`,
+      async () => {
+        let holdCard = true
+        let holdBack = false
+        const h = host({ liveReads, holdState: (value, key) => key === 'welcome' && ((holdCard && value?.version === PLUGIN_VERSION) || (holdBack && value === null)) })
+        const wire = l => {
+          l.$.env.get = async name => ({ HOME: '/home/dev', BQAA_ACCESS_TOKEN: 'synthetic-token-for-offline-test' })[name]
+          l.$.http.fetch = async () => ({ status: 200, text: '{"kind":"bigquery#tableDataInsertAllResponse"}' })
+          return l
+        }
+        const a = wire(await load(h, { dryRun }))
+        await a.start()
+        assert.equal(h.held.length, 1)
+        // /clear, then /resume of this session: each resets the state, and the load goes on.
+        h.state.clear()
+        h.sessionId = 'after-clear'
+        await a.fire('classic.SessionStart', { source: 'clear', session_id: h.sessionId, model: 'example-model', cwd: '/work' })
+        h.state.clear()
+        h.sessionId = SESSION
+        await a.fire('classic.SessionStart', { source: 'resume', session_id: h.sessionId, model: 'example-model', cwd: '/work' })
+        holdCard = false
+        holdBack = true
+        h.release('state')
+        await settle()
+        assert.equal(h.held[0]?.value, null)
+        // The rows of the clear and the resume land while the card waits to go.
+        await a.flush()
+        assert.equal(h.card().sent, 2)
+        holdBack = false
+        h.release('state')
+        await settle()
+        assert.deepEqual([h.card() ?? null, a.greetings(), await a.shown()], [null, 0, false])
+        const b = wire(await load(h, { dryRun }))
+        await b.start()
+        assert.deepEqual([await b.shown(), h.card().sent, h.card().landedAt], [true, 0, null])
+        await b.prompt()
+        assert.equal(h.card().closed, false)
+      },
+    ]),
+  ),
+  async 'this session\'s card of the lifetime before a reset, landed, is taken over with no count and no landing: the next prompt leaves it until this lifetime lands'() {
+    const h = host()
+    h.store.set(`welcome:${PLUGIN_VERSION}`, { version: PLUGIN_VERSION, sessionId: SESSION, previous: null })
+    h.state.set('welcome', { value: { version: PLUGIN_VERSION, previous: null, sessionId: SESSION, landedAt: 1, landedTo: 'dry run: /home/dev/.bqaa-mod/dry-run', closed: false, sent: 7, destination: 'dry run: /home/dev/.bqaa-mod/dry-run', owner: 'gone:1', rank: 1, since: 1, lifetime: 'before' }, version: 1 })
+    const a = await load(h)
+    await a.start()
+    assert.equal(await a.shown(), true)
+    assert.deepEqual([h.card().sent, h.card().landedAt, h.card().landedTo], [0, null, null])
+    await a.prompt()
+    assert.equal(h.card().closed, false)
+    // The prompt's row and the next one land: this lifetime's own.
+    await a.land()
+    assert.deepEqual([h.card().sent, typeof h.card().landedAt], [2, 'number'])
+  },
   async 'a landing an earlier load never got written is written by the load that takes the card over'() {
     let holding = false
     const h = host({ hold: key => holding && key === OWN })

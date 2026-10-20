@@ -304,15 +304,17 @@ not show. The store makes "once" a best effort:
 * if the records cannot be written, the next session shows the card again,
   and a reload in a session that keeps no `$.state` shows it as the store
   last had it (a write that fails goes again when more rows land, a
-  landing also when a reload takes the card over, and a close at each flush
-  until it lands);
+  landing also when a reload takes the card over, and a close at each of
+  that load's flushes until it lands: a reload before it does, the state's
+  close refused too, can show the card again);
 * if they cannot be read, or the versions greeted before cannot be listed,
   no card shows, after a reload too, nor where no session id is known when
   the session starts (the card's landing and close are kept under it);
 * two sessions started at the same moment can both show it;
 * a reload in the moment between Got it and its store write landing (its
   state write refused) shows the card again, until the write lands and the
-  band draws again (a refused store close is written again at each flush); a new process in that session, the greeting's write
+  band draws again (a refused store close is written again at each flush
+  of the load that wrote it); a new process in that session, the greeting's write
   lost too, can also write the greeting line once more;
 * `/clear`, `/resume` or `/branch` in the session that shows the card ends
   it there (the session's state starts over, and no session start brings
@@ -1506,7 +1508,9 @@ it was writing then going again, also in a load that never hears of the
 reset (its write shows it), which leaves the next update's card, and a card
 of this session the next run showed again, as they are; that a card of the
 lifetime before a reset, of whatever rank, keeps no update from showing its
-card, and is taken over, counting afresh, by the session's next run; that a landing an
+card, and is taken over, with no count and no landing of its own lifetime,
+by the session's next run; that a card a run wrote as a reset came goes
+again even when that run's own rows counted on it meanwhile; that a landing an
 earlier load never got written is written by the load that takes the card
 over, and a store close whose write was refused goes again at the next
 flush; that where no session id is
