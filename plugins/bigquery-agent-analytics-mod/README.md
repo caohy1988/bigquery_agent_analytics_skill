@@ -273,8 +273,10 @@ so again, or late, counts once, and no run's total stands for another's
 rows. The card reads them again when it opens, once its write lands, and
 at each delivery: rows its own session start landed as it read the store
 count at once. Rows of the version before an update never count on the
-updated version's card; in the host a reload stops the load it replaces,
-so they cannot land after it anyway. If rows now go somewhere else (another
+updated version's card, whenever they land: the card counts only the runs
+from the one it counts from. (In the host a reload stops the load it
+replaces, so that load reports no more landings; rows it had already sent
+may still reach the table.) If rows now go somewhere else (another
 table or location, or BigQuery after a dry run), the card waits again until
 rows land there, counting from the run that moved it, and a prompt closes
 it only once they have, hiding it and writing the store's close at once, as
