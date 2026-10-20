@@ -24,7 +24,7 @@ import type { BqaaRow } from './lib/rows.ts'
 import { redactDiagnostic } from './lib/sanitize.ts'
 import { type DeadLetterSummary, formatStatus } from './lib/status.ts'
 import { type StepCtx, type StepResult, type ToolCtx, type ToolOutcome, Tracer, errorText } from './lib/tracer.ts'
-import { type Io, Writer } from './lib/writer.ts'
+import { COMMAND_LINE_CHARS, type Io, Writer } from './lib/writer.ts'
 
 let options: Options = {}
 let config: Config = resolveConfig({}, {})
@@ -276,7 +276,8 @@ export const register: Register = (on, registered) => {
           const read = await $.fs.read(path)
           return typeof read === 'string' ? read : ''
         },
-        listDir: async path => (await $.fs.list(path)).map(entry => ({ name: entry.name, kind: entry.kind, size: entry.size })),
+        exists: path => $.fs.exists(path),
+        listDir: async path => (await $.fs.list(path)).map(entry => ({ name: entry.name, kind: entry.kind, size: entry.size, mtimeMs: entry.mtimeMs })),
         storeGet: key => $.store.get(key),
         storeSet: (key, value) => $.store.set(key, value),
         storeDelete: key => $.store.delete(key),
@@ -285,12 +286,17 @@ export const register: Register = (on, registered) => {
         toast: text => $.ui.toast(clean(text, 500), { timeoutMs: 15_000 }),
         notice: text => $.ui.log(clean(text)),
         redraw: () => $.ui.invalidate('ui.render'),
+        // Where setup.sh is, for the fix when BigQuery cannot find the dataset.
+        pluginRoot: $.plugin.root,
       }
       const previous = writer
       writer = new Writer(io, () => config, () => tracer.sessionId)
       // session.start can fire again without a reload (the plugin was turned
       // off and on): keep what the previous writer still held.
       if (previous) writer.adopt(previous)
+      // The host keeps one status line per plugin until it is replaced, a
+      // reload included: this writer starts with none, as it holds no notice.
+      writer.clearStatus()
       for (const held of early.splice(0)) writer.enqueue(held.row, held.redactions)
       const [sessionId, version] = await Promise.all([$.session.id().catch(() => null), $.session.version().catch(() => null)])
       tracer.setSession({ sessionId, cwd: e.cwd, engineVersion: version?.version ?? null })
@@ -327,7 +333,7 @@ export const register: Register = (on, registered) => {
       internalErrors += 1
     }
     try {
-      await $.command.register({ name: 'bqaa-backfill', description: 'BigQuery Agent Analytics: resend rows parked in the dead-letter directory', immediate: true })
+      await $.command.register({ name: 'bqaa-backfill', description: 'BigQuery Agent Analytics: resend rows parked in the dead-letter directory', argumentHint: '[force]', immediate: true })
     } catch {
       internalErrors += 1
     }
@@ -385,15 +391,17 @@ export const register: Register = (on, registered) => {
   }).catch(($, e, next) => next(e))
 
   // The band above the prompt while rows cannot be written for lack of
-  // credentials or permission: what is wrong, the fix, and how many rows
-  // wait. What the mods after this one draw there stays, under this line; a
-  // survey has the band to itself.
+  // credentials or permission, or because BigQuery cannot find the dataset:
+  // what is wrong, the fix (for a missing dataset, the setup.sh command on a
+  // line of its own), and how many rows wait. What the mods after this one
+  // draw there stays, under these lines; a survey has the band to itself.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const theirs = await next(e)
     const current = writer
     const problem = current?.problem ?? null
     if (current === null || problem === null || e.props.hasSurvey) return theirs
     const { headline, fix } = current.problemText()
+    const run = current.commandLine()
     const { Box, Text } = $.ui.resolve(e)
     const line = Box({
       flexDirection: 'row',
@@ -401,10 +409,11 @@ export const register: Register = (on, registered) => {
       children: [
         Text({ color: 'warning', bold: true, children: '⚠ BQAA: ' }),
         Text({ children: clean(`rows are not being written: ${headline}. To fix, ${fix}.`, 500) }),
-        Text({ dimColor: true, children: ` ${current.waitingRows()} row(s) waiting.` }),
+        Text({ dimColor: true, children: ` ${current.waitingText()} row(s) waiting.` }),
       ],
     })
-    return Box({ flexDirection: 'column', children: [line, theirs] })
+    const lines = run === null ? [line] : [line, Text({ dimColor: true, children: clean(run, COMMAND_LINE_CHARS) })]
+    return Box({ flexDirection: 'column', children: [...lines, theirs] })
   })
 
   // Permission decisions, from the host's own collector records: each record
@@ -542,15 +551,19 @@ export const register: Register = (on, registered) => {
       const elsewhere = summary.elsewhere > 0 ? ` ${summary.elsewhere} file(s) elsewhere in ${config.deadLetterDir} are for other tables or an older layout; they are replayed only under a configuration for their table.` : ''
       return say(`BigQuery Agent Analytics mod: no dead-letter files for ${tableRef(config)} in ${summary.dir}.${elsewhere}`)
     }
-    // Runs in the background: the command returns now. Its result is a
-    // transcript line.
+    // `force` replays afresh, too, a file another session's replay holds (its
+    // mark, or its record cut off part-way): for a session that stopped
+    // mid-replay. Runs in the background: the command returns now. Its
+    // result is a transcript line.
+    const force = (e.args ?? '').trim() === 'force'
     void current
-      .backfill(['spill', 'retry', 'rejected'], 'command')
+      .backfill(['spill', 'retry', 'rejected'], force ? 'force' : 'command')
       .then(report => {
+        const refused = report.rowsRefused ? `, ${report.rowsRefused} of them refused` : ''
         const other = report.otherTableRows ? ` (${report.otherTableRows} for another table)` : ''
         const oversized = report.oversizedFiles.length ? `, ${report.oversizedFiles.length} file(s) too large to read` : ''
         const incomplete = report.incompleteFiles.length ? `, ${report.incompleteFiles.length} file(s) without a completion record kept` : ''
-        $.ui.log(clean(`bqaa backfill: ${report.files} file(s), ${report.rowsSent} row(s) sent, ${report.rowsLeft} left${other}${oversized}${incomplete}${report.error ? `; stopped: ${report.error}` : ''}`, 500))
+        $.ui.log(clean(`bqaa backfill: ${report.files} file(s), ${report.rowsSent} row(s) sent, ${report.rowsLeft} left${refused}${other}${oversized}${incomplete}${report.held ? `; left waiting: ${report.held}` : ''}${report.error ? `; stopped: ${report.error}` : ''}`, 500))
       })
       .catch(() => {
         internalErrors += 1

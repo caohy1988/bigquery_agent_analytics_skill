@@ -87,5 +87,19 @@ check 'no project: refused' bash -c "$(declare -f run_setup); work='$work'; plug
 check 'no project: says which variable' has 'set BQAA_PROJECT_ID' "$log.err"
 check 'an unknown argument is refused' bash -c "! bash '$plugin/setup.sh' --force 2>/dev/null"
 
+# 6. The command the mod prints when BigQuery cannot find the dataset (the
+# shape tests/destination.test.ts holds it to) sets every name setup.sh
+# reads: a views dataset, project, dataset or table already set in the shell
+# that runs it, valid or not, changes nothing.
+printed="BQAA_PROJECT_ID=my-gcp-project BQAA_DATASET=agent_analytics BQAA_TABLE=agent_events BQAA_VIEWS_DATASET=agent_analytics_reporting BQAA_LOCATION=US bash '$plugin/setup.sh'"
+for inherited in ambient_reports v-w; do
+  log="$work/printed-$inherited.log"
+  : >"$log"
+  check "the printed command runs with BQAA_VIEWS_DATASET=$inherited in the shell" env -i PATH="$work/bin:/usr/bin:/bin" BQ_LOG="$log" BQAA_VIEWS_DATASET="$inherited" GCP_PROJECT_ID=other-project BQ_DATASET=other_dataset BQ_TABLE=other_table bash -c "$printed >'$log.out' 2>'$log.err'"
+  check "  its views go to agent_analytics_reporting" has 'CREATE OR REPLACE VIEW `my-gcp-project.agent_analytics_reporting.daily_usage_by_user`' "$log"
+  check "  nothing goes to $inherited" lacks "$inherited" "$log"
+  check "  nothing goes to the shell's project, dataset or table" bash -c "! grep -qE 'other-project|other_dataset|other_table' '$log'"
+done
+
 echo "$passed passed, $failed failed"
 ((failed == 0))

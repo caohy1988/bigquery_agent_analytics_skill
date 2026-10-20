@@ -15,11 +15,15 @@ so the [analysis skill](../../bigquery-agent-analytics-skill) and its queries
 work on what it writes.
 
 Status: early. Mods are an early-access feature of the host CLI (v2.1.287 or
-later); this mod was built against **v2.1.296** and is tested with 2.1.296
-and 2.1.299. Its writer is tested against a scripted BigQuery API (see
+later); this mod was built against **v2.1.296** and is tested with 2.1.296,
+2.1.299 and 2.1.302. Its writer is tested against a scripted BigQuery API (see
 [Testing](#testing)). It has also run live: a real session (host 2.1.299)
 wrote its 14 rows to a test dataset, the last of them through a spill file
-that the next session replayed, and the rows were read back with `bq`.
+that the next session replayed, and the rows were read back with `bq`. On
+2.1.302, installed from GitHub, sessions with tool calls, a subagent and a
+permission prompt were read back the same way, as was a session started
+before its dataset existed: its rows waited, then landed on their own once
+`setup.sh` had made the dataset.
 
 ## Why a mod, and not settings hooks
 
@@ -38,8 +42,9 @@ host CLI, which lets this one keep a hard rule:
   `$.clock` timers does that. Two lifecycle hooks do bounded work of their own
   before passing their event on: `session.start` sets the writer up and
   registers the three commands, and `session.end` writes what is still queued
-  to a spill file, waiting at most `BQAA_EXIT_FLUSH_MS` (800 ms) inside the
-  host's end-of-session bound. That write is the only wait on the disk.
+  to a spill file, waiting at most `BQAA_EXIT_FLUSH_MS` (800 ms), inside the
+  host's end-of-session bound, for that write and for any dead-letter file
+  still being written. Those writes are the only wait on the disk.
 * If the mod's own code throws, the event goes on as if the mod were not
   installed (fail open). The six observers the validator lists as gating
   hooks (`classic.SessionStart`, `classic.SubagentStart`,
@@ -50,7 +55,7 @@ host CLI, which lets this one keep a hard rule:
 * `prompt.submit` passes every prompt on, first and as it came, whatever
   the credentials do: no prompt waits on a token or on BigQuery. While rows
   cannot be written, a notice says so (see
-  [If no credentials work](#if-no-credentials-work)).
+  [If rows cannot be written](#if-rows-cannot-be-written)).
 
 The test suite holds the mod to that: a test makes BigQuery hang forever and
 then runs 25 tool calls through the mod, and a test checks that no hook,
@@ -89,6 +94,8 @@ is what a person would have seen as the CLI hanging.
                                                      3 retries, then dead-letter
                                                           │ 401: a fresh token, one retry at once
                                                           │ 404 table: create it, retry
+                                                          │ 404 still (no dataset, or too new):
+                                                          │   notice with the setup.sh command, retry
                                                           │ 400/403/invalid row: refused
                                                           ▼
                      $.fs.write  <deadLetterDir>/<project.dataset.table>/{spill,retry,rejected}-*.jsonl
@@ -99,16 +106,56 @@ is what a person would have seen as the CLI hanging.
 At `session.end` (the process is exiting) the mod starts no request: the
 rows still queued, and any whose request has not answered yet, go to a spill
 file in the table's dead-letter subdirectory, and the hook waits at most
-`BQAA_EXIT_FLUSH_MS` for that write. The next session sends the file 15
-seconds after it starts (or `/bqaa-backfill` does). A row whose request was
-still in flight can arrive twice; `event_id` dedups it. `/clear` and
-`/resume` keep sending as usual.
+`BQAA_EXIT_FLUSH_MS` for that write and for the files of refused or parked
+rows still being written (it never waits for a request). A write not done
+by then may end with the process, and its rows with it. The next session
+sends the file 15 seconds after it starts (or `/bqaa-backfill` does). A row
+whose request was still in flight can arrive twice; `event_id` dedups it.
+`/clear` and `/resume` keep sending as usual.
 
 ## Install
 
 You need the host CLI at v2.1.287 or later (its `--version` flag prints it),
-a BigQuery dataset, and a way to get a Google access token (below). The mod
-creates the table on first write if it is missing.
+a BigQuery dataset (below), and a way to get a Google access token (see
+[Authentication](#authentication)). The mod creates the table on first write
+if it is missing.
+
+From GitHub (`--marketplace` needs v2.1.292 or later):
+
+```bash
+claude plugin install bigquery-agent-analytics-mod \
+  --marketplace haiyuan-eng-google/bigquery_agent_analytics_skill \
+  --config project=my-gcp-project --config dataset=agent_analytics
+```
+
+If this repository's marketplace was added from a clone before (the
+settings-hook tracing plugin's guide adds it that way), that command stops:
+the marketplace's "source doesn't match its extraKnownMarketplaces entry".
+Install from the clone instead, once it is up to date:
+
+```bash
+git -C path/to/your/clone pull
+claude plugin marketplace update bigquery-agent-analytics-plugin
+claude plugin install bigquery-agent-analytics-mod@bigquery-agent-analytics-plugin \
+  --config project=my-gcp-project --config dataset=agent_analytics
+```
+
+Inside a session, `/plugin install bigquery-agent-analytics-mod@bigquery-agent-analytics-plugin`
+does the same and opens the configuration dialog. If you install or update it
+from your shell while a session is open, run `/reload-plugins` there. Run
+`/plugin` and look for `1 mod active · bigquery-agent-analytics-mod` under the tabs.
+
+**For one session, from a checkout** (development, or to try it):
+
+```bash
+export BQAA_PROJECT_ID=my-gcp-project BQAA_DATASET=agent_analytics
+claude --plugin-dir ./plugins/bigquery-agent-analytics-mod
+```
+
+Use this mod **or** the settings-hook tracing plugin against a table, not both:
+with both enabled every event is written twice.
+
+### The dataset
 
 [`setup.sh`](setup.sh) creates the rest with the `bq` CLI, and is safe to run
 again:
@@ -124,37 +171,14 @@ BQAA_PROJECT_ID=my-gcp-project BQAA_DATASET=agent_analytics ./plugins/bigquery-a
 
 `--dry-run` prints the commands and the SQL. Without it, they run.
 
-**For one session, from a checkout** (development, or to try it):
-
-```bash
-export BQAA_PROJECT_ID=my-gcp-project BQAA_DATASET=agent_analytics
-claude --plugin-dir ./plugins/bigquery-agent-analytics-mod
-```
-
-**From this repository's marketplace.** The mod is on the `coding-agent-mod`
-branch until its PR merges; from a clone of that branch:
-
-```bash
-claude plugin marketplace add ./
-claude plugin install bigquery-agent-analytics-mod@bigquery-agent-analytics-plugin \
-  --config project=my-gcp-project --config dataset=agent_analytics
-```
-
-Once merged, from GitHub (`--marketplace` needs v2.1.292 or later):
-
-```bash
-claude plugin install bigquery-agent-analytics-mod \
-  --marketplace haiyuan-eng-google/bigquery_agent_analytics_skill \
-  --config project=my-gcp-project --config dataset=agent_analytics
-```
-
-Inside a session, `/plugin install bigquery-agent-analytics-mod@bigquery-agent-analytics-plugin`
-does the same and opens the configuration dialog. If you install or update it
-from your shell while a session is open, run `/reload-plugins` there. Run
-`/plugin` and look for `1 mod active · bigquery-agent-analytics-mod` under the tabs.
-
-Use this mod **or** the settings-hook tracing plugin against a table, not both:
-with both enabled every event is written twice.
+`setup.sh` ships with the mod. Installed from a marketplace, it is in the
+mod's own directory, not a checkout: start a session, and while BigQuery
+cannot find the dataset the mod prints the whole command, with your project,
+dataset, table and location and the script's path (see
+[If rows cannot be written](#if-rows-cannot-be-written)). The rows of that
+session wait for it. A dataset or table made moments ago can still answer
+"Not found" to streaming inserts for a few minutes; rows wait through that
+too, and land on their own.
 
 ## Configure
 
@@ -167,7 +191,7 @@ the environment variable the tracing plugin already uses, then to a default.
 | `project` | `BQAA_PROJECT_ID`, `GCP_PROJECT_ID`, `GOOGLE_CLOUD_PROJECT` | (required) | Project that holds the dataset |
 | `dataset` | `BQAA_DATASET`, `BQ_DATASET` | (required) | Dataset of the events table |
 | `table` | `BQAA_TABLE`, `BQ_TABLE` | `agent_events` | Events table |
-| `location` | `BQAA_LOCATION` | `US` | Dataset location; shown by `/bqaa-status` (insertAll itself is addressed by table) |
+| `location` | `BQAA_LOCATION` | `US` | Dataset location; shown by `/bqaa-status`, and passed to `setup.sh` by the setup command the mod offers (insertAll itself is addressed by table) |
 | `enabled` | `BQAA_TRACE_ENABLED=false` turns it off | `true` | Capture on or off |
 | `dryRun` | `BQAA_DRY_RUN=true` turns it on | `false` | Write rows as JSONL to `<deadLetterDir>/../dry-run/` instead of sending |
 | `maxPayloadChars` | | `16384` (1024 to 500000) | Cap per JSON payload column (`content`, `attributes`); past it the value is cut and `is_truncated` set |
@@ -186,7 +210,7 @@ Advanced, environment only:
 | `BQAA_USER_ID` | `$USER` / `$USERNAME` | `user_id` column (with `userIdFromCredentials` on, the token's account takes its place once known) |
 | `BQAA_REQUEST_TIMEOUT_MS` | `10000` (1000 to 30000) | Client-side timeout per insertAll request |
 | `BQAA_MAX_QUEUE_ROWS` | `5000` (10 to 100000) | Queue bound in rows (the byte bound is 8 MiB of UTF-8) |
-| `BQAA_EXIT_FLUSH_MS` | `800` (0 to 1200) | How long session end may wait for its spill file to be written; `0` starts the write without waiting |
+| `BQAA_EXIT_FLUSH_MS` | `800` (0 to 1200) | How long session end may wait for its spill file, and any dead-letter file still being written, to be written; `0` starts the write without waiting |
 | `BQAA_AUTO_CREATE_TABLE` | `true` | Create the table (BQAA schema v2, partitioned and clustered) when insertAll answers 404 for it |
 | `BQAA_AUTO_BACKFILL` | `true` | Replay the table's `spill` and `retry` files at session start and after BigQuery recovers |
 
@@ -216,39 +240,90 @@ not available, set `BQAA_ACCESS_TOKEN`.
 The identity needs `roles/bigquery.dataEditor` on the dataset (insert rows,
 create the table). The repo's `setup_gcp_prereqs.py` grants it.
 
-### If no credentials work
+### If rows cannot be written
 
-Rows stop being written when no Google credentials work, or when the identity
-lacks permission on the dataset. That happens when:
+Rows stop being written when no Google credentials work, when the identity
+lacks permission on the dataset, or when BigQuery cannot find the dataset or
+table. That happens when:
 
 * the token command fails (never signed in, or a sign-in expired);
 * BigQuery answers 401 even to a fresh token;
-* BigQuery answers 403 access denied.
+* BigQuery answers 403 access denied;
+* insertAll answers 404 for the dataset (not made yet, say the mod was
+  installed before `setup.sh` ran, or a name is wrong), or for a table the
+  mod may not create (`BQAA_AUTO_CREATE_TABLE=false`) or still does not see
+  two minutes after creating it. Streaming inserts can miss a dataset or
+  table made minutes ago, so this also comes up just after `setup.sh`.
 
 While that lasts, the mod shows a notice:
 
 * **The band above the prompt** (terminal and desktop) says what is wrong
   and the fix for the token source in use, for example `run: gcloud auth
   application-default login`. For a missing permission it names the role to
-  ask for on which dataset. It also counts the rows waiting: queued, in
-  flight, or parked on disk since the problem began. It keeps what other
-  mods draw there below it, and gives the band up to a survey.
+  ask for on which dataset. For a dataset or table BigQuery cannot find, a
+  second line gives the `setup.sh` command. It sets every name the script
+  reads (your project, dataset, table, views dataset `<dataset>_reporting`
+  and location), so none comes from a variable already set in your shell,
+  then runs the script in the mod's directory with `bash`, its path quoted
+  as one shell word. It is offered only for names `setup.sh` takes and a
+  POSIX path; otherwise the fix says to create it or correct the options.
+  The band also counts the
+  rows waiting: queued, in flight, or parked on disk since the problem began.
+  It keeps what other mods draw there below it, and gives the band up to a
+  survey.
 * **A toast** comes once per kind of problem in a session.
 * **A dim transcript line** comes once per kind of problem, with the reason
-  (redacted). A `-p` or SDK host receives it as `ui_log`.
-* **The status line** shows the same notice.
-* **`/bqaa-status`** adds a `notice` line.
+  (redacted) and, for a missing dataset, the command, which goes on a line
+  of its own when the redaction would take it with the rest (a project
+  named like a credential). A `-p` or SDK host receives it as `ui_log`.
+* **The status line** shows the headline and the fix, with the count of
+  rows waiting; the command is on the band, the transcript line and
+  `/bqaa-status`.
+* **`/bqaa-status`** adds a `notice` line, and for a missing dataset a
+  `setup` line with the command.
 
-The next successful send clears the notice. Recovery is quick:
+A command too long for the band's line (very long names, or a deep mod
+directory) is not cut there or in the transcript line, where a command cut
+short would not run: they say to run the one `/bqaa-status` shows whole.
+No command is offered when its path holds text the redaction would change
+(a path segment shaped like `token=…`), or when it is longer than
+`/bqaa-status` can show whole.
 
-* While credentials are the problem, retries come at least every 30
-  seconds.
+The next send or replay that BigQuery takes clears the notice. So does a
+400 refusing the rows themselves, which shows that BigQuery found the table,
+took the credentials and let the identity write. Recovery is quick:
+
+* While credentials or a missing dataset are the problem, the backoff
+  before the next retry is at most 30 seconds. That bounds the pause, not
+  the time to the retry: it goes at the next flush tick after the pause,
+  so add up to `flushIntervalMs` (5 seconds by default, longer if the
+  options set it so).
 * A prompt starts a retry at once, from a timer, so signing in from the
   session (`! gcloud auth application-default login`) is enough.
 * Rows parked meanwhile follow on their own once BigQuery takes rows again
-  (`BQAA_AUTO_BACKFILL`).
+  (`BQAA_AUTO_BACKFILL`). With nothing new queued (a session left idle),
+  the retries replay the parked rows until every one has landed, a replay
+  that lands only some included, so they land and the notice clears
+  without a prompt. That covers rows parked while a table the mod just
+  made was not visible yet. A file another session is replaying, or one
+  that could not be listed or read, keeps its rows waiting for the next
+  replay. A replay records what became of each of a file's rows before it
+  writes what is left (in `$.store`, or in two files beside it that take
+  the record's updates in turn when the store does not take it), so when
+  what is left cannot all be written, or the file cannot be emptied, the
+  next replay of any writer, in this session or another, writes the rest
+  under the same names and empties the file, and none of its rows goes
+  again. A record that cannot be read leaves its file waiting, nothing of
+  what a replay left is written until its record is, and a file of what is
+  left is replayed only once the record has it as written. The paced replay
+  of an idle session stops between requests for rows queued meanwhile, which
+  go first.
+* A replay's 401 gets a fresh token and one more try, as a send's does, and
+  a second 401 is the credentials notice.
 * Rows refused for a missing permission wait for `/bqaa-backfill`, and the
-  transcript says so when rows flow again.
+  transcript says so when rows flow again. So do rows BigQuery refuses on a
+  replay: they move to a `rejected` file, and no replay that runs by itself
+  sends them again.
 
 The notice never holds up a prompt: prompts go to the model as usual, and
 the rows wait.
@@ -448,6 +523,9 @@ requests, sessions and tokens always count the same rows.
 * [`daily_usage_by_user`](sql/views/daily_usage_by_user.sql): per day and
   `user_id`, sessions, model requests and the token counts.
 
+`day` is the UTC date of each request (`DATE(timestamp)`): in the evening
+west of Greenwich, today's requests are under tomorrow's date.
+
 The details below were checked on BigQuery itself:
 
 * Each view keeps one row per `(timestamp, event_id)`. A row sent twice has
@@ -507,24 +585,29 @@ GROUP BY model
   the queue passes 80%, the writer moves the oldest half to a `spill` file
   instead of letting rows drop.
 * **Flush:** every `flushIntervalMs`, and right after each main-loop turn; one
-  request at a time; batches of at most 500 rows and 3 MiB of UTF-8
+  flush request at a time for each writer (a replay of parked rows, at
+  session start, once rows land again or by `/bqaa-backfill`, can run beside
+  it, and so can a batch a writer taken over from still has out); batches of
+  at most 500 rows and 3 MiB of UTF-8
   (`$.http.fetch` refuses bodies over 4 MiB, counted in characters, and UTF-8
   bytes are never fewer).
 * **Timeouts:** each insertAll is raced against `BQAA_REQUEST_TIMEOUT_MS`
   (a `$.clock.after` timer), under the host's own 30-second cap per
   `$.http.fetch`; the token command has 15 seconds.
-* **Retries:** 408, 429, 5xx, quota 403s, network errors and timeouts back off
-  exponentially (1 s doubling to 60 s, with jitter; at most 30 s while no
-  credentials work) and retry a batch up to 3 times with the same
-  `insertId`s. A 401 gets a fresh token and one retry at once, and only a
-  second 401 counts as a failure. A 2xx
+* **Retries:** 408, 429, 5xx, quota 403s, network errors, timeouts and a 404
+  for a dataset or table BigQuery cannot find back off exponentially (1 s
+  doubling to 60 s, with jitter; at most 30 s while no credentials work or
+  the dataset cannot be found) and retry a batch up to 3 times with the same
+  `insertId`s. A 401 gets a fresh token and one retry at once, on a send or
+  a replay, and only a second 401 counts as a failure. A 2xx
   answer counts as delivered only when it is a valid insertAll response: a
   body cut off at the response limit, a non-JSON page or an `insertErrors`
   entry that names no row of the batch leaves the outcome unknown, so the rows
   are retried the same way and parked if the retries run out.
-* **Dead letter:** rows that exhaust retries go to `retry-*.jsonl`; rows
-  BigQuery or the configuration refuses (400, 403 access denied, missing
-  dataset, an invalid row reported by insertAll) go to `rejected-*.jsonl`;
+* **Dead letter:** rows that exhaust retries go to `retry-*.jsonl`, rows
+  waiting for a dataset or table BigQuery cannot find included; rows
+  BigQuery or the configuration refuses (400, 403 access denied, an invalid
+  row reported by insertAll) go to `rejected-*.jsonl`;
   rows queued at exit go to `spill-*.jsonl`. Each line keeps the full row,
   the reason (redacted), the attempt count and the table it was meant for.
   Each file ends with a completion record, written after its rows: how many
@@ -539,22 +622,180 @@ GROUP BY model
   line for another table is kept as written, and rows parked for another
   table are sent only by a session configured for that table. `spill` and
   `retry` files are also replayed 15 seconds after a session starts and once
-  BigQuery recovers in a session that parked rows. A replay reads a file
+  BigQuery recovers in a session that parked rows. While none is queued,
+  the paced retries replay them too, until every row parked for the
+  configured table (by this session, or left by a replay) has landed: a
+  file another session holds, or one that could not be listed or read,
+  keeps its rows waiting for the next replay. The paced replay, which a
+  flush runs while nothing is queued, stops between requests for rows
+  queued meanwhile, which go first; the replay after `session.start` runs
+  beside the flushes, which send rows queued meanwhile. A replay that runs
+  by itself sends `spill` and `retry` rows only, whatever file holds
+  them. Rows BigQuery refuses on any replay (an invalid row, a
+  400, 403 access denied) move to `rejected-*.jsonl` and wait for
+  `/bqaa-backfill`, as a send's refused rows do. Access denied is the
+  notice; the other refusals are on the status line, and `/bqaa-status`
+  counts them in its last-backfill line. Each row counts once, in the order
+  the requests came: one `/bqaa-backfill` sends again from a `rejected`
+  file, and BigQuery refuses again, is not counted twice, and rows that land
+  end the count of the refusals before them. A count keeps the ids of
+  10,000 rows; past that a row may count again, and the count reads "about
+  N". A replay that BigQuery takes
+  clears the notice, as a send does. A replay reads a file
   only when its completion record is there and matches every line above it:
   the API's writes are not atomic, so another session can read a file
   part-written, and the record is what marks a file whole. A file without a
   matching record (still being written, or left by a writer that stopped
   part-way) is kept as it is, never read or emptied, and `/bqaa-status`
-  lists it. A file whose rows all land is truncated to zero bytes (the API
+  lists it. One read whole at another length than the directory listing
+  gave (a write that finished between the two) waits for the next replay,
+  since what the replay records of it goes by the listed size. A file whose rows all land is truncated to zero bytes (the API
   has no delete; empty files are safe to remove). What a replay leaves (rows
   that fail again, other tables' lines, lines it cannot parse) is written to
-  new files first, each with its completion record, and only then is the
-  replayed file truncated: the API has no rename either, so a write that
-  fails leaves that file as it was (rows sent meanwhile may go again;
-  `event_id` dedups them). A file over 4 MiB, which the API cannot read, is
-  reported by `/bqaa-status` and the backfill instead of being passed over. A
-  per-file lease in `$.store` keeps two sessions from replaying the same file
-  at once (best effort; `event_id` dedups the rest).
+  new files first, each kind to files of its own and each file with its
+  completion record, and only then is the replayed file truncated. A replay
+  whose rows BigQuery only asks for again rewrites nothing. The API has no
+  rename either, so a write that fails leaves that file as it was. Before
+  it sends any of a file's rows, a replay writes its own mark beside the
+  file (`outcome-sending-`, the writer's name, and the file's), a file no
+  other writer writes or empties, and reads the marks and the file's record
+  back: another writer's mark (unless `/bqaa-backfill force` asked for the
+  file afresh), an outcome recorded or the file done meanwhile, and it
+  sends none of the file and lets its own mark go. One that cannot write its mark
+  sends none of it either: the rows wait. A replay that changes nothing
+  (rows only asked for again, or no answer), or that finishes the file,
+  lets its own mark go, so each try writes its one small file twice and
+  adds no file per try. Each writer (each session, and each load of the mod
+  in it) adds one such file beside a file it replays, emptied once it lets
+  its mark go, and not read once empty; the API has no delete, so the
+  emptied files stay (empty files are safe to remove). A writer that finds
+  another writer's mark, whole or cut off part-way, and no outcome recorded
+  (that writer still at it, unable to write its record, or stopped after
+  sending) sends none of the file, `/bqaa-backfill` included: its rows may
+  have been refused, and that writer may yet record what became of them.
+  `/bqaa-backfill force` replays it afresh, for a session that stopped
+  mid-replay, once no other session's lease on the file stands (a lease
+  lasts ten minutes; force passes the mark, not the lease); run while that
+  session is in fact still replaying the file, it can send a refused row
+  once more, as two replays of one file each keep what they learned.
+  Likewise a file of what is left of each of two outcomes of one file
+  recorded at once can go, and so can one first replayed more than a day
+  after its parent was done (its parent's records swept): a row can arrive
+  twice, and `event_id` dedups it. Where `session.start` fires again in
+  the same load of the mod (the plugin turned off and on), the writer it
+  makes takes over from the one before: it holds the outcomes that one
+  held, an outcome that one's replay comes to afterwards included, but not
+  its marks: a mark of the one before whose outcome it does not hold keeps
+  it from sending the file, as another session's does. It shares that
+  one's queue, and what waits for a replay, with every writer before and
+  after it, so the rows of a batch any writer before still had out, asked
+  for again, go with this writer's own (rows it had queued itself go
+  behind the older ones), rows one parks late, a batch out of retries, set
+  this writer's paced replays going, the status line is one for them all
+  (a line one sets late is cleared by the next landing), and the exit spill
+  takes a batch one still has out, its answer not come (rows an answer
+  refused or parks are in a file being written already: the exit waits for
+  that write, within the same bound, and makes no second copy); after it
+  they start no batch (a replay one has under way goes on, its rows on disk
+  and fenced by their records). The counts `/bqaa-status` gives, a standing
+  notice and the refused count on the status line are each writer's own:
+  they start over at the takeover.
+  A reload of the
+  mod's code is a load afresh, which holds none of that (see the limits
+  below). Before
+  it writes what is left, a replay records its outcome: one record per
+  file, with what became of each row (a letter each, and for a refused row
+  a number naming its reason), the refusals' reasons (16 at most: rows
+  refused for any reason past the first 15 share one that says so), and
+  the names of the files of what is left, each marked once written. A
+  writer that resumes an outcome reads the file again first: read
+  part-written, or other than as listed, it keeps its record and waits
+  until it reads whole, as a file with no record does. The
+  record goes to `$.store`, which holds 4 MiB of JSON in all; one over
+  64 KiB, or one the store does not take, goes to the files beside the
+  replayed one (`outcome-` and its name, then `outcome-b-` and it, which no
+  replay takes for rows). Those two take its updates in turn, each
+  numbered, and a writer reads the later whole one, so an update cut off
+  part-way leaves the one before it whole. A record cut off with none
+  whole behind it means nothing of what is left was written: the writer
+  that holds the outcome writes it again, any other replay leaves the file
+  waiting, and `/bqaa-backfill force` replays it afresh. An empty one of those files beside a file that still
+  holds its rows counts as cut off too (a write that stopped before its
+  first byte). Once every file of what is left is written, the record is
+  written as the mark that the file is done, in a file of the writer's
+  own (`outcome-done-`, the writer's name, and the file's), which no write
+  of a record goes to and no other writer writes, so no late write of
+  another session's, a done mark of its own still being written included,
+  takes it away; then the replayed file is emptied, and the store's copy
+  of the record goes. A writer that finds a done mark never writes one:
+  a late copy of a finished file is emptied with the marks left as they
+  were. One cut off part-way, with no other record whole, counts as a
+  record cut off (the file may have been done): the file waits, and
+  `/bqaa-backfill force` replays it afresh. Of two whole ones, every
+  writer goes by the later, by number, then by name. The
+  mark is read before any other record, and read again, after the
+  sending marks, before a writer takes no record found for an answer
+  (another writer may have finished the file while those were read, its
+  done mark written before it let the store's copy, or its sending mark,
+  go; a writer about to send goes by the sending marks that read found,
+  or, beside a record cut off part-way, reads them and then the done marks
+  once more): a late write of another session's copy of
+  a file it left is then emptied unsent, another session's late outcome
+  for it stops there, and a file of what is left that the mark does not
+  name is a late copy of another session's outcome, emptied unsent too, as
+  it is where the mark could not be written and the record of the emptied
+  file has every file it names written. These files, of files emptied more
+  than a day ago, are emptied at the next replay: how long ago, by the
+  listing's time, or, where it gives none (or 0), by when the done mark
+  says the file was done. Nothing of what is left
+  is written until the record is: when neither the store nor those files
+  take it, the replayed file stays as it was, this session tries again at
+  each replay, and its mark keeps every other session from sending the
+  file. Each file of what is left names the file it came from, and
+  no replay takes it until that file's record has it as written (or names
+  other files, or is gone, or its file is emptied): one written whose mark
+  the record could not keep waits, and the writer that finishes the
+  outcome writes it again over the copy no one took. Before it records
+  anything, a writer reads the record, and the file, again: another
+  writer's outcome goes on instead; the file done, or emptied with no
+  record whole, it writes nothing. Any writer that
+  replays the file next, this session's or another's, a later
+  session.start's included, reads the record, even one that holds the
+  outcome itself: it writes from the file and the record what is still
+  missing, under the same names, never a file the record has as written
+  (one may since have been replayed and emptied), then empties the file,
+  and sends none of its rows again. A record that cannot be read leaves
+  its file waiting for the next replay, never taken for no record. A file
+  a replay leaves waiting (its record cut off or unreadable, or not
+  writable, another writer's mark beside it, or its own mark not written)
+  holds up none of the files after it, and `/bqaa-status`,
+  like the `/bqaa-backfill` transcript line, says why the first such file
+  was left (`left waiting:`), another session's lease on a file, or a file
+  of what is left waiting on its parent's record, included. A file
+  that cannot be emptied stays on disk, its rows landed or in the newer
+  files, and each replay tries to empty it. A file over 4 MiB, which the
+  API cannot read, is reported by `/bqaa-status` and the backfill instead
+  of being passed over. A file read before its completion record was
+  written keeps its table due, so the paced replays read it again and send
+  it once it is whole, and so does an empty one (a write can show a file
+  empty before any of it lands) with nothing beside it to say a replay
+  emptied it, each for a lease's time from its last write (or, where the
+  listing gives no time, or 0, from when the writer first saw it so): one
+  never finished costs those reads and nothing more. So does one listed
+  with its rows and read empty with no done mark beside it. A per-file lease in `$.store` keeps two sessions from replaying the
+  same file at once (best effort: of two that read the lease at the same
+  moment, one that reads the other's mark back beside its own sends none of
+  the file, so at most one sends it, and if each reads the other's,
+  neither does, and the next replay sends it; a `/bqaa-backfill force` that
+  sends past another writer's mark, and whose answer comes second, finds
+  the other's record and writes nothing of its own (that outcome goes on,
+  at the next replay), or finds the file already done, and writes nothing, so what is left is written
+  once, unless both record theirs at the same moment; a write already under
+  way when the other session finishes lands, and the marks above have the
+  next replay empty it unsent); a session that finds a file leased tries
+  it again at its next replay. Files a replay writes are named with the
+  writer's name too, so two writers of one session never make the same
+  name.
 * **Fail open:** a hook's bookkeeping runs behind `.catch` or inside `try`;
   the writer never throws into a hook; every failure path ends in sent, on
   disk, or counted as dropped. An environment variable a policy refuses reads
@@ -566,19 +807,31 @@ All three run immediately, even while the agent is working, and print counts,
 never payloads or tokens (the agent reads a command's output too).
 
 * `/bqaa-status`: target table, queue depth, rows captured / sent /
-  dead-lettered / refused / spilled / dropped this session, retries, backoff,
+  dead-lettered / refused / spilled / dropped since `session.start` (they
+  start over where the plugin is turned off and on), retries, backoff,
+  the notice if rows cannot be written (with the `setup.sh` command when
+  BigQuery cannot find the dataset),
   the last error (redacted), the configured table's dead-letter files, how
   many files elsewhere in the directory belong to other tables, any file too
   large to read or without a completion record, the last backfill.
 * `/bqaa-flush`: send the queue now instead of at the next interval.
 * `/bqaa-backfill`: resend the configured table's dead-letter files in the
-  background; a dim transcript line reports the result.
+  background; a dim transcript line reports the result, and why any file
+  was left waiting. It leaves a file another session's replay holds (its
+  mark, or its record cut off part-way); `/bqaa-backfill force` replays
+  such a file afresh, for a session that stopped mid-replay, once that
+  session's lease on it (ten minutes) has run out.
 
 When BigQuery refuses rows or retries run out, the mod also sets a status line
-under the prompt (`⚠ bigquery-agent-analytics-mod: …`) until the next
-successful send. While no credentials work or a permission is missing, that
-line, the band above the prompt and `/bqaa-status` give the fix (see
-[If no credentials work](#if-no-credentials-work)).
+under the prompt (`⚠ bigquery-agent-analytics-mod: …`) until rows land
+again, sent or replayed; its count of refused rows covers every row refused,
+and written to a dead-letter file, since rows last landed. Rows whose file
+could not be written are lost, and the line says so instead of pointing at
+`/bqaa-backfill`. While no credentials work, a permission is missing or
+BigQuery cannot find the dataset, that line, the band above the prompt and
+`/bqaa-status` give the fix (see
+[If rows cannot be written](#if-rows-cannot-be-written)). The host keeps a
+status line across a reload of the mod; the reloaded mod clears it.
 
 ## Privacy and security
 
@@ -692,13 +945,23 @@ claude plugin validate plugins/bigquery-agent-analytics-mod
 cd plugins/bigquery-agent-analytics-mod && claude plugin test
 bash tests/setup.test.sh
 python3 tests/views.test.py   # needs DuckDB: python3 -m pip install duckdb
+npx -p typescript tsc -p .    # once the host CLI has loaded the mod (below)
 ```
+
+`tsc -p .` type-checks `hooks/` and `tests/` (strict, with
+`noUncheckedIndexedAccess`) against the declarations the host CLI writes to
+`.claude-plugin/types/` when an interactive session loads the mod from a
+folder: start one once with `--plugin-dir` pointed at this directory
+(`plugin test` and `plugin validate` do not write them). The
+mod's `tsconfig.json` leaves out the MCP tools' declarations there, which
+depend on the servers that machine has connected.
 
 The test command runs the `tests/*.test.ts` files against the host CLI's own
 test kit, with no session, sign-in, GCP or network: `$.http.fetch`,
 `$.process.run`, `$.fs` and `$.store` are stubbed, and `mock.clock` drives the
 timers; the `$.fs` stubs measure files in UTF-8 bytes and refuse a file over
-4 MiB, as the host does. 176 tests cover the captured rows and their spans,
+4 MiB, and the `$.store` stub a store over 4 MiB of JSON in all, as the host
+does. 336 tests cover the captured rows and their spans,
 subagent runs in the order the host raises them (one invocation and one
 trace for the turn, a span per run, a SubagentStart that comes late or never),
 the session-start row raised before or during `session.start`'s setup,
@@ -733,15 +996,205 @@ They also cover what happens when credentials fail:
 * one toast and one transcript line, the status line and `/bqaa-status`;
 * the fix for each token source (the default command, gcloud's own account,
   `BQAA_ACCESS_TOKEN`, another command named by its program only);
-* the notice clearing on the next send;
+* the notice clearing on the next send, and, with nothing new queued, the
+  rows parked meanwhile replayed by the retries once a sign-in works;
 * a 401's immediate retry with a fresh token;
 * the role to ask for on a 403;
-* retries at least every 30 s, and a prompt's retry from a timer;
+* the backoff before the next retry capped at 30 s (the retry going at the
+  next flush tick after it), and a prompt's retry from a timer;
 * `prompt.submit` passing every prompt on with no request and no process
   while it runs, with the token command failing, BigQuery refusing the
   credentials, or either never answering. Each of those tests runs with a
   leftover `onAuthFailure: block` from an earlier version's settings, which
   nothing reads now.
+
+And when BigQuery cannot find the dataset or table:
+
+* the band, toast, transcript line, status line and `/bqaa-status`, with the
+  `setup.sh` command, which sets the views dataset too;
+* the command's path as one shell word (a quote or a closing backslash in it
+  included), and no command for a name `setup.sh` would refuse (its views
+  dataset too) or a directory that is not a POSIX path;
+* rows retried, and parked as retries, never refused;
+* every row landing once it is found, with new rows or with none (a session
+  left idle), and a prompt's retry from a timer;
+* the backoff before the next retry capped at 30 s (the retry going at the
+  next flush tick after it);
+* a command longer than the band's line pointed to `/bqaa-status`, which
+  shows it whole; a long one that fits shown whole in the band and the
+  transcript line; `/bqaa-status`'s command whole beside very long names;
+  no command for a path redaction would change, or one too long to show;
+  the command on a transcript line of its own for a project the redaction
+  mistakes for a credential name;
+* a table the mod made that BigQuery still cannot find after two minutes,
+  on a send or on a replay with nothing queued, and table creation turned
+  off;
+* a 400 after the notice, the access-denied one included: the notice clears,
+  and the rows are refused;
+* a reload clearing the status line the previous load set, and the refused
+  count on the status line covering every row since rows last landed;
+  session.start fired again in the same load clearing the line, and the
+  writer that takes over saying the same line again; a status or debug line
+  the surface does not take leaving the flush going (the line written at the
+  next try, a clear at session.start included); refused rows, and rows out
+  of retries, whose file cannot be written said to be lost, and left out of
+  the refused count.
+
+And the replay that runs by itself while nothing is queued:
+
+* it goes on until every parked row lands, a replay that lands only some
+  included, and rewrites no file while BigQuery only asks for a row again;
+* rows parked while a table the mod just made was not visible yet;
+* rows parked for one table stay due while another table is configured;
+* a row refused on it (insertAll's row error, a 400, 403 access denied,
+  which is the notice) moves to a `rejected` file, with no further request
+  or file, and `/bqaa-backfill` still sends it;
+* a refused row in a `retry` file, as earlier versions rewrote them, is
+  never sent by it;
+* a file another session leases, then lets go: its rows land once the
+  lease ends; a directory it cannot list: its rows stay due and land once
+  it can;
+* a file it cannot empty, after its rows land or are refused, or what is
+  left of it only partly written: sent once, with no further request or
+  file, the rest written under the same names and the file emptied once
+  writes work, and the rows left going on; a file another session already
+  wrote out, by the record it left, and one this session wrote out, after
+  the next session.start: emptied, never sent; a file written out under a
+  kept outcome never written again; what is left only partly written,
+  finished by the writers of three later session.start runs, and by
+  another session's writer, sending none of it and copying no row; an
+  outcome recorded before any of what is left was written, written whole
+  by the next writer; a file of what is left that `/bqaa-backfill` sent and
+  emptied meanwhile never written again; a record that does not fit the
+  file (another size, or fewer lines) never trusted, and a file with a
+  record read part-written, written again longer or changed in place
+  keeping its record and waiting until it reads whole; the writer that
+  recorded an outcome, back after another writer finished it and replayed
+  what it left, writing none of it again; two writers replaying one file
+  at once writing what it left once; a record that cannot be read leaving
+  its file waiting and due, with nothing sent; a record the store does not
+  take, or one over 64 KiB, kept in the file beside the source and resumed
+  from there, and the done mark left beside the emptied source; a record
+  the store took
+  at first and then did not, where the file's marks count too; a record
+  in neither place leaving the file as it was until it can be written; a
+  store record that no longer fits not hiding the one beside the file, and
+  one beside it that does not fit emptied; 4,500 rows refused for as many
+  reasons kept with 16 reasons in a record under 64 KiB, with the store
+  holding 4 MiB in all, and none sent again; a record update beside the
+  source cut off part-way, the one before it read, nothing sent again,
+  and the done mark left once the source is emptied; a first record cut off
+  with none whole, written
+  again by the writer that holds the outcome, left waiting by any other
+  replay, `/bqaa-backfill` included, and replayed afresh by
+  `/bqaa-backfill force`; a
+  file of what is left written while its record could not be updated, not
+  replayed until the record has it, its rows then going once; one replayed
+  once its parent's record names other files, and waiting while that
+  record is cut off or cannot be read; while the source cannot be emptied,
+  one the later record has as written replayed; a replay whose answer
+  comes after another session wrote out its outcome going on with that
+  one, also when that record cannot be read at first, and writing nothing
+  of its own once that session has emptied the file, its mark gone or not;
+  a file of what is left whose parent was emptied going whatever an older
+  record of the parent says, and one the parent's done mark does not name
+  emptied unsent; a record write cut off before its first byte leaving the
+  file waiting; a write of a file of what is left that lands after another
+  session finished the outcome and replayed that file emptied unsent; an
+  outcome whose first record lands after another session finished the file
+  stopping at the done mark, and a record of it the store takes after that
+  session finished the file let go again; a writer back from reading the file to resume
+  writing nothing once another writer finished it, its records in the store
+  or beside the file; no record written again when it already holds the
+  outcome; a writer that takes over in the same session holding what the
+  one before held, and an outcome that one's replay comes to after the
+  takeover, sending none of the file again, and sending the rows of a
+  batch the one before still had out, asked for again, also through two
+  takeovers, under its own queue's bounds; rows a writer parks after the
+  next one took over setting that writer's paced replays going, also
+  while that writer's own replay is under way; rows a writer had queued
+  when it took over going behind the older ones; the exit spill after a
+  takeover taking the batch the writer before still had out, that writer
+  starting nothing more, and no second copy of rows an answer refused or
+  parked whose write is still under way, while it takes the rows a mixed
+  answer asked for again; the exit waiting, the process ending once it
+  returns, for the files those rows are being written to (with nothing left
+  to spill, and for writes the writer before began after the takeover, or
+  the writer that took over began before it) and no longer than its bound,
+  through session.end too; a status line the writer before sets after a
+  takeover cleared by the next landing, and one session.start cleared said
+  again by the writer that takes over; rows queued before a takeover held
+  to the new writer's own, larger, bounds; records of files emptied more than a day ago emptied;
+  a record another session writes late, beside a file finished meanwhile,
+  never standing over its done mark, and a replay with nothing left to
+  write never writing its done mark over another's; a replay whose mark
+  lands after the file was finished, or after another session recorded
+  its outcome, or beside another session's, sending none of it, two that
+  each read the other's sending none, and the next replay sending it once;
+  a replay that cannot write its mark sending none of the file, and a file
+  it leaves waiting (its record cut off, unreadable or not writable,
+  another writer's mark, whole or cut off, its mark not written) holding up
+  none after it, and `/bqaa-backfill`'s transcript line saying why one was
+  left; a session whose mark is written late, after another sent
+  the file and could record its outcome nowhere, sending none of it, and
+  a late or cut-off mark, or a late letting go, never taking another
+  writer's mark away;
+  a replay that sent rows and can record its outcome nowhere keeping every
+  other session from sending the file, its writer finishing it once it
+  can, and `/bqaa-backfill force` replaying it afresh once that writer is
+  gone, `/bqaa-backfill` waiting as other replays do;
+  a replay that changes nothing letting its mark go, and only its own; a
+  mark its writer could not let go being that writer's own, its successor
+  in the same session waiting on it as another session does; a file
+  listed part-written and read whole waiting for the next replay; a late
+  copy of a finished file emptied with its done mark left as it was, also
+  when every write of that mark is cut off and the emptying fails, and one
+  another session writes while a writer writes the same outcome out never
+  written again by that writer; a done mark still being written when
+  another writer finished the file, landing cut off, in a file of its own,
+  taking nothing from that writer's; `/bqaa-backfill` sending none of a
+  file another session's replay is sending, saying why in its transcript
+  line, and `/bqaa-backfill force` replaying such a file afresh; a file
+  another session's lease holds, and one of what is left waiting on its
+  parent's record, each saying why; of two whole done marks for one file,
+  every writer going by the later, by number and then by name; a writer
+  whose read of the record, or of the sending marks, answers after another
+  finished the file, put back by a late write, sending none of it, and one
+  replaying the file afresh past a done mark cut off part-way, its read of
+  the marks answering before that writer empties the file; a writer that
+  finds another's sending mark standing leaving the file, whatever a later
+  read of the marks would find; where the listing gives no
+  times, the records of a file done more than a day ago emptied by its done
+  mark's time, and a listing time of 0 taken for none; two writers of one session never giving
+  two files one name; a done
+  mark cut off part-way, with no other record, leaving the file waiting,
+  for `/bqaa-backfill` too, and `/bqaa-backfill force` replaying it
+  afresh; a file of what is left that the record
+  of its emptied parent does not name emptied unsent, the done mark there
+  or not; the done mark letting a later replay empty a file the store's
+  record of cannot be read, and reporting the file's rows left and
+  refused;
+* it stops between requests for a row queued meanwhile, which goes first,
+  with no backoff, and then goes on;
+* a retry file it read before its completion record was written is sent
+  once it is whole, and one never finished makes no request or file over
+  ten minutes of paced reads; one listed empty before its write landed, or
+  listed with its rows and read empty, is sent once whole, with or without
+  times in the listing, and one left empty or part-written long ago, or
+  emptied by its replay, keeps nothing going;
+* rows refused on a send and then on a replay all counted on the status
+  line, which a replay whose rows are only asked for again leaves as it
+  was, and a later request of the same replay that lands rows ends; a
+  replay's second 401 is the credentials notice; `/bqaa-backfill` run twice
+  counts the rows it refuses again once, on the status line and while
+  access is denied, and a row an earlier session refused once; a row
+  refused again after rows landed, or under a later access-denied notice,
+  counted again there; past the 10,000 rows a count keeps, the status line
+  saying about; rows with no id each counted once, however often
+  `/bqaa-backfill` sends them, and rows alike in two files counted as two; a run that only finishes a recorded outcome
+  counted in its report, its refused rows included;
+* the status line for rows parked after retries, with automatic replay on
+  and off.
 
 And the other additions:
 
@@ -771,7 +1224,10 @@ calls. It checks:
 * the fallback variables;
 * that a dry run calls nothing;
 * that names which are not plain ones are refused before any call;
-* that the rendered views keep to this mod's rows.
+* that the rendered views keep to this mod's rows;
+* that the command the mod prints for a missing dataset makes the views in
+  `<dataset>_reporting` even when the shell already sets `BQAA_VIEWS_DATASET`
+  (valid or not), or another project, dataset or table.
 
 `tests/views.test.py` runs both views in DuckDB. It uses five dialect
 substitutions, and each must match. The fixture is a table shared by this
@@ -783,7 +1239,7 @@ the same views count other producers' requests but not their tokens.
 ## Limitations
 
 * Mods are early access; the events and `$` methods can change between
-  host CLI releases. Tested with 2.1.296 and 2.1.299.
+  host CLI releases. Tested with 2.1.296, 2.1.299 and 2.1.302.
 * A subagent's run is told from a main-loop turn by the loop id its
   `turn.start` carries (`agentId`, in the host's type declarations from
   2.1.299). A host that raised `turn.start` for a subagent without it would

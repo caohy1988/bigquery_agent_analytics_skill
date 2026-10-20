@@ -1,8 +1,9 @@
 // Stubs for the parts of the host CLI the mod reaches through `$`, so every
 // test runs with no session, no GCP and no network: `$.http.fetch` answers
 // from a script the test controls, `$.fs` is a Map held to the host's limits
-// (UTF-8 bytes, 4 MiB a file), `$.process.run` prints a fake token, and
-// `mock.clock` drives the flush timer.
+// (UTF-8 bytes, 4 MiB a file), `$.store` is a Map the test can read,
+// `$.process.run` prints a fake token, and `mock.clock` drives the flush
+// timer.
 
 import { type Engine, type MockClock, mock } from 'claude-code/testing'
 import type { On, TurnStepChunk, TurnStepResult } from 'claude-code'
@@ -40,10 +41,15 @@ export type World = {
   // What `$.session.id()` answers, and whether a policy refuses it.
   sessionId: string
   sessionIdRefused: boolean
-  // Makes `$.fs.write` refuse every write.
+  // Makes `$.fs.write` refuse every write, or the writes this picks.
   failWrites: boolean
-  // Makes `$.fs.write` wait until `releaseWrites` is called.
+  refuseWrite: ((path: string, text: string) => boolean) | null
+  // When files were last written, as the listing says (none: 0).
+  mtimes: Map<string, number>
+  // Makes `$.fs.write` wait until `releaseWrites` is called: every write,
+  // or the writes this picks.
   hangWrites: boolean
+  hangWrite: ((path: string, text: string) => boolean) | null
   releaseWrites: () => void
   // Rows from insertAll calls BigQuery answered 200 to, oldest first.
   acceptedRows: () => Row[]
@@ -59,6 +65,8 @@ export type World = {
   insertCalls: () => FetchCall[]
   // Lets every `{ hang: true }` request answer now.
   releaseHung: (status: number, text: string) => void
+  // The mod's `$.store`, each value read back as JSON, as the host keeps it.
+  store: Map<string, unknown>
 }
 
 export type Row = {
@@ -113,7 +121,7 @@ export const USAGE = {
 export function setUp(on: On, env: Record<string, string> = {}, store: Record<string, unknown> = {}): World {
   const clock = mock.clock(on, { now: 0 })
   mock.env(on, { HOME, USER: 'dev', ...env })
-  mock.store(on, store)
+  const asJson = (value: unknown): unknown => JSON.parse(JSON.stringify(value)) as unknown
   const hung: ((answer: { value: { status: number; ok: boolean; headers: Record<string, string>; text: string } }) => void)[] = []
   const heldWrites: { path: string; text: string; resolve: (answer: { value: undefined }) => void }[] = []
   const world: World = {
@@ -136,7 +144,10 @@ export function setUp(on: On, env: Record<string, string> = {}, store: Record<st
     sessionId: SESSION_ID,
     sessionIdRefused: false,
     failWrites: false,
+    refuseWrite: null,
+    mtimes: new Map(),
     hangWrites: false,
+    hangWrite: null,
     releaseWrites: () => {
       for (const held of heldWrites.splice(0)) {
         world.files.set(held.path, held.text)
@@ -157,8 +168,22 @@ export function setUp(on: On, env: Record<string, string> = {}, store: Record<st
     releaseHung: (status, text) => {
       for (const resolve of hung.splice(0)) resolve({ value: { status, ok: status >= 200 && status < 300, headers: {}, text } })
     },
+    store: new Map(Object.entries(store).map(([key, value]) => [key, asJson(value)])),
   }
 
+  on('store.get', ($, e) => ({ value: world.store.get(e.key) }))
+  // As the host, a store of no more than 4 MiB of JSON in all.
+  on('store.set', ($, e) => {
+    const value = asJson(e.value)
+    if (utf8Bytes(JSON.stringify(Object.fromEntries(new Map(world.store).set(e.key, value)))) > HOST_FILE_BYTES) return { deny: 'the store would pass 4 MiB of JSON' }
+    world.store.set(e.key, value)
+    return { value: undefined }
+  })
+  on('store.delete', ($, e) => {
+    world.store.delete(e.key)
+    return { value: undefined }
+  })
+  on('store.keys', () => ({ value: [...world.store.keys()] }))
   on('session.start', () => ({ cwd: '/work/my-repo' }))
   on('session.end', ($, e) => ({ sessionId: e.sessionId }))
   on('session.id', () => (world.sessionIdRefused ? { deny: 'refused by policy' } : { value: world.sessionId }))
@@ -198,9 +223,9 @@ export function setUp(on: On, env: Record<string, string> = {}, store: Record<st
     return { value: { status: reply.status, ok: reply.status >= 200 && reply.status < 300, headers: {}, text: reply.text } }
   })
   on('fs.write', ($, e) => {
-    if (world.failWrites) return { deny: `EACCES: ${e.path}` }
+    if (world.failWrites || world.refuseWrite?.(e.path, e.text)) return { deny: `EACCES: ${e.path}` }
     if (utf8Bytes(e.text) > HOST_FILE_BYTES) return { deny: `${e.path}: over the 4 MiB file limit` }
-    if (world.hangWrites) return new Promise(resolve => heldWrites.push({ path: e.path, text: e.text, resolve }))
+    if (world.hangWrites || world.hangWrite?.(e.path, e.text)) return new Promise(resolve => heldWrites.push({ path: e.path, text: e.text, resolve }))
     world.files.set(e.path, e.text)
     return { value: undefined }
   })
@@ -219,7 +244,7 @@ export function setUp(on: On, env: Record<string, string> = {}, store: Record<st
       if (!p.startsWith(prefix)) continue
       const rest = p.slice(prefix.length)
       const slash = rest.indexOf('/')
-      if (slash === -1) entries.set(rest, { name: rest, kind: 'file', size: utf8Bytes(text), mtimeMs: 0, isLink: false })
+      if (slash === -1) entries.set(rest, { name: rest, kind: 'file', size: utf8Bytes(text), mtimeMs: world.mtimes.get(p) ?? 0, isLink: false })
       else entries.set(rest.slice(0, slash), { name: rest.slice(0, slash), kind: 'dir', size: 0, mtimeMs: 0, isLink: false })
     }
     return { value: [...entries.values()] }
@@ -286,8 +311,10 @@ export const json = (text: string | null): Record<string, unknown> => (text === 
 
 export const byType = (rows: Row[], type: string): Row[] => rows.filter(r => r.event_type === type)
 
+// The dead-letter files that hold something (not the replay records kept
+// beside them, `outcome-…`).
 export function deadLetterFiles(world: World): [string, string][] {
-  return [...world.files.entries()].filter(([p, text]) => p.startsWith(`${DEAD_LETTER_DIR}/`) && text.length > 0)
+  return [...world.files.entries()].filter(([p, text]) => p.startsWith(`${DEAD_LETTER_DIR}/`) && text.length > 0 && /^(spill|retry|rejected)-/.test(p.split('/').pop() ?? ''))
 }
 
 // The rows parked in dead-letter files, file by file in name (time) order.

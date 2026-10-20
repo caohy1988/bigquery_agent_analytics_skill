@@ -37,7 +37,7 @@
     "location": {
       "type": "string",
       "title": "BigQuery location",
-      "description": "Dataset location, shown by /bqaa-status and used in the setup SQL. Empty: BQAA_LOCATION, then US.",
+      "description": "Dataset location, shown by /bqaa-status and passed to setup.sh by the setup command the mod offers, which makes the dataset there. Empty: BQAA_LOCATION, then US.",
       "default": ""
     },
     "enabled": {

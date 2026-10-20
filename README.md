@@ -41,13 +41,17 @@ It also records each model request with its token usage and latency, and
 subagents with their own spans. Use it or the tracing plugin against a table,
 not both.
 
+`--marketplace` needs v2.1.292 or later:
+
 ```bash
-claude plugin install bigquery-agent-analytics-mod@bigquery-agent-analytics-plugin \
+claude plugin install bigquery-agent-analytics-mod \
+  --marketplace haiyuan-eng-google/bigquery_agent_analytics_skill \
   --config project=my-gcp-project --config dataset=agent_analytics
 ```
 
-See `plugins/bigquery-agent-analytics-mod/README.md` for configuration, the
-event mapping, sample rows and queries, and limitations.
+See `plugins/bigquery-agent-analytics-mod/README.md` for the dataset
+(`setup.sh`), installing from a clone, configuration, the event mapping,
+sample rows and queries, and limitations.
 
 ### 2. Install in your AI assistant
 

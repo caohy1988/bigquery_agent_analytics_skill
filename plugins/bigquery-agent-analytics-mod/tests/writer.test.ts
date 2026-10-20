@@ -124,6 +124,15 @@ test('a failed request is retried with the same insertIds, then succeeds', { opt
   expect(await statusText($)).toMatch(/sent 3, dead-lettered 0/)
 })
 
+test('with automatic replay off, the status line for rows parked after retries says /bqaa-backfill sends them', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on, { BQAA_AUTO_BACKFILL: 'false' })
+  world.replies = [UNAVAILABLE]
+  await startSession($)
+  for (let t = 0; t < 6; t += 1) await world.clock.advance(5000)
+  expect(deadLetterRows(world).length).toBe(1)
+  expect(world.statusLines.at(-1) ?? '').toMatch(/^BQAA: 1 row\(s\) parked after retries \(HTTP 503: .*\); \/bqaa-backfill sends them$/)
+})
+
 test('rows that exhaust their retries go to a dead-letter file, and are replayed once BigQuery is back', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on)
   world.replies = [UNAVAILABLE, UNAVAILABLE, UNAVAILABLE, UNAVAILABLE, OK_INSERT]
@@ -147,7 +156,7 @@ test('rows that exhaust their retries go to a dead-letter file, and are replayed
   expect(lines.map(l => l.row.event_type)).toEqual(['STATE_DELTA', 'TOOL_STARTING', 'TOOL_COMPLETED'])
   expect(lines[0]).toMatchObject({ kind: 'retry', attempts: 4, table: 'my-gcp-project.agent_analytics.agent_events' })
   expect(lines[0]?.reason ?? '').toMatch(/HTTP 503/)
-  expect(world.statusLines.some(l => (l ?? '').includes('parked after retries'))).toBe(true)
+  expect(world.statusLines.some(l => /^BQAA: 3 row\(s\) parked after retries \(HTTP 503: .*\); they are replayed on their own$/.test(l ?? ''))).toBe(true)
 
   // BigQuery answers again: new rows go out, then the parked ones follow.
   await $.tool.call({ tool: 'Read', file_path: 'b.ts' })
@@ -197,15 +206,17 @@ test('a missing table is created with the BQAA schema, then written', { options:
   expect(world.acceptedRows().length).toBe(1)
 })
 
-test('a missing dataset is not created: the rows are refused and parked', { options: OPTIONS }, async ($, on) => {
+// The notice and the replay once it is found: destination.test.ts.
+test('a missing dataset is not created: the rows wait as retries, none refused', { options: OPTIONS }, async ($, on) => {
   const world = setUp(on)
   world.replies = [DATASET_MISSING]
   await startSession($)
   await world.clock.advance(5000)
   expect(world.fetches.length).toBe(1)
-  const [file] = deadLetterFiles(world)
-  expect(file?.[0].startsWith(`${PARTITION_DIR}/rejected-`)).toBe(true)
-  expect(await statusText($)).toMatch(/1 refused/)
+  expect(deadLetterFiles(world).length).toBe(0)
+  const status = await statusText($)
+  expect(status).toMatch(/queue: 1 rows/)
+  expect(status).toMatch(/\(0 refused\)/)
 })
 
 test('a permission error parks rows as refused; /bqaa-backfill sends them once fixed', { options: OPTIONS }, async ($, on) => {
@@ -219,7 +230,7 @@ test('a permission error parks rows as refused; /bqaa-backfill sends them once f
   expect(file?.[0].startsWith(`${PARTITION_DIR}/rejected-`)).toBe(true)
   // The status line says what is wrong, and the fix, with the rows waiting.
   expect(world.statusLines.at(-1) ?? '').toBe(
-    'BQAA: BigQuery denied the identity access to the dataset. To fix, ask for roles/bigquery.dataEditor on my-gcp-project:agent_analytics, then run /bqaa-backfill (3 row(s) waiting)',
+    'BQAA: BigQuery denied the identity access to the dataset. To fix, ask for roles/bigquery.dataEditor on my-gcp-project.agent_analytics, then run /bqaa-backfill (3 row(s) waiting)',
   )
   // Refused rows are not replayed automatically.
   await world.clock.advance(60_000)
@@ -232,6 +243,21 @@ test('a permission error parks rows as refused; /bqaa-backfill sends them once f
   expect(deadLetterFiles(world).length).toBe(0)
   expect(world.logs.some(l => l.includes('bqaa backfill: 1 file(s), 3 row(s) sent, 0 left'))).toBe(true)
   expect(await statusText($)).toMatch(/last backfill \(command, .*\): 1 file\(s\), 3 rows sent, 0 left/)
+})
+
+test('the /bqaa-backfill transcript line says why a file was left waiting', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  world.replies = [DENIED, OK_INSERT]
+  await startSession($)
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
+  await world.clock.advance(5000)
+  expect(deadLetterFiles(world).length).toBe(1)
+  // No mark can be written beside the file: none of it is sent.
+  world.refuseWrite = (path, text) => path.includes('/outcome-sending-') && text !== ''
+  await $.command.run({ command: 'bqaa-backfill', args: '', ...COMMAND })
+  await world.clock.settle()
+  expect(world.acceptedRows().length).toBe(0)
+  expect(world.logs.some(l => /^bqaa backfill: .*; left waiting: could not mark the replay of rejected-\S+ before sending, so none of it is sent/.test(l))).toBe(true)
 })
 
 test('a refused token is fetched again', { options: OPTIONS }, async ($, on) => {
@@ -340,6 +366,54 @@ test('a spill write that hangs holds session end no longer than its budget', { o
   await ending
   expect(ended).toBe(true)
   expect(world.fetches.length).toBe(0)
+  world.releaseWrites()
+})
+
+// The event types of the rows in this table's files of one kind.
+const typesIn = (world: World, kind: 'spill' | 'rejected'): string[] =>
+  deadLetterFiles(world)
+    .filter(([path, text]) => path.startsWith(`${PARTITION_DIR}/${kind}-`) && text !== '')
+    .flatMap(([, text]) => parseFile(text).lines.map(l => l.row.event_type))
+
+// A send whose second row BigQuery refuses, while the file that row goes to
+// is still being written when the session ends.
+async function refusedWhileEnding($: Engine, on: Parameters<typeof setUp>[0]): Promise<{ world: World; ended: () => boolean; ending: Promise<void> }> {
+  const world = setUp(on)
+  world.replies = [
+    {
+      status: 200,
+      text: JSON.stringify({ kind: 'bigquery#tableDataInsertAllResponse', insertErrors: [{ index: 1, errors: [{ reason: 'invalid', message: 'no such field: foo.' }] }] }),
+    },
+  ]
+  world.hangWrite = path => path.includes('/rejected-')
+  await startSession($)
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
+  await world.clock.advance(5000)
+  expect(world.insertCalls().length).toBe(1)
+  let ended = false
+  const ending = $.session.end(END).then(() => {
+    ended = true
+  })
+  return { world, ended: () => ended, ending }
+}
+
+test('session end waits, inside its budget, for a file of refused rows still being written, and spills its own row apart', { options: OPTIONS }, async ($, on) => {
+  const { world, ended, ending } = await refusedWhileEnding($, on)
+  await world.clock.advance(500)
+  // Its own row is on disk; the refused row is not yet.
+  expect([ended(), typesIn(world, 'spill'), typesIn(world, 'rejected')]).toEqual([false, ['STATE_DELTA'], []])
+  world.releaseWrites()
+  await ending
+  expect([typesIn(world, 'spill'), typesIn(world, 'rejected'), world.insertCalls().length]).toEqual([['STATE_DELTA'], ['TOOL_STARTING'], 1])
+})
+
+test('a file of refused rows whose write hangs holds session end no longer than its budget', { options: OPTIONS }, async ($, on) => {
+  const { world, ended, ending } = await refusedWhileEnding($, on)
+  await world.clock.advance(500)
+  expect(ended()).toBe(false)
+  await world.clock.advance(400)
+  await ending
+  expect([ended(), typesIn(world, 'spill'), typesIn(world, 'rejected')]).toEqual([true, ['STATE_DELTA'], []])
   world.releaseWrites()
 })
 
@@ -530,6 +604,45 @@ test('a dead-letter write that fails is counted as dropped, not thrown', { optio
   expect(status).toMatch(/dead-letter write failed \(1 rows lost\)/)
 })
 
+test('refused rows whose dead-letter file cannot be written are said to be lost, and not counted among the rows /bqaa-backfill sends', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  world.replies = [{ status: 400, text: '{"error":{"code":400,"message":"Invalid value for the table schema","errors":[{"reason":"invalid"}],"status":"INVALID_ARGUMENT"}}' }]
+  world.failWrites = true
+  await startSession($)
+  await $.tool.call({ tool: 'Read', file_path: 'a.ts' })
+  await world.clock.advance(5000)
+  expect(world.statusLines.at(-1)).toBe('BQAA: 3 refused row(s) lost: their dead-letter file could not be written (HTTP 400: Invalid value for the table schema); see /bqaa-status')
+  // Writes work again: the next refused rows are the only ones counted.
+  world.failWrites = false
+  await $.tool.call({ tool: 'Read', file_path: 'b.ts' })
+  for (let t = 0; t < 4; t += 1) await world.clock.advance(5000)
+  expect(world.statusLines.at(-1)).toBe('BQAA: 2 row(s) refused (HTTP 400: Invalid value for the table schema); fix, then /bqaa-backfill')
+})
+
+test('session.start fired again clears the status line, and the writer that takes over says the same line again', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  world.replies = [{ status: 400, text: '{"error":{"code":400,"message":"Invalid value for the table schema","errors":[{"reason":"invalid"}],"status":"INVALID_ARGUMENT"}}' }]
+  await startSession($)
+  await world.clock.advance(5000)
+  const said = 'BQAA: 1 row(s) refused (HTTP 400: Invalid value for the table schema); fix, then /bqaa-backfill'
+  expect(world.statusLines.at(-1)).toBe(said)
+  // The plugin turned off and on: session.start fires again in the same
+  // load, and its own row is refused the same way.
+  await startSession($)
+  expect(world.statusLines.at(-1)).toBeUndefined()
+  await world.clock.advance(5000)
+  expect(world.statusLines.at(-1)).toBe(said)
+})
+
+test('rows out of retries whose dead-letter file cannot be written are said to be lost', { options: OPTIONS }, async ($, on) => {
+  const world = setUp(on)
+  world.replies = [UNAVAILABLE]
+  world.failWrites = true
+  await startSession($)
+  for (let t = 0; t < 6; t += 1) await world.clock.advance(5000)
+  expect(world.statusLines.at(-1) ?? '').toMatch(/^BQAA: 1 row\(s\) out of retries lost: their dead-letter file could not be written \(HTTP 503: .*\); see \/bqaa-status$/)
+})
+
 test('dry run writes the rows locally and sends nothing', { options: { dryRun: true } }, async ($, on) => {
   const world = setUp(on)
   await startSession($)
@@ -670,7 +783,8 @@ test('a replayed file whose answer is malformed stays as it was', { options: OPT
   await startSession($)
   await world.clock.advance(15_000)
   expect(world.files.get(path)).toBe(text)
-  expect(await statusText($)).toMatch(/last backfill \(auto, .*\): 1 file\(s\), 0 rows sent, 1 left; stopped: HTTP 200 with a response that is not a valid insertAll answer/)
+  // The replay 15 s in, or the one the paced retries run after it.
+  expect(await statusText($)).toMatch(/last backfill \((auto|recovery), .*\): 1 file\(s\), 0 rows sent, 1 left; stopped: HTTP 200 with a response that is not a valid insertAll answer/)
 })
 
 // The round-three probes, end to end: each payload reaches the mod as a tool
@@ -849,7 +963,8 @@ async function splitReplay(failNewFiles: boolean) {
     envToken: async () => undefined,
     readFile: async path => files.get(path) ?? '',
     writeFile: async (path, text) => {
-      if (failNewFiles && path !== source) throw new Error('disk full')
+      // The replay's mark and record files beside the source are written.
+      if (failNewFiles && path !== source && !path.includes('/outcome-')) throw new Error('disk full')
       files.set(path, text)
     },
     listDir: async () => [{ name: source.split('/').pop() as string, kind: 'file', size: utf8Bytes(encoded[0] as string) }],
@@ -862,7 +977,7 @@ async function splitReplay(failNewFiles: boolean) {
   const writer = new Writer(io, () => config, () => 'replay-session')
   const report = await writer.backfill(['spill'], 'command')
   const ids = [...files.values()].flatMap(text => parseFile(text).lines.map(line => line.row.event_id))
-  const incomplete = [...files].filter(([path, text]) => path !== source && !parseFile(text).complete).map(([path]) => path)
+  const incomplete = [...files].filter(([path, text]) => path !== source && !path.includes('/outcome-') && !parseFile(text).complete).map(([path]) => path)
   return { files, source, report, ids, incomplete }
 }
 
@@ -882,7 +997,7 @@ test('a replay that splits what is left writes every part before emptying its so
 
 test('a write that fails while a replay splits leaves the source whole', async () => {
   const { files, source, report, ids } = await splitReplay(true)
-  expect(report.error ?? '').toMatch(/disk full/)
+  expect(report.held ?? report.error ?? '').toMatch(/disk full/)
   expect(parseFile(files.get(source) ?? '').lines.length).toBe(1000)
   expect(new Set(ids).size).toBe(1000)
 })
