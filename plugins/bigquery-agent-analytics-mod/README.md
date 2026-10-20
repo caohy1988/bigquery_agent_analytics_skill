@@ -188,7 +188,7 @@ the environment variable the tracing plugin already uses, then to a default.
 | `project` | `BQAA_PROJECT_ID`, `GCP_PROJECT_ID`, `GOOGLE_CLOUD_PROJECT` | (required) | Project that holds the dataset |
 | `dataset` | `BQAA_DATASET`, `BQ_DATASET` | (required) | Dataset of the events table |
 | `table` | `BQAA_TABLE`, `BQ_TABLE` | `agent_events` | Events table |
-| `location` | `BQAA_LOCATION` | `US` | Dataset location; shown by `/bqaa-status` (insertAll itself is addressed by table) |
+| `location` | `BQAA_LOCATION` | `US` | Dataset location; shown by `/bqaa-status`, and passed to `setup.sh` by the setup command the mod offers (insertAll itself is addressed by table) |
 | `enabled` | `BQAA_TRACE_ENABLED=false` turns it off | `true` | Capture on or off |
 | `dryRun` | `BQAA_DRY_RUN=true` turns it on | `false` | Write rows as JSONL to `<deadLetterDir>/../dry-run/` instead of sending |
 | `maxPayloadChars` | | `16384` (1024 to 500000) | Cap per JSON payload column (`content`, `attributes`); past it the value is cut and `is_truncated` set |
@@ -290,9 +290,11 @@ The next send or replay that BigQuery takes clears the notice. So does a
 400 refusing the rows themselves, which shows that BigQuery found the table,
 took the credentials and let the identity write. Recovery is quick:
 
-* While credentials or a missing dataset are the problem, the wait before
-  the next retry is at most 30 seconds. The retry then goes at the next
-  flush, so add up to `flushIntervalMs` (5 seconds by default).
+* While credentials or a missing dataset are the problem, the backoff
+  before the next retry is at most 30 seconds. That bounds the pause, not
+  the time to the retry: it goes at the next flush tick after the pause,
+  so add up to `flushIntervalMs` (5 seconds by default, longer if the
+  options set it so).
 * A prompt starts a retry at once, from a timer, so signing in from the
   session (`! gcloud auth application-default login`) is enough.
 * Rows parked meanwhile follow on their own once BigQuery takes rows again
@@ -580,8 +582,10 @@ GROUP BY model
   the queue passes 80%, the writer moves the oldest half to a `spill` file
   instead of letting rows drop.
 * **Flush:** every `flushIntervalMs`, and right after each main-loop turn; one
-  flush request at a time (a replay of parked rows, at session start or by
-  `/bqaa-backfill`, can run beside it); batches of at most 500 rows and 3 MiB of UTF-8
+  flush request at a time for each writer (a replay of parked rows, at
+  session start, once rows land again or by `/bqaa-backfill`, can run beside
+  it, and so can a batch a writer taken over from still has out); batches of
+  at most 500 rows and 3 MiB of UTF-8
   (`$.http.fetch` refuses bodies over 4 MiB, counted in characters, and UTF-8
   bytes are never fewer).
 * **Timeouts:** each insertAll is raced against `BQAA_REQUEST_TIMEOUT_MS`
@@ -684,8 +688,13 @@ GROUP BY model
   after it, so the rows of a batch any writer before still had out, asked
   for again, go with this writer's own (rows it had queued itself go
   behind the older ones), rows one parks late, a batch out of retries, set
-  this writer's paced replays going, and the exit spill takes a batch one
-  still has out. A reload of the
+  this writer's paced replays going, the status line is one for them all
+  (a line one sets late is cleared by the next landing), and the exit spill
+  takes a batch one still has out, its answer not come (rows an answer
+  refused or parks are in a file being written already, which is left to
+  finish, and get no second copy); after it they start no batch (a replay
+  one has under way goes on, its rows on disk and fenced by their records).
+  A reload of the
   mod's code is a load afresh, which holds none of that (see the limits
   below). Before
   it writes what is left, a replay records its outcome: one record per
@@ -943,7 +952,7 @@ test kit, with no session, sign-in, GCP or network: `$.http.fetch`,
 `$.process.run`, `$.fs` and `$.store` are stubbed, and `mock.clock` drives the
 timers; the `$.fs` stubs measure files in UTF-8 bytes and refuse a file over
 4 MiB, and the `$.store` stub a store over 4 MiB of JSON in all, as the host
-does. 319 tests cover the captured rows and their spans,
+does. 325 tests cover the captured rows and their spans,
 subagent runs in the order the host raises them (one invocation and one
 trace for the turn, a span per run, a SubagentStart that comes late or never),
 the session-start row raised before or during `session.start`'s setup,
@@ -982,8 +991,8 @@ They also cover what happens when credentials fail:
   rows parked meanwhile replayed by the retries once a sign-in works;
 * a 401's immediate retry with a fresh token;
 * the role to ask for on a 403;
-* the wait before the next retry capped at 30 s, and a prompt's retry from
-  a timer;
+* the backoff before the next retry capped at 30 s (the retry going at the
+  next flush tick after it), and a prompt's retry from a timer;
 * `prompt.submit` passing every prompt on with no request and no process
   while it runs, with the token command failing, BigQuery refusing the
   credentials, or either never answering. Each of those tests runs with a
@@ -1000,7 +1009,8 @@ And when BigQuery cannot find the dataset or table:
 * rows retried, and parked as retries, never refused;
 * every row landing once it is found, with new rows or with none (a session
   left idle), and a prompt's retry from a timer;
-* the wait before the next retry capped at 30 s;
+* the backoff before the next retry capped at 30 s (the retry going at the
+  next flush tick after it);
 * a command longer than the band's line pointed to `/bqaa-status`, which
   shows it whole; a long one that fits shown whole in the band and the
   transcript line; `/bqaa-status`'s command whole beside very long names;
@@ -1090,7 +1100,12 @@ And the replay that runs by itself while nothing is queued:
   while that writer's own replay is under way; rows a writer had queued
   when it took over going behind the older ones; the exit spill after a
   takeover taking the batch the writer before still had out, that writer
-  starting nothing more; records of files emptied more than a day ago emptied;
+  starting nothing more, and no second copy of rows an answer refused or
+  parked whose write is still under way, while it takes the rows a mixed
+  answer asked for again; a status line the writer before sets after a
+  takeover cleared by the next landing, and one session.start cleared said
+  again by the writer that takes over; rows queued before a takeover held
+  to the new writer's own, larger, bounds; records of files emptied more than a day ago emptied;
   a record another session writes late, beside a file finished meanwhile,
   never standing over its done mark, and a replay with nothing left to
   write never writing its done mark over another's; a replay whose mark

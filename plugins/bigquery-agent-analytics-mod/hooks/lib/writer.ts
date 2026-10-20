@@ -392,6 +392,9 @@ export class Writer {
   private config: () => Config
   private sessionId: () => string | null
   private inFlight: Promise<void> | null = null
+  // The batch out whose answer has not come: once one does, its rows are
+  // handed on at once (landed, back to the queue, or to a file being
+  // written), and none is held here.
   private inFlightRows: Queued[] = []
   // The writers this one took over from (`adopt`), oldest first: a batch one
   // still has out goes to the exit spill with this writer's rows.
@@ -421,7 +424,9 @@ export class Writer {
   // not have read its rows), and whether rows were parked since the last
   // replay that rows landing set going (`succeeded`).
   private parked = { seq: 0, recoverable: false }
-  private statusText: string | undefined = undefined
+  // The host's status line as the writers of this load last set it: one
+  // line for the plugin, so every writer that takes over shares it (`adopt`).
+  private status: { text: string | undefined } = { text: undefined }
   // Set once the session is ending: no new batch starts after that.
   private closing = false
   // Why rows cannot be written now, if credentials or permission stop them.
@@ -494,10 +499,16 @@ export class Writer {
   // writer's paced replays going. Every writer that takes over shares them.
   adopt(previous: Writer): void {
     const c = this.config()
-    // Any rows this writer queued already are newer: they go behind.
-    previous.queue.append(this.queue.takeAll())
+    // Any rows this writer queued already are newer: they go behind, under
+    // this writer's bounds.
     previous.queue.limit(c.maxQueueRows, c.maxQueueBytes)
+    previous.queue.append(this.queue.takeAll())
     this.queue = previous.queue
+    // The status line too, which session.start cleared before the takeover:
+    // a line the writer before sets late is then one this writer's next
+    // landing clears.
+    previous.status.text = undefined
+    this.status = previous.status
     for (const dir of this.replayDue) previous.replayDue.add(dir)
     this.replayDue = previous.replayDue
     previous.parked.seq += this.parked.seq
@@ -648,12 +659,13 @@ export class Writer {
           } else if (outcome.retry.has(i)) retry.push(q)
         })
         this.succeeded(batch.length - rejected.length - retry.length)
-        if (rejected.length > 0) await this.reject(rejected, `BigQuery rejected ${rejected.length} row(s): ${reasons[0]}`)
-        if (retry.length > 0) {
-          await this.retryLater(retry, 'BigQuery asked to retry some rows')
-          return false
-        }
-        return true
+        // Every row handed on before either write is waited for: the refused
+        // to their file, those asked for again back to the queue.
+        const writes: Promise<void>[] = []
+        if (rejected.length > 0) writes.push(this.reject(rejected, `BigQuery rejected ${rejected.length} row(s): ${reasons[0]}`))
+        if (retry.length > 0) writes.push(this.retryLater(retry, 'BigQuery asked to retry some rows'))
+        await Promise.all(writes)
+        return retry.length === 0
       }
       case 'auth':
         this.dropToken()
@@ -744,6 +756,7 @@ export class Writer {
 
   private async retryLater(batch: Queued[], message: string): Promise<void> {
     this.batchOpen = false
+    this.inFlightRows = []
     const c = this.config()
     const reason = diagnostic(message)
     this.consecutiveFailures += 1
@@ -768,6 +781,7 @@ export class Writer {
 
   private async reject(batch: Queued[], message: string): Promise<void> {
     this.batchOpen = false
+    this.inFlightRows = []
     const reason = diagnostic(message)
     this.consecutiveFailures += 1
     this.pause()
@@ -799,8 +813,8 @@ export class Writer {
 
   private setStatus(text: string | undefined): void {
     const clean = text === undefined ? undefined : diagnostic(text, 300)
-    if (clean === this.statusText) return
-    this.statusText = clean
+    if (clean === this.status.text) return
+    this.status.text = clean
     this.io.status(clean)
   }
 
@@ -1190,11 +1204,13 @@ export class Writer {
     this.soon?.cancel()
     this.soon = null
     // The writers this one took over from start nothing more either, and a
-    // batch one still has out goes with the rest.
+    // batch one still has out, its answer not come, goes with the rest. Rows
+    // an answer refused, or parks after their retries, are in a file being
+    // written already: a copy here would send them again.
     const out: Queued[] = []
     for (const writer of [...this.before, this]) {
       writer.closing = true
-      if (writer.inFlight) out.push(...writer.inFlightRows)
+      out.push(...writer.inFlightRows)
     }
     const rows = [...out, ...this.queue.takeAll()]
     if (rows.length === 0) return { spilled: 0 }

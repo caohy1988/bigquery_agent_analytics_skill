@@ -38,6 +38,7 @@ const TABLE_CREATED = { status: 200, text: '{"kind":"bigquery#table"}' }
 // again; and insertAll refused the first row.
 const FIRST_AGAIN = { status: 200, text: JSON.stringify({ insertErrors: [{ index: 0, errors: [{ reason: 'backendError', message: 'try again' }] }] }) }
 const FIRST_REFUSED = { status: 200, text: JSON.stringify({ insertErrors: [{ index: 0, errors: [{ reason: 'invalid', message: 'no such field: extra' }] }] }) }
+const FIRST_RETRY = { status: 200, text: JSON.stringify({ insertErrors: [{ index: 0, errors: [{ reason: 'backendError', message: 'try again' }] }] }) }
 const DENIED = {
   status: 403,
   text: '{"error":{"code":403,"message":"Access Denied: Table my-gcp-project:agent_analytics.agent_events: Permission bigquery.tables.updateData denied","errors":[{"reason":"accessDenied"}],"status":"PERMISSION_DENIED"}}',
@@ -2040,6 +2041,127 @@ test('the exit spill after a takeover takes the batch the writer before still ha
   answer()
   await flushing
   expect([w.sentOf(a), w.sentOf(d)]).toEqual([1, 0])
+})
+
+for (const kind of ['refused', 'parked after their retries'] as const) {
+  test(`the exit spill after a takeover, rows the batch out had ${kind} still being written, makes no second copy of them`, async () => {
+    const w = twoWriters(() => (kind === 'refused' ? FIRST_REFUSED : FIRST_RETRY))
+    const a = 'a'.repeat(32)
+    const rowOf = (id: string) => (JSON.parse(line(id, 'retry')) as { row: Parameters<Writer['enqueue']>[0] }).row
+    const before = w.writer('a-session')
+    before.enqueue(rowOf(a), 0)
+    if (kind !== 'refused') {
+      const queued = before.queue.takeAll()
+      for (const q of queued) q.attempts = resolveConfig({}, {}).maxRetries
+      before.queue.unshift(queued)
+    }
+    // The file the answer sends the row to: its write waits.
+    let reached = (): void => undefined
+    let release = (): void => undefined
+    const atWrite = new Promise<void>(resolve => (reached = resolve))
+    const held = new Promise<void>(resolve => (release = resolve))
+    w.holdWrites((_, path, text) => {
+      if (!path.includes(kind === 'refused' ? '/rejected-' : '/retry-') || text === '') return undefined
+      w.holdWrites(null)
+      reached()
+      return held
+    })
+    const flushing = before.flush()
+    await atWrite
+    const after = w.writer('a-session')
+    after.adopt(before)
+    expect(await after.spillForExit(1000)).toEqual({ spilled: 0 })
+    release()
+    await flushing
+    await w.writer('next-session').backfill(['spill', 'retry'], 'auto')
+    const copies = (dir: 'spill' | 'retry'): number => [...w.files].filter(([path, text]) => path.includes(`/${dir}-`) && text !== '').flatMap(([, text]) => parseFile(text).lines).filter(l => l.row.event_id === a).length
+    if (kind === 'refused') expect([w.sentOf(a), w.copiesOf(a), copies('spill')]).toEqual([1, 1, 0])
+    else expect([copies('spill'), w.sentOf(a)]).toEqual([0, 2])
+  })
+}
+
+test('the exit spill while a batch\'s refused rows are still being written takes those its answer asked for again, and none it landed or refused', async () => {
+  const [l, r, x] = ['1'.repeat(32), '2'.repeat(32), '3'.repeat(32)]
+  const mixed = { status: 200, text: JSON.stringify({ insertErrors: [{ index: 1, errors: [{ reason: 'invalid', message: 'no such field: extra' }] }, { index: 2, errors: [{ reason: 'backendError', message: 'try again' }] }] }) }
+  let calls = 0
+  const w = twoWriters(() => (++calls === 1 ? mixed : OK_INSERT))
+  const rowOf = (id: string) => (JSON.parse(line(id, 'retry')) as { row: Parameters<Writer['enqueue']>[0] }).row
+  const writer = w.writer('a-session')
+  for (const id of [l, r, x]) writer.enqueue(rowOf(id), 0)
+  let reached = (): void => undefined
+  let release = (): void => undefined
+  const atWrite = new Promise<void>(resolve => (reached = resolve))
+  const held = new Promise<void>(resolve => (release = resolve))
+  w.holdWrites((_, path, text) => {
+    if (!path.includes('/rejected-') || text === '') return undefined
+    w.holdWrites(null)
+    reached()
+    return held
+  })
+  const flushing = writer.flush()
+  await atWrite
+  expect(await writer.spillForExit(1000)).toEqual({ spilled: 1 })
+  release()
+  await flushing
+  await w.writer('next-session').backfill(['spill', 'retry'], 'auto')
+  expect([w.sentOf(l), w.sentOf(r), w.sentOf(x), w.copiesOf(r)]).toEqual([1, 1, 2, 1])
+})
+
+test('a status line the writer before sets after the next one took over is cleared by the next writer\'s landing', async () => {
+  let calls = 0
+  const w = twoWriters(() => (++calls === 1 ? DATASET_MISSING : OK_INSERT))
+  const [a, b] = ['a'.repeat(32), 'b'.repeat(32)]
+  const rowOf = (id: string) => (JSON.parse(line(id, 'retry')) as { row: Parameters<Writer['enqueue']>[0] }).row
+  const before = w.writer('a-session')
+  before.enqueue(rowOf(a), 0)
+  let asked = (): void => undefined
+  let answer = (): void => undefined
+  const atRequest = new Promise<void>(resolve => (asked = resolve))
+  const answered = new Promise<void>(resolve => (answer = resolve))
+  w.hold(() => {
+    w.hold(null)
+    asked()
+    return answered
+  })
+  const flushing = before.flush()
+  await atRequest
+  const after = w.writer('a-session')
+  after.adopt(before)
+  // The writer before learns of the missing dataset now, and says so.
+  answer()
+  await flushing
+  expect(w.statuses.at(-1) ?? '').toMatch(/cannot find the dataset/)
+  after.enqueue(rowOf(b), 0)
+  await after.flush()
+  expect([w.sentOf(b), w.statuses.at(-1)]).toEqual([1, undefined])
+})
+
+test('a status line the writer before set, cleared at session.start, is said again by the writer that takes over when the same problem stands', async () => {
+  const w = twoWriters(() => DATASET_MISSING)
+  const a = 'a'.repeat(32)
+  const before = w.writer('a-session')
+  before.enqueue((JSON.parse(line(a, 'retry')) as { row: Parameters<Writer['enqueue']>[0] }).row, 0)
+  await before.flush()
+  const said = w.statuses.at(-1)
+  expect(said ?? '').toMatch(/cannot find the dataset/)
+  // session.start clears the host's line (register.ts), then its writer takes over.
+  w.statuses.push(undefined)
+  const after = w.writer('a-session')
+  after.adopt(before)
+  await after.flush()
+  expect([w.sentOf(a), w.statuses.at(-1)]).toEqual([2, said])
+})
+
+test('rows a writer queued before it took over, behind a queue under smaller bounds, are held to its own larger bounds', async () => {
+  const w = twoWriters(() => OK_INSERT)
+  const rowOf = (id: string) => (JSON.parse(line(id, 'retry')) as { row: Parameters<Writer['enqueue']>[0] }).row
+  const small = resolveConfig({ project: 'my-gcp-project', dataset: 'agent_analytics', deadLetterDir: '/dl' }, { BQAA_MAX_QUEUE_ROWS: '10' })
+  const before = w.writer('a-session', small)
+  for (let i = 0; i < 8; i += 1) before.enqueue(rowOf(`b${i}`.padStart(32, '0')), 0)
+  const after = w.writer('a-session')
+  for (let i = 0; i < 5; i += 1) after.enqueue(rowOf(`a${i}`.padStart(32, '0')), 0)
+  after.adopt(before)
+  expect(after.queue.length).toBe(13)
 })
 
 test('rows with no id alike in two files count as two refused', async () => {
