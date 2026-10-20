@@ -337,6 +337,18 @@ test('a landing whose store write is refused is written once more rows land', { 
   expect(own(world)).toMatchObject({ landedTo: HERE })
 })
 
+test('a greeting whose store write is refused is written again at the next flush, on a card no rows change', { options: {} }, async ($, on) => {
+  let refusing = true
+  on('store.set', { key: GREETED_KEY }, ($, e, next) => (refusing ? { deny: 'the store could not be written' } : next(e)))
+  const world = setUp(on, {}, {})
+  await startSession($)
+  await world.clock.settle()
+  expect(world.store.get(GREETED_KEY)).toBeUndefined()
+  refusing = false
+  await world.clock.advance(5000)
+  expect(world.store.get(GREETED_KEY)).toEqual(GREETED_HERE)
+})
+
 test('a flush interval of no whole number of seconds is said as it is', { options: { ...OPTIONS, flushIntervalMs: 1500 } }, async ($, on) => {
   const world = setUp(on, {}, {})
   await startSession($)

@@ -303,10 +303,11 @@ not show. The store makes "once" a best effort:
 
 * if the records cannot be written, the next session shows the card again,
   and a reload in a session that keeps no `$.state` shows it as the store
-  last had it (a write that fails goes again when more rows land, a
-  landing also when a reload takes the card over, and a close at each of
-  that load's flushes until it lands: a reload before it does, the state's
-  close refused too, can show the card again);
+  last had it (a greeting or landing write that fails goes again at each
+  of that load's flushes and when more rows land, a landing also when a
+  reload takes the card over, and a close at each of that load's flushes
+  until it lands: a reload before it does, the state's close refused too,
+  can show the card again);
 * if they cannot be read, or the versions greeted before cannot be listed,
   no card shows, after a reload too, nor where no session id is known when
   the session starts (the card's landing and close are kept under it);
@@ -1090,6 +1091,7 @@ bash tests/setup.test.sh
 bash tests/version.test.sh    # plugin.json and PLUGIN_VERSION agree
 node tests/reload.test.mjs    # node 24: the welcome card across a fresh load
 bash tests/state-contract.test.sh   # the host's $.state, as the reload test models it
+bash tests/state-reset.live.sh [folder]   # live: the host's $.state across /clear (below)
 python3 tests/views.test.py   # needs DuckDB: python3 -m pip install duckdb
 npx -p typescript tsc -p .    # once the host CLI has loaded the mod (below)
 ```
@@ -1107,7 +1109,7 @@ test kit, with no session, sign-in, GCP or network: `$.http.fetch`,
 `$.process.run`, `$.fs` and `$.store` are stubbed, and `mock.clock` drives the
 timers; the `$.fs` stubs measure files in UTF-8 bytes and refuse a file over
 4 MiB, and the `$.store` stub a store over 4 MiB of JSON in all, as the host
-does. 389 tests cover the captured rows and their spans,
+does. 390 tests cover the captured rows and their spans,
 subagent runs in the order the host raises them (one invocation and one
 trace for the turn, a span per run, a SubagentStart that comes late or never),
 the session-start row raised before or during `session.start`'s setup,
@@ -1377,7 +1379,8 @@ And the welcome card:
   version it replaced, the newest greeted before; "updated" only for a
   newer version, pre-releases part by part; the card's write queue on its
   own, a greeting or landing whose write fails going again at the card's
-  next change; rows the writer before a reload lands counting on the card after
+  next change, and a greeting at the next flush on a card no rows change;
+  rows the writer before a reload lands counting on the card after
   it; a close whose session-state write is refused hiding the card, and
   the store's close keeping it hidden after a reload;
 * a reload to another table, or out of a dry run, waiting for rows to land
@@ -1430,6 +1433,17 @@ its check kept as `state.contract.ts`, a name this mod's tests leave alone)
 reads one value, waits while another dispatch writes, then writes at the
 version it read: the other write is not seen until a write of its own,
 landed or missed, brings the whole moment up to date.
+
+`tests/state-reset.live.sh` checks, in a live session, what that stand-in
+models of a reset of the session's state, which the test runtime cannot
+make: a small mod of its own (`tests/state-reset`) writes one value three
+times at session start, and after `/clear` reads it as never written, at
+version 0, writes it three times at versions above every one from before,
+and misses each write made at the version from before. It needs a signed-in
+host CLI and python3, opens the session in a pseudo-terminal in the folder
+given (this mod's, if none), which the host must trust already (it never
+answers that question), types `/clear` and `/exit`, and submits no prompt,
+so no model is called. On host 2.1.304 it passes.
 
 `tests/version.test.sh` checks that `plugin.json` and `PLUGIN_VERSION` name
 the same version: the welcome card greets an update by the latter.
@@ -1490,7 +1504,9 @@ stands at once too; that a read of the close that never answers stops no
 read of it ten seconds on, and one that answers after the next began
 leaves that one's turn alone; that its own `$.state` reads one moment an
 event, brought up to date whole by a conditional write of its own, landed
-or missed; that no row of the version before an update counts on the
+or missed, and after a reset reads a value as never written, at version 0,
+numbering the writes after it above every version before, as the host
+does; that no row of the version before an update counts on the
 updated version's card, whenever it lands or is recorded: after the card
 opened, after the earlier card was closed, while the session showed no
 card, while the update read the store, recorded late, or with a later total
@@ -1606,7 +1622,7 @@ setup.sh                     creates the dataset, table, views dataset and views
 sql/                         DDL and sample queries
 sql/views/                   the usage views setup.sh makes
 examples/sample-rows.jsonl   fixture output
-tests/                       plugin-test suites, setup.test.sh for setup.sh, version.test.sh, and reload.test.mjs
+tests/                       plugin-test suites, setup.test.sh for setup.sh, version.test.sh, reload.test.mjs, and the host's $.state checks (state-contract.test.sh, state-reset.live.sh)
 types/index.d.ts             the values the mod keeps in the session's $.state
 ```
 

@@ -24,7 +24,7 @@ import type { DeliveredRows, DeliveredState, Run } from '../types'
 
 import { type Config, type EnvSnapshot, type Options, PLUGIN_VERSION, canDeliver, deadLetterPartition, destinationDir, joinPath, resolveConfig, tableRef } from './lib/config.ts'
 import { HOST_FILE_BYTES, kindOf } from './lib/deadletter.ts'
-import { randomIds } from './lib/ids.ts'
+import { randomHex, randomIds } from './lib/ids.ts'
 import type { BqaaRow } from './lib/rows.ts'
 import { redactDiagnostic } from './lib/sanitize.ts'
 import { type DeadLetterSummary, formatStatus } from './lib/status.ts'
@@ -46,7 +46,7 @@ let clockAfter: ((ms: number, fn: () => void) => { cancel: () => void }) | null 
 // every load of this code reads that one copy, and the band draws from it.
 // This load of the code, its session.start runs, and the writes of the card
 // it showed (`CardRecords`).
-const LOAD = Math.random().toString(36).slice(2)
+const LOAD = randomHex(8)
 let welcomeStarts = 0
 // How many resets of the session's state this load has seen (/clear,
 // /resume and /branch, which `classic.SessionStart` reports): a run's
@@ -280,7 +280,7 @@ async function lookUpHostname($: EngineInterface): Promise<void> {
 async function nextLoad($: EngineInterface): Promise<Run | null> {
   for (let i = 0; i < 8; i += 1) {
     const held = await $.state.get(LOADS_STATE)
-    const now = held.value ?? { count: 0, lifetime: Math.random().toString(36).slice(2) }
+    const now = held.value ?? { count: 0, lifetime: randomHex(8) }
     const next = { count: now.count + 1, lifetime: now.lifetime }
     if ((await $.state.set(LOADS_STATE, next, { ifVersion: held.version })).isSet) return { rank: next.count, lifetime: next.lifetime }
   }
@@ -867,6 +867,7 @@ export const register: Register = (on, registered) => {
       flushTimer = $.clock.every(config.flushIntervalMs, () => {
         void writer?.flush()
         saveClose($)
+        records?.retry()
       })
       if (config.enabled && config.recordHostname) $.clock.after(0, () => void lookUpHostname($))
       if (canDeliver(config) && !config.dryRun) {

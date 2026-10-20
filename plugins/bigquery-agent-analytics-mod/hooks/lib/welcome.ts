@@ -141,6 +141,12 @@ export class CardRecords {
     this.write()
   }
 
+  // A write that failed goes again (at each flush): a card no rows change
+  // (not set up, capture off) has no next change to take it.
+  retry(): void {
+    if (this.greetingDue || this.landingDue) this.write()
+  }
+
   private write(): void {
     if (this.writing) return
     this.writing = true
@@ -161,9 +167,10 @@ export class CardRecords {
             if (sessionId !== null) await this.save(cardKey(version, sessionId), { landedAt, landedTo })
           }
         } catch {
-          // Not recorded: it goes again at the card's next change (rows that
-          // land later). Until then the next session shows the card again, or
-          // a reload with no `$.state` shows it as the store last had it.
+          // Not recorded: it goes again at the next flush, or the card's next
+          // change (rows that land later). Until then the next session shows
+          // the card again, or a reload with no `$.state` shows it as the
+          // store last had it.
           if (greeting) this.greetingDue = true
           else this.landingDue = true
           break

@@ -65,7 +65,10 @@ function host({ hold = () => false, holdState = () => false, refuseState = () =>
   // A new version for each write that lands, from one sequence for the
   // session's values. The code compares a value's version only with that
   // value's own; the host's test runtime numbers writes of different values
-  // alike at times, so nothing here asks more of the numbers than that.
+  // alike at times, so nothing here asks more of the numbers than that. A
+  // reset (`state.clear()`, as /clear, /resume and /branch) leaves each value
+  // as never written, at version 0, and numbers the writes after it on: no
+  // version from before comes back, as in the host (`state-reset.live.sh`).
   let stamp = 0
   const stateSet = (ref, value, options) => {
     if (refuseState(value, ref.key)) return Promise.reject(new Error('refused by policy'))
@@ -854,6 +857,24 @@ const tests = {
     const seen = await first
     assert.equal(seen.missed.isSet, false)
     assert.deepEqual([seen.x.value, seen.x.version, seen.y.value, seen.y.version], [1, wrote[0].version, { probe: true }, wrote[1].version])
+  },
+  async 'after a reset the stand-in reads a value as never written, at version 0, and numbers the writes after it above every version before, as the host does'() {
+    const h = host()
+    const a = await load(h)
+    const ref = key => ({ plugin: 'bigquery-agent-analytics-mod', key })
+    const write = (value, ifVersion) => dispatch.run({ moment: null }, async () => a.$.state.set(ref('loads'), value, ifVersion === undefined ? undefined : { ifVersion }))
+    const read = () => dispatch.run({ moment: null }, async () => a.$.state.get(ref('loads')))
+    let last = { version: 0 }
+    for (let n = 1; n <= 3; n += 1) last = await write(n, (await read()).version)
+    h.state.clear()
+    const first = await read()
+    const after = []
+    for (let n = 1; n <= 3; n += 1) {
+      after.push(await write(100 * n, (await read()).version))
+      assert.equal((await write(999, last.version)).isSet, false)
+    }
+    assert.deepEqual([first.value, first.version], [undefined, 0])
+    assert.ok(after.every(w => w.isSet && w.version > last.version))
   },
   async 'the stand-in brings the whole moment up to date after a conditional write of its own lands too, as the host\'s'() {
     const h = host()

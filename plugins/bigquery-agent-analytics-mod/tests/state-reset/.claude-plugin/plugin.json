@@ -1,0 +1,1 @@
+{ "name": "state-reset", "version": "0.0.0", "description": "Checks the host's $.state versions across /clear, as the reload test models them", "types": "./types/index.d.ts" }
