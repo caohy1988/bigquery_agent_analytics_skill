@@ -701,10 +701,13 @@ GROUP BY model
   record cut off (the file may have been done): the file waits, and
   `/bqaa-backfill force` replays it afresh. Of two whole ones, every
   writer goes by the later, by number, then by name. The
-  mark is read before any other record, and read again before a writer
-  takes no record found for an answer (another writer may have finished
-  the file while the record was read, its done mark written before it let
-  the store's copy go): a late write of another session's copy of
+  mark is read before any other record, and read again, after the
+  sending marks, before a writer takes no record found for an answer
+  (another writer may have finished the file while those were read, its
+  done mark written before it let the store's copy, or its sending mark,
+  go; a writer about to send goes by the sending marks that read found,
+  or, beside a record cut off part-way, reads them and then the done marks
+  once more): a late write of another session's copy of
   a file it left is then emptied unsent, another session's late outcome
   for it stops there, and a file of what is left that the mark does not
   name is a late copy of another session's outcome, emptied unsent too, as
@@ -923,7 +926,7 @@ test kit, with no session, sign-in, GCP or network: `$.http.fetch`,
 `$.process.run`, `$.fs` and `$.store` are stubbed, and `mock.clock` drives the
 timers; the `$.fs` stubs measure files in UTF-8 bytes and refuse a file over
 4 MiB, and the `$.store` stub a store over 4 MiB of JSON in all, as the host
-does. 306 tests cover the captured rows and their spans,
+does. 309 tests cover the captured rows and their spans,
 subagent runs in the order the host raises them (one invocation and one
 trace for the turn, a span per run, a SubagentStart that comes late or never),
 the session-start row raised before or during `session.start`'s setup,
@@ -1095,8 +1098,12 @@ And the replay that runs by itself while nothing is queued:
   another session's lease holds, and one of what is left waiting on its
   parent's record, each saying why; of two whole done marks for one file,
   every writer going by the later, by number and then by name; a writer
-  whose read of the record answers after another finished the file, put
-  back by a late write, sending none of it; where the listing gives no
+  whose read of the record, or of the sending marks, answers after another
+  finished the file, put back by a late write, sending none of it, and one
+  replaying the file afresh past a done mark cut off part-way, its read of
+  the marks answering before that writer empties the file; a writer that
+  finds another's sending mark standing leaving the file, whatever a later
+  read of the marks would find; where the listing gives no
   times, the records of a file done more than a day ago emptied by its done
   mark's time, and a listing time of 0 taken for none; two writers of one session never giving
   two files one name; a done

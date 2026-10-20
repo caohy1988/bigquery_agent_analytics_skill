@@ -2320,6 +2320,235 @@ test('a writer whose read of the record answers after another writer finished th
   expect([w.sentOf(a), w.copiesOf(a)]).toEqual([1, 1])
 })
 
+test('a writer whose read of the marks answers after another writer finished the file, which a late write then puts back, sends none of it: the done marks are read after the marks', async () => {
+  const w = twoWriters(() => FIRST_REFUSED)
+  const parentName = 'retry-20261013T200102002Z-parent-1.jsonl'
+  const parent = `/dl/${TABLE_REF}/${parentName}`
+  const name = 'retry-20261013T200102003Z-child-1.jsonl'
+  const source = `/dl/${TABLE_REF}/${name}`
+  const a = 'a'.repeat(32)
+  const text = packFiles([line(a, 'retry'), line('c'.repeat(32), 'retry')])[0] as string
+  w.files.set(parent, text)
+  // The parent's outcome is recorded: its first row waits, in the child, and
+  // its second landed.
+  w.store.set(`replayed:${TABLE_REF}/${parentName}`, { size: new TextEncoder().encode(text).length, fates: 'WL', reasons: [], refusals: [], files: [source], written: [false], waits: true, seq: 1 })
+  // A writer's write of the child waits; its lease runs out, and another
+  // writer finishes the parent.
+  let outputReached = (): void => undefined
+  let releaseOutput = (): void => undefined
+  const atOutput = new Promise<void>(resolve => (outputReached = resolve))
+  const output = new Promise<void>(resolve => (releaseOutput = resolve))
+  let outputHeld = false
+  w.holdWrites((session, path, value) => {
+    if (session !== 'delayed-parent' || path !== source || value === '' || outputHeld) return undefined
+    outputHeld = true
+    outputReached()
+    return output
+  })
+  const delayed = w.writer('delayed-parent').backfill(['spill', 'retry'], 'auto')
+  await atOutput
+  w.store.delete(`lease:${TABLE_REF}/${parentName}`)
+  await w.writer('finishing-parent').backfill(['spill', 'retry'], 'auto')
+  expect([w.files.get(parent), parseFile(w.files.get(source) ?? '').lines.length]).toEqual(['', 1])
+  // A checker's read of the child waits; its lease runs out, and a sender
+  // sends the child, its answer held.
+  let readReached = (): void => undefined
+  let releaseRead = (): void => undefined
+  const atRead = new Promise<void>(resolve => (readReached = resolve))
+  const read = new Promise<void>(resolve => (releaseRead = resolve))
+  let readHeld = false
+  w.holdReads((session, path) => {
+    if (session !== 'checking-child' || path !== source || readHeld) return undefined
+    readHeld = true
+    readReached()
+    return read
+  })
+  const checking = w.writer('checking-child').backfill(['spill', 'retry'], 'auto')
+  await atRead
+  w.store.delete(`lease:${TABLE_REF}/${name}`)
+  let asked = (): void => undefined
+  let answer = (): void => undefined
+  const atRequest = new Promise<void>(resolve => (asked = resolve))
+  const answered = new Promise<void>(resolve => (answer = resolve))
+  w.hold(session => {
+    if (session !== 'sending-child') return undefined
+    asked()
+    return answered
+  })
+  const sending = w.writer('sending-child').backfill(['spill', 'retry'], 'auto')
+  await atRequest
+  // The checker goes on to its mark; its read of a mark beside the child
+  // waits.
+  let getReached = (): void => undefined
+  let releaseGet = (): void => undefined
+  const atGet = new Promise<void>(resolve => (getReached = resolve))
+  const got = new Promise<void>(resolve => (releaseGet = resolve))
+  let getHeld = false
+  w.holdReads((session, path) => {
+    if (session !== 'checking-child' || !path.includes('/outcome-sending-') || !path.endsWith(name) || getHeld) return undefined
+    getHeld = true
+    getReached()
+    return got
+  })
+  releaseRead()
+  await atGet
+  // The sender's row is refused: it records, copies, marks the child done,
+  // empties it and lets its record go; the late write puts the child back.
+  answer()
+  await sending
+  expect([w.sentOf(a), w.copiesOf(a), w.files.get(source), doneMark(w.files, name)]).toEqual([1, 1, '', true])
+  releaseOutput()
+  await delayed
+  expect(parseFile(w.files.get(source) ?? '').lines.length).toBe(1)
+  releaseGet()
+  await checking
+  expect([w.sentOf(a), w.copiesOf(a)]).toEqual([1, 1])
+})
+
+test('a writer that finds another writer\'s mark standing as it reads the record leaves the file: no later read of the marks, after that writer finished, lets it send', async () => {
+  const w = twoWriters(() => FIRST_REFUSED)
+  const parentName = 'retry-20261013T200102002Z-parent-1.jsonl'
+  const parent = `/dl/${TABLE_REF}/${parentName}`
+  const name = 'retry-20261013T200102003Z-child-1.jsonl'
+  const source = `/dl/${TABLE_REF}/${name}`
+  const a = 'a'.repeat(32)
+  const text = packFiles([line(a, 'retry'), line('c'.repeat(32), 'retry')])[0] as string
+  w.files.set(parent, text)
+  w.store.set(`replayed:${TABLE_REF}/${parentName}`, { size: new TextEncoder().encode(text).length, fates: 'WL', reasons: [], refusals: [], files: [source], written: [false], waits: true, seq: 1 })
+  // A late write of the child waits, and another writer finishes the parent.
+  let outputReached = (): void => undefined
+  let releaseOutput = (): void => undefined
+  const atOutput = new Promise<void>(resolve => (outputReached = resolve))
+  const output = new Promise<void>(resolve => (releaseOutput = resolve))
+  let outputHeld = false
+  w.holdWrites((session, path, value) => {
+    if (session !== 'delayed-parent' || path !== source || value === '' || outputHeld) return undefined
+    outputHeld = true
+    outputReached()
+    return output
+  })
+  const delayed = w.writer('delayed-parent').backfill(['spill', 'retry'], 'auto')
+  await atOutput
+  w.store.delete(`lease:${TABLE_REF}/${parentName}`)
+  await w.writer('finishing-parent').backfill(['spill', 'retry'], 'auto')
+  // A checker's read of the child waits; a sender sends the child, its answer held.
+  let readReached = (): void => undefined
+  let releaseRead = (): void => undefined
+  const atRead = new Promise<void>(resolve => (readReached = resolve))
+  const read = new Promise<void>(resolve => (releaseRead = resolve))
+  let readHeld = false
+  w.holdReads((session, path) => {
+    if (session !== 'checking-child' || path !== source || readHeld) return undefined
+    readHeld = true
+    readReached()
+    return read
+  })
+  const checking = w.writer('checking-child').backfill(['spill', 'retry'], 'auto')
+  await atRead
+  w.store.delete(`lease:${TABLE_REF}/${name}`)
+  let asked = (): void => undefined
+  let answer = (): void => undefined
+  const atRequest = new Promise<void>(resolve => (asked = resolve))
+  const answered = new Promise<void>(resolve => (answer = resolve))
+  w.hold(session => {
+    if (session !== 'sending-child') return undefined
+    asked()
+    return answered
+  })
+  const sending = w.writer('sending-child').backfill(['spill', 'retry'], 'auto')
+  await atRequest
+  // The sender's mark, the only one standing now.
+  const marks = [...w.files].filter(([path, value]) => path.includes('/outcome-sending-') && path.endsWith(`-${name}`) && value !== '').map(([path]) => path)
+  expect(marks.length).toBe(1)
+  // The checker's first read of the sender's mark finds it standing; a second
+  // read of it, if any, waits.
+  let secondReached = (): void => undefined
+  let releaseSecond = (): void => undefined
+  const atSecond = new Promise<void>(resolve => (secondReached = resolve))
+  const second = new Promise<void>(resolve => (releaseSecond = resolve))
+  let reads = 0
+  w.holdReads((session, path) => {
+    if (session !== 'checking-child' || path !== marks[0]) return undefined
+    reads += 1
+    if (reads !== 2) return undefined
+    secondReached()
+    return second
+  })
+  releaseRead()
+  const first = await Promise.race([atSecond.then(() => 'read again'), checking.then(() => 'done')])
+  // The sender finishes; the late write puts the child back.
+  answer()
+  await sending
+  releaseOutput()
+  await delayed
+  releaseSecond()
+  await checking
+  expect([first, w.sentOf(a), w.copiesOf(a)]).toEqual(['done', 1, 1])
+})
+
+test('a writer replaying a file afresh past a done mark cut off part-way, whose read of the marks answers after another writer finished the file, sends none of it: the done marks are read after the marks', async () => {
+  const w = twoWriters(() => FIRST_REFUSED)
+  const name = 'retry-20261013T200102003Z-earlier-1.jsonl'
+  const source = `/dl/${TABLE_REF}/${name}`
+  const a = 'a'.repeat(32)
+  const text = packFiles([line(a, 'retry'), line('c'.repeat(32), 'retry')])[0] as string
+  w.files.set(source, text)
+  const size = new TextEncoder().encode(text).length
+  const whole = sealFile(`${JSON.stringify({ fates: 'RL', reasons: [], refusals: [], size, waits: false, seq: 1, files: [], written: [], retired: true })}\n`)
+  w.files.set(doneOf(name), whole.slice(0, Math.floor(whole.length / 2)))
+  // A writer replays the file afresh, its answer held; it will hold its
+  // emptying of the file too.
+  let asked = (): void => undefined
+  let answer = (): void => undefined
+  const atRequest = new Promise<void>(resolve => (asked = resolve))
+  const answered = new Promise<void>(resolve => (answer = resolve))
+  w.hold(session => {
+    if (session !== 'finishing-session') return undefined
+    asked()
+    return answered
+  })
+  let emptyReached = (): void => undefined
+  let releaseEmpty = (): void => undefined
+  const atEmpty = new Promise<void>(resolve => (emptyReached = resolve))
+  const emptying = new Promise<void>(resolve => (releaseEmpty = resolve))
+  w.holdWrites((session, path, value) => {
+    if (session !== 'finishing-session' || path !== source || value !== '') return undefined
+    emptyReached()
+    return emptying
+  })
+  const finishing = w.writer('finishing-session').backfill(['spill', 'retry'], 'force')
+  await atRequest
+  w.store.delete(`lease:${TABLE_REF}/${name}`)
+  const theirs = [...w.files].filter(([path, value]) => path.includes('/outcome-sending-') && path.endsWith(`-${name}`) && value !== '').map(([path]) => path)
+  expect(theirs.length).toBe(1)
+  // Another writer replays it afresh too: its second read of its own mark,
+  // after the record read cut off, waits.
+  let getReached = (): void => undefined
+  let releaseGet = (): void => undefined
+  const atGet = new Promise<void>(resolve => (getReached = resolve))
+  const got = new Promise<void>(resolve => (releaseGet = resolve))
+  let own = 0
+  w.holdReads((session, path) => {
+    if (session !== 'checking-session' || !path.includes('/outcome-sending-') || !path.endsWith(`-${name}`) || path === theirs[0]) return undefined
+    own += 1
+    if (own !== 2) return undefined
+    getReached()
+    return got
+  })
+  const checking = w.writer('checking-session').backfill(['spill', 'retry'], 'force')
+  await atGet
+  // The first writer's row is refused: it records, copies and marks the file
+  // done; its emptying of the file waits.
+  answer()
+  await atEmpty
+  expect([w.sentOf(a), w.copiesOf(a), doneMark(w.files, name), w.files.get(source)]).toEqual([1, 1, true, text])
+  releaseGet()
+  await checking
+  releaseEmpty()
+  await finishing
+  expect([w.sentOf(a), w.copiesOf(a), w.files.get(source)]).toEqual([1, 1, ''])
+})
+
 test('of two whole done marks of one number, every writer goes by the later name', async () => {
   const w = twoWriters(() => OK_INSERT)
   const parent = 'retry-20261013T200102003Z-earlier-1.jsonl'

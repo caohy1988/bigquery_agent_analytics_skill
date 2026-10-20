@@ -1595,19 +1595,7 @@ export class Writer {
     // its own. One cut off part-way, with no other whole record, is cut off
     // too: the file's outcome may have been done, and none of it goes but by
     // /bqaa-backfill force.
-    // Of two whole ones (two outcomes recorded at the same moment), the later
-    // by number, then by name: every writer reads the same one.
-    const doneIn = async (entries: readonly { name: string; size: number }[]): Promise<{ done: Partial<Journal> | undefined; torn: boolean }> => {
-      let torn = false
-      let done: Partial<Journal> | undefined
-      const marks = entries.filter(entry => entry.size > 0 && doneMarkerOf(entry.name, source.name) !== null)
-      for (const entry of marks.sort((x, y) => (x.name < y.name ? -1 : x.name > y.name ? 1 : 0))) {
-        const kept = journalOf(await this.io.readFile(joinPath(source.dir, entry.name)))
-        if (kept === 'torn') torn = true
-        else if (fits(kept) && kept.retired === true && (done === undefined || seqOf(kept) >= seqOf(done))) done = kept
-      }
-      return { done, torn }
-    }
+    const doneIn = (entries: readonly { name: string; size: number }[]): Promise<{ done: Partial<Journal> | undefined; torn: boolean }> => this.doneMarks(source, entries)
     let entries = await this.io.listDir(source.dir)
     const first = await doneIn(entries)
     if (first.done !== undefined) return { journal: first.done, filed: true }
@@ -1630,13 +1618,14 @@ export class Writer {
       if (filed !== undefined) return { journal: filed, filed: true }
       // No record whole in the store or beside the file: a writer may have
       // finished the file while those were read, and it writes its done mark
-      // before it lets the store's record go. The done marks are listed
-      // again, and the marks with them, before none is taken for an answer.
+      // before it lets the store's record go, and before it lets its mark
+      // go. So the marks are read, and only then the done marks listed
+      // again, before none is taken for an answer.
       entries = await this.io.listDir(source.dir)
-      const again = await doneIn(entries)
+      const by = await this.marksOn(source, entries)
+      const again = await doneIn(await this.io.listDir(source.dir))
       if (again.done !== undefined) return { journal: again.done, filed: true }
       if (torn || doneTorn || again.torn) return 'torn'
-      const by = await this.marksOn(source, entries)
       return by.length === 0 ? undefined : { pending: by }
     }
     if (filed === undefined) return { journal: stored, filed: torn }
@@ -1645,6 +1634,23 @@ export class Writer {
     const a = writtenOf(stored)
     const b = writtenOf(filed)
     return { journal: { ...stored, written: a.map((w, i) => w || b[i] === true), seq: Math.max(seqOf(stored), seqOf(filed)), retired: stored.retired === true || filed.retired === true }, filed: true }
+  }
+
+  // The marks that `source` was done, each writer's, from `entries` (its
+  // directory listed): the one that stands, and whether one is cut off. Of
+  // two whole ones (two outcomes recorded at the same moment), the later by
+  // number, then by name: every writer reads the same one.
+  private async doneMarks(source: Source, entries: readonly { name: string; size: number }[]): Promise<{ done: Partial<Journal> | undefined; torn: boolean }> {
+    const fits = (journal: Partial<Journal> | undefined): journal is Partial<Journal> => journal !== undefined && (source.size < 0 || journal.size === source.size)
+    let torn = false
+    let done: Partial<Journal> | undefined
+    const marks = entries.filter(entry => entry.size > 0 && doneMarkerOf(entry.name, source.name) !== null)
+    for (const entry of marks.sort((x, y) => (x.name < y.name ? -1 : x.name > y.name ? 1 : 0))) {
+      const kept = journalOf(await this.io.readFile(joinPath(source.dir, entry.name)))
+      if (kept === 'torn') torn = true
+      else if (fits(kept) && kept.retired === true && (done === undefined || seqOf(kept) >= seqOf(done))) done = kept
+    }
+    return { done, torn }
   }
 
   // What becomes of the file `path`, which a replay of `parent` wrote (the
@@ -1904,8 +1910,21 @@ export class Writer {
       report.held ??= diagnostic(`could not mark the replay of ${source.name} before sending, so none of it is sent: ${errorText(err)}`)
       return false
     }
-    const found = Writer.recorded(await this.readJournal(source))
-    const others = found === 'torn' || found === undefined ? (await this.marksOn(source)).filter(by => by !== this.mark) : []
+    // The marks as readJournal read them, before its last look at the done
+    // marks, so no mark let go meanwhile (by a writer that finished the file)
+    // is taken for no writer. With a record cut off part-way, which comes
+    // with no marks, they are read now, and the done marks once more after
+    // them.
+    const read = await this.readJournal(source)
+    let found = Writer.recorded(read)
+    let others: string[] = []
+    if (read === 'torn') {
+      others = (await this.marksOn(source)).filter(by => by !== this.mark)
+      const last = await this.doneMarks(source, await this.io.listDir(source.dir))
+      if (last.done !== undefined) found = { journal: last.done, filed: true }
+    } else if (read !== undefined && 'pending' in read) {
+      others = read.pending.filter(by => by !== this.mark)
+    }
     const another = trigger !== 'force' && others.length > 0
     if ((found !== undefined && found !== 'torn') || another || (await this.io.readFile(path)) === '') {
       if (another && (found === undefined || found === 'torn')) report.held ??= diagnostic(`another session is replaying ${source.name}; if it stopped, /bqaa-backfill force replays the file afresh`)
