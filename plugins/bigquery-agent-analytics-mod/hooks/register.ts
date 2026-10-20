@@ -48,6 +48,11 @@ let clockAfter: ((ms: number, fn: () => void) => { cancel: () => void }) | null 
 // it showed (`CardRecords`).
 const LOAD = Math.random().toString(36).slice(2)
 let welcomeStarts = 0
+// How many resets of the session's state this load has seen (/clear,
+// /resume and /branch, which `classic.SessionStart` reports): a run's
+// welcome card begun before one is neither shown nor taken over after it.
+let resets = 0
+const RESET_SOURCES: ReadonlySet<string> = new Set(['clear', 'resume', 'fork'])
 let records: CardRecords | null = null
 // Who speaks for the card a session.start run of this load showed (its
 // writer counts under the same name).
@@ -71,9 +76,11 @@ const LOADS_STATE = { plugin: 'bigquery-agent-analytics-mod', key: 'loads' } as 
 // Each session.start run's rows landed so far in the session, by run and
 // destination (`countKey`), with the run's rank and lifetime, whatever the
 // card shows. A card counts the rows of the run it counts from (`since`: the
-// one that opened it, or last moved it where rows go now) and of every later
-// run of its lifetime, where it counts rows, and never an earlier run's, nor
-// a run's of the lifetime before the state was reset (`counts`). A run knows
+// one that opened it, or last moved it where rows go now) and of every run
+// of its lifetime ranked above it, where it counts rows, and never a run's
+// ranked below it, nor a run's of the lifetime before the state was reset
+// (`counts`). Ranks go by when each run's count write landed: within one
+// load, a run's whose write landed after the next run's ranks above it. A run knows
 // its own rank and lifetime with nothing to read, so no read or write that
 // answers late, before or after an update, moves a delivery from one card to
 // another.
@@ -308,6 +315,10 @@ async function admit($: EngineInterface, ranked: Promise<Run | null>): Promise<R
 // conditional on the version it read, and it takes over the card shown
 // instead, where it ranks above the run that has it.
 async function startWelcome($: EngineInterface, e: SessionStartInput, sessionId: string | null, start: number, admitted: Promise<Run | null>): Promise<void> {
+  // Whether this run still speaks for the load: no later session.start run,
+  // and no reset of the session's state, since it began.
+  const resetAt = resets
+  const current = (): boolean => start === welcomeStarts && resets === resetAt
   if (!e.isInteractive || e.surface === null) return
   // Nor where the session's id cannot be read: its landing and its close
   // are kept under it, so Got it could not keep the card closed.
@@ -327,19 +338,19 @@ async function startWelcome($: EngineInterface, e: SessionStartInput, sessionId:
   } catch {
     return
   }
-  if (start !== welcomeStarts) return
+  if (!current()) return
   const isOurs = (card: Welcome | null): boolean => card !== null && card.version === PLUGIN_VERSION && sessionId !== null && card.sessionId === sessionId
-  if (isOurs(held.value)) return takeOver($, sessionId as string, start, run)
+  if (isOurs(held.value)) return takeOver($, sessionId as string, start, run, current)
   // A card a later load or run showed (another version's, after an update in
-  // the session) is left alone.
-  if (held.value !== null && (held.value.rank ?? 0) > rank) return
+  // the session) is left alone; one of the lifetime before a reset is not.
+  if (held.value !== null && outranks(held.value, run)) return
   let opened: { welcome: Welcome; isNew: boolean } | null
   try {
     // This session's close is read whether or not its greeting is there: Got
     // it may have been written while the greeting's write was lost, and a
     // resumed session (no state) then shows no card and greets no more.
     const [latest, greeted, closed] = await Promise.all([$.store.get(WELCOME_KEY), $.store.get(greetedKey(PLUGIN_VERSION)), sessionId === null ? undefined : $.store.get(closedKey(PLUGIN_VERSION, sessionId))])
-    if (start !== welcomeStarts || closed === true) return
+    if (!current() || closed === true) return
     let landing: unknown
     let versions: string[] = []
     if (sessionId !== null && greetedBy(latest, greeted)?.sessionId === sessionId) {
@@ -354,7 +365,7 @@ async function startWelcome($: EngineInterface, e: SessionStartInput, sessionId:
     // Unable to tell whether it showed before: never a card each session.
     return
   }
-  if (start !== welcomeStarts || opened === null) return
+  if (!current() || opened === null) return
   const shown: Welcome = { ...opened.welcome, owner: me, rank, since: rank, lifetime: run.lifetime }
   // Shown only if the state still stands as read: no other load has shown
   // or changed a card since. The one that does shows it, and greets. Where
@@ -370,13 +381,23 @@ async function startWelcome($: EngineInterface, e: SessionStartInput, sessionId:
   let isSet = false
   const card: Welcome = shown
   for (let i = 0; i < 8 && !isSet; i += 1) {
+    let wrote: { isSet: boolean; version: number }
     try {
-      isSet = (await $.state.set(WELCOME_STATE, card, { ifVersion: version })).isSet
+      wrote = await $.state.set(WELCOME_STATE, card, { ifVersion: version })
     } catch {
       return
     }
+    // A run of the lifetime before a reset of the session's state (seen
+    // here, or by the count its write, landed or missed, brought up to date)
+    // shows no card, and a card it wrote as the reset came goes again,
+    // unless a later run wrote since.
+    if (resets !== resetAt || !(await inLifetime($, run))) {
+      if (wrote.isSet) await $.state.set(WELCOME_STATE, null, { ifVersion: wrote.version }).catch(() => undefined)
+      return
+    }
+    isSet = wrote.isSet
     if (isSet) break
-    if (start !== welcomeStarts) return
+    if (!current()) return
     let now: { value: Welcome | null; version: number }
     try {
       const read = await $.state.get(WELCOME_STATE)
@@ -384,8 +405,8 @@ async function startWelcome($: EngineInterface, e: SessionStartInput, sessionId:
     } catch {
       return
     }
-    if (isOurs(now.value)) return takeOver($, sessionId as string, start, run)
-    if (now.value !== null && (now.value.rank ?? 0) > rank) return
+    if (isOurs(now.value)) return takeOver($, sessionId as string, start, run, current)
+    if (now.value !== null && outranks(now.value, run)) return
     version = now.version
   }
   if (!isSet) return
@@ -398,7 +419,7 @@ async function startWelcome($: EngineInterface, e: SessionStartInput, sessionId:
       // No transcript here: the card says it.
     }
   }
-  if (start !== welcomeStarts) return
+  if (!current()) return
   records = new CardRecords(save, card, opened.isNew)
   cardReady = cardId(card.version, card.sessionId)
   redrawBand($)
@@ -412,7 +433,7 @@ async function startWelcome($: EngineInterface, e: SessionStartInput, sessionId:
 // unless a later load or run has it. A close the store has, which the state
 // may lack (its write refused, or late), wins; where the store cannot be read
 // there is no telling, and no card.
-async function takeOver($: EngineInterface, sessionId: string, start: number, run: Run): Promise<void> {
+async function takeOver($: EngineInterface, sessionId: string, start: number, run: Run, current: () => boolean): Promise<void> {
   const { rank } = run
   const key = destinationKey(config)
   const me = ownerOf(start)
@@ -427,26 +448,51 @@ async function takeOver($: EngineInterface, sessionId: string, start: number, ru
     closedCard = cardId(PLUGIN_VERSION, sessionId)
     redrawBand($)
   }
-  if (start !== welcomeStarts) return
-  const taken = await changeCard($, card => {
+  if (!current()) return
+  const take = (card: Welcome): Welcome | null => {
     // Another version's card (an update in the session), or another
     // session's: not this run's to close or take over.
     if (card.version !== PLUGIN_VERSION || card.sessionId !== sessionId) return null
     if (stored.closed === true) return { ...card, closed: true }
     // A later load, or run, took the card over meanwhile: it shows it.
-    if ((card.rank ?? 0) > rank) return null
+    if (outranks(card, run)) return null
     const reopened = reopenWelcome(card, key)
     if (reopened === null) return null
-    // Moved where rows go now: it counts from this run on there, so rows that
-    // went there before it moved never count again.
-    const moved = reopened.welcome.destination !== card.destination
-    return { ...reopened.welcome, owner: me, rank, since: moved ? rank : (card.since ?? rank), lifetime: moved ? run.lifetime : (card.lifetime ?? run.lifetime) }
-  }).catch(() => null)
-  if (taken === null || taken.closed || start !== welcomeStarts) return
+    // Moved where rows go now, or of the lifetime before a reset: it counts
+    // from this run on, so rows that went there before never count again.
+    const anew = reopened.welcome.destination !== card.destination || card.lifetime !== run.lifetime
+    return { ...reopened.welcome, owner: me, rank, since: anew ? rank : card.since, lifetime: run.lifetime }
+  }
+  // As `changeCard`, but a run of the lifetime before a reset of the
+  // session's state (as its write, landed or missed, shows) takes over
+  // nothing: a card it took as the reset came goes back as it was.
+  let taken: Welcome | null = null
+  try {
+    for (let i = 0; i < 8; i += 1) {
+      const held = await $.state.get(WELCOME_STATE)
+      const card = held.value ?? null
+      const next = card === null ? null : take(card)
+      if (card === null || next === null) break
+      const written = { ...next, closed: card.closed || next.closed }
+      const wrote = await $.state.set(WELCOME_STATE, written, { ifVersion: held.version })
+      if (!(await inLifetime($, run))) {
+        if (wrote.isSet) await $.state.set(WELCOME_STATE, card, { ifVersion: wrote.version }).catch(() => undefined)
+        return
+      }
+      if (wrote.isSet) {
+        taken = written
+        break
+      }
+    }
+  } catch {
+    taken = null
+  }
+  if (taken === null || taken.closed || !current()) return
   // The greeting written again where the store has none (its write was
   // lost with an earlier load): the same record, so no later session greets.
-  records = new CardRecords((key, value) => $.store.set(key, value), taken, !stored.greeted)
-  if (!(await stillOpen($, sessionId)) || start !== welcomeStarts) return
+  // Its landing too, the same value, whose write an earlier load may have lost.
+  records = new CardRecords((key, value) => $.store.set(key, value), taken, !stored.greeted, true)
+  if (!(await stillOpen($, sessionId)) || !current()) return
   cardReady = cardId(PLUGIN_VERSION, sessionId)
   redrawBand($)
   // Rows this run landed while the records were read (where the card counts
@@ -566,6 +612,23 @@ async function noteDelivered($: EngineInterface, id: string, entry: DeliveredRow
   }
 }
 
+// Whether `run` is of the lifetime the session's count of runs stands in,
+// as the dispatch reads it: run right after a write of its own, which
+// brings that view up to date, it tells a run from before a reset of the
+// session's state. A count that cannot be read tells nothing: no.
+async function inLifetime($: EngineInterface, run: Run): Promise<boolean> {
+  try {
+    return (await $.state.get(LOADS_STATE)).value?.lifetime === run.lifetime
+  } catch {
+    return false
+  }
+}
+
+// Whether `card` is a later run's than `run`, of the same lifetime: a card
+// of the lifetime before a reset of the session's state outranks no run of
+// the one after it (which a run checks of itself, `inLifetime`).
+const outranks = (card: Welcome, run: Run): boolean => card.lifetime === run.lifetime && (card.rank ?? 0) > run.rank
+
 // Whether `card` counts the rows of `run`: one of the lifetime it counts in,
 // from the run it counts from on.
 const counts = (card: Welcome, run: Run): boolean => run.lifetime === card.lifetime && run.rank >= card.since
@@ -630,6 +693,28 @@ function recount($: EngineInterface, run: Run): void {
 // the state first: only a card that shows rows landed here closes. Either
 // closes only the card of this version and session, however often its write
 // is tried again: never one an update put in its place in the session.
+// A store close (`closeWelcome`) whose write failed: written again at each
+// flush tick until one lands, so a reload, its state close refused too,
+// shows the card no more.
+let unsavedClose: string | null = null
+let closeSaving = false
+function saveClose($: EngineInterface): void {
+  const key = unsavedClose
+  if (key === null || closeSaving) return
+  closeSaving = true
+  $.store
+    .set(key, true)
+    .then(() => {
+      if (unsavedClose === key) unsavedClose = null
+    })
+    .catch(() => {
+      internalErrors += 1
+    })
+    .finally(() => {
+      closeSaving = false
+    })
+}
+
 function closeWelcome($: EngineInterface, landedOnly = false): void {
   const sessionId = tracer.sessionId
   const id = cardId(PLUGIN_VERSION, sessionId)
@@ -639,9 +724,8 @@ function closeWelcome($: EngineInterface, landedOnly = false): void {
   const close = (): void => {
     closedCard = id
     if (sessionId !== null) {
-      $.store.set(closedKey(PLUGIN_VERSION, sessionId), true).catch(() => {
-        internalErrors += 1
-      })
+      unsavedClose = closedKey(PLUGIN_VERSION, sessionId)
+      saveClose($)
     }
     redrawBand($)
   }
@@ -766,6 +850,7 @@ export const register: Register = (on, registered) => {
       flushTimer?.cancel()
       flushTimer = $.clock.every(config.flushIntervalMs, () => {
         void writer?.flush()
+        saveClose($)
       })
       if (config.enabled && config.recordHostname) $.clock.after(0, () => void lookUpHostname($))
       if (canDeliver(config) && !config.dryRun) {
@@ -812,6 +897,9 @@ export const register: Register = (on, registered) => {
   // the session id where it needs it. Their `.catch` spells out what a
   // failure means here: the event goes on as if the mod were not there.
   on('classic.SessionStart', ($, e, next) => {
+    // /clear, /resume and /branch reset the session's state: a card a run
+    // began before stays the session's before (`startWelcome`).
+    if (RESET_SOURCES.has(String(e.source))) resets += 1
     const pending = next(e)
     // Its row carries what session.start loads (the user, the agent name,
     // the writer mode, the host version): written now if that is done, else

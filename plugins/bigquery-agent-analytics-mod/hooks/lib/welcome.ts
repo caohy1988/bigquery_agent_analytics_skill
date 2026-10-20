@@ -122,10 +122,13 @@ export class CardRecords {
   private landingDue = false
   private writing = false
 
-  constructor(save: (key: string, value: unknown) => Promise<void>, card: Welcome, greet: boolean) {
+  // `land`: the card's landing goes too, where it has one (a load that took
+  // the card over, an earlier load's write of it perhaps lost).
+  constructor(save: (key: string, value: unknown) => Promise<void>, card: Welcome, greet: boolean, land = false) {
     this.save = save
     this.card = card
     this.greetingDue = greet
+    this.landingDue = land && card.landedAt !== null
     this.write()
   }
 

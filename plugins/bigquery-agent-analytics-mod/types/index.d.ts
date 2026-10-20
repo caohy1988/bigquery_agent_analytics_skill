@@ -22,8 +22,8 @@ export type WelcomeState = {
   // answered late never takes the card from a later one.
   rank: number
   // The rank of the run that opened the card, or last moved it where rows go
-  // now: the card counts that run's rows and every later run's there, and no
-  // earlier run's, whenever they land.
+  // now: the card counts that run's rows and those of every run ranked above
+  // it there, and no run's ranked below it, whenever they land.
   since: number
   // The lifetime of the count that rank is of (`loads`): runs of another,
   // from before the session's state was reset, never count on the card.

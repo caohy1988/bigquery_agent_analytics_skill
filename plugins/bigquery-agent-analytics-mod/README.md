@@ -258,8 +258,10 @@ an earlier one beat takes the card over, with no second greeting; a later
 version's (an update in the session) shows its own card over the earlier
 version's, with its own greeting. The card
 counts the rows of the session start that opened it, or last moved it
-where rows go now, and of every later one, where it counts rows, and never
-an earlier one's, whenever they land: a run knows its own rank with nothing
+where rows go now, and of every one ranked above it, where it counts rows,
+and never one's ranked below it, whenever they land (ranks go by when each
+run's count write landed: within one load, a run's that landed after the
+next run's ranks above it): a run knows its own rank with nothing
 to read, so no read or write that answers late, before or after an update,
 moves rows from one card to another (a rule that took a delivery's place
 from the session's state after its rows landed could be held past the
@@ -301,18 +303,21 @@ not show. The store makes "once" a best effort:
 
 * if the records cannot be written, the next session shows the card again,
   and a reload in a session that keeps no `$.state` shows it as the store
-  last had it (a write that fails goes again when more rows land);
+  last had it (a write that fails goes again when more rows land, a
+  landing also when a reload takes the card over, and a close at each flush
+  until it lands);
 * if they cannot be read, or the versions greeted before cannot be listed,
   no card shows, after a reload too, nor where no session id is known when
   the session starts (the card's landing and close are kept under it);
 * two sessions started at the same moment can both show it;
 * a reload in the moment between Got it and its store write landing (its
   state write refused) shows the card again, until the write lands and the
-  band draws again; a new process in that session, the greeting's write
+  band draws again (a refused store close is written again at each flush); a new process in that session, the greeting's write
   lost too, can also write the greeting line once more;
 * `/clear`, `/resume` or `/branch` in the session that shows the card ends
   it there (the session's state starts over, and no session start brings
-  it back); the version stays greeted;
+  it back); the version stays greeted; a card still being set up then is
+  not shown, and its version not greeted, so a later session shows it;
 * reinstalling the same version shows no card while the store keeps the
   record.
 
@@ -1495,7 +1500,16 @@ updated version's own rows count once,
 whatever order their records land in, also one that landed while its
 card's first write waited, its first landing and toast its own when a row
 of the version before lands meanwhile; that a load whose rank came back
-after a later load took one counts none of its rows; that where no session id is
+after a later load took one counts none of its rows; that a run whose card
+the session's state was reset under (`/clear`) shows none after it, a card
+it was writing then going again, also in a load that never hears of the
+reset (its write shows it), which leaves the next update's card, and a card
+of this session the next run showed again, as they are; that a card of the
+lifetime before a reset, of whatever rank, keeps no update from showing its
+card, and is taken over, counting afresh, by the session's next run; that a landing an
+earlier load never got written is written by the load that takes the card
+over, and a store close whose write was refused goes again at the next
+flush; that where no session id is
 known no card shows and no one is greeted, after a reload too;
 that a Got it, a takeover's stored close or a
 prompt in a load of the

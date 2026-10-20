@@ -49,14 +49,15 @@ const settle = async () => {
 // What outlives a load of the code: the store, the session's state (each
 // value with a version, a write with `ifVersion` landing only while the
 // value stands at it, as the host's), and the writes still to answer.
-// `hold` picks the store keys whose writes wait; `holdState` the state
-// writes that wait, `refuseState` those refused (each given the value and
-// its key); `read` may hold store reads.
-function host({ hold = () => false, holdState = () => false, refuseState = () => false, read, liveReads = false } = {}) {
+// `hold` picks the store keys whose writes wait, `refuseStore` those
+// refused; `holdState` the state writes that wait, `refuseState` those
+// refused (each given the value and its key); `read` may hold store reads.
+function host({ hold = () => false, holdState = () => false, refuseState = () => false, refuseStore = () => false, read, liveReads = false } = {}) {
   const store = new Map()
   const state = new Map()
   const held = []
   const write = (key, value) => {
+    if (refuseStore(key)) return Promise.reject(new Error('refused by policy'))
     const land = () => store.set(key, structuredClone(value))
     if (!hold(key)) return Promise.resolve(land())
     return new Promise(resolve => held.push({ key, release: () => resolve(land()) }))
@@ -133,7 +134,8 @@ async function load(h, options = {}, version = null) {
       },
     },
     // `h.noSessionId`: a host that refuses the session's id.
-    session: { id: async () => (h.noSessionId ? Promise.reject(new Error('refused by policy')) : SESSION), version: async () => ({ version: 'test' }) },
+    // `h.sessionId`: the session's id after /clear, /resume or /branch.
+    session: { id: async () => (h.noSessionId ? Promise.reject(new Error('refused by policy')) : (h.sessionId ?? SESSION)), version: async () => ({ version: 'test' }) },
     clock: {
       every: (ms, fn) => (timers.push(() => dispatch.run({ moment: null }, fn)), { cancel() {} }),
       after: () => ({ cancel() {} }),
@@ -159,6 +161,8 @@ async function load(h, options = {}, version = null) {
   return {
     // The stand-in itself, and the event it reads in, for a test of it.
     $,
+    // An event raised in this load.
+    fire,
     texts: async () => (await band()).filter(n => n.type === 'Text').map(n => n.props.children),
     greetings: () => lines.filter(line => line.startsWith('bqaa: BigQuery Agent Analytics mod')).length,
     toasts: () => toasts.length,
@@ -1227,6 +1231,179 @@ const tests = {
       },
     ]),
   ),
+  ...Object.fromEntries(
+    [false, true].flatMap(liveReads => ['removed', 'written back to defaults'].map(reset => [liveReads, reset])).map(([liveReads, reset]) => [
+      `a run whose card the session's state was reset under (/clear, values ${reset}${liveReads ? ', reads that see what stands' : ''}) shows none after it, and the next update shows its card`,
+      async () => {
+        // Every write of the earlier version's card once the state is reset.
+        let afterReset = false
+        let staleWrites = 0
+        const h = host({ liveReads, holdState: (value, key) => (afterReset && key === 'welcome' && value?.version === NEXT && (staleWrites += 1), false) })
+        h.store.set(`welcome:${PLUGIN_VERSION}`, { version: PLUGIN_VERSION, sessionId: 'another-session', previous: null })
+        const a = await load(h)
+        await a.start()
+        assert.equal(await a.shown(), false)
+        let holding = true
+        const reads = heldReads(h, () => holding)
+        const b = await load(h, {}, NEXT)
+        await b.start()
+        assert.ok(reads.count() > 0)
+        // The reset, while that run reads the store.
+        if (reset === 'removed') h.state.clear()
+        else for (const key of ['loads', 'welcome', 'delivered']) await h.stateSet({ key }, undefined)
+        afterReset = true
+        h.sessionId = 'after-clear'
+        await b.fire('classic.SessionStart', { source: 'clear', session_id: h.sessionId, model: 'example-model', cwd: '/work' })
+        holding = false
+        reads.answer()
+        await settle()
+        assert.deepEqual([h.card() ?? null, staleWrites], [null, 0])
+        assert.equal(await b.shown(), false)
+        const c = await load(h, {}, '0.3.0')
+        await c.start()
+        assert.deepEqual([h.card().version, await c.shown(), c.greetings()], ['0.3.0', true, 1])
+      },
+    ]),
+  ),
+  async 'a card a run writes as the session\'s state is reset goes again: the next update shows its own'() {
+    let holding = false
+    const h = host({ holdState: (value, key) => holding && key === 'welcome' && value?.version === NEXT })
+    // No card before: the write lands at the version a reset leaves.
+    h.store.set(`welcome:${PLUGIN_VERSION}`, { version: PLUGIN_VERSION, sessionId: 'another-session', previous: null })
+    const a = await load(h)
+    await a.start()
+    assert.equal(await a.shown(), false)
+    holding = true
+    const b = await load(h, {}, NEXT)
+    await b.start()
+    assert.equal(h.held.length, 1)
+    holding = false
+    h.state.clear()
+    h.sessionId = 'after-clear'
+    await b.fire('classic.SessionStart', { source: 'clear', session_id: h.sessionId, model: 'example-model', cwd: '/work' })
+    h.release('state')
+    await settle()
+    assert.equal(h.card() ?? null, null)
+    assert.equal(b.greetings(), 0)
+    const c = await load(h, {}, '0.3.0')
+    await c.start()
+    assert.deepEqual([h.card().version, await c.shown()], ['0.3.0', true])
+  },
+  ...Object.fromEntries(
+    ['first read', 'read after its write missed'].map(when => [
+      `a card of the lifetime before a reset, of a higher rank, found at the ${when}, keeps no update from showing its card`,
+      async () => {
+        let holding = false
+        const h = host({ holdState: (value, key) => holding && key === 'welcome' && value?.version === '0.3.0' })
+        const stale = { version: NEXT, previous: PLUGIN_VERSION, sessionId: 'before-clear', landedAt: null, landedTo: null, closed: false, sent: 0, destination: 'dry run: /home/dev/.bqaa-mod/dry-run', owner: 'gone:1', rank: 5, since: 5, lifetime: 'before' }
+        if (when === 'first read') h.state.set('welcome', { value: stale, version: 1 })
+        else holding = true
+        const c = await load(h, {}, '0.3.0')
+        await c.start()
+        if (when !== 'first read') {
+          assert.equal(h.held.length, 1)
+          holding = false
+          h.state.set('welcome', { value: stale, version: 1000 })
+          h.release('state')
+          await settle()
+        }
+        assert.deepEqual([h.card().version, h.card().rank, await c.shown()], ['0.3.0', 1, true])
+      },
+    ]),
+  ),
+  async 'this session\'s card of the lifetime before a reset, of a higher rank, is taken over by the next run, which counts from itself'() {
+    const h = host()
+    h.store.set(`welcome:${PLUGIN_VERSION}`, { version: PLUGIN_VERSION, sessionId: SESSION, previous: null })
+    h.state.set('welcome', { value: { version: PLUGIN_VERSION, previous: null, sessionId: SESSION, landedAt: null, landedTo: null, closed: false, sent: 0, destination: 'dry run: /home/dev/.bqaa-mod/dry-run', owner: 'gone:1', rank: 5, since: 5, lifetime: 'before' }, version: 1 })
+    const a = await load(h)
+    await a.start()
+    assert.equal(await a.shown(), true)
+    assert.deepEqual([h.card().rank, h.card().since, h.card().lifetime === h.state.get('loads').value.lifetime], [1, 1, true])
+    await a.land()
+    assert.equal(h.card().sent, 1)
+  },
+  async 'a load of the lifetime before a reset, its reads answering after the next update showed its card, leaves that card as it is'() {
+    const h = host()
+    let holding = true
+    const reads = heldReads(h, () => holding)
+    const a = await load(h)
+    await a.start()
+    assert.ok(reads.count() > 0)
+    // The reset, which the earlier load never hears of.
+    h.state.clear()
+    holding = false
+    const b = await load(h, {}, NEXT)
+    await b.start()
+    await b.land()
+    assert.deepEqual([h.card().version, h.card().sent], [NEXT, 1])
+    reads.answer()
+    await settle()
+    assert.deepEqual([h.card().version, h.card().sent], [NEXT, 1])
+  },
+  async 'a load whose reads answer after the session\'s state was reset, which it never heard of, shows no card: one it wrote goes again'() {
+    const h = host()
+    let holding = true
+    const reads = heldReads(h, () => holding)
+    const a = await load(h)
+    await a.start()
+    assert.ok(reads.count() > 0)
+    h.state.clear()
+    holding = false
+    reads.answer()
+    await settle()
+    assert.deepEqual([await a.shown(), h.card() ?? null, a.greetings()], [false, null, 0])
+  },
+  async 'a takeover of the lifetime before a reset, its reads answering after the next run showed this session\'s card again, leaves that card to it'() {
+    const h = host()
+    const a = await load(h)
+    await a.start()
+    assert.equal(await a.shown(), true)
+    let holding = true
+    const reads = heldReads(h, () => holding)
+    const b = await load(h)
+    await b.start()
+    assert.ok(reads.count() > 0)
+    // The reset, which the load taking the card over never hears of.
+    h.state.clear()
+    holding = false
+    const c = await load(h)
+    await c.start()
+    assert.equal(await c.shown(), true)
+    const shown = h.card()
+    reads.answer()
+    await settle()
+    assert.deepEqual([h.card().owner, h.card().lifetime, h.card().since], [shown.owner, shown.lifetime, shown.since])
+    await c.land()
+    assert.equal(h.card().sent, 1)
+  },
+  async 'a landing an earlier load never got written is written by the load that takes the card over'() {
+    let holding = false
+    const h = host({ hold: key => holding && key === OWN })
+    const a = await load(h)
+    await a.start()
+    holding = true
+    await a.land()
+    holding = false
+    assert.deepEqual([h.held.length, h.store.get(OWN)], [1, undefined])
+    const b = await load(h)
+    await b.start()
+    await settle()
+    assert.equal(h.store.get(OWN)?.landedAt, h.card().landedAt)
+    assert.equal(typeof h.card().landedAt, 'number')
+  },
+  async 'a store close whose write was refused goes again at the next flush: a reload, its state close refused too, shows no card'() {
+    let refusals = 0
+    const h = host({ refuseStore: key => key === CLOSED && refusals++ === 0, refuseState: value => value?.closed === true })
+    const a = await load(h)
+    await a.start()
+    await a.close()
+    assert.deepEqual([h.store.get(CLOSED), h.card().closed], [undefined, false])
+    await a.flush()
+    assert.equal(h.store.get(CLOSED), true)
+    const b = await load(h)
+    await b.start()
+    assert.equal(await b.shown(), false)
+  },
   async 'where the session id cannot be read no card shows and no one is greeted, after a reload too: Got it could keep no close'() {
     const h = host({ hold: key => key.startsWith('welcome') })
     h.noSessionId = true
