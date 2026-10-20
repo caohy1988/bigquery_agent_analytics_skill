@@ -1067,7 +1067,7 @@ function twoWriters(answer: (ids: string[]) => { status: number; text: string })
     store,
     sent,
     statuses,
-    writer: (session: string) => new Writer(io(session), () => config, () => session),
+    writer: (session: string, c = config) => new Writer(io(session), () => c, () => session),
     // Refuses the writes of what is left to the paths `f` picks.
     refuse: (f: ((path: string) => boolean) | null) => (refuseWrite = f === null ? null : (path, text) => text !== '' && f(path)),
     // Refuses the writes `f` picks, emptying a file included.
@@ -1871,6 +1871,133 @@ test('a batch the writer before had out when the next writer took over, asked fo
   expect(w.sentOf(a)).toBe(1)
   await after.flush()
   expect(w.sentOf(a)).toBe(2)
+})
+
+test('a batch the first writer had out, through two takeovers, asked for again, goes with the last writer\'s rows', async () => {
+  let calls = 0
+  const w = twoWriters(() => (++calls === 1 ? { status: 503, text: 'backend error' } : OK_INSERT))
+  const a = 'a'.repeat(32)
+  const first = w.writer('a-session')
+  first.enqueue((JSON.parse(line(a, 'retry')) as { row: Parameters<Writer['enqueue']>[0] }).row, 0)
+  let asked = (): void => undefined
+  let answer = (): void => undefined
+  const atRequest = new Promise<void>(resolve => (asked = resolve))
+  const answered = new Promise<void>(resolve => (answer = resolve))
+  let held = false
+  w.hold(() => {
+    if (held) return undefined
+    held = true
+    asked()
+    return answered
+  })
+  const flushing = first.flush()
+  await atRequest
+  const second = w.writer('a-session')
+  second.adopt(first)
+  const third = w.writer('a-session')
+  third.adopt(second)
+  answer()
+  await flushing
+  expect([w.sentOf(a), third.queue.length]).toEqual([1, 1])
+  await third.flush()
+  expect([w.sentOf(a), third.queue.length]).toEqual([2, 0])
+})
+
+test('rows a writer parks after the next one took over, its batch out of retries, set the next writer\'s paced replays going', async () => {
+  let failing = true
+  const w = twoWriters(() => (failing ? { status: 503, text: 'backend error' } : OK_INSERT))
+  const a = 'a'.repeat(32)
+  const before = w.writer('a-session')
+  before.enqueue((JSON.parse(line(a, 'retry')) as { row: Parameters<Writer['enqueue']>[0] }).row, 0)
+  // Asked for again as often as a row may be: the next answer like it parks it.
+  const queued = before.queue.takeAll()
+  for (const q of queued) q.attempts = resolveConfig({}, {}).maxRetries
+  before.queue.unshift(queued)
+  let asked = (): void => undefined
+  let answer = (): void => undefined
+  const atRequest = new Promise<void>(resolve => (asked = resolve))
+  const answered = new Promise<void>(resolve => (answer = resolve))
+  w.hold(() => {
+    w.hold(null)
+    asked()
+    return answered
+  })
+  const flushing = before.flush()
+  await atRequest
+  const after = w.writer('a-session')
+  after.adopt(before)
+  // Its own scan of what is parked finds nothing yet.
+  await after.backfill(['spill', 'retry'], 'auto')
+  answer()
+  await flushing
+  const parkedRows = (): number => [...w.files].filter(([path, text]) => path.includes('/retry-') && text !== '').flatMap(([, text]) => parseFile(text).lines).filter(l => l.row.event_id === a).length
+  expect([w.sentOf(a), parkedRows()]).toEqual([1, 1])
+  failing = false
+  await after.flush()
+  expect([w.sentOf(a), parkedRows()]).toEqual([2, 0])
+})
+
+test('rows a writer parks while the next writer\'s own replay is under way keep the table due: that replay, ending with nothing left, does not take them for read', async () => {
+  let failing = true
+  const w = twoWriters(() => (failing ? { status: 503, text: 'backend error' } : OK_INSERT))
+  const a = 'a'.repeat(32)
+  const s = 's'.repeat(32)
+  const before = w.writer('a-session')
+  before.enqueue((JSON.parse(line(a, 'retry')) as { row: Parameters<Writer['enqueue']>[0] }).row, 0)
+  const queued = before.queue.takeAll()
+  for (const q of queued) q.attempts = resolveConfig({}, {}).maxRetries
+  before.queue.unshift(queued)
+  let asked = (): void => undefined
+  let answer = (): void => undefined
+  const atRequest = new Promise<void>(resolve => (asked = resolve))
+  const answered = new Promise<void>(resolve => (answer = resolve))
+  w.hold(() => {
+    w.hold(null)
+    asked()
+    return answered
+  })
+  const flushing = before.flush()
+  await atRequest
+  const after = w.writer('a-session')
+  after.adopt(before)
+  // The next writer's replay reads a file parked before; its read waits.
+  const spill = `/dl/${TABLE_REF}/spill-20261013T200102003Z-earlier-1.jsonl`
+  w.files.set(spill, packFiles([line(s, 'spill')])[0] as string)
+  let readReached = (): void => undefined
+  let releaseRead = (): void => undefined
+  const atRead = new Promise<void>(resolve => (readReached = resolve))
+  const read = new Promise<void>(resolve => (releaseRead = resolve))
+  w.holdReads((_, path) => {
+    if (path !== spill) return undefined
+    w.holdReads(null)
+    readReached()
+    return read
+  })
+  const replaying = after.backfill(['spill', 'retry'], 'auto')
+  await atRead
+  // The writer before parks its row meanwhile, its batch out of retries.
+  answer()
+  await flushing
+  const parkedRows = (): number => [...w.files].filter(([path, text]) => path.includes('/retry-') && text !== '').flatMap(([, text]) => parseFile(text).lines).filter(l => l.row.event_id === a).length
+  expect(parkedRows()).toBe(1)
+  failing = false
+  releaseRead()
+  await replaying
+  expect([w.sentOf(s), w.files.get(spill)]).toEqual([1, ''])
+  await after.flush()
+  expect([w.sentOf(a), parkedRows()]).toEqual([2, 0])
+})
+
+test('a writer that takes over holds the queue it takes to its own bounds', async () => {
+  const w = twoWriters(() => OK_INSERT)
+  const before = w.writer('a-session')
+  const ids = Array.from({ length: 12 }, (_, i) => i.toString(16).padStart(32, '0'))
+  for (const id of ids) before.enqueue((JSON.parse(line(id, 'retry')) as { row: Parameters<Writer['enqueue']>[0] }).row, 0)
+  const after = w.writer('a-session', resolveConfig({ project: 'my-gcp-project', dataset: 'agent_analytics', deadLetterDir: '/dl' }, { BQAA_MAX_QUEUE_ROWS: '10' }))
+  after.adopt(before)
+  expect(after.queue.length).toBe(10)
+  await after.flush()
+  expect(ids.map(id => w.sentOf(id))).toEqual([0, 0, ...ids.slice(2).map(() => 1)])
 })
 
 test('rows with no id alike in two files count as two refused', async () => {

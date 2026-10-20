@@ -409,15 +409,15 @@ export class Writer {
   private seq = 0
   private soon: Timer | null = null
   private backfilling: Promise<BackfillReport> | null = null
-  private wroteRecoverable = false
   // The dead-letter directories (one per table) whose rows wait for a replay
   // that runs by itself: this writer parked them as retries or spills, or a
   // replay left them unsent. While nothing is queued, the paced retries
   // replay the configured table's until one sends every such row.
   private replayDue = new Set<string>()
-  // Counts those parkings: a replay that began before the latest one may not
-  // have read its rows.
-  private parkedSeq = 0
+  // Those parkings: how many (a replay that began before the latest one may
+  // not have read its rows), and whether rows were parked since the last
+  // replay that rows landing set going (`succeeded`).
+  private parked = { seq: 0, recoverable: false }
   private statusText: string | undefined = undefined
   // Set once the session is ending: no new batch starts after that.
   private closing = false
@@ -483,12 +483,20 @@ export class Writer {
 
   // ---- background --------------------------------------------------------
 
-  // Takes over the rows another writer still queues (oldest first), and
-  // the queue itself: a batch it still has out, asked for again, comes back
-  // to this writer's queue, which this writer sends.
+  // Takes over from the writer before it in the same load of the code (a
+  // session.start that fires again): its queue itself, under this writer's
+  // bounds, so a batch it, or any writer before it, still has out comes
+  // back, asked for again, to the queue this writer sends; and what waits
+  // for a replay, so rows it parks late, a batch out of retries, set this
+  // writer's paced replays going. Every writer that takes over shares them.
   adopt(previous: Writer): void {
-    this.queue.unshift(previous.queue.takeAll())
-    previous.queue = this.queue
+    const c = this.config()
+    previous.queue.unshift(this.queue.takeAll())
+    previous.queue.limit(c.maxQueueRows, c.maxQueueBytes)
+    this.queue = previous.queue
+    for (const dir of this.replayDue) previous.replayDue.add(dir)
+    this.replayDue = previous.replayDue
+    this.parked = previous.parked
     // And the outcomes it holds, one whose record no store or file took
     // included: the same map, so an outcome a replay still under way there
     // comes to is held here too. Its marks stay its own: one with no
@@ -679,8 +687,8 @@ export class Writer {
     this.counters.batches += 1
     this.tookRequest(rows)
     // BigQuery is reachable again: replay what this session parked on disk.
-    if (hadFailures && this.wroteRecoverable && this.config().autoBackfill) {
-      this.wroteRecoverable = false
+    if (hadFailures && this.parked.recoverable && this.config().autoBackfill) {
+      this.parked.recoverable = false
       this.io.after(1000, () => {
         void this.backfill(['spill', 'retry'], 'recovery')
       })
@@ -1150,9 +1158,9 @@ export class Writer {
         await this.io.writeFile(path, sealFile(body))
         this.counters.deadLetterFiles += 1
         if (kind !== 'rejected') {
-          this.wroteRecoverable = true
+          this.parked.recoverable = true
           this.replayDue.add(dir)
-          this.parkedSeq += 1
+          this.parked.seq += 1
         }
         if (this.problem !== null) this.countParked(ids)
       } catch (err) {
@@ -1215,7 +1223,7 @@ export class Writer {
   // written.
   backfill(kinds: DeadLetterKind[], trigger: BackfillReport['trigger']): Promise<BackfillReport> {
     if (this.backfilling) return this.backfilling
-    const parked = this.parkedSeq
+    const parked = this.parked.seq
     const dir = deadLetterPartition(this.config())
     const run = this.backfillRun(kinds, trigger, dir, parked).catch(err => {
       // A file that could not be read or written: its rows are still in it,
@@ -1274,7 +1282,7 @@ export class Writer {
       if (!/ENOENT|no such file|not found/i.test(message)) {
         this.replayDue.add(dir)
         report.error = diagnostic(`cannot list ${dir}: ${message}`)
-      } else if (this.parkedSeq === parked) this.replayDue.delete(dir)
+      } else if (this.parked.seq === parked) this.replayDue.delete(dir)
       return finish()
     }
     const files: string[] = []
@@ -1514,7 +1522,7 @@ export class Writer {
     // included), files not whole or empty that a write still under way may
     // finish, or rows parked once it had begun. Rows refused here, and files
     // too large to read, never keep it going.
-    if (tally.waiting > 0 || this.parkedSeq !== parked) this.replayDue.add(dir)
+    if (tally.waiting > 0 || this.parked.seq !== parked) this.replayDue.add(dir)
     else this.replayDue.delete(dir)
     return finish()
   }

@@ -673,13 +673,18 @@ GROUP BY model
   Likewise a file of what is left of each of two outcomes of one file
   recorded at once can go, and so can one first replayed more than a day
   after its parent was done (its parent's records swept): a row can arrive
-  twice, and `event_id` dedups it. The writer that takes over when the
-  mod reloads in a session holds the outcomes the one before it held, an
-  outcome that one's replay comes to after the reload included, but not
+  twice, and `event_id` dedups it. Where `session.start` fires again in
+  the same load of the mod (the plugin turned off and on), the writer it
+  makes takes over from the one before: it holds the outcomes that one
+  held, an outcome that one's replay comes to afterwards included, but not
   its marks: a mark of the one before whose outcome it does not hold keeps
-  it from sending the file, as another session's does. It takes that
-  one's queue too, so the rows of a batch the one before still had out,
-  asked for again, go with this writer's own. Before
+  it from sending the file, as another session's does. It shares that
+  one's queue, and what waits for a replay, with every writer before and
+  after it, so the rows of a batch any writer before still had out, asked
+  for again, go with this writer's own, and rows one parks late, a batch
+  out of retries, set this writer's paced replays going. A reload of the
+  mod's code is a load afresh, which holds none of that (see the limits
+  below). Before
   it writes what is left, a replay records its outcome: one record per
   file, with what became of each row (a letter each, and for a refused row
   a number naming its reason), the refusals' reasons (16 at most: rows
@@ -935,7 +940,7 @@ test kit, with no session, sign-in, GCP or network: `$.http.fetch`,
 `$.process.run`, `$.fs` and `$.store` are stubbed, and `mock.clock` drives the
 timers; the `$.fs` stubs measure files in UTF-8 bytes and refuse a file over
 4 MiB, and the `$.store` stub a store over 4 MiB of JSON in all, as the host
-does. 313 tests cover the captured rows and their spans,
+does. 317 tests cover the captured rows and their spans,
 subagent runs in the order the host raises them (one invocation and one
 trace for the turn, a span per run, a SubagentStart that comes late or never),
 the session-start row raised before or during `session.start`'s setup,
@@ -1076,7 +1081,10 @@ And the replay that runs by itself while nothing is queued:
   outcome; a writer that takes over in the same session holding what the
   one before held, and an outcome that one's replay comes to after the
   takeover, sending none of the file again, and sending the rows of a
-  batch the one before still had out, asked for again; records of files emptied more than a day ago emptied;
+  batch the one before still had out, asked for again, also through two
+  takeovers, under its own queue's bounds; rows a writer parks after the
+  next one took over setting that writer's paced replays going, also
+  while that writer's own replay is under way; records of files emptied more than a day ago emptied;
   a record another session writes late, beside a file finished meanwhile,
   never standing over its done mark, and a replay with nothing left to
   write never writing its done mark over another's; a replay whose mark

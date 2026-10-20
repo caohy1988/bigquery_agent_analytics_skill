@@ -10,8 +10,8 @@ export type Queued = { row: BqaaRow; bytes: number; attempts: number; configured
 
 export class BoundedQueue {
   private items: Queued[] = []
-  private readonly maxRows: number
-  private readonly maxBytes: number
+  private maxRows: number
+  private maxBytes: number
   bytes = 0
   dropped = 0
 
@@ -60,6 +60,14 @@ export class BoundedQueue {
     this.items = []
     this.bytes = 0
     return all
+  }
+
+  // Holds the queue to new bounds (a configuration that changed), the oldest
+  // rows dropped past them.
+  limit(maxRows: number, maxBytes: number): void {
+    this.maxRows = maxRows
+    this.maxBytes = maxBytes
+    this.enforce()
   }
 
   isUnderPressure(): boolean {
