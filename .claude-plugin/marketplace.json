@@ -1,0 +1,13 @@
+{
+  "name": "bqaa-tracing",
+  "owner": {
+    "name": "Pin check"
+  },
+  "plugins": [
+    {
+      "name": "bigquery-agent-analytics-mod",
+      "version": "0.1.0-pin1",
+      "source": "./plugins/claude_code_dist/bigquery-agent-analytics-mod"
+    }
+  ]
+}
