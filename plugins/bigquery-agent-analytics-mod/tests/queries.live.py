@@ -15,7 +15,10 @@ The fixture holds what the queries must count right:
     2.11's own aggregator and plugin wrote for a call that streamed text
     and then a function call (a partial and a final response under the
     call's span, two more final responses under the agent's), followed by
-    a failed tool and a second call;
+    a failed tool and a second call, also counted from a window that
+    starts after the first call's request; and an ADK agent making
+    concurrent calls (three with progressive streaming, two without), in
+    the order ADK 2.11 wrote them;
   - a subagent run;
   - each kind of refusal: a person's at the prompt, a hook's, a permission
     rule's, and two from elsewhere (a source the queries do not name, and
@@ -184,6 +187,37 @@ FIXTURE = [
         span="adk-req-2", parent="adk-agent-1",
         attributes={"model": "model-c", "usage_metadata": {"total_token_count": 50}, "cache_type": "none", "finish_reason": "STOP"}),
 ]
+# Concurrent calls of one ADK agent, as ADK 2.11's aggregator and plugin
+# wrote them for workers each in their own task under one agent span: every
+# request first, then each call's responses on its own span (and, with
+# progressive streaming off, two more finals under the agent's span).
+def fanout(session, agent, calls, start_minute, legacy):
+    out, second = [], 0
+    def at():
+        nonlocal second
+        second += 1
+        return f"2026-10-20T{start_minute}:{second:02d}Z"
+    agent_span = f"{agent}-span"
+    for i, _ in enumerate(calls, 1):
+        out.append(row(None, at(), "LLM_REQUEST", session, user="carol", agent=agent, writer=None, invocation=f"I{session}",
+                       span=f"{agent}-req-{i}", parent=agent_span, attributes={"model": "model-c"}))
+    final = {"cache_type": "none", "finish_reason": "STOP"}
+    for i, tokens in enumerate(calls, 1):
+        usage = {"usage_metadata": {"total_token_count": tokens}}
+        out.append(row(None, at(), "LLM_RESPONSE", session, user="carol", agent=agent, writer=None, invocation=f"I{session}",
+                       span=f"{agent}-req-{i}", parent=agent_span, attributes={"model": "model-c", **({} if legacy else usage)}))
+        closed = at()
+        out.append(row(None, closed, "LLM_RESPONSE", session, user="carol", agent=agent, writer=None, invocation=f"I{session}",
+                       span=f"{agent}-req-{i}", parent=agent_span, attributes={"model": "model-c", **usage, **final}))
+        if legacy:
+            for _ in range(2):
+                out.append(row(None, closed, "LLM_RESPONSE", session, user="carol", agent=agent, writer=None, invocation=f"I{session}",
+                               span=agent_span, attributes={"model": "model-c", **usage, **final}))
+    return out
+
+
+FIXTURE += fanout("A3", "adk-fanout", [15, 15, 15], "16:00", legacy=False)
+FIXTURE += fanout("A4", "adk-fanout-legacy", [100, 40], "17:00", legacy=True)
 # The replay: e05 sent twice.
 FIXTURE.append(dict(FIXTURE[4]))
 ROSTER = ["alice", "bob", "dave"]
@@ -256,7 +290,17 @@ def checks(name: str, rows: list[dict]):
         adk = p[("adk (no writer)", "adk-agent")]
         yield "ADK, normalized: each streamed call once, with its largest token count: 3 model requests, 147 tokens (77 from total_token_count), 25.0% of 4 rows in error, rows with no event_id kept", (adk["sessions"], adk["model_requests"], adk["tokens"], adk["error_row_pct"]) == (1, 3, 147, 25.0)
         legacy = p[("adk (no writer)", "adk-legacy")]
-        yield "ADK with progressive streaming off: final responses under the agent's span go to the request before them: 2 model requests, 150 tokens (100 once, then 50), 20.0% of 5 rows in error", (legacy["sessions"], legacy["model_requests"], legacy["tokens"], legacy["error_row_pct"]) == (1, 2, 150, 20.0)
+        yield "ADK with progressive streaming off: final responses under the agent's span go to the call that closed before them: 2 model requests, 150 tokens (100 once, then 50), 20.0% of 5 rows in error", (legacy["sessions"], legacy["model_requests"], legacy["model_requests_unmatched"], legacy["tokens"], legacy["error_row_pct"]) == (1, 2, 0, 150, 20.0)
+        yield "ADK's streamed calls with no request rows: counted by their span, and said so (3 unmatched)", adk["model_requests_unmatched"] == 3
+        fan = p[("adk (no writer)", "adk-fanout")]
+        yield "ADK, three concurrent calls of one agent: 3 model requests, 45 tokens", (fan["model_requests"], fan["model_requests_unmatched"], fan["tokens"], fan["error_row_pct"]) == (3, 0, 45, 0.0)
+        fan_legacy = p[("adk (no writer)", "adk-fanout-legacy")]
+        yield "ADK, two concurrent calls with progressive streaming off: 2 model requests, 140 tokens (100 and 40)", (fan_legacy["model_requests"], fan_legacy["model_requests_unmatched"], fan_legacy["tokens"]) == (2, 0, 140)
+        yield "the mod's and the tracer's rows are never unmatched", all(r["model_requests_unmatched"] == 0 for r in rows if r["producer"] != "adk (no writer)")
+    elif name == "V7 clipped":
+        p = by(rows, "producer", "agent")
+        legacy = p[("adk (no writer)", "adk-legacy")]
+        yield "from just after the first call's request: that call is still one, matched from before the window: 2 model requests, 150 tokens, 25.0% of the 4 rows inside", (legacy["model_requests"], legacy["model_requests_unmatched"], legacy["tokens"], legacy["error_row_pct"]) == (2, 0, 150, 25.0)
     elif name == "1":
         yield "the mod's rows, each once: 26", len(rows) == 26
     elif name == "2":
@@ -355,6 +399,8 @@ def main() -> int:
                 if name == "V4":
                     sql = re.sub(r"-- rates: begin.*?-- rates: end", RATES, sql, flags=re.S)
                 runs.append((f"{path.name} {name}", name, sql, START, END))
+                if name == "V7":
+                    runs.append((f"{path.name} V7 (from just after a call's request)", "V7 clipped", sql, "2026-10-20T15:00:01Z", END))
                 if name == "V3":
                     runs.append((f"{path.name} V3 (through a day with no rows)", "V3 silent day", sql, START, "2026-10-21"))
                     runs.append((f"{path.name} V3 (a window with no rows)", "V3 empty window", sql, "2026-09-01", "2026-09-02"))

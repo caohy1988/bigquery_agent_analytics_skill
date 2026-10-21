@@ -265,20 +265,47 @@ ORDER BY day DESC;
 --     agent: sessions, model requests, tokens and the share of rows in
 --     error. Normalized: rows with no writer are named for ADK, and an ADK
 --     response's tokens are read from total_token_count when total_tokens
---     is missing. An ADK model call counts once, as one row: ADK writes an
---     LLM_RESPONSE for each streamed chunk, and with progressive streaming
---     off it writes further final responses, some under the agent's span
---     rather than the call's. So each ADK response belongs to the latest
---     LLM_REQUEST before it from the same agent in the same invocation
---     (else to its span, else to itself), and each call counts one
---     request, with the largest token count among its responses, in error
---     if any of them was. Other columns differ by producer and are left
---     out.
+--     is missing. Other columns differ by producer and are left out.
+--     An ADK model call counts once, as one row, with the largest token
+--     count among its responses, in error if any of them was. ADK writes a
+--     response for each streamed chunk, and with progressive streaming off
+--     it writes further final responses under the agent's span; one agent
+--     can also make several calls at once. So an ADK response belongs to
+--     the request on its own span; one on the agent's span belongs to the
+--     call that last closed under it (its final response on its own span),
+--     else to the latest request under it. Requests are looked up from a
+--     day before the window, so a call that began just before it is still
+--     matched, and only rows inside the window are counted. A response
+--     with no request found is counted by its span, or alone, and
+--     model_requests_unmatched says how many requests were counted so.
 WITH events AS (
-  SELECT *
+  SELECT
+    *,
+    timestamp >= @start AS in_window,
+    JSON_VALUE(attributes, '$.writer.plugin') IS NULL AS adk
   FROM `{PROJECT}.{DATASET}.{TABLE}`
-  WHERE timestamp BETWEEN @start AND @end
+  WHERE timestamp BETWEEN TIMESTAMP_SUB(@start, INTERVAL 1 DAY) AND @end
   QUALIFY event_id IS NULL OR ROW_NUMBER() OVER (PARTITION BY event_id ORDER BY timestamp) = 1
+),
+spans AS (
+  SELECT
+    *,
+    span_id IS NOT NULL AND LOGICAL_OR(event_type = 'LLM_REQUEST') OVER (PARTITION BY adk, session_id, span_id) AS on_request_span,
+    JSON_VALUE(attributes, '$.cache_type') IS NOT NULL OR JSON_VALUE(attributes, '$.finish_reason') IS NOT NULL AS final
+  FROM events
+),
+linked AS (
+  SELECT
+    *,
+    LAST_VALUE(IF(event_type = 'LLM_RESPONSE' AND on_request_span AND final, span_id, NULL) IGNORE NULLS) OVER (
+      PARTITION BY adk, session_id, IF(on_request_span, parent_span_id, span_id)
+      ORDER BY timestamp, IF(on_request_span, 0, 1)
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS closed_call,
+    LAST_VALUE(IF(event_type = 'LLM_REQUEST', span_id, NULL) IGNORE NULLS) OVER (
+      PARTITION BY adk, session_id, IF(on_request_span, parent_span_id, span_id)
+      ORDER BY timestamp, IF(event_type = 'LLM_REQUEST', 0, 1)
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS open_call
+  FROM spans
 ),
 tagged AS (
   SELECT
@@ -286,28 +313,28 @@ tagged AS (
     agent,
     session_id,
     event_type,
+    in_window,
     status = 'ERROR' AS failed,
     COALESCE(SAFE_CAST(JSON_VALUE(attributes, '$.usage_metadata.total_tokens') AS INT64),
       SAFE_CAST(JSON_VALUE(attributes, '$.usage_metadata.total_token_count') AS INT64)) AS tokens,
-    IF(JSON_VALUE(attributes, '$.writer.plugin') IS NULL AND event_type = 'LLM_RESPONSE',
-      COALESCE(
-        LAST_VALUE(IF(event_type = 'LLM_REQUEST', FORMAT('request %s %t', IFNULL(span_id, ''), timestamp), NULL) IGNORE NULLS) OVER (
-          PARTITION BY session_id, invocation_id, agent, JSON_VALUE(attributes, '$.writer.plugin') IS NULL
-          ORDER BY timestamp, IF(event_type = 'LLM_REQUEST', 0, 1)
-          ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
-        CONCAT('span ', span_id),
-        GENERATE_UUID()),
+    IF(adk AND event_type = 'LLM_RESPONSE',
+      CASE
+        WHEN on_request_span THEN CONCAT('request ', span_id)
+        WHEN span_id IS NOT NULL AND COALESCE(closed_call, open_call) IS NOT NULL THEN CONCAT('request ', COALESCE(closed_call, open_call))
+        WHEN span_id IS NOT NULL THEN CONCAT('span ', span_id)
+        ELSE GENERATE_UUID()
+      END,
       NULL) AS call
-  FROM events
+  FROM linked
 ),
 counted AS (
-  SELECT producer, agent, session_id, event_type, failed, tokens
+  SELECT producer, agent, session_id, event_type, failed, tokens, FALSE AS unmatched
   FROM tagged
-  WHERE call IS NULL
+  WHERE in_window AND call IS NULL
   UNION ALL
-  SELECT producer, agent, session_id, 'LLM_RESPONSE', LOGICAL_OR(failed), MAX(tokens)
+  SELECT producer, agent, session_id, 'LLM_RESPONSE', LOGICAL_OR(failed), MAX(tokens), NOT STARTS_WITH(call, 'request ')
   FROM tagged
-  WHERE call IS NOT NULL
+  WHERE in_window AND call IS NOT NULL
   GROUP BY producer, agent, session_id, call
 )
 SELECT
@@ -315,6 +342,7 @@ SELECT
   agent,
   COUNT(DISTINCT session_id) AS sessions,
   COUNTIF(event_type = 'LLM_RESPONSE') AS model_requests,
+  COUNTIF(unmatched) AS model_requests_unmatched,
   SUM(IF(event_type = 'LLM_RESPONSE', tokens, 0)) AS tokens,
   ROUND(COUNTIF(failed) / COUNT(*) * 100, 1) AS error_row_pct
 FROM counted
