@@ -59,25 +59,41 @@ So the bootstrap, with `--writer-role row-writer` or `--reader`:
   and a project Editor, granted after the change held no right on the
   table. The change took a few minutes to apply: a minute after it, a
   Viewer still read the table;
-- lists everyone who still reads every row: through a project role (Owner,
-  and BigQuery Admin, Data Owner, Data Editor or Data Viewer granted on the
-  project, which read every table whatever a dataset's access says), or
-  through any grant on the events dataset or table;
-- stops, before anything is granted, when a grant reaches a `--reader` or
-  `--token-creator` member: one to the member itself, to everyone
-  (`allUsers`, `allAuthenticatedUsers`), or to the member's domain; when
-  everyone may read the table; and when a group or a set of identity-pool
-  principals holds a grant there while readers or token creators are being
-  set up, since it cannot see who is in them (check them, then
-  `--allow-existing-grants`). Moving a team off `roles/bigquery.dataEditor`
-  takes those grants off first (see
+- lists everyone who still reads every row: through a project role that
+  reads tables (Owner, and BigQuery Admin, Data Owner, Data Editor or Data
+  Viewer granted on the project, which read every table whatever a
+  dataset's access says, and any other role, custom roles included, whose
+  permissions hold `bigquery.tables.getData` or `bigquery.tables.export`,
+  as `gcloud iam roles describe` lists them), or through any grant on the
+  events dataset or table;
+- stops, before anything is granted, when everyone may read the table, and
+  when a grant reaches a `--reader` or `--token-creator` member, or may:
+  - it reaches them when it is to the member itself, to everyone
+    (`allUsers`, `allAuthenticatedUsers`), or to the domain of a person's
+    address;
+  - it may when it is to another domain (a domain's identity customer can
+    hold other domains, and a group's address says nothing of its
+    members'); to a person, a service account or a group while the member
+    is a group, or to a group while the member is a person, unless Cloud
+    Identity answers that they are not in it
+    (`gcloud identity groups memberships check-transitive-membership`,
+    which needs a caller who may see the group's members); when it goes
+    through a set of identity-pool principals; and when it is of a role
+    whose permissions could not be read.
+
+  Check those, then `--allow-existing-grants` keeps them. Moving a team off
+  `roles/bigquery.dataEditor` takes those grants off first (see
   [Moving from dataEditor](#moving-from-dataeditor)).
 
-Roles held on a folder or the organization are not looked at, and nor is
-who is in a group: a group's grant there stops the run until someone who
-can see its members says otherwise. The simplest way to keep the audience small is a project of
-its own for the events dataset, where only the administrators hold project
-roles.
+Roles held on a folder or the organization are not looked at. Where Cloud
+Identity cannot answer for a group, a grant that may reach its members
+stops the run until someone who can see them says otherwise. That includes
+the project's Owners, and the Google service agents that hold BigQuery data
+roles: in a shared project, run the bootstrap as someone who may see the
+groups' members, or check the grants it lists and pass
+`--allow-existing-grants`. The simplest way to keep the audience small is a
+project of its own for the events dataset, where only the administrators
+hold project roles.
 
 ## What this protects, and what it does not
 
@@ -352,8 +368,11 @@ readers' group a reader, take them off:
    (A dataset grant made with `roles/bigquery.dataEditor` shows as `WRITER`
    in the dataset's access; the `REVOKE` above takes it off.)
 3. **Switch people's token command** to the impersonation of setup 1, and
-   run the bootstrap: it stops while a reader or token creator still holds
-   a grant there.
+   run the bootstrap. It stops while a reader or token creator still holds
+   a grant there, or may. With readers or token creators that are groups,
+   a person's grant there stops it unless Cloud Identity answers that the
+   person is in neither group. A domain's grant stops it until you have
+   checked who the domain holds and pass `--allow-existing-grants`.
 
 ## What a writer needs
 

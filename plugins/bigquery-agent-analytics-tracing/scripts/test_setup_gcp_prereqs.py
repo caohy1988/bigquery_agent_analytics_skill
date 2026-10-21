@@ -481,6 +481,18 @@ def _stub_run(fake: _FakeRun):
         setup.subprocess.run = original
 
 
+@contextlib.contextmanager
+def _views_left_alone():
+    """A run that gets past the checks with readers authorizes the views
+    through the BigQuery client: stood in for here."""
+    original = setup._authorize_views
+    setup._authorize_views = lambda *args, **kwargs: None
+    try:
+        yield
+    finally:
+        setup._authorize_views = original
+
+
 WRITER = "bqaa-row-writer@test-project.iam.gserviceaccount.com"
 CLEAN_ROLE = json.dumps({"includedPermissions": ["bigquery.tables.get", "bigquery.tables.updateData"]})
 
@@ -493,7 +505,7 @@ def _row_writer_run(fake: _FakeRun, **overrides: object) -> None:
     )
     settings.update(overrides)
     args = _args(**settings)
-    with _stub_preflight(_preflight()), _stub_run(fake), contextlib.redirect_stdout(io.StringIO()):
+    with _stub_preflight(_preflight()), _stub_run(fake), contextlib.redirect_stdout(io.StringIO()), _views_left_alone():
         setup.run(args)
 
 
@@ -826,10 +838,12 @@ def test_who_reads_every_row_through_a_project_role_is_listed() -> None:
     policy = {"bindings": [{"role": "roles/owner", "members": ["user:admin@example.com"]},
                            {"role": "roles/bigquery.jobUser", "members": ["group:r@example.com"]}]}
     out = io.StringIO()
-    with _stub_run(_FakeRun([(("projects", "get-iam-policy"), 0, json.dumps(policy))])), contextlib.redirect_stdout(out):
+    answers = [(("projects", "get-iam-policy"), 0, json.dumps(policy)), (("identity", "check-transitive-membership"), 0, "{}")]
+    with _stub_run(_FakeRun(answers)), contextlib.redirect_stdout(out):
         setup._check_project_readers(_args(reader=["group:r@example.com"]))
     assert "user:admin@example.com: roles/owner on the project" in out.getvalue()
     assert "OK no grant to everyone" in out.getvalue()
+    assert "not a member, as Cloud Identity answers: group:r@example.com: user:admin@example.com" in out.getvalue()
 
 
 def test_dataset_access_and_project_roles_are_settled_before_token_creators_and_readers() -> None:
@@ -1042,17 +1056,31 @@ def test_a_public_project_binding_or_dataset_entry_stops_the_run() -> None:
 def test_a_group_grant_a_reader_may_be_in_needs_the_override() -> None:
     dataset = {"access": [{"role": "READER", "groupByEmail": "all-staff@example.com"}]}
     answers = [(("gcloud", "projects", "get-iam-policy"), 0, "{}"), (("bq", "show"), 0, json.dumps(dataset)),
-               (("bq", "get-iam-policy"), 0, "{}")]
+               (("bq", "get-iam-policy"), 0, "{}"),
+               (("identity", "check-transitive-membership"), 1, "ERROR: (gcloud.identity.groups.memberships.check-transitive-membership) PERMISSION_DENIED")]
     with _stub_run(_FakeRun(answers)), contextlib.redirect_stdout(io.StringIO()):
         try:
             setup._check_project_readers(_args(reader=["user:alice@example.com"]))
         except SystemExit as exc:
-            assert "may be a member of these" in str(exc) and "group:all-staff@example.com" in str(exc)
+            assert "could not rule out" in str(exc) and "user:alice@example.com: group:all-staff@example.com" in str(exc)
         else:
             raise AssertionError("expected SystemExit")
         setup._check_project_readers(_args(reader=["user:alice@example.com"], allow_existing_grants=True))
         # With no reader or token creator, there is no one to be a member.
         setup._check_project_readers(_args(service_account="bqaa-row-writer", writer_role="row-writer"))
+    # Cloud Identity's answer settles it: a member reads every row; one who is not passes.
+    for answer, stops in (('{"hasMembership": true}', True), ("{}", False)):
+        answers[-1] = (("identity", "check-transitive-membership"), 0, answer)
+        fake = _FakeRun(answers)
+        with _stub_run(fake), contextlib.redirect_stdout(io.StringIO()):
+            try:
+                setup._check_project_readers(_args(reader=["user:alice@example.com"]))
+            except SystemExit as exc:
+                assert stops and "a member, as Cloud Identity answers" in str(exc)
+            else:
+                assert not stops
+        asked = [c for c in fake.calls if "check-transitive-membership" in c]
+        assert asked and "--group-email=all-staff@example.com" in asked[0] and "--member-email=alice@example.com" in asked[0]
 
 
 def test_a_grant_to_the_writers_domain_counts_against_the_writer() -> None:
@@ -1103,6 +1131,187 @@ def test_the_writer_check_itself_refuses_a_public_or_domain_grant() -> None:
                (("bq", "get-iam-policy"), 0, "{}")]
     with _stub_run(_FakeRun(answers)), contextlib.redirect_stdout(io.StringIO()):
         setup._check_writer_grants(_args(service_account="bqaa-row-writer", writer_role="row-writer", principal=f"serviceAccount:{WRITER}"))
+
+
+GROUPS = dict(token_creator=["group:bqaa-writers@example.com"], reader=["group:bqaa-readers@example.com"])
+
+
+
+def test_a_persons_grant_with_group_readers_needs_cloud_identity_or_the_override() -> None:
+    # The guide's setup: groups for the token creators and the readers. A
+    # developer kept WRITER on the events dataset (the dataEditor move), or
+    # dataViewer on the table: either may be in a group.
+    for dataset, table in (({"access": [{"role": "WRITER", "userByEmail": "dev7@example.com"}]}, {}),
+                           ({}, {"bindings": [{"role": "roles/bigquery.dataViewer", "members": ["user:dev7@example.com"]}]})):
+        fake = _FakeRun([(("identity", "check-transitive-membership"), 1, "ERROR: PERMISSION_DENIED")] + _answers({}, dataset, table))
+        try:
+            _row_writer_run(fake, **GROUPS)
+        except SystemExit as exc:
+            assert "could not rule out" in str(exc)
+            assert "group:bqaa-writers@example.com: user:dev7@example.com" in str(exc)
+            assert "group:bqaa-readers@example.com: user:dev7@example.com" in str(exc)
+        else:
+            raise AssertionError("expected SystemExit")
+        assert _no_grant_calls(fake)
+    dataset = {"access": [{"role": "WRITER", "userByEmail": "dev7@example.com"}]}
+    # In a group, as Cloud Identity answers: stops, named a member.
+    fake = _FakeRun([(("identity", "check-transitive-membership", "--group-email=bqaa-writers@example.com"), 0, '{"hasMembership": true}')]
+                    + _answers({}, dataset, {}))
+    try:
+        _row_writer_run(fake, **GROUPS)
+    except SystemExit as exc:
+        assert "group:bqaa-writers@example.com: user:dev7@example.com (WRITER on the dataset test-project.agent_analytics) (a member, as Cloud Identity answers)" in str(exc)
+    else:
+        raise AssertionError("expected SystemExit")
+    assert _no_grant_calls(fake)
+    # In neither group: the run goes on, and says what was checked.
+    out = io.StringIO()
+    fake = _FakeRun([(("identity", "check-transitive-membership"), 0, "{}")] + _answers({}, dataset, {}))
+    args = _args(service_account="bqaa-row-writer", writer_role="row-writer", execute=True, create_dataset=False,
+                 create_table=False, keep_project_groups=True, **GROUPS)
+    with _stub_preflight(_preflight()), _stub_run(fake), contextlib.redirect_stdout(out), _views_left_alone():
+        setup.run(args)
+    ok = next(line for line in out.getvalue().splitlines() if line.startswith("OK no grant to everyone"))
+    assert "not a member, as Cloud Identity answers: " in ok
+    assert "group:bqaa-readers@example.com: user:dev7@example.com (WRITER on the dataset test-project.agent_analytics)" in ok
+    assert "group:bqaa-writers@example.com: user:dev7@example.com (WRITER on the dataset test-project.agent_analytics)" in ok
+    assert _token_creator_calls(fake)
+    # Unanswered, the override keeps it.
+    fake = _FakeRun([(("identity", "check-transitive-membership"), 1, "ERROR: PERMISSION_DENIED")] + _answers({}, dataset, {}))
+    _row_writer_run(fake, allow_existing_grants=True, **GROUPS)
+    assert _token_creator_calls(fake)
+
+
+def test_a_group_grant_and_a_group_member_need_more_than_a_no() -> None:
+    # The member group is not inside the granted group, but some of its
+    # members may be: that cannot be ruled out.
+    dataset = {"access": [{"role": "READER", "groupByEmail": "all-staff@example.com"}]}
+    answers = [(("gcloud", "projects", "get-iam-policy"), 0, "{}"), (("bq", "show"), 0, json.dumps(dataset)),
+               (("bq", "get-iam-policy"), 0, "{}"), (("identity", "check-transitive-membership"), 0, "{}")]
+    with _stub_run(_FakeRun(answers)), contextlib.redirect_stdout(io.StringIO()):
+        try:
+            setup._check_project_readers(_args(reader=["group:bqaa-readers@example.com"]))
+        except SystemExit as exc:
+            assert "could not rule out" in str(exc) and "group:bqaa-readers@example.com: group:all-staff@example.com" in str(exc)
+        else:
+            raise AssertionError("expected SystemExit")
+    # Inside it as a whole: every reader reads every row.
+    answers[-1] = (("identity", "check-transitive-membership"), 0, '{"hasMembership": true}')
+    with _stub_run(_FakeRun(answers)), contextlib.redirect_stdout(io.StringIO()):
+        try:
+            setup._check_project_readers(_args(reader=["group:bqaa-readers@example.com"]))
+        except SystemExit as exc:
+            assert "can read every row" in str(exc) and "(a member, as Cloud Identity answers)" in str(exc)
+        else:
+            raise AssertionError("expected SystemExit")
+
+
+def test_a_domain_grant_and_a_group_member_need_the_override() -> None:
+    # A group's own address says nothing of its members' domains.
+    dataset = {"access": [{"role": "READER", "domain": "example.com"}]}
+    fake = _FakeRun(_answers({}, dataset, {}))
+    try:
+        _row_writer_run(fake, token_creator=["group:bqaa-writers@groups.example.com"])
+    except SystemExit as exc:
+        assert "could not rule out" in str(exc)
+        assert "group:bqaa-writers@groups.example.com: domain:example.com (READER on the dataset test-project.agent_analytics)" in str(exc)
+    else:
+        raise AssertionError("expected SystemExit")
+    assert _no_grant_calls(fake)
+    # Nor does a group in the same domain: its members may be from anywhere.
+    with _stub_run(_FakeRun(_answers({}, dataset, {}))), contextlib.redirect_stdout(io.StringIO()):
+        try:
+            setup._check_project_readers(_args(reader=["group:readers@example.com"]))
+        except SystemExit as exc:
+            assert "could not rule out" in str(exc)
+        else:
+            raise AssertionError("expected SystemExit")
+
+
+def test_a_domain_grant_and_a_person_in_another_domain_need_the_override() -> None:
+    # example.org may be a secondary domain of example.com's identity
+    # customer: the address alone cannot tell.
+    table = {"bindings": [{"role": "roles/bigquery.dataViewer", "members": ["domain:example.com"]}]}
+    fake = _FakeRun(_answers({}, {}, table))
+    try:
+        _row_writer_run(fake, token_creator=["user:alice@example.org"], reader=["user:alice@example.org"])
+    except SystemExit as exc:
+        assert "could not rule out" in str(exc)
+        assert "user:alice@example.org: domain:example.com (roles/bigquery.dataViewer on the table test-project.agent_analytics.agent_events)" in str(exc)
+    else:
+        raise AssertionError("expected SystemExit")
+    assert _no_grant_calls(fake)
+    # A service account belongs to no domain but its own address's.
+    answers = [(("gcloud", "projects", "get-iam-policy"), 0, "{}"), (("bq", "show"), 0, "{}"),
+               (("bq", "get-iam-policy"), 0, json.dumps(table))]
+    with _stub_run(_FakeRun(answers)), contextlib.redirect_stdout(io.StringIO()):
+        setup._check_project_readers(_args(reader=["serviceAccount:ci@test-project.iam.gserviceaccount.com"]))
+
+
+def test_a_custom_project_role_that_reads_is_found() -> None:
+    raw = json.dumps({"includedPermissions": ["bigquery.tables.get", "bigquery.tables.getData"]})
+    exports = json.dumps({"includedPermissions": ["bigquery.tables.export", "bigquery.jobs.create"]})
+    narrow = json.dumps({"includedPermissions": ["bigquery.jobs.create"]})
+    cases = (
+        ("projects/test-project/roles/rawReader", ("describe", "rawReader", "--project", "test-project"), raw),
+        ("organizations/123/roles/orgReader", ("describe", "orgReader", "--organization", "123"), exports),
+        ("roles/somevendor.dataReader", ("describe", "roles/somevendor.dataReader"), raw),
+    )
+    for role, words, answer in cases:
+        policy = {"bindings": [{"role": role, "members": ["user:alice@example.com"]}]}
+        fake = _FakeRun([(words, 0, answer)] + _answers(policy, {}, {}))
+        try:
+            _row_writer_run(fake, token_creator=["user:alice@example.com"], reader=["user:alice@example.com"])
+        except SystemExit as exc:
+            assert f"user:alice@example.com: user:alice@example.com ({role} on the project test-project)" in str(exc)
+        else:
+            raise AssertionError(f"expected SystemExit for {role}")
+        assert _no_grant_calls(fake)
+        assert any(all(w in c for w in words) for c in fake.calls), role
+    # A custom role that reads nothing is not a grant on the table.
+    policy = {"bindings": [{"role": "projects/test-project/roles/jobsOnly", "members": ["user:alice@example.com"]}]}
+    fake = _FakeRun([(("describe", "jobsOnly", "--project", "test-project"), 0, narrow)] + _answers(policy, {}, {}))
+    _row_writer_run(fake, token_creator=["user:alice@example.com"], reader=["user:alice@example.com"])
+    assert _token_creator_calls(fake)
+    # One whose permissions cannot be read needs the override.
+    fake = _FakeRun([(("describe", "jobsOnly"), 1, "ERROR: PERMISSION_DENIED: iam.roles.get")] + _answers(policy, {}, {}))
+    try:
+        _row_writer_run(fake, token_creator=["user:alice@example.com"], reader=["user:alice@example.com"])
+    except SystemExit as exc:
+        assert "could not rule out" in str(exc) and "a role whose permissions could not be read" in str(exc)
+    else:
+        raise AssertionError("expected SystemExit")
+    assert _no_grant_calls(fake)
+    # Granted to everyone, a role that cannot be read stops the check with no reader at all.
+    public = {"bindings": [{"role": "projects/test-project/roles/jobsOnly", "members": ["allUsers"]}]}
+    answers = [(("describe", "jobsOnly"), 1, "ERROR: PERMISSION_DENIED"), (("gcloud", "projects", "get-iam-policy"), 0, json.dumps(public)),
+               (("bq", "show"), 0, "{}"), (("bq", "get-iam-policy"), 0, "{}")]
+    with _stub_run(_FakeRun(answers)), contextlib.redirect_stdout(io.StringIO()):
+        try:
+            setup._check_project_readers(_args(service_account="bqaa-row-writer", writer_role="row-writer"))
+        except SystemExit as exc:
+            assert "could not rule out" in str(exc) and "allUsers (projects/test-project/roles/jobsOnly on the project" in str(exc)
+        else:
+            raise AssertionError("expected SystemExit")
+
+
+def test_the_writer_check_reads_a_broad_grants_custom_role() -> None:
+    args = _args(service_account="bqaa-row-writer", writer_role="row-writer", principal=f"serviceAccount:{WRITER}")
+    raw = json.dumps({"includedPermissions": ["bigquery.tables.getData"]})
+    narrow = json.dumps({"includedPermissions": ["resourcemanager.projects.get"]})
+    policy = {"bindings": [{"role": "projects/test-project/roles/rawReader", "members": ["allAuthenticatedUsers"]}]}
+    for code, answer, stops in ((0, raw, True), (1, "ERROR: PERMISSION_DENIED", True), (0, narrow, False)):
+        answers = [(("describe", "rawReader"), code, answer), (("gcloud", "projects", "get-iam-policy"), 0, json.dumps(policy)),
+                   (("bq", "show"), 0, "{}"), (("bq", "get-iam-policy"), 0, "{}")]
+        with _stub_run(_FakeRun(answers)), contextlib.redirect_stdout(io.StringIO()):
+            try:
+                setup._check_writer_grants(args)
+            except SystemExit as exc:
+                assert stops and "projects/test-project/roles/rawReader on the project test-project" in str(exc)
+                if code:
+                    assert "a role whose permissions could not be read" in str(exc)
+            else:
+                assert not stops
 
 
 if __name__ == "__main__":
@@ -1162,6 +1371,12 @@ if __name__ == "__main__":
         test_a_grant_to_the_writers_domain_counts_against_the_writer,
         test_the_reader_check_runs_before_any_change,
         test_the_writer_check_itself_refuses_a_public_or_domain_grant,
+        test_a_persons_grant_with_group_readers_needs_cloud_identity_or_the_override,
+        test_a_group_grant_and_a_group_member_need_more_than_a_no,
+        test_a_domain_grant_and_a_group_member_need_the_override,
+        test_a_domain_grant_and_a_person_in_another_domain_need_the_override,
+        test_a_custom_project_role_that_reads_is_found,
+        test_the_writer_check_reads_a_broad_grants_custom_role,
     ):
         test()
     print("setup_gcp_prereqs tests passed")
