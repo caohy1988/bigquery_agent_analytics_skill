@@ -16,9 +16,9 @@
 -- own sandbox); readers without it use the views in <dataset>_reporting.
 --
 -- Every query reads only this mod's rows (attributes.writer.plugin), except
--- V7, which compares producers on purpose, and keeps one row per event_id:
--- a row resent after an ambiguous timeout, or by a replay, has the same
--- event_id. Rows without an event_id (other producers) are all kept.
+-- V7, which sets them beside ADK agents' on purpose, and keeps one row per
+-- event_id: a row resent after an ambiguous timeout, or by a replay, has the
+-- same event_id. Rows without an event_id (ADK's) are all kept.
 -- tests/queries.live.py runs each one on a synthetic fixture.
 
 -- V1. Developer: my sessions at a glance. Per session: when it started, how
@@ -53,31 +53,74 @@ ORDER BY started_at DESC;
 -- V2. Developer: where each turn's time went. The turn's total (NULL when
 --     no end of turn was recorded), the time in model requests, answered or
 --     failed, and in tool calls (a permission prompt's wait is part of its
---     tool call's), and the tool calls that asked for permission. A part is
---     NULL when one of its requests or calls recorded no duration: unknown,
---     not zero. The parts can add up to more than the turn: a tool call can
---     run beside a model request.
+--     tool call's), and the tool calls that asked for permission. A request
+--     or a tool call is its rows on one span, its start and its end, and
+--     its time is its end's duration. A part is NULL when one of its
+--     requests or calls has no time: it recorded no duration, or its end is
+--     not in the table by the end of the window (it ended later, or the row
+--     was lost). Unknown, not zero; a turn with no requests, or no tool
+--     calls, has 0 for that part. A turn with a row in the window is taken
+--     whole, its rows looked up from a day before the window, so one that
+--     began before it keeps its earlier calls. The parts can add up to more
+--     than the turn: a tool call can run beside a model request.
 WITH events AS (
-  SELECT *
+  SELECT
+    *,
+    timestamp >= @start AS in_window
   FROM `{PROJECT}.{DATASET}.{TABLE}`
-  WHERE timestamp BETWEEN @start AND @end
+  WHERE timestamp BETWEEN TIMESTAMP_SUB(@start, INTERVAL 1 DAY) AND @end
     AND JSON_VALUE(attributes, '$.writer.plugin') = 'bigquery-agent-analytics-mod'
     AND invocation_id IS NOT NULL
   QUALIFY event_id IS NULL OR ROW_NUMBER() OVER (PARTITION BY event_id ORDER BY timestamp) = 1
+),
+turn_rows AS (
+  SELECT *
+  FROM events
+  WHERE TRUE
+  QUALIFY LOGICAL_OR(in_window) OVER (PARTITION BY session_id, invocation_id)
+),
+calls AS (
+  SELECT
+    session_id,
+    invocation_id,
+    LOGICAL_OR(STARTS_WITH(event_type, 'LLM_')) AS model,
+    MAX(IF(event_type IN ('LLM_RESPONSE', 'LLM_ERROR', 'TOOL_COMPLETED'),
+      SAFE_CAST(JSON_VALUE(latency_ms, '$.total_ms') AS INT64), NULL)) AS ms
+  FROM turn_rows
+  WHERE event_type IN ('LLM_REQUEST', 'LLM_RESPONSE', 'LLM_ERROR', 'TOOL_STARTING', 'TOOL_COMPLETED')
+  GROUP BY session_id, invocation_id, IFNULL(span_id, event_id)
+),
+parts AS (
+  SELECT
+    session_id,
+    invocation_id,
+    IF(LOGICAL_OR(model AND ms IS NULL), NULL, IFNULL(SUM(IF(model, ms, NULL)), 0)) AS model_ms,
+    IF(LOGICAL_OR(NOT model AND ms IS NULL), NULL, IFNULL(SUM(IF(model, NULL, ms)), 0)) AS tool_ms
+  FROM calls
+  GROUP BY session_id, invocation_id
+),
+turns AS (
+  SELECT
+    session_id,
+    invocation_id,
+    MIN(timestamp) AS started_at,
+    MAX(IF(event_type IN ('INVOCATION_COMPLETED', 'INVOCATION_ERROR'), SAFE_CAST(JSON_VALUE(latency_ms, '$.total_ms') AS INT64), NULL)) AS turn_ms,
+    COUNTIF(event_type = 'TOOL_COMPLETED' AND JSON_VALUE(attributes, '$.permission_requested') = 'true') AS permission_prompts
+  FROM turn_rows
+  GROUP BY session_id, invocation_id
 )
 SELECT
-  session_id,
-  invocation_id,
-  MIN(timestamp) AS started_at,
-  MAX(IF(event_type IN ('INVOCATION_COMPLETED', 'INVOCATION_ERROR'), SAFE_CAST(JSON_VALUE(latency_ms, '$.total_ms') AS INT64), NULL)) AS turn_ms,
-  IF(COUNTIF(event_type IN ('LLM_RESPONSE', 'LLM_ERROR') AND SAFE_CAST(JSON_VALUE(latency_ms, '$.total_ms') AS INT64) IS NULL) > 0, NULL,
-    IFNULL(SUM(IF(event_type IN ('LLM_RESPONSE', 'LLM_ERROR'), SAFE_CAST(JSON_VALUE(latency_ms, '$.total_ms') AS INT64), NULL)), 0)) AS model_ms,
-  IF(COUNTIF(event_type = 'TOOL_COMPLETED' AND SAFE_CAST(JSON_VALUE(latency_ms, '$.total_ms') AS INT64) IS NULL) > 0, NULL,
-    IFNULL(SUM(IF(event_type = 'TOOL_COMPLETED', SAFE_CAST(JSON_VALUE(latency_ms, '$.total_ms') AS INT64), NULL)), 0)) AS tool_ms,
-  COUNTIF(event_type = 'TOOL_COMPLETED' AND JSON_VALUE(attributes, '$.permission_requested') = 'true') AS permission_prompts
-FROM events
-GROUP BY session_id, invocation_id
-ORDER BY started_at DESC;
+  t.session_id,
+  t.invocation_id,
+  t.started_at,
+  t.turn_ms,
+  IF(p.invocation_id IS NULL, 0, p.model_ms) AS model_ms,
+  IF(p.invocation_id IS NULL, 0, p.tool_ms) AS tool_ms,
+  t.permission_prompts
+FROM turns AS t
+LEFT JOIN parts AS p
+  ON p.invocation_id = t.invocation_id AND p.session_id IS NOT DISTINCT FROM t.session_id
+ORDER BY t.started_at DESC;
 
 -- V3. Team lead: adoption against a roster. Per calendar day of the
 --     window: the people enrolled (a table of their login names that you
@@ -259,10 +302,12 @@ FROM events
 GROUP BY day
 ORDER BY day DESC;
 
--- V7. Platform team: coding-agent sessions beside ADK agents and the
---     settings-hook tracer. The producers share the agent_events schema,
---     so one table, or a UNION over two, holds them all. Per producer and
---     agent: sessions, model requests, tokens and the share of rows in
+-- V7. Platform team: the mod's coding-agent sessions beside ADK agents.
+--     Both write the agent_events schema, so one table, or a UNION over
+--     two, holds them both. The settings-hook tracer's rows are left out:
+--     it writes one response per turn and per subagent run, with their
+--     usage summed, so its model requests would count turns. Per producer
+--     and agent: sessions, model requests, tokens and the share of rows in
 --     error. Normalized: rows with no writer are named for ADK, and an ADK
 --     response's tokens are read from total_token_count when total_tokens
 --     is missing. Other columns differ by producer and are left out.
@@ -289,6 +334,7 @@ WITH events AS (
     JSON_VALUE(attributes, '$.writer.plugin') IS NULL AS adk
   FROM `{PROJECT}.{DATASET}.{TABLE}`
   WHERE timestamp BETWEEN TIMESTAMP_SUB(@start, INTERVAL 1 DAY) AND @end
+    AND IFNULL(JSON_VALUE(attributes, '$.writer.plugin'), 'bigquery-agent-analytics-mod') = 'bigquery-agent-analytics-mod'
   QUALIFY event_id IS NULL OR ROW_NUMBER() OVER (PARTITION BY event_id ORDER BY timestamp) = 1
 ),
 spans AS (

@@ -17,7 +17,7 @@ on a synthetic fixture and checks the answers.
 | Team lead or administrator | What does a session cost? | V4, with your rates | An administrator | An estimate: tokens times the rates you enter, dated. Not a bill. None for a session and model with a response that recorded no usage |
 | Team lead or administrator | Which tools do people use, and how often do they fail, prompt, or get refused, by the person, a hook or a permission rule? | V5, sample 4 | An administrator | Each refused call is counted once, by where the refusal came from (`permission_decision_source`): the person, a hook, a rule, or another source (`refused_other`: one the host did not give, recorded as `unknown`, or one the queries do not name). The four add up to all refused calls (`refused_pct`, `refused`). A call that a rule blocks before the host records it leaves no row |
 | Team lead or administrator | Are errors going up? | V6, sample 8 | An administrator | Each rate has its own denominator (turns, model requests, tool calls), as V6 shows them |
-| Platform team | How do coding-agent sessions compare with our ADK agents? | V7 | An administrator of the shared table | Only sessions, model requests, tokens and error rows are compared; other columns differ by producer. An ADK model call counts once, with the largest token count among its responses, however it streamed and when one agent makes several calls at once. A call's tokens come from its own rows only, so a later final, which repeats them, is left out (`later_finals`). A call whose own rows recorded no usage is in `model_requests_without_usage`, and one whose request is not in the table counts by its span (`model_requests_unmatched`) |
+| Platform team | How do coding-agent sessions compare with our ADK agents? | V7 | An administrator of the shared table | The mod's rows beside ADK agents' only. The settings-hook tracer's are left out: it writes one response per turn and per subagent run, with their usage summed, so its model requests would count turns. Only sessions, model requests, tokens and error rows are compared; other columns differ by producer. An ADK model call counts once, with the largest token count among its responses, however it streamed and when one agent makes several calls at once. A call's tokens come from its own rows only, so a later final, which repeats them, is left out (`later_finals`). A call whose own rows recorded no usage is in `model_requests_without_usage`, and one whose request is not in the table counts by its span (`model_requests_unmatched`) |
 | Anyone with the views | Sessions, model requests and tokens per day, by person or model | `daily_usage_by_user`, `daily_usage_by_model` | The reader group | No prompts, tools or errors: counts only |
 
 ## Denominators
@@ -66,8 +66,12 @@ on a synthetic fixture and checks the answers.
     seen, with `no_rows_that_day` set: absent telemetry, not proof that
     nobody worked;
   - a turn with no recorded end has no duration (NULL), and a turn's model
-    or tool time is NULL when one of its requests or calls recorded no
-    duration (a failed request's time counts as model time);
+    or tool time is NULL when one of its requests or calls has no time: it
+    recorded no duration, or its end is not in the table by the end of the
+    window (it ended later, or the row was lost). A turn with no requests,
+    or no tool calls, has 0 for that part, and a failed request's time
+    counts as model time. V2 takes each turn with a row in the window
+    whole, looking its rows up from a day before the window;
   - a response that recorded no usage adds no tokens, and is counted in
     `responses_without_usage`;
   - a session and model with such a response, or a model with no rate row,

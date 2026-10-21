@@ -6,7 +6,9 @@ run_bq.py) against a synthetic fixture, and checks the answers.
 The fixture holds what the queries must count right:
   - a row the mod sent twice (a replay: the same event_id);
   - a session with no user_id;
-  - other producers in the same table: the settings-hook tracer's rows and
+  - other producers in the same table: the settings-hook tracer's rows (a
+    turn with three model requests among them, which it writes as one
+    response) and
     an ADK agent's, the latter with no event_id and its tokens under
     usage_metadata.total_token_count, with two streamed model calls (a row
     for each chunk and the last; one call's final row marked by cache_type
@@ -29,6 +31,10 @@ The fixture holds what the queries must count right:
     none), each to be counted once, the kinds adding up to all refusals;
   - a failed model request with its duration, and a response that
     recorded neither usage nor a duration;
+  - a turn whose second model request and tool call end after a window
+    that closes before them, seen from that window, from one after the
+    turn and from one that starts after the turn's first request ended,
+    and a turn with no requests or tool calls;
   - a window with a day of no rows, and a window with none at all.
 
 It makes a dataset of its own (bqaa_query_check_<random>, in US), with the
@@ -288,6 +294,42 @@ FIXTURE += staggered("A8", "adk-staggered-three",
                      ["R1", "R2", "F1", "R3", "F2", "L1", "L1", "F3", "L2", "L2", "L3", "L3"], {1: 100, 2: 40, 3: 30})
 # A later final that reports an error is kept as an error row.
 FIXTURE += staggered("A9", "adk-later-error", ["R1", "F1", "L1"], {1: 50}, error_in="L1")
+# A turn of the settings-hook tracer's with three model requests and two
+# tool calls (300 tokens), as it writes one: a request at the prompt, the
+# tool calls, and one response at Stop with the turn's usage summed.
+TRACER_TURN = dict(writer=TRACER_WRITER, invocation="T2-1")
+FIXTURE += [
+    row("t03", "2026-10-20T13:10:00Z", "LLM_REQUEST", "T2", **TRACER_TURN, attributes={"model": "model-a"}),
+    row("t04", "2026-10-20T13:10:01Z", "TOOL_STARTING", "T2", **TRACER_TURN, content={"tool": "Bash"}),
+    row("t05", "2026-10-20T13:10:02Z", "TOOL_COMPLETED", "T2", **TRACER_TURN, content={"tool": "Bash"},
+        latency={"total_ms": 900}),
+    row("t06", "2026-10-20T13:10:03Z", "TOOL_STARTING", "T2", **TRACER_TURN, content={"tool": "Read"}),
+    row("t07", "2026-10-20T13:10:04Z", "TOOL_COMPLETED", "T2", **TRACER_TURN, content={"tool": "Read"},
+        latency={"total_ms": 100}),
+    row("t08", "2026-10-20T13:10:05Z", "LLM_RESPONSE", "T2", **TRACER_TURN,
+        attributes={"model": "model-a", "usage_metadata": usage(200, 100)}, latency={"total_ms": 5000}),
+]
+# S9, on a day outside the other windows: a turn whose second model request
+# and tool call end at 20:00:20 and 20:00:21, after a window that closes at
+# 20:00:10; then a turn with no requests or tool calls.
+D9 = "2026-10-22T20:00:"
+I9 = dict(invocation="I9", trace="trace-9")
+FIXTURE += [
+    row("e91", D9 + "00Z", "INVOCATION_STARTING", "S9", **I9, span="inv-9"),
+    row("e92", D9 + "01Z", "LLM_REQUEST", "S9", **I9, span="req-91", parent="inv-9", attributes={"model": "model-a"}),
+    row("e93", D9 + "02Z", "LLM_RESPONSE", "S9", **I9, span="req-91", parent="inv-9",
+        attributes={"model": "model-a", "usage_metadata": usage(10, 5)}, latency={"total_ms": 1000}),
+    row("e94", D9 + "03Z", "LLM_REQUEST", "S9", **I9, span="req-92", parent="inv-9", attributes={"model": "model-a"}),
+    row("e95", D9 + "04Z", "TOOL_STARTING", "S9", **I9, span="tool-91", parent="req-91", content={"tool": "Bash"}),
+    row("e96", D9 + "20Z", "LLM_RESPONSE", "S9", **I9, span="req-92", parent="inv-9",
+        attributes={"model": "model-a", "usage_metadata": usage(10, 5)}, latency={"total_ms": 17000}),
+    row("e97", D9 + "21Z", "TOOL_COMPLETED", "S9", **I9, span="tool-91", parent="req-91",
+        content={"tool": "Bash", "tool_origin": "builtin"}, latency={"total_ms": 17000}),
+    row("e98", D9 + "22Z", "INVOCATION_COMPLETED", "S9", **I9, span="inv-9", latency={"total_ms": 22000}),
+    row("e99", D9 + "23Z", "INVOCATION_STARTING", "S9", invocation="I9b", trace="trace-9b", span="inv-9b"),
+    row("e9a", D9 + "24Z", "INVOCATION_COMPLETED", "S9", invocation="I9b", trace="trace-9b", span="inv-9b",
+        latency={"total_ms": 1000}),
+]
 # The replay: e05 sent twice.
 FIXTURE.append(dict(FIXTURE[4]))
 ROSTER = ["alice", "bob", "dave"]
@@ -319,6 +361,16 @@ def checks(name: str, rows: list[dict]):
         yield "I1: turn 7000 ms, models 1400 ms, tools 700 ms, 1 permission prompt", (t["I1"]["turn_ms"], t["I1"]["model_ms"], t["I1"]["tool_ms"], t["I1"]["permission_prompts"]) == (7000, 1400, 700, 1)
         yield "I2: turn 9000 ms, models 8300 ms (with the subagent's and the 6000 ms failed request), tools 300 ms", (t["I2"]["turn_ms"], t["I2"]["model_ms"], t["I2"]["tool_ms"]) == (9000, 8300, 300)
         yield "I3: no end of turn, and a response with no duration: turn_ms and model_ms are NULL, not 0", t["I3"]["turn_ms"] is None and t["I3"]["model_ms"] is None
+    elif name == "V2 ends mid-turn":
+        t = by(rows, "invocation_id")
+        yield "a window that ends before a model request and a tool call end: that turn's model and tool time are NULL, not 1000 and 0 ms", "I9" in t and (t["I9"]["turn_ms"], t["I9"]["model_ms"], t["I9"]["tool_ms"]) == (None, None, None)
+    elif name == "V2 after the turn":
+        t = by(rows, "invocation_id")
+        yield "a window after both ended: turn 22000 ms, models 18000 ms, tools 17000 ms", "I9" in t and (t["I9"]["turn_ms"], t["I9"]["model_ms"], t["I9"]["tool_ms"]) == (22000, 18000, 17000)
+        yield "a turn with no requests or tool calls: 0 ms for both, not NULL", "I9b" in t and (t["I9b"]["turn_ms"], t["I9b"]["model_ms"], t["I9b"]["tool_ms"]) == (1000, 0, 0)
+    elif name == "V2 starts mid-turn":
+        t = by(rows, "invocation_id")
+        yield "a window that starts after the turn's first request ended: the turn is taken whole, from when it started: models 18000 ms, not 17000", "I9" in t and (t["I9"]["turn_ms"], t["I9"]["model_ms"], t["I9"]["tool_ms"], t["I9"]["started_at"].replace("T", " ")[:19]) == (22000, 18000, 17000, "2026-10-22 20:00:00")
     elif name == "V3":
         d = by(rows, "day")
         yield "day 1: 3 enrolled, 1 seen, 2 not seen, 1 session, 1 turn", (d["2026-10-19"]["enrolled"], d["2026-10-19"]["enrolled_seen"], d["2026-10-19"]["enrolled_not_seen"], d["2026-10-19"]["enrolled_sessions"], d["2026-10-19"]["enrolled_turns"]) == (3, 1, 2, 1, 1)
@@ -356,7 +408,7 @@ def checks(name: str, rows: list[dict]):
         mod = p[("bigquery-agent-analytics-mod", "coding-agent")]
         yield "the mod (main loop): 3 sessions, 5 model requests, 465 tokens, 34.8% rows in error", (mod["sessions"], mod["model_requests"], mod["tokens"], mod["error_row_pct"]) == (3, 5, 465, 34.8)
         yield "the mod's subagent: 1 request, 50 tokens", (p[("bigquery-agent-analytics-mod", "general-purpose")]["model_requests"], p[("bigquery-agent-analytics-mod", "general-purpose")]["tokens"]) == (1, 50)
-        yield "the tracer, apart: 999 tokens", p[("bqaa-coding-agent-plugin", "coding-agent")]["tokens"] == 999
+        yield "the settings-hook tracer is left out, its three-request turn too: it writes one response per turn", all(r["producer"] != "bqaa-coding-agent-plugin" for r in rows)
         adk = p[("adk (no writer)", "adk-agent")]
         yield "ADK, normalized: each streamed call once, with its largest token count: 3 model requests, 147 tokens (77 from total_token_count), 25.0% of 4 rows in error, rows with no event_id kept", (adk["sessions"], adk["model_requests"], adk["tokens"], adk["error_row_pct"]) == (1, 3, 147, 25.0)
         legacy = p[("adk (no writer)", "adk-legacy")]
@@ -378,7 +430,7 @@ def checks(name: str, rows: list[dict]):
         yield "ADK, a later final that reports an error is kept as an error row: 1 model request, 50 tokens, 33.3% of 3 rows", (later_error["model_requests"], later_error["tokens"], later_error["later_finals"], later_error["error_row_pct"]) == (1, 50, 1, 33.3)
         yield "sequential calls leave out their later finals (2) and keep 20.0% of 5 rows; unstreamed calls have none", (legacy["later_finals"], legacy["error_row_pct"], fan["later_finals"], adk["later_finals"]) == (2, 20.0, 0, 0)
         yield "a call whose own rows recorded no usage adds no tokens and is shown: the mod's main loop has 1", (mod["model_requests_without_usage"], adk["model_requests_without_usage"]) == (1, 0)
-        yield "the mod's and the tracer's rows are never unmatched", all(r["model_requests_unmatched"] == 0 for r in rows if r["producer"] != "adk (no writer)")
+        yield "the mod's rows are never unmatched", all(r["model_requests_unmatched"] == 0 for r in rows if r["producer"] != "adk (no writer)")
     elif name == "V7 later finals only":
         p = by(rows, "producer", "agent")
         only = p.get(("adk (no writer)", "adk-staggered"))
@@ -491,6 +543,11 @@ def main() -> int:
                     runs.append((f"{path.name} V7 (from just after a call's request)", "V7 clipped", sql, "2026-10-20T15:00:01Z", END))
                     runs.append((f"{path.name} V7 (a window of later finals)", "V7 later finals only", sql,
                                  "2026-10-20T19:00:05Z", "2026-10-20T19:00:08Z"))
+                if name == "V2":
+                    for case, start, end in (("V2 ends mid-turn", "2026-10-22T20:00:00Z", "2026-10-22T20:00:10Z"),
+                                             ("V2 after the turn", "2026-10-22T20:00:00Z", "2026-10-22T20:00:30Z"),
+                                             ("V2 starts mid-turn", "2026-10-22T20:00:15Z", "2026-10-22T20:00:30Z")):
+                        runs.append((f"{path.name} {case}", case, sql, start, end))
                 if name == "V3":
                     runs.append((f"{path.name} V3 (through a day with no rows)", "V3 silent day", sql, START, "2026-10-21"))
                     runs.append((f"{path.name} V3 (a window with no rows)", "V3 empty window", sql, "2026-09-01", "2026-09-02"))
