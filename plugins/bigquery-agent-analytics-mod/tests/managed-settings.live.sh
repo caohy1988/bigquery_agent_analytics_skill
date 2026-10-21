@@ -46,6 +46,10 @@
 #             allowManagedModsOnly and allowManagedHooksOnly refuse it.
 #             With the policy removed the copy stays installed and loads,
 #             until a disable policy holds it while it is uninstalled.
+#             With the ref moved to a second tag (PIN_REF2), the
+#             marketplace is fetched at it, but the earlier copy keeps
+#             running until claude plugin update, after which the next
+#             session runs the second tag's.
 #             Its policy names the guide's token command for this variant
 #             (env -i and gcloud's absolute path, no delivered file): a
 #             stand-in gcloud at that path runs with the guide's arguments
@@ -55,6 +59,7 @@
 #   HOST_CLI_LINUX=/path/to/linux/claude bash tests/managed-settings.live.sh
 #   BQAA_CHECK_NETWORK=1 BQAA_CHECK_GIT_IMAGE=my-image-with-git \
 #     PIN_REPO=owner/repo PIN_REF=a-tag PIN_VERSION=the-mod-version-there \
+#     PIN_REF2=a-later-tag PIN_VERSION2=the-mod-version-there \
 #     HOST_CLI_LINUX=... bash tests/managed-settings.live.sh
 # The host CLI's Linux build is a single binary for the container's
 # architecture. The work folder goes under $HOME, which docker on a Mac
@@ -69,8 +74,9 @@ if [[ ! -x "${HOST_CLI_LINUX:-}" ]]; then
   exit 1
 fi
 network="${BQAA_CHECK_NETWORK:-0}"
-if [[ "$network" == 1 && ( -z "${BQAA_CHECK_GIT_IMAGE:-}" || -z "${PIN_REPO:-}" || -z "${PIN_REF:-}" || -z "${PIN_VERSION:-}" ) ]]; then
-  echo "not ok - BQAA_CHECK_NETWORK=1 needs BQAA_CHECK_GIT_IMAGE, PIN_REPO, PIN_REF and PIN_VERSION"
+if [[ "$network" == 1 && ( -z "${BQAA_CHECK_GIT_IMAGE:-}" || -z "${PIN_REPO:-}" || -z "${PIN_REF:-}" || -z "${PIN_VERSION:-}" \
+      || -z "${PIN_REF2:-}" || -z "${PIN_VERSION2:-}" ) ]]; then
+  echo "not ok - BQAA_CHECK_NETWORK=1 needs BQAA_CHECK_GIT_IMAGE, PIN_REPO, PIN_REF, PIN_VERSION, PIN_REF2 and PIN_VERSION2"
   exit 1
 fi
 work="$(mktemp -d "$HOME/.bqaa-managed-check.XXXXXX")"
@@ -80,7 +86,7 @@ trap '[[ "${BQAA_CHECK_KEEP:-0}" == 1 ]] && echo "kept $work" || rm -rf "$work"'
 mkdir -p "$work/in/mod" "$work/out"
 cp "$HOST_CLI_LINUX" "$work/in/claude"
 (cd "$plugin" && tar -cf - --exclude ./.claude-plugin/types .) | tar -xf - -C "$work/in/mod"
-printf '%s\n%s\n%s\n' "${PIN_REPO:-}" "${PIN_REF:-}" "${PIN_VERSION:-}" >"$work/in/pin"
+printf '%s\n%s\n%s\n%s\n%s\n' "${PIN_REPO:-}" "${PIN_REF:-}" "${PIN_VERSION:-}" "${PIN_REF2:-}" "${PIN_VERSION2:-}" >"$work/in/pin"
 # A session held open with no input (so no model call), then ended: the time
 # a first session gives the host to register a marketplace or install a mod.
 cat >"$work/in/hold.py" <<'PY'
@@ -385,6 +391,17 @@ chown dev:dev /home/dev/repo/.claude/settings.json
 rm -f /out/gcloud.args /out/gcloud.env
 run github-token-env 60
 cp /out/gcloud.args /out/gcloud.env /out/github-token-env/ 2>/dev/null
+# A moved ref: the next tag's copy is fetched, the installed one keeps
+# running until plugin update.
+echo '{}' >/home/dev/repo/.claude/settings.json
+REF2="$(sed -n 4p /in/pin)"
+policy github "p['extraKnownMarketplaces']['bigquery-agent-analytics-plugin']['source']['ref'] = '$REF2'"
+hold github-moved-1 30; hold github-moved-2 30; run github-moved-3 60; copies github-moved-3
+as_dev "cd ~ && claude plugin list" >/out/github-moved-3/list.txt 2>&1
+as_dev "cd ~ && claude plugin update $OLD" >/out/github-plugin-update.txt 2>&1
+run github-updated 60
+as_dev "cd ~ && claude plugin list" >/out/github-updated/list.txt 2>&1
+policy github 'pass'
 fresh_user "$OLD"
 as_dev "cd ~ && claude plugin install $MOD --marketplace '$REPO#$REF'" >/out/pinned-install.txt 2>&1
 run pinned-install-1 60; copies pinned-install-1
@@ -507,6 +524,12 @@ if [[ "$network" == 1 ]]; then
   check 'github: the policy'"'"'s options hold against the person'"'"'s' bash -c "grep -q '$TARGET' '$out/github-3/status.txt' && ! grep -qE '$OTHERS' '$out/github-3/status.txt'"
   check 'github: the token command needs no delivered file: env -i runs gcloud at its path with the guide'"'"'s arguments' \
     bash -c "grep -qx 'auth print-access-token --impersonate-service-account=bqaa-row-writer@example-project.iam.gserviceaccount.com' '$out/github-token-env/gcloud.args' && grep -q 'token command .env. printed no access token' '$out/github-token-env/status.txt'"
+  ref2="$(sed -n 4p "$work/in/pin")"
+  version2="$(sed -n 5p "$work/in/pin")"
+  check "github: a moved ref fetches the marketplace at the next tag ($ref2), and the earlier copy ($version) keeps running three sessions on" \
+    bash -c "cat '$out'/github-moved-[123]/debug.log | grep -q 'git clone: url=.* ref=$ref2 ' && grep -q 'Version: $version\$' '$out/github-moved-3/list.txt'"
+  check "github: plugin update moves it, and the next session runs $version2" \
+    bash -c "grep -q 'Version: $version2\$' '$out/github-updated/list.txt' && grep -q '$TARGET' '$out/github-updated/status.txt'"
   check 'github: a repository'"'"'s settings env does not reach it: gcloud gets only PATH' \
     bash -c "test -s '$out/github-token-env/gcloud.env' && ! grep -qvE '^(PATH=/usr/bin:/bin|PWD=.*)\$' '$out/github-token-env/gcloud.env'"
   check 'github: rows carry the policy'"'"'s agent name, the login name and no host name' rows_are github-3 "$ROWS"

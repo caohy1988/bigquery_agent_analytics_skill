@@ -378,9 +378,20 @@ Checked in a container, against a test tag:
 
 The repository has no release tags for the mod yet. Until it does, use the
 folder, or a tag in a fork your organization controls. `ref` takes a branch
-or a tag, not a commit. How an installed copy follows a changed `ref` was
-not checked: change it for the pilot group first, and check the version
-under `~/.claude/plugins/cache/` on a pilot machine.
+or a tag, not a commit (checked: a commit is "not found in upstream
+origin").
+
+To move to another tag, change `ref` for the pilot group first. Each
+machine fetches the marketplace again at the new tag, but keeps running the
+copy it installed: run
+`claude plugin update bigquery-agent-analytics-mod@bigquery-agent-analytics-plugin`
+on each, as the person (or a script run as them), and check that
+`claude plugin list` shows the new `Version` (not
+`~/.claude/plugins/cache/`, which held both versions in one check).
+Checked in a container, with `autoUpdate` off: the next session fetched
+the marketplace at the new tag, and three sessions after the ref moved the
+earlier version still ran. `plugin update` moved it, and the next session
+ran it.
 
 ## 7. Roll out in stages
 
@@ -527,5 +538,4 @@ Not checked:
 - `/status` (it needs an interactive session);
 - the desktop app and editor extensions (the checks run the CLI);
 - Windows token commands;
-- how a GitHub copy follows a changed `ref`;
 - groups (people stood in for group members).
