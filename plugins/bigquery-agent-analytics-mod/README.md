@@ -155,6 +155,11 @@ claude --plugin-dir ./plugins/bigquery-agent-analytics-mod
 Use this mod **or** the settings-hook tracing plugin against a table, not both:
 with both enabled every event is written twice.
 
+**For a whole team**, an administrator can turn the mod on for everyone with
+the host's managed settings, pinning the table and the token command so
+nobody installs or configures anything: see
+[Managed settings](docs/managed-settings.md).
+
 ### The dataset
 
 [`setup.sh`](setup.sh) creates the rest with the `bq` CLI, and is safe to run
@@ -1105,6 +1110,7 @@ bash tests/setup.test.sh
 bash tests/version.test.sh    # plugin.json and PLUGIN_VERSION agree
 node tests/reload.test.mjs    # node 24: the welcome card across a fresh load
 bash tests/state-contract.test.sh   # the host's $.state, as the reload test models it
+HOST_CLI_LINUX=... bash tests/managed-settings.live.sh   # docker: a managed policy in a Linux container (below)
 python3 tests/views.test.py   # needs DuckDB: python3 -m pip install duckdb
 npx -p typescript tsc -p .    # once the host CLI has loaded the mod (below)
 ```
@@ -1457,6 +1463,16 @@ landed or missed, brings the whole moment up to date.
 `tests/version.test.sh` checks that `plugin.json` and `PLUGIN_VERSION` name
 the same version: the welcome card greets an update by the latter.
 
+`tests/managed-settings.live.sh` runs the
+[managed-settings](docs/managed-settings.md) folder setup in a Linux
+container, offline: a root-owned policy and an administrator-owned
+marketplace folder holding this checkout, and an ordinary user whose own
+settings, repository settings and shell all say otherwise. It checks that
+the mod loads as the organization's, keeps the policy's destination, token
+command and live writes with capture on, and that without the policy's
+`env` pins a shell `BQAA_TRACE_ENABLED=false` turns capture off. It needs
+docker and the host CLI's Linux build (`HOST_CLI_LINUX`).
+
 `tests/reload.test.mjs` loads `hooks/register.ts` afresh, as a hot reload
 does, which the test kit cannot, under node 24 with a small stand-in for
 `$` (its `$.state` held for the session, its `$.store` across loads, store
@@ -1632,6 +1648,7 @@ sql/views/                   the usage views setup.sh makes
 examples/sample-rows.jsonl   fixture output
 tests/                       plugin-test suites, setup.test.sh for setup.sh, version.test.sh, reload.test.mjs, and access.live.sh (live)
 types/index.d.ts             the values the mod keeps in the session's $.state
+docs/managed-settings.md     turning the mod on for a team with the host's managed settings
 ```
 
 The credential notice, the identity options, the permission decisions,
