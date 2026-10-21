@@ -323,8 +323,10 @@ def _json_output(command: list[str], missing_ok: bool = False) -> dict:
 def _row_writer_role(args: argparse.Namespace) -> list[str] | None:
     """The row-writer role's missing permissions, or None when there is no
     such role. A role that holds more than ROW_WRITER_PERMISSIONS, or is
-    deleted, is refused: bound on the table, it would let the writer read
-    or change it."""
+    deleted or disabled, is refused: bound on the table, it would let the
+    writer read or change it. Any failure to read it other than NOT_FOUND
+    (access denied, a network error) stops the run too: an unread role is
+    not a role known to be narrow."""
     project = args.project
     name = f"projects/{project}/roles/{ROW_WRITER_ROLE_ID}"
     describe = subprocess.run(
@@ -334,7 +336,14 @@ def _row_writer_role(args: argparse.Namespace) -> list[str] | None:
         check=False,
     )
     if describe.returncode != 0:
-        return None
+        said = f"{describe.stderr or ''}\n{describe.stdout or ''}"
+        if "NOT_FOUND" in said:
+            return None
+        raise SystemExit(
+            f"Could not read {name}: {_summarize_stderr(said, 'no output')}. It must be read before "
+            "anyone may impersonate the writer: run as someone who may read the project's roles "
+            "(iam.roles.get), and run again."
+        )
     try:
         role = json.loads(describe.stdout or "{}")
     except json.JSONDecodeError as error:
@@ -343,6 +352,11 @@ def _row_writer_role(args: argparse.Namespace) -> list[str] | None:
         raise SystemExit(
             f"{name} is deleted. Undelete it (gcloud iam roles undelete {ROW_WRITER_ROLE_ID} "
             f"--project {project}) and run again."
+        )
+    if role.get("stage") == "DISABLED":
+        raise SystemExit(
+            f"{name} is disabled (stage DISABLED). Set its stage back (gcloud iam roles update "
+            f"{ROW_WRITER_ROLE_ID} --project {project} --stage GA) and run again."
         )
     held = set(role.get("includedPermissions") or [])
     extra = sorted(held - set(ROW_WRITER_PERMISSIONS))
@@ -387,15 +401,38 @@ def _ensure_row_writer_role(args: argparse.Namespace) -> None:
         print(f"OK role exists, with {', '.join(ROW_WRITER_PERMISSIONS)} only: {name}")
 
 
+def _writer_holds_row_writer_binding(args: argparse.Namespace) -> bool:
+    """Whether the writer holds the row-writer role on the table."""
+    role = f"projects/{args.project}/roles/{ROW_WRITER_ROLE_ID}"
+    table = f"{args.project}:{args.dataset}.{args.table}"
+    policy = _json_output(_bq_command(args, "--format=json", "get-iam-policy", table), missing_ok=True)
+    principal = args.principal.lower()
+    return any(
+        binding.get("role") == role and principal in (m.lower() for m in binding.get("members") or [])
+        for binding in policy.get("bindings") or []
+    )
+
+
 def _check_row_writer_role(args: argparse.Namespace) -> None:
-    """With --no-grant-iam: refuse a row-writer role that holds more, and
-    change nothing."""
+    """With --no-grant-iam: refuse a row-writer role that holds more, or that
+    the writer is bound to but cannot be found, and change nothing."""
     missing = _row_writer_role(args)
     name = f"projects/{args.project}/roles/{ROW_WRITER_ROLE_ID}"
     if missing is None:
+        if _writer_holds_row_writer_binding(args):
+            raise SystemExit(
+                f"{args.principal} holds {name} on the table, but the role cannot be found: "
+                "what the binding grants cannot be checked. Run without --no-grant-iam to make the role, "
+                "or remove the binding."
+            )
         print(f"OK no role {name}: the writer holds no row-writer grant from this setup")
+    elif missing:
+        print(
+            f"MISSING: {name} lacks {', '.join(missing)}: the writer cannot insert until it has them "
+            "(run without --no-grant-iam to add them)"
+        )
     else:
-        print(f"OK role {name} holds nothing beyond {', '.join(ROW_WRITER_PERMISSIONS)}")
+        print(f"OK role {name} holds {', '.join(ROW_WRITER_PERMISSIONS)} and nothing else")
 
 
 # The access-entry key that names a member of each kind in a dataset's ACL.
@@ -449,36 +486,66 @@ def _check_writer_grants(args: argparse.Namespace) -> None:
     )
 
 
+def _dataset_member(entry: dict) -> str | None:
+    """The member a dataset access entry names, written as IAM writes it."""
+    for key, kind in (("userByEmail", "user"), ("groupByEmail", "group"), ("domain", "domain"),
+                      ("specialGroup", "specialGroup")):
+        if entry.get(key):
+            return f"{kind}:{entry[key]}"
+    return entry.get("iamMember")
+
+
+def _member_matches(member: str, named: str) -> bool:
+    """Whether a --reader or --token-creator member is the one an entry
+    names (a dataset's ACL writes service accounts as userByEmail)."""
+    kind, _, email = member.partition(":")
+    other_kind, _, other_email = named.partition(":")
+    if email.lower() != other_email.lower():
+        return False
+    return kind == other_kind or {kind, other_kind} == {"serviceAccount", "user"}
+
+
 def _check_project_readers(args: argparse.Namespace) -> None:
-    """Name who reads every row through a project role, and stop if a
-    --reader or --token-creator member is one of them."""
+    """Name who can read every row (a project role, or a grant on the events
+    dataset or table), and stop if a --reader or --token-creator member is
+    one of them."""
     roles = PROJECT_READ_ROLES + (PROJECT_GROUP_ROLES if args.keep_project_groups else ())
     policy = _json_output(_gcloud_command(args, "projects", "get-iam-policy", args.project, "--format=json"))
-    holders: dict[str, list[str]] = {}
-    names: dict[str, str] = {}
+    grants: list[tuple[str, str]] = []  # (member, what it holds)
     for binding in policy.get("bindings") or []:
         if binding.get("role") in roles:
             for member in binding.get("members") or []:
-                holders.setdefault(member.lower(), []).append(binding["role"])
-                names.setdefault(member.lower(), member)
-    if holders:
-        listed = "\n  - ".join(f"{names[key]}: {', '.join(held)}" for key, held in sorted(holders.items()))
-        print(f"These read every row of {args.project}.{args.dataset}.{args.table} through a project role:\n  - {listed}")
+                grants.append((member, f"{binding['role']} on the project"))
+    dataset = _json_output(_bq_command(args, "--format=json", "show", f"{args.project}:{args.dataset}"), missing_ok=True)
+    for entry in dataset.get("access") or []:
+        member = _dataset_member(entry)
+        if member and entry.get("role"):
+            grants.append((member, f"{entry['role']} on the dataset {args.project}.{args.dataset}"))
+    table = f"{args.project}:{args.dataset}.{args.table}"
+    table_policy = _json_output(_bq_command(args, "--format=json", "get-iam-policy", table), missing_ok=True)
+    for binding in table_policy.get("bindings") or []:
+        for member in binding.get("members") or []:
+            grants.append((member, f"{binding.get('role')} on the table {args.project}.{args.dataset}.{args.table}"))
+    if grants:
+        listed = "\n  - ".join(f"{member}: {held}" for member, held in grants)
+        print(f"These hold a project role that reads every table, or a grant on the events dataset or table:\n  - {listed}")
     clashes = [
-        f"{member} ({', '.join(holders[member.lower()])})"
+        f"{member} ({held})"
         for member in [*args.reader, *args.token_creator]
-        if member.lower() in holders
+        for named, held in grants
+        if _member_matches(member, named)
     ]
     if not clashes:
-        print("OK no --reader or --token-creator member reads the table through a project role")
+        print("OK no --reader or --token-creator member holds a project role that reads the table, "
+              "or any grant on the events dataset or table")
         return
     if args.allow_existing_grants:
-        print(f"KEPT (--allow-existing-grants): {', '.join(clashes)} read every row through a project role")
+        print(f"KEPT (--allow-existing-grants): {'; '.join(clashes)}")
         return
     raise SystemExit(
-        f"{', '.join(clashes)} read every row of the table through a project role, views or not. "
-        "Take the role off, or keep the events dataset in a project of its own; "
-        "--allow-existing-grants keeps them."
+        f"{'; '.join(clashes)}: a reader or token creator that holds this reads every row of the table, "
+        "views or not. Take it off (see docs/service-account-auth.md, Moving from dataEditor), or keep "
+        "the events dataset in a project of its own; --allow-existing-grants keeps them."
     )
 
 
@@ -824,13 +891,14 @@ def _build_steps(args: argparse.Namespace) -> list[Step]:
             )
         steps.append(
             Step(
-                "Check who reads every row through a project role, and that no reader or token creator does",
+                "Check who reads every row, and that no reader or token creator does",
                 action=lambda: _check_project_readers(args),
                 detail=(
-                    "gcloud projects get-iam-policy: list the holders of "
-                    f"{', '.join(PROJECT_READ_ROLES)} (and, with --keep-project-groups, "
-                    f"{', '.join(PROJECT_GROUP_ROLES)}); stop if a --reader or --token-creator "
-                    "member is one, unless --allow-existing-grants"
+                    "gcloud projects get-iam-policy, bq show of the events dataset, bq get-iam-policy "
+                    f"of the table: list the holders of {', '.join(PROJECT_READ_ROLES)} on the project "
+                    f"(and, with --keep-project-groups, {', '.join(PROJECT_GROUP_ROLES)}) and of any grant "
+                    "on the events dataset or table; stop if a --reader or --token-creator member is one, "
+                    "unless --allow-existing-grants"
                 ),
                 needs_cli_auth=True,
             )
@@ -1059,6 +1127,14 @@ def _print_preflight(result: _PreflightResult, args: argparse.Namespace) -> None
     print()
 
 
+def _bigquery_client_importable() -> bool:
+    try:
+        import google.cloud.bigquery  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
 def _steps_need_adc(steps: list[Step]) -> bool:
     """Whether any step in the plan needs Application Default Credentials."""
     return any(step.needs_adc for step in steps)
@@ -1116,6 +1192,13 @@ def run(args: argparse.Namespace) -> int:
                 "Run: gcloud auth application-default login "
                 "(or set GOOGLE_APPLICATION_CREDENTIALS to a service-"
                 "account JSON key) and re-run."
+            )
+        if _steps_need_adc(steps) and not _bigquery_client_importable():
+            raise SystemExit(
+                "This plan calls the Python BigQuery client (google-cloud-bigquery), which this Python "
+                "cannot import. Install it, for example python3 -m venv .venv && .venv/bin/pip install "
+                "google-cloud-bigquery, run the script with .venv/bin/python, and run again. Nothing "
+                "was changed."
             )
         if _steps_need_cli_auth(steps) and not preflight.cli_auth_ok:
             raise SystemExit(

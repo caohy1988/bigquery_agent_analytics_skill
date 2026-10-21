@@ -59,10 +59,13 @@ So the bootstrap, with `--writer-role row-writer` or `--reader`:
   and a project Editor, granted after the change held no right on the
   table. The change took a few minutes to apply: a minute after it, a
   Viewer still read the table;
-- lists everyone who still reads every row through a project role:
-  Owner, and BigQuery Admin, Data Owner, Data Editor or Data Viewer granted
-  on the project, which read every table whatever a dataset's access says;
-- stops if a `--reader` or `--token-creator` member is one of them.
+- lists everyone who still reads every row: through a project role (Owner,
+  and BigQuery Admin, Data Owner, Data Editor or Data Viewer granted on the
+  project, which read every table whatever a dataset's access says), or
+  through any grant on the events dataset or table;
+- stops if a `--reader` or `--token-creator` member is one of them. Moving
+  a team off `roles/bigquery.dataEditor` takes those grants off first (see
+  [Moving from dataEditor](#moving-from-dataeditor)).
 
 Roles held on a folder or the organization, and memberships of groups, are
 not looked at. The simplest way to keep the audience small is a project of
@@ -82,8 +85,9 @@ roles.
   [Privacy and security](../README.md#privacy-and-security)): only
   administrators read the table; readers see the views, which hold counts.
 - **A copied key file** (setup 5) works from anywhere until the key is
-  deleted, and tokens issued from it until they expire; disabling the
-  account stops both.
+  deleted, and tokens issued from it until they expire. Disabling the
+  account stops both, but only while it stays disabled: enabling it again
+  makes the tokens issued before work again until they expire.
 - **Capture is not enforced on a machine its user controls**: they can turn
   the mod off, change its options, or insert rows of their own. A managed
   policy pins what it can ([managed settings](managed-settings.md)).
@@ -118,15 +122,17 @@ roles.
      looked at;
    - creates, or finds, the project's custom role `bqaaRowWriter`, with two
      permissions (see [What a writer needs](#what-a-writer-needs)), and
-     stops if the role holds any other. It grants the role to the service
+     stops if the role holds any other, is disabled, or cannot be read (only
+     "not found" means there is none). It grants the role to the service
      account on the events table alone: no `roles/bigquery.dataEditor`, no
      `roles/bigquery.jobUser`. With `--no-grant-iam` it grants nothing
      there, and still checks the account and the role before any
      `--token-creator`;
    - takes the project's Viewer and Editor groups off the events dataset,
      and Editors off the views dataset, lists who still reads every row
-     through a project role, and stops if a reader or token creator does
-     (see [Project roles reach the table too](#project-roles-reach-the-table-too));
+     (a project role, or a grant on the events dataset or table), and stops
+     if a reader or token creator does (see
+     [Project roles reach the table too](#project-roles-reach-the-table-too));
    - enables the IAM Service Account Credentials API
      (`iamcredentials.googleapis.com`), which issues the impersonated
      tokens, and grants `roles/iam.serviceAccountTokenCreator` on the
@@ -143,9 +149,12 @@ roles.
      there could select any column. It refuses a views dataset that is the
      events dataset.
 
-   It needs `gcloud`, `bq` and the Python BigQuery client, signed in (with
-   `gcloud auth login`, and `gcloud auth application-default login` for the
-   step that authorizes the views) as someone who may enable services,
+   It needs `gcloud`, `bq` and the Python BigQuery client
+   (`python3 -m venv .venv && .venv/bin/pip install google-cloud-bigquery`,
+   then run the script with `.venv/bin/python`; it checks the client before
+   it changes anything), signed in (with `gcloud auth login`, and
+   `gcloud auth application-default login` for the steps that change the
+   datasets' access) as someone who may enable services,
    create service accounts and custom roles, and set IAM on them, the
    project, the table and the datasets: project Owner, or Service Usage
    Admin, Service Account Admin, Role Administrator, Project IAM Admin,
@@ -294,11 +303,49 @@ Keep the file readable by the machine's account only, and never commit it.
   the old one (`gcloud iam service-accounts keys delete KEY_ID
   --iam-account=...`). Deleting a key stops new tokens from it; tokens
   already issued from it last until they expire, up to an hour.
-- **If the key leaks**: disable the exception's service account first
-  (`gcloud iam service-accounts disable ...`), which refuses its tokens,
-  those already issued included. Then delete the key, check that a token
-  issued before is refused (an `insertAll` with it answers `401`), create a
-  new key, and enable the account again.
+- **If the key leaks**, either:
+  - retire the account: disable it (`gcloud iam service-accounts disable
+    ...`), which refuses its tokens, those already issued included; delete
+    the key; and give the exception a new service account, with the
+    row-writer role on the table and nothing else, and a new key; or
+  - disable the account, delete the key, and keep the account disabled
+    until every token issued before the disable has expired: an hour by
+    default, longer where your organization allows longer token lifetimes
+    (`iam.allowServiceAccountCredentialLifetimeExtension`, up to 12 hours).
+    Enabling it sooner brings those tokens back: when this guide was
+    checked, a token refused (`401`) while the account was disabled was
+    accepted again 20 seconds after it was enabled. Then create a new key,
+    enable the account, and check with a token you saved before the
+    disable: an `insertAll` with it must answer `401`.
+
+## Moving from dataEditor
+
+Teams that followed earlier instructions gave writers
+`roles/bigquery.dataEditor` on the dataset: a group, or each person (the
+tracing plugin's default setup grants it per developer). Those grants read
+every row. Before the writers' group becomes a token creator, and the
+readers' group a reader, take them off:
+
+1. **See who holds what**: the bootstrap lists every grant on the project,
+   the events dataset and the table when it checks the readers and token
+   creators. Without it:
+   `bq show --format=prettyjson my-gcp-project:agent_analytics` (the
+   dataset's `access`), `bq get-iam-policy --format=prettyjson
+   my-gcp-project:agent_analytics.agent_events`, and
+   `gcloud projects get-iam-policy my-gcp-project`.
+2. **Take each grant off**, group or person:
+
+   ```bash
+   bq --project_id=my-gcp-project query --use_legacy_sql=false      'REVOKE `roles/bigquery.dataEditor` ON SCHEMA `my-gcp-project.agent_analytics` FROM "group:old-writers@example.com"'
+   bq remove-iam-policy-binding --member=user:dev@example.com      --role=roles/bigquery.dataViewer my-gcp-project:agent_analytics.agent_events
+   gcloud projects remove-iam-policy-binding my-gcp-project      --member=group:old-writers@example.com --role=roles/bigquery.dataEditor
+   ```
+
+   (A dataset grant made with `roles/bigquery.dataEditor` shows as `WRITER`
+   in the dataset's access; the `REVOKE` above takes it off.)
+3. **Switch people's token command** to the impersonation of setup 1, and
+   run the bootstrap: it stops while a reader or token creator still holds
+   a grant there.
 
 ## What a writer needs
 
@@ -357,11 +404,16 @@ skip that attempt.
 3. **To cut every token off at once**, disable the writer service account:
    `gcloud iam service-accounts disable bqaa-row-writer@my-gcp-project.iam.gserviceaccount.com`.
    When this guide was checked, a token issued before the disable was
-   refused (`401`) 15 seconds after it, and no new token was issued; every
-   person's rows then wait until you enable it again
-   (`gcloud iam service-accounts enable ...`). For a key file (setup 5),
-   disable its account the same way before you delete the key: deleting a
-   key leaves the tokens already issued from it working until they expire.
+   refused (`401`) 15 seconds after it, and no new token was issued.
+   Everyone's rows wait while it is disabled. Keep it disabled until every
+   token issued before the disable has expired (an hour by default; longer
+   where your organization allows longer lifetimes) and the group change of
+   step 1 has propagated: enabling it sooner brings those tokens back (in
+   the same check, the refused token was accepted again 20 seconds after
+   the account was enabled). Then enable it
+   (`gcloud iam service-accounts enable ...`), and check with a token saved
+   before the disable that it is refused. For a key file (setup 5), see
+   [If the key leaks](#5-a-key-file-an-approved-exception).
 4. **Check that access is gone**: the group no longer lists the person
    (`gcloud identity groups memberships list --group-email=...`), and the
    service account's policy names no one else

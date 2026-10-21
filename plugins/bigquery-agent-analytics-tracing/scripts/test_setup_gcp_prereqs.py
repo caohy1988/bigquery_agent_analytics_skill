@@ -50,11 +50,14 @@ def _stub_preflight(result: setup._PreflightResult):
     machine's gcloud install.
     """
     original = setup._run_preflight
+    importable = setup._bigquery_client_importable
     setup._run_preflight = lambda: result
+    setup._bigquery_client_importable = lambda: True
     try:
         yield
     finally:
         setup._run_preflight = original
+        setup._bigquery_client_importable = importable
 
 
 def _commands(args: argparse.Namespace) -> list[list[str]]:
@@ -793,7 +796,7 @@ def test_a_token_creator_or_reader_with_a_project_role_that_reads_is_refused() -
             try:
                 setup._check_project_readers(args)
             except SystemExit as exc:
-                assert "(roles/bigquery.dataViewer) read every row" in str(exc)
+                assert "(roles/bigquery.dataViewer on the project)" in str(exc)
             else:
                 raise AssertionError("expected SystemExit")
     # Project Viewers read only through the dataset entries this setup removes,
@@ -804,7 +807,7 @@ def test_a_token_creator_or_reader_with_a_project_role_that_reads_is_refused() -
         try:
             setup._check_project_readers(_args(reader=["group:r@example.com"], keep_project_groups=True))
         except SystemExit as exc:
-            assert "group:r@example.com (roles/viewer)" in str(exc)
+            assert "group:r@example.com (roles/viewer on the project)" in str(exc)
         else:
             raise AssertionError("expected SystemExit")
         setup._check_project_readers(_args(reader=["group:r@example.com"], keep_project_groups=True, allow_existing_grants=True))
@@ -825,8 +828,8 @@ def test_who_reads_every_row_through_a_project_role_is_listed() -> None:
     out = io.StringIO()
     with _stub_run(_FakeRun([(("projects", "get-iam-policy"), 0, json.dumps(policy))])), contextlib.redirect_stdout(out):
         setup._check_project_readers(_args(reader=["group:r@example.com"]))
-    assert "user:admin@example.com: roles/owner" in out.getvalue()
-    assert "OK no --reader or --token-creator member reads the table" in out.getvalue()
+    assert "user:admin@example.com: roles/owner on the project" in out.getvalue()
+    assert "OK no --reader or --token-creator member holds a project role" in out.getvalue()
 
 
 def test_dataset_access_and_project_roles_are_settled_before_token_creators_and_readers() -> None:
@@ -835,10 +838,142 @@ def test_dataset_access_and_project_roles_are_settled_before_token_creators_and_
     labels = _labels(args)
     groups = labels.index("Take the project's Viewer and Editor groups off test-project.agent_analytics, "
                           "and Editors off test-project.agent_analytics_reporting")
-    check = labels.index("Check who reads every row through a project role, and that no reader or token creator does")
+    check = labels.index("Check who reads every row, and that no reader or token creator does")
     for grant in (f"Grant token creation on {WRITER} to group:w@example.com", "Grant views dataset dataViewer to reader group:r@example.com"):
         assert groups < check < labels.index(grant)
     assert not any(label.startswith("Check who reads every row") for label in _labels(_args(service_account="bqaa-writer")))
+
+
+def _role_answers(role_code: int, role_out: str, table_policy: dict | None = None):
+    return [
+        (("gcloud", "projects", "get-iam-policy"), 0, "{}"),
+        (("bq", "show", "test-project:agent_analytics"), 0, "{}"),
+        (("bq", "show", "test-project:agent_analytics_reporting"), 2, "BigQuery error in show operation: Not found: Dataset"),
+        (("bq", "get-iam-policy"), 0, json.dumps(table_policy or {})),
+        (("gcloud", "iam", "roles", "describe"), role_code, role_out),
+    ]
+
+
+def test_a_role_that_cannot_be_read_stops_the_run_before_any_token_creator() -> None:
+    # Under --no-grant-iam, an unread role is not a role known to be narrow:
+    # access denied, or a network error, stops the run.
+    for said in ("ERROR: (gcloud.iam.roles.describe) PERMISSION_DENIED: Permission 'iam.roles.get' denied",
+                 "ERROR: (gcloud.iam.roles.describe) There was a problem refreshing your current auth tokens: timed out"):
+        fake = _FakeRun(_role_answers(1, said))
+        try:
+            _row_writer_run(fake, grant_iam=False)
+        except SystemExit as exc:
+            assert "Could not read projects/test-project/roles/bqaaRowWriter" in str(exc)
+        else:
+            raise AssertionError("expected SystemExit")
+        assert not _token_creator_calls(fake)
+
+
+def test_a_missing_role_the_writer_is_bound_to_stops_the_run() -> None:
+    bound = {"bindings": [{"role": "projects/test-project/roles/bqaaRowWriter", "members": [f"serviceAccount:{WRITER}"]}]}
+    missing = "ERROR: (gcloud.iam.roles.describe) NOT_FOUND: The role named projects/test-project/roles/bqaaRowWriter was not found."
+    fake = _FakeRun(_role_answers(1, missing, bound))
+    try:
+        _row_writer_run(fake, grant_iam=False)
+    except SystemExit as exc:
+        assert "the role cannot be found" in str(exc)
+    else:
+        raise AssertionError("expected SystemExit")
+    assert not _token_creator_calls(fake)
+    # No role and no binding: nothing to check, and the token creators get theirs.
+    fake = _FakeRun(_role_answers(1, missing))
+    _row_writer_run(fake, grant_iam=False)
+    assert len(_token_creator_calls(fake)) == 1
+
+
+def test_a_disabled_row_writer_role_is_refused() -> None:
+    disabled = json.dumps({"stage": "DISABLED", "includedPermissions": list(setup.ROW_WRITER_PERMISSIONS)})
+    for grant_iam in (True, False):
+        fake = _FakeRun(_role_answers(0, disabled))
+        try:
+            _row_writer_run(fake, grant_iam=grant_iam)
+        except SystemExit as exc:
+            assert "stage DISABLED" in str(exc)
+        else:
+            raise AssertionError("expected SystemExit")
+        assert not _token_creator_calls(fake)
+
+
+def test_a_role_missing_a_permission_is_reported_without_iam_grants() -> None:
+    out = io.StringIO()
+    fake = _FakeRun(_role_answers(0, json.dumps({"stage": "GA", "includedPermissions": ["bigquery.tables.updateData"]})))
+    args = _args(service_account="bqaa-row-writer", writer_role="row-writer", execute=True, grant_iam=False,
+                 create_dataset=False, create_table=False, token_creator=["group:bqaa-writers@example.com"],
+                 keep_project_groups=True)
+    with _stub_preflight(_preflight()), _stub_run(fake), contextlib.redirect_stdout(out):
+        setup.run(args)
+    assert "MISSING: projects/test-project/roles/bqaaRowWriter lacks bigquery.tables.get" in out.getvalue()
+    assert not any(c[1:4] == ["iam", "roles", "update"] for c in fake.calls)
+
+
+def test_a_token_creator_or_reader_with_a_grant_on_the_events_dataset_or_table_is_refused() -> None:
+    # The tracing plugin's default setup gives each developer dataEditor on
+    # the dataset; a group that keeps it reads every row.
+    dataset = {"access": [{"role": "roles/bigquery.dataEditor", "groupByEmail": "BQAA-writers@example.com"}]}
+    fake = _FakeRun(_answers({}, dataset, {}))
+    try:
+        _row_writer_run(fake)
+    except SystemExit as exc:
+        assert "group:bqaa-writers@example.com (roles/bigquery.dataEditor on the dataset test-project.agent_analytics)" in str(exc)
+    else:
+        raise AssertionError("expected SystemExit")
+    assert not _token_creator_calls(fake)
+    table = {"bindings": [{"role": "roles/bigquery.dataViewer", "members": ["group:r@example.com"]}]}
+    answers = [(("gcloud", "projects", "get-iam-policy"), 0, "{}"), (("bq", "show"), 0, "{}"),
+               (("bq", "get-iam-policy"), 0, json.dumps(table))]
+    with _stub_run(_FakeRun(answers)), contextlib.redirect_stdout(io.StringIO()):
+        try:
+            setup._check_project_readers(_args(reader=["group:r@example.com"]))
+        except SystemExit as exc:
+            assert "group:r@example.com (roles/bigquery.dataViewer on the table test-project.agent_analytics.agent_events)" in str(exc)
+        else:
+            raise AssertionError("expected SystemExit")
+    # A service account written as userByEmail in the dataset's access is matched.
+    sa_entry = {"access": [{"role": "READER", "userByEmail": "ci@test-project.iam.gserviceaccount.com"}]}
+    answers = [(("gcloud", "projects", "get-iam-policy"), 0, "{}"), (("bq", "show"), 0, json.dumps(sa_entry)),
+               (("bq", "get-iam-policy"), 0, "{}")]
+    with _stub_run(_FakeRun(answers)), contextlib.redirect_stdout(io.StringIO()):
+        try:
+            setup._check_project_readers(_args(reader=["serviceAccount:ci@test-project.iam.gserviceaccount.com"]))
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("expected SystemExit")
+
+
+def test_every_grant_on_the_events_dataset_and_table_is_listed() -> None:
+    dataset = {"access": [{"role": "OWNER", "specialGroup": "projectOwners"},
+                          {"role": "OWNER", "userByEmail": "admin@example.com"},
+                          {"view": {"projectId": "test-project", "datasetId": "agent_analytics_reporting", "tableId": "daily_usage_by_user"}}]}
+    table = {"bindings": [{"role": "projects/test-project/roles/bqaaRowWriter", "members": [f"serviceAccount:{WRITER}"]}]}
+    answers = [(("gcloud", "projects", "get-iam-policy"), 0, "{}"), (("bq", "show"), 0, json.dumps(dataset)),
+               (("bq", "get-iam-policy"), 0, json.dumps(table))]
+    out = io.StringIO()
+    with _stub_run(_FakeRun(answers)), contextlib.redirect_stdout(out):
+        setup._check_project_readers(_args(reader=["group:r@example.com"]))
+    text = out.getvalue()
+    assert "specialGroup:projectOwners: OWNER on the dataset test-project.agent_analytics" in text
+    assert "user:admin@example.com: OWNER on the dataset test-project.agent_analytics" in text
+    assert f"serviceAccount:{WRITER}: projects/test-project/roles/bqaaRowWriter on the table" in text
+
+
+def test_a_missing_bigquery_client_stops_before_any_change() -> None:
+    fake = _FakeRun([])
+    args = _args(reader=["group:r@example.com"], execute=True, create_dataset=False, create_table=False)
+    with _stub_preflight(_preflight()), _stub_run(fake), contextlib.redirect_stdout(io.StringIO()):
+        setup._bigquery_client_importable = lambda: False
+        try:
+            setup.run(args)
+        except SystemExit as exc:
+            assert "google-cloud-bigquery" in str(exc) and "Nothing was changed" in str(exc)
+        else:
+            raise AssertionError("expected SystemExit")
+    assert fake.calls == []
 
 
 if __name__ == "__main__":
@@ -884,6 +1019,13 @@ if __name__ == "__main__":
         test_a_token_creator_or_reader_with_a_project_role_that_reads_is_refused,
         test_who_reads_every_row_through_a_project_role_is_listed,
         test_dataset_access_and_project_roles_are_settled_before_token_creators_and_readers,
+        test_a_role_that_cannot_be_read_stops_the_run_before_any_token_creator,
+        test_a_missing_role_the_writer_is_bound_to_stops_the_run,
+        test_a_disabled_row_writer_role_is_refused,
+        test_a_role_missing_a_permission_is_reported_without_iam_grants,
+        test_a_token_creator_or_reader_with_a_grant_on_the_events_dataset_or_table_is_refused,
+        test_every_grant_on_the_events_dataset_and_table_is_listed,
+        test_a_missing_bigquery_client_stops_before_any_change,
     ):
         test()
     print("setup_gcp_prereqs tests passed")
