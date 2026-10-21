@@ -35,6 +35,7 @@ def _args(**overrides: object) -> argparse.Namespace:
         "reader": [],
         "views_dataset": "",
         "allow_existing_grants": False,
+        "keep_project_groups": False,
     }
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -402,7 +403,7 @@ def test_members_must_name_their_kind() -> None:
     for field in ("token_creator", "reader"):
         overrides = {field: ["bqaa-users@example.com"]}
         if field == "token_creator":
-            overrides["service_account"] = "bqaa-writer"
+            overrides.update(service_account="bqaa-writer", writer_role="row-writer")
         try:
             setup._require_project_dataset(_args(**overrides))
         except SystemExit as exc:
@@ -418,8 +419,9 @@ def test_readers_get_the_views_dataset_and_jobs_and_the_views_are_authorized() -
     assert "gcloud projects add-iam-policy-binding test-project --member group:bqaa-readers@example.com --role roles/bigquery.jobUser" in joined
     # No grant on the events dataset or table for readers.
     assert not any("group:bqaa-readers@example.com" in j and "agent_analytics " in j + " " and "_reporting" not in j and "projects add-iam-policy-binding" not in j for j in joined)
-    authorize = [s for s in setup._build_steps(args) if s.label.startswith("Authorize the views")]
+    authorize = [s for s in setup._build_steps(args) if s.label.startswith("Authorize ")]
     assert len(authorize) == 1 and authorize[0].needs_adc
+    assert authorize[0].label.startswith("Authorize daily_usage_by_user, daily_usage_by_model of test-project.agent_analytics_reporting")
 
 
 def test_views_dataset_can_be_named() -> None:
@@ -481,11 +483,13 @@ CLEAN_ROLE = json.dumps({"includedPermissions": ["bigquery.tables.get", "bigquer
 
 
 def _row_writer_run(fake: _FakeRun, **overrides: object) -> None:
-    args = _args(
+    settings = dict(
         service_account="bqaa-row-writer", writer_role="row-writer", execute=True,
         create_dataset=False, create_table=False, token_creator=["group:bqaa-writers@example.com"],
-        **overrides,
+        keep_project_groups=True,
     )
+    settings.update(overrides)
+    args = _args(**settings)
     with _stub_preflight(_preflight()), _stub_run(fake), contextlib.redirect_stdout(io.StringIO()):
         setup.run(args)
 
@@ -605,6 +609,238 @@ def test_without_enabling_apis_the_iam_credentials_api_is_checked() -> None:
         setup._check_api_enabled(args, "iamcredentials.googleapis.com")
 
 
+def test_token_creators_need_the_row_writer_role() -> None:
+    # Impersonating an account that holds dataEditor reads every row.
+    fake = _FakeRun([])
+    args = _args(service_account="bqaa-writer", token_creator=["group:w@example.com"], execute=True)
+    with _stub_preflight(_preflight()), _stub_run(fake), contextlib.redirect_stdout(io.StringIO()):
+        try:
+            setup.run(args)
+        except SystemExit as exc:
+            assert "--writer-role row-writer" in str(exc)
+        else:
+            raise AssertionError("expected SystemExit")
+    assert fake.calls == []
+
+
+def test_a_principal_other_than_the_service_account_is_refused() -> None:
+    fake = _FakeRun([])
+    args = _args(service_account="bqaa-row-writer", principal="serviceAccount:other@test-project.iam.gserviceaccount.com",
+                 writer_role="row-writer", token_creator=["group:w@example.com"], execute=True)
+    with _stub_preflight(_preflight()), _stub_run(fake), contextlib.redirect_stdout(io.StringIO()):
+        try:
+            setup.run(args)
+        except SystemExit as exc:
+            assert "is not --service-account" in str(exc)
+        else:
+            raise AssertionError("expected SystemExit")
+    assert fake.calls == []
+    # The same account, however its case is written, is fine.
+    setup._require_project_dataset(_args(service_account="bqaa-row-writer", writer_role="row-writer",
+                                         principal=f"serviceAccount:{WRITER.upper()}"))
+
+
+def test_without_iam_grants_the_writer_and_its_role_are_still_checked_before_token_creators() -> None:
+    args = _args(service_account="bqaa-row-writer", writer_role="row-writer", grant_iam=False,
+                 token_creator=["group:w@example.com"])
+    labels = _labels(args)
+    check = labels.index(f"Check that serviceAccount:{WRITER} holds nothing beyond the row-writer role")
+    role = labels.index("Check that role projects/test-project/roles/bqaaRowWriter, if there is one, "
+                        "holds nothing beyond bigquery.tables.get, bigquery.tables.updateData")
+    assert check < role < labels.index(f"Grant token creation on {WRITER} to group:w@example.com")
+    assert not any(label.startswith(("Ensure role", "Grant the row-writer role")) for label in labels)
+    # An account with other grants, or a role holding more, stops it.
+    dirty = _FakeRun(_answers({"bindings": [{"role": "roles/bigquery.jobUser", "members": [f"serviceAccount:{WRITER}"]}]}, {}, {}))
+    superset = _FakeRun(_answers({}, {}, {}, role=json.dumps(
+        {"includedPermissions": ["bigquery.tables.get", "bigquery.tables.getData", "bigquery.tables.updateData"]})))
+    for fake in (dirty, superset):
+        try:
+            _row_writer_run(fake, grant_iam=False)
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("expected SystemExit")
+        assert not _token_creator_calls(fake)
+    clean = _FakeRun(_answers({}, {}, {}))
+    _row_writer_run(clean, grant_iam=False)
+    assert len(_token_creator_calls(clean)) == 1
+    assert not any(c[1:4] in (["iam", "roles", "create"], ["iam", "roles", "update"]) for c in clean.calls)
+    assert not any(c[:2] == ["bq", "add-iam-policy-binding"] for c in clean.calls)
+
+
+def test_a_views_dataset_that_is_the_events_dataset_is_refused_before_any_call() -> None:
+    fake = _FakeRun([])
+    args = _args(reader=["group:r@example.com"], views_dataset="agent_analytics", execute=True)
+    with _stub_preflight(_preflight()), _stub_run(fake), contextlib.redirect_stdout(io.StringIO()):
+        try:
+            setup.run(args)
+        except SystemExit as exc:
+            assert "the views dataset is the events dataset" in str(exc)
+        else:
+            raise AssertionError("expected SystemExit")
+    assert fake.calls == []
+
+
+class _FakeClient:
+    """Stands in for bigquery.Client: datasets and tables by id."""
+
+    def __init__(self, datasets: dict, tables: dict) -> None:
+        self.datasets, self.tables, self.updated = datasets, tables, []
+
+    def get_dataset(self, ref):
+        from google.cloud.exceptions import NotFound
+
+        if ref not in self.datasets:
+            raise NotFound(ref)
+        return self.datasets[ref]
+
+    def get_table(self, ref):
+        from google.cloud.exceptions import NotFound
+
+        if ref not in self.tables:
+            raise NotFound(ref)
+        return self.tables[ref]
+
+    def update_dataset(self, dataset, fields):
+        self.updated.append((dataset, list(fields)))
+
+
+def _bigquery():
+    try:
+        from google.cloud import bigquery
+    except ImportError:  # the Python BigQuery client is the bootstrap's own need
+        return None
+    return bigquery
+
+
+def test_only_the_mods_views_are_authorized() -> None:
+    bigquery = _bigquery()
+    if bigquery is None:
+        return
+    from types import SimpleNamespace
+
+    events = SimpleNamespace(access_entries=[bigquery.AccessEntry("OWNER", "specialGroup", "projectOwners")])
+
+    def view(name: str) -> SimpleNamespace:
+        return SimpleNamespace(project="test-project", dataset_id="agent_analytics_reporting", table_id=name, table_type="VIEW")
+
+    client = _FakeClient(
+        {"test-project.agent_analytics": events},
+        {"test-project.agent_analytics_reporting.daily_usage_by_user": view("daily_usage_by_user"),
+         "test-project.agent_analytics_reporting.daily_usage_by_model": view("daily_usage_by_model"),
+         "test-project.agent_analytics_reporting.raw_rows": view("raw_rows")},
+    )
+    with contextlib.redirect_stdout(io.StringIO()):
+        setup._authorize_views("test-project", "agent_analytics", "agent_analytics_reporting", client=client)
+    authorized = sorted(e.entity_id["tableId"] for e in events.access_entries if e.entity_type == "view")
+    assert authorized == ["daily_usage_by_model", "daily_usage_by_user"]
+    # One of them missing: the other is authorized, and nothing else.
+    events.access_entries = []
+    del client.tables["test-project.agent_analytics_reporting.daily_usage_by_model"]
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        setup._authorize_views("test-project", "agent_analytics", "agent_analytics_reporting", client=client)
+    assert [e.entity_id["tableId"] for e in events.access_entries] == ["daily_usage_by_user"]
+    assert "no view daily_usage_by_model" in out.getvalue()
+
+
+def test_the_project_groups_come_off_the_datasets() -> None:
+    bigquery = _bigquery()
+    if bigquery is None:
+        return
+    from types import SimpleNamespace
+
+    entry = bigquery.AccessEntry
+    events = SimpleNamespace(access_entries=[
+        entry("READER", "specialGroup", "projectReaders"), entry("WRITER", "specialGroup", "projectWriters"),
+        entry("OWNER", "specialGroup", "projectOwners"), entry("OWNER", "userByEmail", "admin@example.com"),
+        entry(None, "view", {"projectId": "test-project", "datasetId": "agent_analytics_reporting", "tableId": "daily_usage_by_user"}),
+        entry("READER", "iamMember", "allAuthenticatedUsers"),
+    ])
+    views = SimpleNamespace(access_entries=[
+        entry("READER", "specialGroup", "projectReaders"), entry("WRITER", "specialGroup", "projectWriters"),
+        entry("READER", "groupByEmail", "bqaa-readers@example.com"),
+    ])
+    client = _FakeClient({"test-project.agent_analytics": events, "test-project.agent_analytics_reporting": views}, {})
+    with contextlib.redirect_stdout(io.StringIO()):
+        setup._restrict_dataset_access("test-project", "agent_analytics", "agent_analytics_reporting", client=client)
+    kept = [(e.entity_type, "view" if isinstance(e.entity_id, dict) else e.entity_id) for e in events.access_entries]
+    assert kept == [("specialGroup", "projectOwners"), ("userByEmail", "admin@example.com"), ("view", "view")]
+    assert [e.entity_id for e in views.access_entries] == ["projectReaders", "bqaa-readers@example.com"]
+    # Run again: nothing to take off.
+    client.updated.clear()
+    with contextlib.redirect_stdout(io.StringIO()):
+        setup._restrict_dataset_access("test-project", "agent_analytics", "agent_analytics_reporting", client=client)
+    assert client.updated == []
+
+
+def test_shared_table_plans_take_the_project_groups_off_unless_kept() -> None:
+    step = ("Take the project's Viewer and Editor groups off test-project.agent_analytics, "
+            "and Editors off test-project.agent_analytics_reporting")
+    for args in (_args(service_account="bqaa-row-writer", writer_role="row-writer"), _args(reader=["group:r@example.com"])):
+        assert step in _labels(args)
+    assert step not in _labels(_args(reader=["group:r@example.com"], keep_project_groups=True))
+    assert step not in _labels(_args(service_account="bqaa-writer"))
+
+
+def test_a_token_creator_or_reader_with_a_project_role_that_reads_is_refused() -> None:
+    # BigQuery data roles on the project read every table, whatever a
+    # dataset's access says.
+    reads = {"bindings": [{"role": "roles/bigquery.dataViewer", "members": ["group:bqaa-writers@example.com", "group:r@example.com"]}]}
+    for args in (_args(service_account="bqaa-row-writer", writer_role="row-writer", token_creator=["group:bqaa-writers@example.com"]),
+                 _args(reader=["group:r@example.com"])):
+        with _stub_run(_FakeRun([(("projects", "get-iam-policy"), 0, json.dumps(reads))])), contextlib.redirect_stdout(io.StringIO()):
+            try:
+                setup._check_project_readers(args)
+            except SystemExit as exc:
+                assert "(roles/bigquery.dataViewer) read every row" in str(exc)
+            else:
+                raise AssertionError("expected SystemExit")
+    # Project Viewers read only through the dataset entries this setup removes,
+    # so they count only when --keep-project-groups leaves those.
+    viewer = {"bindings": [{"role": "roles/viewer", "members": ["group:r@example.com"]}]}
+    with _stub_run(_FakeRun([(("projects", "get-iam-policy"), 0, json.dumps(viewer))])), contextlib.redirect_stdout(io.StringIO()):
+        setup._check_project_readers(_args(reader=["group:r@example.com"]))
+        try:
+            setup._check_project_readers(_args(reader=["group:r@example.com"], keep_project_groups=True))
+        except SystemExit as exc:
+            assert "group:r@example.com (roles/viewer)" in str(exc)
+        else:
+            raise AssertionError("expected SystemExit")
+        setup._check_project_readers(_args(reader=["group:r@example.com"], keep_project_groups=True, allow_existing_grants=True))
+    # In a whole run: refused before any Token Creator grant.
+    fake = _FakeRun(_answers(reads, {}, {}))
+    try:
+        _row_writer_run(fake)
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("expected SystemExit")
+    assert not _token_creator_calls(fake)
+
+
+def test_who_reads_every_row_through_a_project_role_is_listed() -> None:
+    policy = {"bindings": [{"role": "roles/owner", "members": ["user:admin@example.com"]},
+                           {"role": "roles/bigquery.jobUser", "members": ["group:r@example.com"]}]}
+    out = io.StringIO()
+    with _stub_run(_FakeRun([(("projects", "get-iam-policy"), 0, json.dumps(policy))])), contextlib.redirect_stdout(out):
+        setup._check_project_readers(_args(reader=["group:r@example.com"]))
+    assert "user:admin@example.com: roles/owner" in out.getvalue()
+    assert "OK no --reader or --token-creator member reads the table" in out.getvalue()
+
+
+def test_dataset_access_and_project_roles_are_settled_before_token_creators_and_readers() -> None:
+    args = _args(service_account="bqaa-row-writer", writer_role="row-writer",
+                 token_creator=["group:w@example.com"], reader=["group:r@example.com"])
+    labels = _labels(args)
+    groups = labels.index("Take the project's Viewer and Editor groups off test-project.agent_analytics, "
+                          "and Editors off test-project.agent_analytics_reporting")
+    check = labels.index("Check who reads every row through a project role, and that no reader or token creator does")
+    for grant in (f"Grant token creation on {WRITER} to group:w@example.com", "Grant views dataset dataViewer to reader group:r@example.com"):
+        assert groups < check < labels.index(grant)
+    assert not any(label.startswith("Check who reads every row") for label in _labels(_args(service_account="bqaa-writer")))
+
+
 if __name__ == "__main__":
     for test in (
         test_service_account_plan,
@@ -638,6 +874,16 @@ if __name__ == "__main__":
         test_a_deleted_row_writer_role_is_refused,
         test_token_creators_enable_the_iam_credentials_api,
         test_without_enabling_apis_the_iam_credentials_api_is_checked,
+        test_token_creators_need_the_row_writer_role,
+        test_a_principal_other_than_the_service_account_is_refused,
+        test_without_iam_grants_the_writer_and_its_role_are_still_checked_before_token_creators,
+        test_a_views_dataset_that_is_the_events_dataset_is_refused_before_any_call,
+        test_only_the_mods_views_are_authorized,
+        test_the_project_groups_come_off_the_datasets,
+        test_shared_table_plans_take_the_project_groups_off_unless_kept,
+        test_a_token_creator_or_reader_with_a_project_role_that_reads_is_refused,
+        test_who_reads_every_row_through_a_project_role_is_listed,
+        test_dataset_access_and_project_roles_are_settled_before_token_creators_and_readers,
     ):
         test()
     print("setup_gcp_prereqs tests passed")

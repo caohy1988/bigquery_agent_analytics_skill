@@ -33,12 +33,41 @@ had: the mod shows a notice and keeps the rows on disk until a token works.
 | --- | --- | --- |
 | Writers: the writer service account, and the people or CI jobs that may get its tokens | Insert rows into the events table | Read rows, run a query, change or delete the table |
 | Readers: a group you choose | Query the views (`<dataset>_reporting`): per day, by person or by model, sessions, model requests and token counts | Read the events table, directly or in a query |
-| Administrators: a small group | Read the raw rows: prompts, answers, tool arguments and results | |
+| Administrators: a small group, and everyone with a project role that reads every table (Owner, BigQuery Admin, BigQuery Data Owner, Editor or Viewer on the project) | Read the raw rows: prompts, answers, tool arguments and results | |
 
 Never grant the writer service account a role that can read rows (one with
 `bigquery.tables.getData`, such as `roles/bigquery.dataEditor` or
 `roles/bigquery.dataViewer`): everyone who can get its tokens would read
 everyone's prompts and tool output.
+
+### Project roles reach the table too
+
+A dataset made by `setup.sh` (or `bq mk`) gives the project's roles access
+by default: `projectReaders` (project Viewers) read every row,
+`projectWriters` (project Editors) change and delete tables and views, and
+`projectOwners` (project Owners) own it. When this guide was checked, a
+project Viewer read the events table through that entry, and a project
+Editor held `getData`, `updateData`, `update` and `delete` on it, views or
+not. A reader group that also holds Viewer on the project reads the raw
+rows.
+
+So the bootstrap, with `--writer-role row-writer` or `--reader`:
+
+- takes `projectReaders` and `projectWriters` off the events dataset, and
+  `projectWriters` off the views dataset, so Editors cannot rewrite an
+  authorized view (`--keep-project-groups` leaves them). A project Viewer,
+  and a project Editor, granted after the change held no right on the
+  table. The change took a few minutes to apply: a minute after it, a
+  Viewer still read the table;
+- lists everyone who still reads every row through a project role:
+  Owner, and BigQuery Admin, Data Owner, Data Editor or Data Viewer granted
+  on the project, which read every table whatever a dataset's access says;
+- stops if a `--reader` or `--token-creator` member is one of them.
+
+Roles held on a folder or the organization, and memberships of groups, are
+not looked at. The simplest way to keep the audience small is a project of
+its own for the events dataset, where only the administrators hold project
+roles.
 
 ## What this protects, and what it does not
 
@@ -53,7 +82,8 @@ everyone's prompts and tool output.
   [Privacy and security](../README.md#privacy-and-security)): only
   administrators read the table; readers see the views, which hold counts.
 - **A copied key file** (setup 5) works from anywhere until the key is
-  deleted.
+  deleted, and tokens issued from it until they expire; disabling the
+  account stops both.
 - **Capture is not enforced on a machine its user controls**: they can turn
   the mod off, change its options, or insert rows of their own. A managed
   policy pins what it can ([managed settings](managed-settings.md)).
@@ -90,16 +120,28 @@ everyone's prompts and tool output.
      permissions (see [What a writer needs](#what-a-writer-needs)), and
      stops if the role holds any other. It grants the role to the service
      account on the events table alone: no `roles/bigquery.dataEditor`, no
-     `roles/bigquery.jobUser`;
+     `roles/bigquery.jobUser`. With `--no-grant-iam` it grants nothing
+     there, and still checks the account and the role before any
+     `--token-creator`;
+   - takes the project's Viewer and Editor groups off the events dataset,
+     and Editors off the views dataset, lists who still reads every row
+     through a project role, and stops if a reader or token creator does
+     (see [Project roles reach the table too](#project-roles-reach-the-table-too));
    - enables the IAM Service Account Credentials API
      (`iamcredentials.googleapis.com`), which issues the impersonated
      tokens, and grants `roles/iam.serviceAccountTokenCreator` on the
      service account to each `--token-creator` (a group, so access ends with
      group membership). With `--no-enable-apis`, it checks that the API is
-     on instead;
+     on instead. It takes `--token-creator` only with `--writer-role
+     row-writer`, and refuses a `--principal` other than the service
+     account: whoever may impersonate an account gets everything it holds;
    - for each `--reader`, grants `roles/bigquery.dataViewer` on the views
      dataset and `roles/bigquery.jobUser` on the project, and authorizes the
-     views on the events dataset, so readers need no access to the table.
+     two views `setup.sh` makes (`daily_usage_by_user`,
+     `daily_usage_by_model`) on the events dataset, so readers need no
+     access to the table. No other view is authorized: one someone adds
+     there could select any column. It refuses a views dataset that is the
+     events dataset.
 
    It needs `gcloud`, `bq` and the Python BigQuery client, signed in (with
    `gcloud auth login`, and `gcloud auth application-default login` for the
@@ -122,8 +164,9 @@ everyone's prompts and tool output.
 
    It expects the writer to hold exactly `bigquery.tables.get` and
    `bigquery.tables.updateData` on the table, and to be refused a read of its
-   rows and any query; and the reader to query a view, and to be refused the
-   table, directly and in a query. Its caller needs Token Creator on both
+   rows and any query; the reader to query a view, and to be refused the
+   table, directly and in a query; and neither dataset to give the project's
+   Viewers or Editors access. Its caller needs Token Creator on both
    service accounts (here `READER_SA` stands in for a member of the readers'
    group). With `INSERT_PROBE=1` it also inserts one row as the writer.
 
@@ -235,7 +278,7 @@ for revocation, and an end date. Your organization may forbid keys outright
 Give the exception a service account of its own, with the row-writer role
 on the table and nothing else. Never create a key for the writer service
 account people impersonate: the key would bypass the group that controls
-who may impersonate it, and deleting it is the only way to stop it.
+who may impersonate it.
 
 The mod cannot use a key file directly (it cannot sign the token request).
 Wrap it in a token command that reads the key for that command alone:
@@ -245,9 +288,17 @@ env GOOGLE_APPLICATION_CREDENTIALS=/secure/path/bqaa-exception-key.json gcloud a
 ```
 
 Keep the file readable by the machine's account only, and never commit it.
-To rotate: create a new key (`gcloud iam service-accounts keys create`), put
-it in place, then delete the old one (`gcloud iam service-accounts keys
-delete KEY_ID --iam-account=...`). Deleting the key revokes it.
+
+- **To rotate** (on a schedule): create a new key
+  (`gcloud iam service-accounts keys create`), put it in place, then delete
+  the old one (`gcloud iam service-accounts keys delete KEY_ID
+  --iam-account=...`). Deleting a key stops new tokens from it; tokens
+  already issued from it last until they expire, up to an hour.
+- **If the key leaks**: disable the exception's service account first
+  (`gcloud iam service-accounts disable ...`), which refuses its tokens,
+  those already issued included. Then delete the key, check that a token
+  issued before is refused (an `insertAll` with it answers `401`), create a
+  new key, and enable the account again.
 
 ## What a writer needs
 
@@ -309,7 +360,8 @@ skip that attempt.
    refused (`401`) 15 seconds after it, and no new token was issued; every
    person's rows then wait until you enable it again
    (`gcloud iam service-accounts enable ...`). For a key file (setup 5),
-   delete the key.
+   disable its account the same way before you delete the key: deleting a
+   key leaves the tokens already issued from it working until they expire.
 4. **Check that access is gone**: the group no longer lists the person
    (`gcloud identity groups memberships list --group-email=...`), and the
    service account's policy names no one else

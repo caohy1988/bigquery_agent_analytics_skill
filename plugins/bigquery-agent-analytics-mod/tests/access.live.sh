@@ -6,7 +6,10 @@
 #     and bigquery.tables.updateData) and nothing else there: it cannot
 #     read rows, update or delete the table, or run a query;
 #   the reader (optional) can query the views, and cannot read the table,
-#     directly or through a query.
+#     directly or through a query;
+#   the project's roles reach neither: the events dataset keeps no
+#     projectReaders or projectWriters entry, and the views dataset no
+#     projectWriters (as the caller, who must be able to read the datasets).
 # Nothing is written, changed or deleted: the table's rights are asked with
 # testIamPermissions, and the reads and queries it should be refused are
 # tried. With INSERT_PROBE=1 it also inserts one row as the writer (event_type
@@ -43,10 +46,24 @@ held() { # token, permissions...
     --data "{\"permissions\": [${asked%,}]}" "$API/datasets/$DATASET/tables/$TABLE:testIamPermissions" |
     python3 -c 'import json, sys; print(",".join(sorted(json.load(sys.stdin).get("permissions", []))))'
 }
+# The special groups a dataset's access names, sorted and comma-joined, or
+# "unreadable" when bq cannot show it.
+groups() { # dataset
+  bq --format=json show "$PROJECT:$1" 2>/dev/null |
+    python3 -c 'import json, sys; print(",".join(sorted(e["specialGroup"] for e in json.load(sys.stdin).get("access", []) if "specialGroup" in e)))' 2>/dev/null ||
+    echo unreadable
+}
 query_status() { # token, SQL
   status "$1" POST "$API/queries" "{\"query\": \"$2\", \"useLegacySql\": false, \"location\": \"${LOCATION:-US}\"}"
 }
 ASKED=(bigquery.tables.get bigquery.tables.updateData bigquery.tables.getData bigquery.tables.update bigquery.tables.delete bigquery.tables.setIamPolicy)
+
+events_groups="$(groups "$DATASET")"
+check "the events dataset gives project Viewers and Editors nothing (its groups: ${events_groups:-none})" \
+  bash -c "[[ '$events_groups' != unreadable && ',$events_groups,' != *,projectReaders,* && ',$events_groups,' != *,projectWriters,* ]]"
+views_groups="$(groups "$VIEWS_DATASET")"
+check "the views dataset gives project Editors nothing (its groups: ${views_groups:-none})" \
+  bash -c "[[ '$views_groups' != unreadable && ',$views_groups,' != *,projectWriters,* ]]"
 
 writer="$(token_for "$WRITER_SA")"
 check "a token for the writer $WRITER_SA" test -n "$writer"

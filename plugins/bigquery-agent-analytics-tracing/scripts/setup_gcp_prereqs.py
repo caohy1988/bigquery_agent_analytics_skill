@@ -14,7 +14,11 @@ authorized on the events dataset so readers need no access to the table.
 Before it grants anything, it refuses a writer that already holds other
 grants on the project, the datasets or the table (--allow-existing-grants
 keeps them), and a bqaaRowWriter role that holds more than those two
-permissions.
+permissions; --token-creator is taken only with --writer-role row-writer.
+It also takes the project's Viewer and Editor groups off the events dataset
+(and Editors off the views dataset), so those project roles read no rows
+(--keep-project-groups leaves them), lists who still reads every row through
+a project role, and stops if a --reader or --token-creator member does.
 """
 
 from __future__ import annotations
@@ -43,6 +47,20 @@ BIGQUERY_API_SERVICES = ("bigquery.googleapis.com", "bigquerystorage.googleapis.
 # bigquery.tables.get denied on table" without it).
 ROW_WRITER_ROLE_ID = "bqaaRowWriter"
 ROW_WRITER_PERMISSIONS = ("bigquery.tables.get", "bigquery.tables.updateData")
+# The views the mod's setup.sh makes, the only ones --reader authorizes on
+# the events dataset.
+VIEW_NAMES = ("daily_usage_by_user", "daily_usage_by_model")
+# Project roles that read every table of the project whatever a dataset's
+# access says; and the basic roles that read the events dataset only through
+# its projectReaders and projectWriters entries, which this setup removes.
+PROJECT_READ_ROLES = (
+    "roles/owner",
+    "roles/bigquery.admin",
+    "roles/bigquery.dataOwner",
+    "roles/bigquery.dataEditor",
+    "roles/bigquery.dataViewer",
+)
+PROJECT_GROUP_ROLES = ("roles/editor", "roles/viewer")
 
 PRINCIPAL_PREFIXES = (
     "user:",
@@ -234,6 +252,23 @@ def _require_project_dataset(args: argparse.Namespace) -> None:
         _validate_principal(args.principal)
     if args.token_creator and not args.service_account:
         raise SystemExit("--token-creator goes with --service-account")
+    if args.token_creator and args.writer_role != "row-writer":
+        raise SystemExit(
+            "--token-creator goes with --writer-role row-writer: whoever may impersonate the "
+            "account gets what it holds, and data-editor reads every row"
+        )
+    if args.service_account and args.principal:
+        email = _service_account_email(args.project, args.service_account)
+        if args.principal.lower() != f"serviceAccount:{email}".lower():
+            raise SystemExit(
+                f"--principal {args.principal} is not --service-account {email}: setup would check "
+                "one and let the token creators impersonate the other. Give one of them."
+            )
+    if args.reader and _views_dataset(args) == args.dataset:
+        raise SystemExit(
+            f"the views dataset is the events dataset ({args.dataset}): readers granted on it would "
+            "read every row. Name another with --views-dataset."
+        )
     for member in [*args.token_creator, *args.reader]:
         if not any(member.startswith(prefix) for prefix in ("user:", "group:", "serviceAccount:", "domain:")):
             raise SystemExit(
@@ -285,12 +320,11 @@ def _json_output(command: list[str], missing_ok: bool = False) -> dict:
     return value if isinstance(value, dict) else {}
 
 
-def _ensure_row_writer_role(args: argparse.Namespace) -> None:
-    """Create the row-writer role, or add the permissions it lacks.
-
-    A role that holds more than ROW_WRITER_PERMISSIONS is refused: bound on
-    the table, it would let the writer read or change it.
-    """
+def _row_writer_role(args: argparse.Namespace) -> list[str] | None:
+    """The row-writer role's missing permissions, or None when there is no
+    such role. A role that holds more than ROW_WRITER_PERMISSIONS, or is
+    deleted, is refused: bound on the table, it would let the writer read
+    or change it."""
     project = args.project
     name = f"projects/{project}/roles/{ROW_WRITER_ROLE_ID}"
     describe = subprocess.run(
@@ -299,50 +333,69 @@ def _ensure_row_writer_role(args: argparse.Namespace) -> None:
         text=True,
         check=False,
     )
-    if describe.returncode == 0:
-        try:
-            role = json.loads(describe.stdout or "{}")
-        except json.JSONDecodeError as error:
-            raise SystemExit(f"gcloud iam roles describe {name} printed no JSON: {error}") from error
-        if role.get("deleted"):
-            raise SystemExit(
-                f"{name} is deleted. Undelete it (gcloud iam roles undelete {ROW_WRITER_ROLE_ID} "
-                f"--project {project}) and run again."
-            )
-        held = set(role.get("includedPermissions") or [])
-        extra = sorted(held - set(ROW_WRITER_PERMISSIONS))
-        if extra:
-            raise SystemExit(
-                f"{name} also holds {', '.join(extra)}: bound on the table, it would let the writer "
-                f"do more than insert rows. Remove them (gcloud iam roles update {ROW_WRITER_ROLE_ID} "
-                f"--project {project} --remove-permissions {','.join(extra)}) and run again."
-            )
-        missing = [permission for permission in ROW_WRITER_PERMISSIONS if permission not in held]
-        if missing:
-            subprocess.run(
-                _gcloud_command(
-                    args, "iam", "roles", "update", ROW_WRITER_ROLE_ID, "--project", project,
-                    "--add-permissions", ",".join(missing), "--quiet",
-                ),
-                stdout=subprocess.DEVNULL,
-                check=True,
-            )
-            print(f"UPDATED role {name}: added {', '.join(missing)}")
-        else:
-            print(f"OK role exists, with {', '.join(ROW_WRITER_PERMISSIONS)} only: {name}")
-        return
-    permissions = ",".join(ROW_WRITER_PERMISSIONS)
-    subprocess.run(
-        _gcloud_command(
-            args, "iam", "roles", "create", ROW_WRITER_ROLE_ID, "--project", project,
-            "--title", "BQAA row writer",
-            "--description", "Inserts rows into the tables it is granted on, and reads none",
-            "--permissions", permissions, "--stage", "GA",
-        ),
-        stdout=subprocess.DEVNULL,
-        check=True,
-    )
-    print(f"CREATED role: {name} ({permissions})")
+    if describe.returncode != 0:
+        return None
+    try:
+        role = json.loads(describe.stdout or "{}")
+    except json.JSONDecodeError as error:
+        raise SystemExit(f"gcloud iam roles describe {name} printed no JSON: {error}") from error
+    if role.get("deleted"):
+        raise SystemExit(
+            f"{name} is deleted. Undelete it (gcloud iam roles undelete {ROW_WRITER_ROLE_ID} "
+            f"--project {project}) and run again."
+        )
+    held = set(role.get("includedPermissions") or [])
+    extra = sorted(held - set(ROW_WRITER_PERMISSIONS))
+    if extra:
+        raise SystemExit(
+            f"{name} also holds {', '.join(extra)}: bound on the table, it would let the writer "
+            f"do more than insert rows. Remove them (gcloud iam roles update {ROW_WRITER_ROLE_ID} "
+            f"--project {project} --remove-permissions {','.join(extra)}) and run again."
+        )
+    return [permission for permission in ROW_WRITER_PERMISSIONS if permission not in held]
+
+
+def _ensure_row_writer_role(args: argparse.Namespace) -> None:
+    """Create the row-writer role, or add the permissions it lacks."""
+    project = args.project
+    name = f"projects/{project}/roles/{ROW_WRITER_ROLE_ID}"
+    missing = _row_writer_role(args)
+    if missing is None:
+        permissions = ",".join(ROW_WRITER_PERMISSIONS)
+        subprocess.run(
+            _gcloud_command(
+                args, "iam", "roles", "create", ROW_WRITER_ROLE_ID, "--project", project,
+                "--title", "BQAA row writer",
+                "--description", "Inserts rows into the tables it is granted on, and reads none",
+                "--permissions", permissions, "--stage", "GA",
+            ),
+            stdout=subprocess.DEVNULL,
+            check=True,
+        )
+        print(f"CREATED role: {name} ({permissions})")
+    elif missing:
+        subprocess.run(
+            _gcloud_command(
+                args, "iam", "roles", "update", ROW_WRITER_ROLE_ID, "--project", project,
+                "--add-permissions", ",".join(missing), "--quiet",
+            ),
+            stdout=subprocess.DEVNULL,
+            check=True,
+        )
+        print(f"UPDATED role {name}: added {', '.join(missing)}")
+    else:
+        print(f"OK role exists, with {', '.join(ROW_WRITER_PERMISSIONS)} only: {name}")
+
+
+def _check_row_writer_role(args: argparse.Namespace) -> None:
+    """With --no-grant-iam: refuse a row-writer role that holds more, and
+    change nothing."""
+    missing = _row_writer_role(args)
+    name = f"projects/{args.project}/roles/{ROW_WRITER_ROLE_ID}"
+    if missing is None:
+        print(f"OK no role {name}: the writer holds no row-writer grant from this setup")
+    else:
+        print(f"OK role {name} holds nothing beyond {', '.join(ROW_WRITER_PERMISSIONS)}")
 
 
 # The access-entry key that names a member of each kind in a dataset's ACL.
@@ -396,6 +449,39 @@ def _check_writer_grants(args: argparse.Namespace) -> None:
     )
 
 
+def _check_project_readers(args: argparse.Namespace) -> None:
+    """Name who reads every row through a project role, and stop if a
+    --reader or --token-creator member is one of them."""
+    roles = PROJECT_READ_ROLES + (PROJECT_GROUP_ROLES if args.keep_project_groups else ())
+    policy = _json_output(_gcloud_command(args, "projects", "get-iam-policy", args.project, "--format=json"))
+    holders: dict[str, list[str]] = {}
+    names: dict[str, str] = {}
+    for binding in policy.get("bindings") or []:
+        if binding.get("role") in roles:
+            for member in binding.get("members") or []:
+                holders.setdefault(member.lower(), []).append(binding["role"])
+                names.setdefault(member.lower(), member)
+    if holders:
+        listed = "\n  - ".join(f"{names[key]}: {', '.join(held)}" for key, held in sorted(holders.items()))
+        print(f"These read every row of {args.project}.{args.dataset}.{args.table} through a project role:\n  - {listed}")
+    clashes = [
+        f"{member} ({', '.join(holders[member.lower()])})"
+        for member in [*args.reader, *args.token_creator]
+        if member.lower() in holders
+    ]
+    if not clashes:
+        print("OK no --reader or --token-creator member reads the table through a project role")
+        return
+    if args.allow_existing_grants:
+        print(f"KEPT (--allow-existing-grants): {', '.join(clashes)} read every row through a project role")
+        return
+    raise SystemExit(
+        f"{', '.join(clashes)} read every row of the table through a project role, views or not. "
+        "Take the role off, or keep the events dataset in a project of its own; "
+        "--allow-existing-grants keeps them."
+    )
+
+
 def _check_api_enabled(args: argparse.Namespace, service: str) -> None:
     """Fail when a service the plan relies on is not enabled (--no-enable-apis)."""
     result = subprocess.run(
@@ -428,17 +514,28 @@ def _run_with_retry(command: list[str], what: str) -> None:
     raise subprocess.CalledProcessError(result.returncode, command)
 
 
-def _authorize_views(project: str, dataset: str, views_dataset: str) -> None:
-    """Authorize every view of the views dataset on the events dataset, so
-    readers of the views need no access to the table."""
+def _authorize_views(project: str, dataset: str, views_dataset: str, client=None) -> None:
+    """Authorize the mod's views (VIEW_NAMES) of the views dataset on the
+    events dataset, so readers of the views need no access to the table.
+    Other views there are left out: one could select raw columns."""
     from google.cloud import bigquery
+    from google.cloud.exceptions import NotFound
 
-    client = bigquery.Client(project=project)
+    client = client or bigquery.Client(project=project)
     source = client.get_dataset(f"{project}.{dataset}")
-    views = [t for t in client.list_tables(f"{project}.{views_dataset}") if t.table_type == "VIEW"]
-    if not views:
-        print(f"SKIPPED: no views in {project}.{views_dataset} yet (the mod's setup.sh makes them)")
-        return
+    views, missing = [], []
+    for name in VIEW_NAMES:
+        try:
+            table = client.get_table(f"{project}.{views_dataset}.{name}")
+        except NotFound:
+            missing.append(name)
+            continue
+        if table.table_type == "VIEW":
+            views.append(table)
+        else:
+            missing.append(name)
+    if missing:
+        print(f"SKIPPED: no view {', '.join(missing)} in {project}.{views_dataset} (the mod's setup.sh makes them)")
     entries = list(source.access_entries)
     known = {
         (e.entity_id.get("projectId"), e.entity_id.get("datasetId"), e.entity_id.get("tableId"))
@@ -460,8 +557,45 @@ def _authorize_views(project: str, dataset: str, views_dataset: str) -> None:
         source.access_entries = entries
         client.update_dataset(source, ["access_entries"])
         print(f"AUTHORIZED on {project}.{dataset}: {', '.join(added)}")
-    else:
+    elif views:
         print(f"OK views already authorized on {project}.{dataset}")
+
+
+# What a dataset's default access gives project roles: Viewers read every
+# row (projectReaders), Editors change or delete tables and views
+# (projectWriters). The groups that read the whole world are taken off too.
+_EVENTS_DATASET_GROUPS = ("projectReaders", "projectWriters", "allAuthenticatedUsers")
+_VIEWS_DATASET_GROUPS = ("projectWriters", "allAuthenticatedUsers")
+
+
+def _restrict_dataset_access(project: str, dataset: str, views_dataset: str, client=None) -> None:
+    """Take the project's Viewer and Editor groups off the events dataset, and
+    Editors off the views dataset, so project roles read and change nothing
+    there. Owners, named members and authorized views stay."""
+    from google.cloud import bigquery
+    from google.cloud.exceptions import NotFound
+
+    client = client or bigquery.Client(project=project)
+    for name, groups in ((dataset, _EVENTS_DATASET_GROUPS), (views_dataset, _VIEWS_DATASET_GROUPS)):
+        try:
+            target = client.get_dataset(f"{project}.{name}")
+        except NotFound:
+            print(f"SKIPPED: no dataset {project}.{name}")
+            continue
+        kept, removed = [], []
+        for entry in target.access_entries:
+            group = entry.entity_id if entry.entity_type == "specialGroup" else None
+            everyone = entry.entity_type == "iamMember" and entry.entity_id in ("allUsers", "allAuthenticatedUsers")
+            if group in groups or everyone:
+                removed.append(f"{entry.role} {entry.entity_id}")
+            else:
+                kept.append(entry)
+        if removed:
+            target.access_entries = kept
+            client.update_dataset(target, ["access_entries"])
+            print(f"REMOVED from {project}.{name}: {', '.join(removed)}")
+        else:
+            print(f"OK {project}.{name} gives project Viewers and Editors nothing")
 
 
 def _ensure_dataset(project: str, dataset: str, location: str | None) -> None:
@@ -578,45 +712,59 @@ def _build_steps(args: argparse.Namespace) -> list[Step]:
             )
         )
 
-    if args.grant_iam and args.principal and args.writer_role == "row-writer":
+    row_writer = args.writer_role == "row-writer"
+    if row_writer and args.principal and (args.grant_iam or args.token_creator):
+        # Before any grant, Token Creator's included: the writer, and its role.
         role = f"projects/{args.project}/roles/{ROW_WRITER_ROLE_ID}"
-        steps.extend(
-            [
-                Step(
-                    f"Check that {args.principal} holds nothing beyond the row-writer role",
-                    action=lambda: _check_writer_grants(args),
-                    detail=(
-                        "gcloud projects get-iam-policy; bq show of the events and views "
-                        "datasets; bq get-iam-policy of the table. Stops on any other grant "
-                        "unless --allow-existing-grants"
-                    ),
-                    needs_cli_auth=True,
+        steps.append(
+            Step(
+                f"Check that {args.principal} holds nothing beyond the row-writer role",
+                action=lambda: _check_writer_grants(args),
+                detail=(
+                    "gcloud projects get-iam-policy; bq show of the events and views "
+                    "datasets; bq get-iam-policy of the table. Stops on any other grant "
+                    "unless --allow-existing-grants"
                 ),
-                Step(
-                    f"Ensure role {role} ({', '.join(ROW_WRITER_PERMISSIONS)})",
-                    action=lambda: _ensure_row_writer_role(args),
-                    detail=(
-                        "gcloud iam roles describe; on missing, create with "
-                        f"{','.join(ROW_WRITER_PERMISSIONS)}; else add any it lacks, "
-                        "and stop if it holds any other"
-                    ),
-                    needs_cli_auth=True,
-                ),
-                Step(
-                    "Grant the row-writer role to runtime principal, on the table alone",
-                    _bq_command(
-                        args,
-                        "add-iam-policy-binding",
-                        "--member",
-                        args.principal,
-                        "--role",
-                        role,
-                        f"{args.project}:{args.dataset}.{args.table}",
-                    ),
-                    needs_cli_auth=True,
-                ),
-            ]
+                needs_cli_auth=True,
+            )
         )
+        if args.grant_iam:
+            steps.extend(
+                [
+                    Step(
+                        f"Ensure role {role} ({', '.join(ROW_WRITER_PERMISSIONS)})",
+                        action=lambda: _ensure_row_writer_role(args),
+                        detail=(
+                            "gcloud iam roles describe; on missing, create with "
+                            f"{','.join(ROW_WRITER_PERMISSIONS)}; else add any it lacks, "
+                            "and stop if it holds any other"
+                        ),
+                        needs_cli_auth=True,
+                    ),
+                    Step(
+                        "Grant the row-writer role to runtime principal, on the table alone",
+                        _bq_command(
+                            args,
+                            "add-iam-policy-binding",
+                            "--member",
+                            args.principal,
+                            "--role",
+                            role,
+                            f"{args.project}:{args.dataset}.{args.table}",
+                        ),
+                        needs_cli_auth=True,
+                    ),
+                ]
+            )
+        else:
+            steps.append(
+                Step(
+                    f"Check that role {role}, if there is one, holds nothing beyond {', '.join(ROW_WRITER_PERMISSIONS)}",
+                    action=lambda: _check_row_writer_role(args),
+                    detail="gcloud iam roles describe; stops if it holds any other permission or is deleted",
+                    needs_cli_auth=True,
+                )
+            )
     elif args.grant_iam and args.principal:
         steps.extend(
             [
@@ -658,6 +806,35 @@ def _build_steps(args: argparse.Namespace) -> list[Step]:
                     needs_cli_auth=True,
                 )
             )
+    if row_writer or args.reader:
+        views_dataset = _views_dataset(args)
+        if not args.keep_project_groups:
+            steps.append(
+                Step(
+                    f"Take the project's Viewer and Editor groups off {args.project}.{args.dataset}, "
+                    f"and Editors off {args.project}.{views_dataset}",
+                    action=lambda: _restrict_dataset_access(args.project, args.dataset, views_dataset),
+                    detail=(
+                        "bigquery.Client: remove projectReaders and projectWriters (and allUsers, "
+                        "allAuthenticatedUsers) from the events dataset's access, and projectWriters "
+                        "from the views dataset's; owners, named members and authorized views stay"
+                    ),
+                    needs_adc=True,
+                )
+            )
+        steps.append(
+            Step(
+                "Check who reads every row through a project role, and that no reader or token creator does",
+                action=lambda: _check_project_readers(args),
+                detail=(
+                    "gcloud projects get-iam-policy: list the holders of "
+                    f"{', '.join(PROJECT_READ_ROLES)} (and, with --keep-project-groups, "
+                    f"{', '.join(PROJECT_GROUP_ROLES)}); stop if a --reader or --token-creator "
+                    "member is one, unless --allow-existing-grants"
+                ),
+                needs_cli_auth=True,
+            )
+        )
     if args.service_account:
         email = _service_account_email(args.project, args.service_account)
         if args.token_creator and not args.enable_apis:
@@ -706,11 +883,11 @@ def _build_steps(args: argparse.Namespace) -> list[Step]:
     if args.reader:
         steps.append(
             Step(
-                f"Authorize the views of {args.project}.{views_dataset} on {args.project}.{args.dataset}",
+                f"Authorize {', '.join(VIEW_NAMES)} of {args.project}.{views_dataset} on {args.project}.{args.dataset}",
                 action=lambda: _authorize_views(args.project, args.dataset, views_dataset),
                 detail=(
-                    "bigquery.Client: add each view of the views dataset to the events "
-                    "dataset's access entries, so readers need no access to the table"
+                    "bigquery.Client: add those two views to the events dataset's access "
+                    "entries, so readers need no access to the table; no other view"
                 ),
                 needs_adc=True,
             )
@@ -1024,9 +1201,19 @@ def main(argv: list[str] | None = None) -> int:
         "--allow-existing-grants",
         action="store_true",
         help=(
-            "With --writer-role row-writer: keep a writer that already holds other "
-            "grants on the project, the datasets or the table (an audited account). "
-            "Without it, setup stops before granting anything."
+            "Keep a writer that already holds other grants on the project, the "
+            "datasets or the table (an audited account), and readers or token "
+            "creators that read every table through a project role. Without it, "
+            "setup stops before granting anything."
+        ),
+    )
+    parser.add_argument(
+        "--keep-project-groups",
+        action="store_true",
+        help=(
+            "Leave the project's Viewer and Editor groups on the events dataset (and "
+            "Editors on the views dataset). Without it, --writer-role row-writer and "
+            "--reader take them off, so project roles read and change no rows."
         ),
     )
     parser.add_argument(

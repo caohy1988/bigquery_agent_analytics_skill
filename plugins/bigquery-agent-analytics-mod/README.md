@@ -1443,7 +1443,8 @@ calls. It checks:
 service account holds only `bigquery.tables.get` and
 `bigquery.tables.updateData` on the table, and is refused a read of its rows
 and any query; a reader queries a view, and is refused the table, directly
-and in a query. It changes nothing (`INSERT_PROBE=1` adds one insert).
+and in a query; and neither dataset gives the project's Viewers or Editors
+access. It changes nothing (`INSERT_PROBE=1` adds one insert).
 
 `tests/state-contract.test.sh` checks, with the host CLI's own test runtime,
 what `tests/reload.test.mjs` models of the host's `$.state`, so its stand-in
