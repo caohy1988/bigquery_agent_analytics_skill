@@ -43,7 +43,10 @@ in place:
 | What you deliver | A folder and the policy | The policy only |
 | The version | The archive you copied, checked by its checksum | A tag, with `autoUpdate` off |
 
-Choose the folder wherever your device management can deliver files.
+Choose the folder wherever your device management can deliver files. With
+GitHub, every tag you deploy needs a version of its own, and each move to a
+new tag takes two commands on every machine
+([§6](#6-without-a-folder-the-github-marketplace-pinned)).
 
 ## 1. The marketplace folder
 
@@ -381,17 +384,57 @@ folder, or a tag in a fork your organization controls. `ref` takes a branch
 or a tag, not a commit (checked: a commit is "not found in upstream
 origin").
 
-To move to another tag, change `ref` for the pilot group first. Each
-machine fetches the marketplace again at the new tag, but keeps running the
-copy it installed: run
-`claude plugin update bigquery-agent-analytics-mod@bigquery-agent-analytics-plugin`
-on each, as the person (or a script run as them), and check that
-`claude plugin list` shows the new `Version` (not
-`~/.claude/plugins/cache/`, which held both versions in one check).
-Checked in a container, with `autoUpdate` off: the next session fetched
-the marketplace at the new tag, and three sessions after the ref moved the
-earlier version still ran. `plugin update` moved it, and the next session
-ran it.
+To move to another tag:
+
+1. **Give the tag a version no earlier tag used.** Before tagging, change
+   `version` in the mod's `.claude-plugin/plugin.json`, in its entry in the
+   repository's `.claude-plugin/marketplace.json`, and `PLUGIN_VERSION` in
+   `hooks/lib/config.ts`. `claude plugin update` compares only that string,
+   and `claude plugin list` shows only that string. A tag at a version a
+   machine already has is never installed over its copy ("already at the
+   latest version"), so a fix shipped that way reaches new machines only.
+   The others keep the earlier code and still pass a check by version.
+2. **Change `ref` in the policy**, for the pilot group first.
+3. **On each machine, right after the new policy arrives**, as the person
+   (or a script run as them), fetch the marketplace at the new tag, then
+   update. Require both to succeed:
+
+   ```bash
+   claude plugin marketplace add "haiyuan-eng-google/bigquery_agent_analytics_skill#NEW_TAG"
+   claude plugin update bigquery-agent-analytics-mod@bigquery-agent-analytics-plugin
+   ```
+
+   Until then the machine's copy does not load. The marketplace it came
+   from no longer matches the policy ("its source doesn't match its
+   extraKnownMarketplaces entry"), `claude plugin list` shows the copy as
+   failed to load, and `plugin update` alone fails ("not found").
+4. **Check by commit, not by label.** The host records each copy's commit
+   in `~/.claude/plugins/installed_plugins.json`. It is the new tag's
+   (`git ls-remote https://github.com/haiyuan-eng-google/bigquery_agent_analytics_skill NEW_TAG`):
+
+   ```bash
+   python3 -c 'import json, os; d = json.load(open(os.path.expanduser("~/.claude/plugins/installed_plugins.json"))); print([e.get("gitCommitSha") for e in d["plugins"]["bigquery-agent-analytics-mod@bigquery-agent-analytics-plugin"]])'
+   ```
+
+The same two commands, at the policy's tag, are needed on a machine that
+already has the mod from this marketplace at another ref when the policy
+first arrives: an earlier install from the default branch, say. Until they
+run, that copy becomes the managed copy but does not load, and the machine
+records nothing.
+
+Checked in a container (host CLI 2.1.304, test tags in a fork, `autoUpdate`
+off):
+
+- right after the ref moved, `plugin update` alone failed ("not found");
+- `marketplace add` at the new tag, then `plugin update`, both succeeded
+  ("updated from 0.1.0-pin1 to 0.1.0-pin2 for scope managed"). The
+  recorded commit was the tag's, and the next session ran it;
+- the same held on a machine set up by the pinned install above;
+- a tag at the same version on another commit: "already at the latest
+  version", and the recorded commit stayed the earlier tag's;
+- an install from another ref before the policy: it did not load once the
+  policy arrived. After the two commands at the policy's tag, it was that
+  tag's, by commit, and recorded.
 
 ## 7. Roll out in stages
 

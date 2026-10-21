@@ -46,10 +46,14 @@
 #             allowManagedModsOnly and allowManagedHooksOnly refuse it.
 #             With the policy removed the copy stays installed and loads,
 #             until a disable policy holds it while it is uninstalled.
-#             With the ref moved to a second tag (PIN_REF2), the
-#             marketplace is fetched at it, but the earlier copy keeps
-#             running until claude plugin update, after which the next
-#             session runs the second tag's.
+#             The guide's upgrade, right after the policy moves the ref to
+#             a second tag (PIN_REF2, another version): plugin update alone
+#             fails, and marketplace add at the tag, then plugin update,
+#             make the copy that tag's commit, which the next session runs;
+#             the same on a machine set up by the pinned install. A third
+#             tag at the second's version on another commit (PIN_REF3) is
+#             not installed. An earlier install from another ref does not
+#             load once the policy arrives, until the same two commands.
 #             Its policy names the guide's token command for this variant
 #             (env -i and gcloud's absolute path, no delivered file): a
 #             stand-in gcloud at that path runs with the guide's arguments
@@ -59,7 +63,8 @@
 #   HOST_CLI_LINUX=/path/to/linux/claude bash tests/managed-settings.live.sh
 #   BQAA_CHECK_NETWORK=1 BQAA_CHECK_GIT_IMAGE=my-image-with-git \
 #     PIN_REPO=owner/repo PIN_REF=a-tag PIN_VERSION=the-mod-version-there \
-#     PIN_REF2=a-later-tag PIN_VERSION2=the-mod-version-there \
+#     PIN_REF2=a-later-tag PIN_VERSION2=its-own-mod-version \
+#     PIN_REF3=a-tag-at-PIN_VERSION2-on-another-commit \
 #     HOST_CLI_LINUX=... bash tests/managed-settings.live.sh
 # The host CLI's Linux build is a single binary for the container's
 # architecture. The work folder goes under $HOME, which docker on a Mac
@@ -75,10 +80,20 @@ if [[ ! -x "${HOST_CLI_LINUX:-}" ]]; then
 fi
 network="${BQAA_CHECK_NETWORK:-0}"
 if [[ "$network" == 1 && ( -z "${BQAA_CHECK_GIT_IMAGE:-}" || -z "${PIN_REPO:-}" || -z "${PIN_REF:-}" || -z "${PIN_VERSION:-}" \
-      || -z "${PIN_REF2:-}" || -z "${PIN_VERSION2:-}" ) ]]; then
-  echo "not ok - BQAA_CHECK_NETWORK=1 needs BQAA_CHECK_GIT_IMAGE, PIN_REPO, PIN_REF, PIN_VERSION, PIN_REF2 and PIN_VERSION2"
+      || -z "${PIN_REF2:-}" || -z "${PIN_VERSION2:-}" || -z "${PIN_REF3:-}" ) ]]; then
+  echo "not ok - BQAA_CHECK_NETWORK=1 needs BQAA_CHECK_GIT_IMAGE, PIN_REPO, PIN_REF, PIN_VERSION, PIN_REF2, PIN_VERSION2 and PIN_REF3"
   exit 1
 fi
+if [[ "$network" == 1 && "$PIN_VERSION2" == "$PIN_VERSION" ]]; then
+  echo "not ok - PIN_VERSION2 must differ from PIN_VERSION: plugin update moves a copy only to another version"
+  exit 1
+fi
+# A tag's commit, as the host records it for the copy it installs.
+commit_of() {
+  local out
+  out="$(git ls-remote "https://github.com/$PIN_REPO.git" "refs/tags/$1" "refs/tags/$1^{}")"
+  awk '$2 ~ /\^\{\}$/ { print $1; found = 1 } END { if (!found) exit 1 }' <<<"$out" || awk 'NR == 1 { print $1 }' <<<"$out"
+}
 work="$(mktemp -d "$HOME/.bqaa-managed-check.XXXXXX")"
 # BQAA_CHECK_KEEP=1 keeps the work folder (each scenario's status, debug
 # log and row files) for a look after a failure.
@@ -86,7 +101,10 @@ trap '[[ "${BQAA_CHECK_KEEP:-0}" == 1 ]] && echo "kept $work" || rm -rf "$work"'
 mkdir -p "$work/in/mod" "$work/out"
 cp "$HOST_CLI_LINUX" "$work/in/claude"
 (cd "$plugin" && tar -cf - --exclude ./.claude-plugin/types .) | tar -xf - -C "$work/in/mod"
-printf '%s\n%s\n%s\n%s\n%s\n' "${PIN_REPO:-}" "${PIN_REF:-}" "${PIN_VERSION:-}" "${PIN_REF2:-}" "${PIN_VERSION2:-}" >"$work/in/pin"
+printf '%s\n%s\n%s\n%s\n%s\n%s\n' "${PIN_REPO:-}" "${PIN_REF:-}" "${PIN_VERSION:-}" "${PIN_REF2:-}" "${PIN_VERSION2:-}" "${PIN_REF3:-}" >"$work/in/pin"
+if [[ "$network" == 1 ]]; then
+  printf '%s\n%s\n%s\n' "$(commit_of "$PIN_REF")" "$(commit_of "$PIN_REF2")" "$(commit_of "$PIN_REF3")" >>"$work/in/pin"
+fi
 # A session held open with no input (so no model call), then ended: the time
 # a first session gives the host to register a marketplace or install a mod.
 cat >"$work/in/hold.py" <<'PY'
@@ -368,6 +386,20 @@ cat >"$work/in/github.sh" <<'SH'
 REPO="$(sed -n 1p /in/pin)"
 REF="$(sed -n 2p /in/pin)"
 copies() { as_dev 'ls -d ~/.claude/plugins/cache/*/bigquery-agent-analytics-mod/* 2>/dev/null; python3 -c "import json; d=json.load(open(\"/home/dev/.claude/plugins/known_marketplaces.json\")); print(\"autoUpdate\", d[\"bigquery-agent-analytics-plugin\"].get(\"autoUpdate\"))" 2>/dev/null' >"/out/$1/copies.txt"; }
+# The commit the host records for the installed copy, and the plugin list.
+installed() {
+  mkdir -p "/out/$1" && chmod 777 "/out/$1"
+  as_dev "python3 -c \"import json; d=json.load(open('/home/dev/.claude/plugins/installed_plugins.json')); print(' '.join(e.get('gitCommitSha') or '' for e in d['plugins'].get('$OLD', [])))\"" >"/out/$1/installed.txt" 2>&1
+  as_dev "cd ~ && claude plugin list" >"/out/$1/list.txt" 2>&1
+}
+# The guide's two commands, at a tag.
+upgrade() { # scenario, tag
+  mkdir -p "/out/$1" && chmod 777 "/out/$1"
+  as_dev "cd ~ && claude plugin marketplace add '$REPO#$2'" >"/out/$1/readd.txt" 2>&1; echo "exit $?" >>"/out/$1/readd.txt"
+  as_dev "cd ~ && claude plugin update $OLD" >"/out/$1/update.txt" 2>&1; echo "exit $?" >>"/out/$1/update.txt"
+  installed "$1"
+}
+ref_policy() { policy github "p['extraKnownMarketplaces']['bigquery-agent-analytics-plugin']['source']['ref'] = '$1'"; }
 # A stand-in for gcloud at the path the guide's token command names: it
 # writes down its arguments and the environment it was given.
 cat >/usr/bin/gcloud <<'G'
@@ -391,16 +423,20 @@ chown dev:dev /home/dev/repo/.claude/settings.json
 rm -f /out/gcloud.args /out/gcloud.env
 run github-token-env 60
 cp /out/gcloud.args /out/gcloud.env /out/github-token-env/ 2>/dev/null
-# A moved ref: the next tag's copy is fetched, the installed one keeps
-# running until plugin update.
+# The guide's upgrade, right after the policy moves the ref: plugin update
+# alone, then marketplace add at the tag and plugin update.
 echo '{}' >/home/dev/repo/.claude/settings.json
 REF2="$(sed -n 4p /in/pin)"
-policy github "p['extraKnownMarketplaces']['bigquery-agent-analytics-plugin']['source']['ref'] = '$REF2'"
-hold github-moved-1 30; hold github-moved-2 30; run github-moved-3 60; copies github-moved-3
-as_dev "cd ~ && claude plugin list" >/out/github-moved-3/list.txt 2>&1
-as_dev "cd ~ && claude plugin update $OLD" >/out/github-plugin-update.txt 2>&1
-run github-updated 60
-as_dev "cd ~ && claude plugin list" >/out/github-updated/list.txt 2>&1
+REF3="$(sed -n 6p /in/pin)"
+ref_policy "$REF2"
+mkdir -p /out/github-moved && chmod 777 /out/github-moved
+as_dev "cd ~ && claude plugin update $OLD" >/out/github-moved/update-alone.txt 2>&1; echo "exit $?" >>/out/github-moved/update-alone.txt
+installed github-moved
+upgrade github-upgraded "$REF2"
+run github-upgraded-session 60
+# A tag at the same version on another commit.
+ref_policy "$REF3"
+upgrade github-same-version "$REF3"
 policy github 'pass'
 fresh_user "$OLD"
 as_dev "cd ~ && claude plugin install $MOD --marketplace '$REPO#$REF'" >/out/pinned-install.txt 2>&1
@@ -411,6 +447,10 @@ policy github 'p["pluginConfigs"]["cc-plugin-sec-default@builtin"] = {"options":
 run github-managed-mods-only 15
 policy github 'p["allowManagedHooksOnly"] = True'
 run github-managed-hooks-only 15
+# The pinned install's machine takes the same upgrade.
+ref_policy "$REF2"
+upgrade pinned-upgraded "$REF2"
+run pinned-upgraded-session 60
 # rollback: a copy the person installed stays enabled in their settings
 # when the policy is removed, and loads with their own options; the disable
 # policy, kept until the copy is uninstalled, leaves nothing.
@@ -425,6 +465,14 @@ run github-disabled 15
 as_dev "cd ~ && claude plugin uninstall $OLD" >/out/github-rollback-uninstall.txt 2>&1
 rm -f "$DROPIN"
 run github-rollback-done 15
+# An install from another ref (the second tag) before the policy arrives.
+rm -rf /home/dev/.claude /home/dev/.claude.json && as_dev 'mkdir -p ~/.claude'
+rm -f "$DROPIN"
+as_dev "cd ~ && claude plugin install $MOD --marketplace '$REPO#$REF2' --config project=p --config dataset=d" >/out/earlier-install.txt 2>&1
+policy github 'pass'
+run earlier-1 60
+upgrade earlier-upgraded "$REF"
+run earlier-upgraded-session 60
 echo done >/out/done
 SH
 
@@ -525,11 +573,22 @@ if [[ "$network" == 1 ]]; then
   check 'github: the token command needs no delivered file: env -i runs gcloud at its path with the guide'"'"'s arguments' \
     bash -c "grep -qx 'auth print-access-token --impersonate-service-account=bqaa-row-writer@example-project.iam.gserviceaccount.com' '$out/github-token-env/gcloud.args' && grep -q 'token command .env. printed no access token' '$out/github-token-env/status.txt'"
   ref2="$(sed -n 4p "$work/in/pin")"
-  version2="$(sed -n 5p "$work/in/pin")"
-  check "github: a moved ref fetches the marketplace at the next tag ($ref2), and the earlier copy ($version) keeps running three sessions on" \
-    bash -c "cat '$out'/github-moved-[123]/debug.log | grep -q 'git clone: url=.* ref=$ref2 ' && grep -q 'Version: $version\$' '$out/github-moved-3/list.txt'"
-  check "github: plugin update moves it, and the next session runs $version2" \
-    bash -c "grep -q 'Version: $version2\$' '$out/github-updated/list.txt' && grep -q '$TARGET' '$out/github-updated/status.txt'"
+  ref3="$(sed -n 6p "$work/in/pin")"
+  sha1="$(sed -n 7p "$work/in/pin")"
+  sha2="$(sed -n 8p "$work/in/pin")"
+  upgraded() { # scenario: both commands succeeded, and the copy is the given commit
+    grep -qx 'exit 0' "$out/$1/readd.txt" && grep -qx 'exit 0' "$out/$1/update.txt" && test "$(cat "$out/$1/installed.txt")" = "$2"
+  }
+  check 'github: right after the ref moves, plugin update alone fails, and the copy does not load' \
+    bash -c "grep -q 'not found' '$out/github-moved/update-alone.txt' && grep -qx 'exit 1' '$out/github-moved/update-alone.txt' && grep -q 'failed to load' '$out/github-moved/list.txt'"
+  check "github: marketplace add at $ref2, then plugin update, both succeed; the copy is its commit, and the next session runs it" \
+    bash -c "$(declare -f upgraded); out='$out'; upgraded github-upgraded '$sha2' && grep -q '$TARGET' '$out/github-upgraded-session/status.txt'"
+  check "github: a tag at the same version on another commit ($ref3) is not installed; the copy stays $ref2's" \
+    bash -c "grep -q 'already at the latest version' '$out/github-same-version/update.txt' && test \"\$(cat '$out/github-same-version/installed.txt')\" = '$sha2'"
+  check "github: a machine set up by the pinned install takes the same upgrade" \
+    bash -c "$(declare -f upgraded); out='$out'; upgraded pinned-upgraded '$sha2' && grep -q '$TARGET' '$out/pinned-upgraded-session/status.txt'"
+  check 'github: an install from another ref does not load once the policy arrives, until the two commands at its tag' \
+    bash -c "$(declare -f upgraded); out='$out'; grep -q \"source doesn't match its extraKnownMarketplaces entry\" '$out/earlier-1/debug.log' && ! grep -q 'hooks module $OLD loaded' '$out/earlier-1/debug.log' && upgraded earlier-upgraded '$sha1' && grep -q '$TARGET' '$out/earlier-upgraded-session/status.txt'"
   check 'github: a repository'"'"'s settings env does not reach it: gcloud gets only PATH' \
     bash -c "test -s '$out/github-token-env/gcloud.env' && ! grep -qvE '^(PATH=/usr/bin:/bin|PWD=.*)\$' '$out/github-token-env/gcloud.env'"
   check 'github: rows carry the policy'"'"'s agent name, the login name and no host name' rows_are github-3 "$ROWS"
