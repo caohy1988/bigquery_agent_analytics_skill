@@ -722,9 +722,11 @@ the analysis skill's `{PROJECT}.{DATASET}.{TABLE}` placeholders and `@start` /
 deduplicated, tokens and cache share per session and model, model latency
 (p50/p95 total, time to first token), tool failure rate and latency, one line
 per turn, the span tree of a trace, subagents by type, and the mod's own
-health. `QUALIFY` is evaluated after `GROUP BY`, so a query that aggregates
-dedups on `event_id` in a CTE first and aggregates what it returns. For
-example, tokens per model:
+health. Each reads only this mod's rows (`attributes.writer.plugin`: a table
+can also hold the settings-hook tracer's or ADK agents' rows). `QUALIFY` is
+evaluated after `GROUP BY`, so a query that aggregates dedups on `event_id`
+in a CTE first and aggregates what it returns. For example, tokens per
+model:
 
 ```sql
 WITH responses AS (
@@ -732,6 +734,7 @@ WITH responses AS (
   FROM `{PROJECT}.{DATASET}.{TABLE}`
   WHERE event_type = 'LLM_RESPONSE'
     AND timestamp BETWEEN @start AND @end
+    AND JSON_VALUE(attributes, '$.writer.plugin') = 'bigquery-agent-analytics-mod'
   QUALIFY event_id IS NULL OR ROW_NUMBER() OVER (PARTITION BY event_id ORDER BY timestamp) = 1
 )
 SELECT
@@ -743,6 +746,13 @@ SELECT
 FROM responses
 GROUP BY model
 ```
+
+[`docs/value.md`](docs/value.md) says what a developer, a team lead and a
+platform team can learn from the rows, with the questions' queries in
+[`sql/value_queries.sql`](sql/value_queries.sql): sessions and turns, adoption
+against a roster, an estimated cost, tools, errors over time, and the mod
+beside ADK agents. It also covers who can run each query, the denominators,
+and the limits.
 
 ## Reliability
 
@@ -1115,6 +1125,7 @@ node tests/reload.test.mjs    # node 24: the welcome card across a fresh load
 bash tests/state-contract.test.sh   # the host's $.state, as the reload test models it
 HOST_CLI_LINUX=... bash tests/managed-settings.live.sh   # docker: a managed policy in a Linux container (below)
 python3 tests/views.test.py   # needs DuckDB: python3 -m pip install duckdb
+PROJECT=my-gcp-project python3 tests/queries.live.py   # live: every query on a synthetic fixture (below)
 npx -p typescript tsc -p .    # once the host CLI has loaded the mod (below)
 ```
 
@@ -1587,6 +1598,15 @@ the versions before and after an update, landing in either order, the
 later version's card shows, with its own greeting; and that draws of the
 card while its read of the close waits start no other read of it.
 
+`tests/queries.live.py` runs every query in `sql/value_queries.sql` and
+`sql/sample_queries.sql` through the analysis skill's runner against a
+synthetic fixture in a dataset of its own, which it makes and deletes. The
+fixture holds a replayed row, a session with no `user_id`, the settings-hook
+tracer's and an ADK agent's rows, a subagent run, both answers to a
+permission prompt, and a hook's denial. The test checks the answers, and
+prints each query's dry-run bytes. It needs Application Default Credentials
+that may create a dataset.
+
 `tests/views.test.py` runs both views in DuckDB. It uses five dialect
 substitutions, and each must match. The fixture is a table shared by this
 mod, an ADK-style writer, the settings-hook plugin, a duplicate row, another
@@ -1670,10 +1690,11 @@ hooks/lib/welcome.ts         the welcome card's text, and its records in the sto
 setup.sh                     creates the dataset, table, views dataset and views (bq CLI)
 docs/service-account-auth.md which identity writes where, who reads the views, offboarding
 docs/managed-settings.md     turning the mod on for a team with the host's managed settings
-sql/                         DDL and sample queries
+docs/value.md                what each persona learns, with its query, denominators and limits
+sql/                         DDL, sample queries and the value queries
 sql/views/                   the usage views setup.sh makes
 examples/sample-rows.jsonl   fixture output
-tests/                       plugin-test suites, setup.test.sh for setup.sh, version.test.sh, reload.test.mjs, and access.live.sh (live)
+tests/                       plugin-test suites, setup.test.sh for setup.sh, version.test.sh, reload.test.mjs, access.live.sh and queries.live.py (both live)
 types/index.d.ts             the values the mod keeps in the session's $.state
 ```
 
