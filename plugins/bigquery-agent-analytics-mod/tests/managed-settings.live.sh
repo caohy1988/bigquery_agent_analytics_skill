@@ -47,7 +47,9 @@
 #             With the policy removed the copy stays installed and loads,
 #             until a disable policy holds it while it is uninstalled.
 #             The guide's upgrade, right after the policy moves the ref to
-#             a second tag (PIN_REF2, another version): plugin update alone
+#             a second tag (PIN_REF2, an annotated tag at another version,
+#             so the commit the host records is not the tag object's id):
+#             plugin update alone
 #             fails, and marketplace add at the tag, then plugin update,
 #             make the copy that tag's commit, which the next session runs;
 #             the same on a machine set up by the pinned install. A third
@@ -57,7 +59,9 @@
 #             at the tag's version from another commit (PIN_REF3) keeps its
 #             code after them ("already at the latest version"), until the
 #             guide's replacement (the disable policy, uninstall, the
-#             policy again, the pinned install) makes it the tag's.
+#             policy again, the pinned install) makes it the tag's. Every
+#             tag's commit comes from the guide's own lookup (§6, step 4),
+#             read from the guide.
 #             Its policy names the guide's token command for this variant
 #             (env -i and gcloud's absolute path, no delivered file): a
 #             stand-in gcloud at that path runs with the guide's arguments
@@ -67,7 +71,7 @@
 #   HOST_CLI_LINUX=/path/to/linux/claude bash tests/managed-settings.live.sh
 #   BQAA_CHECK_NETWORK=1 BQAA_CHECK_GIT_IMAGE=my-image-with-git \
 #     PIN_REPO=owner/repo PIN_REF=a-tag PIN_VERSION=the-mod-version-there \
-#     PIN_REF2=a-later-tag PIN_VERSION2=its-own-mod-version \
+#     PIN_REF2=a-later-annotated-tag PIN_VERSION2=its-own-mod-version \
 #     PIN_REF3=a-tag-at-PIN_VERSION2-on-another-commit \
 #     HOST_CLI_LINUX=... bash tests/managed-settings.live.sh
 # The host CLI's Linux build is a single binary for the container's
@@ -92,12 +96,25 @@ if [[ "$network" == 1 && "$PIN_VERSION2" == "$PIN_VERSION" ]]; then
   echo "not ok - PIN_VERSION2 must differ from PIN_VERSION: plugin update moves a copy only to another version"
   exit 1
 fi
-# A tag's commit, as the host records it for the copy it installs.
+# A tag's commit, by the guide's own lookup (§6, step 4): its line in the
+# guide, run with this check's repository and the tag put in.
+guide_url=https://github.com/haiyuan-eng-google/bigquery_agent_analytics_skill
+guide_lookup="$(grep -E "^ *git ls-remote $guide_url \"refs/tags/NEW_TAG\"" "$plugin/docs/managed-settings.md")"
 commit_of() {
-  local out
-  out="$(git ls-remote "https://github.com/$PIN_REPO.git" "refs/tags/$1" "refs/tags/$1^{}")"
-  awk '$2 ~ /\^\{\}$/ { print $1; found = 1 } END { if (!found) exit 1 }' <<<"$out" || awk 'NR == 1 { print $1 }' <<<"$out"
+  local cmd="${guide_lookup#"${guide_lookup%%[! ]*}"}"
+  cmd="${cmd//"$guide_url"/https://github.com/$PIN_REPO}"
+  bash -c "${cmd//NEW_TAG/$1}"
 }
+if [[ "$network" == 1 ]]; then
+  if [[ "$(grep -c . <<<"$guide_lookup")" != 1 ]]; then
+    echo "not ok - the guide's tag lookup (§6, step 4) is not in docs/managed-settings.md exactly once"
+    exit 1
+  fi
+  if [[ -z "$(git ls-remote "https://github.com/$PIN_REPO.git" "refs/tags/$PIN_REF2^{}")" ]]; then
+    echo "not ok - PIN_REF2 must be an annotated tag (git tag -a), so the guide's lookup is checked on one"
+    exit 1
+  fi
+fi
 work="$(mktemp -d "$HOME/.bqaa-managed-check.XXXXXX")"
 # BQAA_CHECK_KEEP=1 keeps the work folder (each scenario's status, debug
 # log and row files) for a look after a failure.
@@ -107,7 +124,13 @@ cp "$HOST_CLI_LINUX" "$work/in/claude"
 (cd "$plugin" && tar -cf - --exclude ./.claude-plugin/types .) | tar -xf - -C "$work/in/mod"
 printf '%s\n%s\n%s\n%s\n%s\n%s\n' "${PIN_REPO:-}" "${PIN_REF:-}" "${PIN_VERSION:-}" "${PIN_REF2:-}" "${PIN_VERSION2:-}" "${PIN_REF3:-}" >"$work/in/pin"
 if [[ "$network" == 1 ]]; then
-  printf '%s\n%s\n%s\n' "$(commit_of "$PIN_REF")" "$(commit_of "$PIN_REF2")" "$(commit_of "$PIN_REF3")" >>"$work/in/pin"
+  for tag in "$PIN_REF" "$PIN_REF2" "$PIN_REF3"; do
+    if ! sha="$(commit_of "$tag")" || [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+      echo "not ok - the guide's tag lookup gave no commit for $tag"
+      exit 1
+    fi
+    echo "$sha" >>"$work/in/pin"
+  done
 fi
 # A session held open with no input (so no model call), then ended: the time
 # a first session gives the host to register a marketplace or install a mod.
@@ -525,6 +548,7 @@ for s in pins pins-flags; do
   check "$s: the mod loads as the organization's (prepend tier)" grep -q "hooks module $ORG loaded (.*tier prepend" "$out/$s/debug.log"
   check "$s: capture on, live, at the policy's project, dataset, table and location" has "$s" "$TARGET" status.txt
   check "$s: no destination of the person's, the repository's or the shell's, and no dry run" lacks "$s" "$OTHERS" status.txt
+  # shellcheck disable=SC2016 # the backticks are the mod's own text
   check "$s: the policy's token command runs; no token from the shell or the repository" has "$s" 'token command `echo` printed no access token' status.txt
   check "$s: rows wait in the default folder, none in the folders the others name" \
     bash -c "grep -q '^/home/dev/.bqaa-mod/dead-letter/example-project.team_dataset.team_events/' '$out/$s/files.txt' && ! grep -q '/home/dev/repo/' '$out/$s/files.txt'"

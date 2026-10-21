@@ -414,10 +414,24 @@ To deploy a tag, the first one and every move after it:
    from no longer matches the policy ("its source doesn't match its
    extraKnownMarketplaces entry"), `claude plugin list` shows the copy as
    failed to load, and `plugin update` alone fails ("not found").
-4. **Check by commit, not by label, on every machine.** The host records
-   each copy's commit in `~/.claude/plugins/installed_plugins.json`. It must
-   be the tag's
-   (`git ls-remote https://github.com/haiyuan-eng-google/bigquery_agent_analytics_skill NEW_TAG`):
+4. **Check by commit, not by label, on every machine.** First look up the
+   tag's commit, once:
+
+   ```bash
+   git ls-remote https://github.com/haiyuan-eng-google/bigquery_agent_analytics_skill "refs/tags/NEW_TAG" "refs/tags/NEW_TAG^{}" | awk '{ c = $1 } /\^\{\}$/ { p = $1 } END { if (!c) { print "no commit found" > "/dev/stderr"; exit 1 } print (p ? p : c) }'
+   ```
+
+   It prints the commit for every kind of tag. For an annotated or signed
+   tag (`git tag -a`, `git tag -s`), the `refs/tags/NEW_TAG` line, the only
+   one `git ls-remote … NEW_TAG` prints, is the tag object's id, not a
+   commit; the commit, which the host records, is on the
+   `refs/tags/NEW_TAG^{}` line. If it prints "no commit found" instead, the
+   tag is missing or the lookup failed: stop, there is nothing to check
+   against.
+
+   The host records each copy's commit in
+   `~/.claude/plugins/installed_plugins.json`. Every commit this prints must
+   be that one:
 
    ```bash
    python3 -c 'import json, os; d = json.load(open(os.path.expanduser("~/.claude/plugins/installed_plugins.json"))); print([e.get("gitCommitSha") for e in d["plugins"]["bigquery-agent-analytics-mod@bigquery-agent-analytics-plugin"]])'
@@ -442,9 +456,10 @@ Checked in a container (host CLI 2.1.304, test tags in a fork, `autoUpdate`
 off):
 
 - right after the ref moved, `plugin update` alone failed ("not found");
-- `marketplace add` at the new tag, then `plugin update`, both succeeded
-  ("updated from 0.1.0-pin1 to 0.1.0-pin2 for scope managed"). The
-  recorded commit was the tag's, and the next session ran it;
+- `marketplace add` at the new tag, an annotated one, then `plugin update`,
+  both succeeded ("updated from 0.1.0-pin1 to 0.1.0-pin2 for scope
+  managed"). The recorded commit was the one the lookup in step 4 printed,
+  not the tag object's id, and the next session ran it;
 - the same held on a machine set up by the pinned install above;
 - a tag at the same version on another commit: "already at the latest
   version", and the recorded commit stayed the earlier tag's;
