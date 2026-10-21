@@ -63,12 +63,19 @@ So the bootstrap, with `--writer-role row-writer` or `--reader`:
   and BigQuery Admin, Data Owner, Data Editor or Data Viewer granted on the
   project, which read every table whatever a dataset's access says), or
   through any grant on the events dataset or table;
-- stops if a `--reader` or `--token-creator` member is one of them. Moving
-  a team off `roles/bigquery.dataEditor` takes those grants off first (see
+- stops, before anything is granted, when a grant reaches a `--reader` or
+  `--token-creator` member: one to the member itself, to everyone
+  (`allUsers`, `allAuthenticatedUsers`), or to the member's domain; when
+  everyone may read the table; and when a group or a set of identity-pool
+  principals holds a grant there while readers or token creators are being
+  set up, since it cannot see who is in them (check them, then
+  `--allow-existing-grants`). Moving a team off `roles/bigquery.dataEditor`
+  takes those grants off first (see
   [Moving from dataEditor](#moving-from-dataeditor)).
 
-Roles held on a folder or the organization, and memberships of groups, are
-not looked at. The simplest way to keep the audience small is a project of
+Roles held on a folder or the organization are not looked at, and nor is
+who is in a group: a group's grant there stops the run until someone who
+can see its members says otherwise. The simplest way to keep the audience small is a project of
 its own for the events dataset, where only the administrators hold project
 roles.
 
@@ -116,8 +123,9 @@ roles.
      `bqaa-writer` with `roles/bigquery.dataEditor`;
    - stops, before it grants anything, if that account already holds any
      role on the project, the events or views dataset, or the table, other
-     than the row-writer role on the table. `--allow-existing-grants` keeps
-     them, for an account someone audited. Roles granted to the account on a
+     than the row-writer role on the table; a grant to everyone, or to its
+     domain, counts. `--allow-existing-grants` keeps them, for an account
+     someone audited. Roles granted to the account on a
      folder, the organization, other datasets or through a group are not
      looked at;
    - creates, or finds, the project's custom role `bqaaRowWriter`, with two

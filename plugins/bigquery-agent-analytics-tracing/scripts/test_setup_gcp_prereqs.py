@@ -796,7 +796,7 @@ def test_a_token_creator_or_reader_with_a_project_role_that_reads_is_refused() -
             try:
                 setup._check_project_readers(args)
             except SystemExit as exc:
-                assert "(roles/bigquery.dataViewer on the project)" in str(exc)
+                assert "(roles/bigquery.dataViewer on the project test-project)" in str(exc)
             else:
                 raise AssertionError("expected SystemExit")
     # Project Viewers read only through the dataset entries this setup removes,
@@ -807,7 +807,7 @@ def test_a_token_creator_or_reader_with_a_project_role_that_reads_is_refused() -
         try:
             setup._check_project_readers(_args(reader=["group:r@example.com"], keep_project_groups=True))
         except SystemExit as exc:
-            assert "group:r@example.com (roles/viewer on the project)" in str(exc)
+            assert "group:r@example.com (roles/viewer on the project test-project)" in str(exc)
         else:
             raise AssertionError("expected SystemExit")
         setup._check_project_readers(_args(reader=["group:r@example.com"], keep_project_groups=True, allow_existing_grants=True))
@@ -829,7 +829,7 @@ def test_who_reads_every_row_through_a_project_role_is_listed() -> None:
     with _stub_run(_FakeRun([(("projects", "get-iam-policy"), 0, json.dumps(policy))])), contextlib.redirect_stdout(out):
         setup._check_project_readers(_args(reader=["group:r@example.com"]))
     assert "user:admin@example.com: roles/owner on the project" in out.getvalue()
-    assert "OK no --reader or --token-creator member holds a project role" in out.getvalue()
+    assert "OK no grant to everyone" in out.getvalue()
 
 
 def test_dataset_access_and_project_roles_are_settled_before_token_creators_and_readers() -> None:
@@ -840,7 +840,7 @@ def test_dataset_access_and_project_roles_are_settled_before_token_creators_and_
                           "and Editors off test-project.agent_analytics_reporting")
     check = labels.index("Check who reads every row, and that no reader or token creator does")
     for grant in (f"Grant token creation on {WRITER} to group:w@example.com", "Grant views dataset dataViewer to reader group:r@example.com"):
-        assert groups < check < labels.index(grant)
+        assert check < groups < labels.index(grant)
     assert not any(label.startswith("Check who reads every row") for label in _labels(_args(service_account="bqaa-writer")))
 
 
@@ -919,7 +919,7 @@ def test_a_token_creator_or_reader_with_a_grant_on_the_events_dataset_or_table_i
     try:
         _row_writer_run(fake)
     except SystemExit as exc:
-        assert "group:bqaa-writers@example.com (roles/bigquery.dataEditor on the dataset test-project.agent_analytics)" in str(exc)
+        assert "group:bqaa-writers@example.com: group:BQAA-writers@example.com (roles/bigquery.dataEditor on the dataset test-project.agent_analytics)" in str(exc)
     else:
         raise AssertionError("expected SystemExit")
     assert not _token_creator_calls(fake)
@@ -930,7 +930,7 @@ def test_a_token_creator_or_reader_with_a_grant_on_the_events_dataset_or_table_i
         try:
             setup._check_project_readers(_args(reader=["group:r@example.com"]))
         except SystemExit as exc:
-            assert "group:r@example.com (roles/bigquery.dataViewer on the table test-project.agent_analytics.agent_events)" in str(exc)
+            assert "group:r@example.com: group:r@example.com (roles/bigquery.dataViewer on the table test-project.agent_analytics.agent_events)" in str(exc)
         else:
             raise AssertionError("expected SystemExit")
     # A service account written as userByEmail in the dataset's access is matched.
@@ -974,6 +974,135 @@ def test_a_missing_bigquery_client_stops_before_any_change() -> None:
         else:
             raise AssertionError("expected SystemExit")
     assert fake.calls == []
+
+
+def _no_grant_calls(fake: _FakeRun) -> bool:
+    return not any(
+        c[:2] == ["bq", "add-iam-policy-binding"] or c[1:4] in (["iam", "roles", "create"], ["iam", "roles", "update"])
+        or "roles/iam.serviceAccountTokenCreator" in c or "GRANT" in " ".join(c)
+        or (c[1:3] == ["projects", "add-iam-policy-binding"])
+        for c in fake.calls
+    )
+
+
+def test_a_public_table_binding_stops_the_run_before_any_grant() -> None:
+    # allAuthenticatedUsers reaches the writer too: its tokens would read rows.
+    table = {"bindings": [{"role": "roles/bigquery.dataViewer", "members": ["allAuthenticatedUsers"]}]}
+    fake = _FakeRun(_answers({}, {}, table))
+    try:
+        _row_writer_run(fake)
+    except SystemExit as exc:
+        assert "allAuthenticatedUsers" in str(exc)
+    else:
+        raise AssertionError("expected SystemExit")
+    assert _no_grant_calls(fake)
+
+
+def test_a_domain_grant_that_covers_a_reader_stops_the_run_before_any_grant() -> None:
+    dataset = {"access": [{"role": "READER", "domain": "example.com"}]}
+    fake = _FakeRun(_answers({}, dataset, {}))
+    args = _args(service_account="bqaa-row-writer", writer_role="row-writer", execute=True, create_dataset=False,
+                 create_table=False, reader=["user:alice@example.com"], keep_project_groups=True)
+    with _stub_preflight(_preflight()), _stub_run(fake), contextlib.redirect_stdout(io.StringIO()):
+        try:
+            setup.run(args)
+        except SystemExit as exc:
+            assert "user:alice@example.com: domain:example.com (READER on the dataset test-project.agent_analytics)" in str(exc)
+        else:
+            raise AssertionError("expected SystemExit")
+    assert _no_grant_calls(fake)
+
+
+def test_a_public_project_binding_or_dataset_entry_stops_the_run() -> None:
+    public_project = {"bindings": [{"role": "roles/bigquery.dataViewer", "members": ["allUsers"]}]}
+    answers = [(("gcloud", "projects", "get-iam-policy"), 0, json.dumps(public_project)), (("bq", "show"), 0, "{}"),
+               (("bq", "get-iam-policy"), 0, "{}")]
+    with _stub_run(_FakeRun(answers)), contextlib.redirect_stdout(io.StringIO()):
+        try:
+            setup._check_project_readers(_args(service_account="bqaa-row-writer", writer_role="row-writer"))
+        except SystemExit as exc:
+            assert "everyone can read the table: allUsers" in str(exc)
+        else:
+            raise AssertionError("expected SystemExit")
+    # A public dataset entry the dataset-access step takes off is left to it;
+    # kept (--keep-project-groups), it stops the run.
+    public_dataset = {"access": [{"role": "READER", "iamMember": "allAuthenticatedUsers"}]}
+    answers = [(("gcloud", "projects", "get-iam-policy"), 0, "{}"), (("bq", "show"), 0, json.dumps(public_dataset)),
+               (("bq", "get-iam-policy"), 0, "{}")]
+    with _stub_run(_FakeRun(answers)), contextlib.redirect_stdout(io.StringIO()):
+        setup._check_project_readers(_args(reader=["group:r@example.com"]))
+        try:
+            setup._check_project_readers(_args(reader=["group:r@example.com"], keep_project_groups=True))
+        except SystemExit as exc:
+            assert "everyone can read the table" in str(exc)
+        else:
+            raise AssertionError("expected SystemExit")
+
+
+def test_a_group_grant_a_reader_may_be_in_needs_the_override() -> None:
+    dataset = {"access": [{"role": "READER", "groupByEmail": "all-staff@example.com"}]}
+    answers = [(("gcloud", "projects", "get-iam-policy"), 0, "{}"), (("bq", "show"), 0, json.dumps(dataset)),
+               (("bq", "get-iam-policy"), 0, "{}")]
+    with _stub_run(_FakeRun(answers)), contextlib.redirect_stdout(io.StringIO()):
+        try:
+            setup._check_project_readers(_args(reader=["user:alice@example.com"]))
+        except SystemExit as exc:
+            assert "may be a member of these" in str(exc) and "group:all-staff@example.com" in str(exc)
+        else:
+            raise AssertionError("expected SystemExit")
+        setup._check_project_readers(_args(reader=["user:alice@example.com"], allow_existing_grants=True))
+        # With no reader or token creator, there is no one to be a member.
+        setup._check_project_readers(_args(service_account="bqaa-row-writer", writer_role="row-writer"))
+
+
+def test_a_grant_to_the_writers_domain_counts_against_the_writer() -> None:
+    dataset = {"access": [{"role": "WRITER", "domain": "test-project.iam.gserviceaccount.com"}]}
+    fake = _FakeRun(_answers({}, dataset, {}))
+    try:
+        _row_writer_run(fake)
+    except SystemExit as exc:
+        assert "granted to domain:test-project.iam.gserviceaccount.com" in str(exc)
+    else:
+        raise AssertionError("expected SystemExit")
+    assert _no_grant_calls(fake)
+
+
+def test_the_reader_check_runs_before_any_change() -> None:
+    args = _args(service_account="bqaa-row-writer", writer_role="row-writer",
+                 token_creator=["group:w@example.com"], reader=["group:r@example.com"])
+    labels = _labels(args)
+    check = labels.index("Check who reads every row, and that no reader or token creator does")
+    writer = labels.index(f"Check that serviceAccount:{WRITER} holds nothing beyond the row-writer role")
+    first_change = min(labels.index("Ensure role projects/test-project/roles/bqaaRowWriter (bigquery.tables.get, bigquery.tables.updateData)"),
+                       labels.index("Take the project's Viewer and Editor groups off test-project.agent_analytics, "
+                                    "and Editors off test-project.agent_analytics_reporting"))
+    assert writer < check < first_change
+    # Readers alone: still before the dataset-access step and the grants.
+    labels = _labels(_args(reader=["group:r@example.com"]))
+    assert labels.index("Check who reads every row, and that no reader or token creator does") < labels.index(
+        "Take the project's Viewer and Editor groups off test-project.agent_analytics, and Editors off test-project.agent_analytics_reporting")
+
+
+def test_the_writer_check_itself_refuses_a_public_or_domain_grant() -> None:
+    # The writer check stands on its own: everyone's grant reaches the writer.
+    for table in ({"bindings": [{"role": "roles/bigquery.dataViewer", "members": ["allUsers"]}]},
+                  {"bindings": [{"role": "roles/bigquery.dataEditor", "members": ["domain:test-project.iam.gserviceaccount.com"]}]}):
+        answers = [(("gcloud", "projects", "get-iam-policy"), 0, "{}"), (("bq", "show"), 0, "{}"),
+                   (("bq", "get-iam-policy"), 0, json.dumps(table))]
+        args = _args(service_account="bqaa-row-writer", writer_role="row-writer", principal=f"serviceAccount:{WRITER}")
+        with _stub_run(_FakeRun(answers)), contextlib.redirect_stdout(io.StringIO()):
+            try:
+                setup._check_writer_grants(args)
+            except SystemExit as exc:
+                assert "already holds more than the row-writer role" in str(exc)
+            else:
+                raise AssertionError("expected SystemExit")
+    # Everyone's project role that reads nothing (a viewer of billing, say) is not the writer's.
+    harmless = {"bindings": [{"role": "roles/billing.viewer", "members": ["allAuthenticatedUsers"]}]}
+    answers = [(("gcloud", "projects", "get-iam-policy"), 0, json.dumps(harmless)), (("bq", "show"), 0, "{}"),
+               (("bq", "get-iam-policy"), 0, "{}")]
+    with _stub_run(_FakeRun(answers)), contextlib.redirect_stdout(io.StringIO()):
+        setup._check_writer_grants(_args(service_account="bqaa-row-writer", writer_role="row-writer", principal=f"serviceAccount:{WRITER}"))
 
 
 if __name__ == "__main__":
@@ -1026,6 +1155,13 @@ if __name__ == "__main__":
         test_a_token_creator_or_reader_with_a_grant_on_the_events_dataset_or_table_is_refused,
         test_every_grant_on_the_events_dataset_and_table_is_listed,
         test_a_missing_bigquery_client_stops_before_any_change,
+        test_a_public_table_binding_stops_the_run_before_any_grant,
+        test_a_domain_grant_that_covers_a_reader_stops_the_run_before_any_grant,
+        test_a_public_project_binding_or_dataset_entry_stops_the_run,
+        test_a_group_grant_a_reader_may_be_in_needs_the_override,
+        test_a_grant_to_the_writers_domain_counts_against_the_writer,
+        test_the_reader_check_runs_before_any_change,
+        test_the_writer_check_itself_refuses_a_public_or_domain_grant,
     ):
         test()
     print("setup_gcp_prereqs tests passed")

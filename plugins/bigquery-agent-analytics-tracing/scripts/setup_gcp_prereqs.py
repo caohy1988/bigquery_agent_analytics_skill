@@ -435,55 +435,13 @@ def _check_row_writer_role(args: argparse.Namespace) -> None:
         print(f"OK role {name} holds {', '.join(ROW_WRITER_PERMISSIONS)} and nothing else")
 
 
-# The access-entry key that names a member of each kind in a dataset's ACL.
-_ACCESS_KEYS = {"user": "userByEmail", "serviceAccount": "userByEmail", "group": "groupByEmail", "domain": "domain"}
-
-
-def _check_writer_grants(args: argparse.Namespace) -> None:
-    """Refuse a writer that already holds more than the row-writer role.
-
-    Looks at the project's IAM policy, the events and views datasets' access
-    and the events table's IAM policy. A reused service account (one an
-    earlier setup gave dataEditor and jobUser, say) would otherwise hand
-    every token creator a read of every row.
-    """
-    principal = args.principal
-    kind, _, name = principal.partition(":")
-    lowered = principal.lower()
-    role = f"projects/{args.project}/roles/{ROW_WRITER_ROLE_ID}"
-    found: list[str] = []
-    policy = _json_output(_gcloud_command(args, "projects", "get-iam-policy", args.project, "--format=json"))
-    for binding in policy.get("bindings") or []:
-        if lowered in (member.lower() for member in binding.get("members") or []):
-            found.append(f"{binding.get('role')} on the project {args.project}")
-    key = _ACCESS_KEYS.get(kind)
-    for dataset in dict.fromkeys([args.dataset, _views_dataset(args)]):
-        info = _json_output(_bq_command(args, "--format=json", "show", f"{args.project}:{dataset}"), missing_ok=True)
-        for entry in info.get("access") or []:
-            named = (key is not None and str(entry.get(key, "")).lower() == name.lower()) or str(
-                entry.get("iamMember", "")
-            ).lower() == lowered
-            if named:
-                found.append(f"{entry.get('role')} on the dataset {args.project}.{dataset}")
-    table = f"{args.project}:{args.dataset}.{args.table}"
-    table_policy = _json_output(_bq_command(args, "--format=json", "get-iam-policy", table), missing_ok=True)
-    for binding in table_policy.get("bindings") or []:
-        if binding.get("role") == role:
-            continue
-        if lowered in (member.lower() for member in binding.get("members") or []):
-            found.append(f"{binding.get('role')} on the table {args.project}.{args.dataset}.{args.table}")
-    if not found:
-        print(f"OK {principal} holds nothing on the project, the datasets or the table beyond {role}")
-        return
-    listed = "\n  - ".join(found)
-    if args.allow_existing_grants:
-        print(f"KEPT (--allow-existing-grants) what {principal} already holds:\n  - {listed}")
-        return
-    raise SystemExit(
-        f"{principal} already holds more than the row-writer role:\n  - {listed}\n"
-        "Its tokens could read or change the table. Use a new service account for the writer, or "
-        "remove those grants and run again; --allow-existing-grants keeps them (an audited account)."
-    )
+# Members a grant to which reaches every account.
+_PUBLIC = {"allusers", "allauthenticatedusers", "specialgroup:allauthenticatedusers", "specialgroup:allusers"}
+# What _restrict_dataset_access takes off each dataset (unless
+# --keep-project-groups): the project's Viewer and Editor groups, and the
+# entries that reach everyone.
+_EVENTS_CLEARED = {"specialgroup:projectreaders", "specialgroup:projectwriters"} | _PUBLIC
+_VIEWS_CLEARED = {"specialgroup:projectwriters"} | _PUBLIC
 
 
 def _dataset_member(entry: dict) -> str | None:
@@ -495,57 +453,129 @@ def _dataset_member(entry: dict) -> str | None:
     return entry.get("iamMember")
 
 
-def _member_matches(member: str, named: str) -> bool:
-    """Whether a --reader or --token-creator member is the one an entry
-    names (a dataset's ACL writes service accounts as userByEmail)."""
+def _covers(named: str, member: str) -> bool:
+    """Whether a grant to `named` reaches `member`: everyone; a domain the
+    member's address is in; or the member itself (a dataset's access writes
+    service accounts as userByEmail)."""
+    if named.lower() in _PUBLIC:
+        return True
     kind, _, email = member.partition(":")
-    other_kind, _, other_email = named.partition(":")
-    if email.lower() != other_email.lower():
+    other_kind, _, other = named.partition(":")
+    if other_kind == "domain":
+        return email.lower().rpartition("@")[2] == other.lower()
+    if email.lower() != other.lower():
         return False
     return kind == other_kind or {kind, other_kind} == {"serviceAccount", "user"}
 
 
-def _check_project_readers(args: argparse.Namespace) -> None:
-    """Name who can read every row (a project role, or a grant on the events
-    dataset or table), and stop if a --reader or --token-creator member is
-    one of them."""
-    roles = PROJECT_READ_ROLES + (PROJECT_GROUP_ROLES if args.keep_project_groups else ())
+def _unexpanded(named: str) -> bool:
+    """A member whose members this setup cannot see: a group, or a set of
+    identity-pool principals."""
+    return named.lower().startswith(("group:", "principalset://"))
+
+
+def _grants(args: argparse.Namespace, project_roles, datasets) -> list[tuple[str, str]]:
+    """(member, what it holds) for the project bindings of `project_roles`
+    (None: every role), the access of `datasets` (leaving out what the
+    dataset-access step takes off), and the events table's IAM policy."""
+    grants: list[tuple[str, str]] = []
     policy = _json_output(_gcloud_command(args, "projects", "get-iam-policy", args.project, "--format=json"))
-    grants: list[tuple[str, str]] = []  # (member, what it holds)
     for binding in policy.get("bindings") or []:
-        if binding.get("role") in roles:
+        if project_roles is None or binding.get("role") in project_roles:
             for member in binding.get("members") or []:
-                grants.append((member, f"{binding['role']} on the project"))
-    dataset = _json_output(_bq_command(args, "--format=json", "show", f"{args.project}:{args.dataset}"), missing_ok=True)
-    for entry in dataset.get("access") or []:
-        member = _dataset_member(entry)
-        if member and entry.get("role"):
-            grants.append((member, f"{entry['role']} on the dataset {args.project}.{args.dataset}"))
+                grants.append((member, f"{binding.get('role')} on the project {args.project}"))
+    for dataset in datasets:
+        cleared = set() if args.keep_project_groups else (_EVENTS_CLEARED if dataset == args.dataset else _VIEWS_CLEARED)
+        info = _json_output(_bq_command(args, "--format=json", "show", f"{args.project}:{dataset}"), missing_ok=True)
+        for entry in info.get("access") or []:
+            member = _dataset_member(entry)
+            if member and entry.get("role") and member.lower() not in cleared:
+                grants.append((member, f"{entry['role']} on the dataset {args.project}.{dataset}"))
     table = f"{args.project}:{args.dataset}.{args.table}"
     table_policy = _json_output(_bq_command(args, "--format=json", "get-iam-policy", table), missing_ok=True)
     for binding in table_policy.get("bindings") or []:
         for member in binding.get("members") or []:
             grants.append((member, f"{binding.get('role')} on the table {args.project}.{args.dataset}.{args.table}"))
+    return grants
+
+
+def _check_writer_grants(args: argparse.Namespace) -> None:
+    """Refuse a writer that already holds more than the row-writer role.
+
+    Looks at the project's IAM policy, the events and views datasets' access
+    and the events table's IAM policy, for grants to the writer itself, to
+    everyone, or to its domain. A reused service account (one an earlier
+    setup gave dataEditor and jobUser, say) would otherwise hand every token
+    creator a read of every row.
+    """
+    principal = args.principal
+    role = f"projects/{args.project}/roles/{ROW_WRITER_ROLE_ID}"
+    reading = set(PROJECT_READ_ROLES + PROJECT_GROUP_ROLES)
+    found: list[str] = []
+    for named, held in _grants(args, None, dict.fromkeys([args.dataset, _views_dataset(args)])):
+        if not _covers(named, principal):
+            continue
+        if held.endswith(f"on the project {args.project}"):
+            # Any project role of the writer's own; only reading roles of
+            # everyone's or its domain's.
+            if named.lower() != principal.lower() and held.split(" on the project")[0] not in reading:
+                continue
+        if held.startswith(f"{role} on the table") and named.lower() == principal.lower():
+            continue
+        found.append(f"{held} (granted to {named})")
+    if not found:
+        print(f"OK {principal} holds nothing on the project, the datasets or the table beyond {role}")
+        return
+    listed = "\n  - ".join(found)
+    if args.allow_existing_grants:
+        print(f"KEPT (--allow-existing-grants) what reaches {principal}:\n  - {listed}")
+        return
+    raise SystemExit(
+        f"{principal} already holds more than the row-writer role:\n  - {listed}\n"
+        "Its tokens could read or change the table. Use a new service account for the writer, or "
+        "remove those grants and run again; --allow-existing-grants keeps them (an audited account)."
+    )
+
+
+def _check_project_readers(args: argparse.Namespace) -> None:
+    """Name who can read every row (a project role, or a grant on the events
+    dataset or table). Stop when everyone can, or when a --reader or
+    --token-creator member can (its own grant, everyone's, or its domain's),
+    or may (through a group or identity pool this setup cannot see into)."""
+    roles = PROJECT_READ_ROLES + (PROJECT_GROUP_ROLES if args.keep_project_groups else ())
+    grants = _grants(args, roles, [args.dataset])
     if grants:
         listed = "\n  - ".join(f"{member}: {held}" for member, held in grants)
         print(f"These hold a project role that reads every table, or a grant on the events dataset or table:\n  - {listed}")
-    clashes = [
-        f"{member} ({held})"
-        for member in [*args.reader, *args.token_creator]
+    public = [f"{member} ({held})" for member, held in grants if member.lower() in _PUBLIC]
+    members = [*args.reader, *args.token_creator]
+    clashes = [f"{member}: {named} ({held})" for member in members for named, held in grants if _covers(named, member)]
+    unseen = [
+        f"{named} ({held})"
         for named, held in grants
-        if _member_matches(member, named)
-    ]
-    if not clashes:
-        print("OK no --reader or --token-creator member holds a project role that reads the table, "
-              "or any grant on the events dataset or table")
+        if _unexpanded(named) and not any(_covers(named, member) for member in members)
+    ] if members else []
+    problems = []
+    if public:
+        problems.append("everyone can read the table: " + "; ".join(public))
+    if clashes:
+        problems.append("a reader or token creator can read every row, views or not: " + "; ".join(clashes))
+    if unseen:
+        problems.append(
+            "a reader or token creator may be a member of these, which this setup cannot see into: "
+            + "; ".join(unseen)
+        )
+    if not problems:
+        print("OK no grant to everyone, and no --reader or --token-creator member reaches a project role "
+              "that reads the table, or any grant on the events dataset or table")
         return
     if args.allow_existing_grants:
-        print(f"KEPT (--allow-existing-grants): {'; '.join(clashes)}")
+        print("KEPT (--allow-existing-grants): " + " | ".join(problems))
         return
     raise SystemExit(
-        f"{'; '.join(clashes)}: a reader or token creator that holds this reads every row of the table, "
-        "views or not. Take it off (see docs/service-account-auth.md, Moving from dataEditor), or keep "
-        "the events dataset in a project of its own; --allow-existing-grants keeps them."
+        " | ".join(problems) + ". Take those grants off (see docs/service-account-auth.md, Moving from "
+        "dataEditor), or keep the events dataset in a project of its own; check the groups, then "
+        "--allow-existing-grants keeps them."
     )
 
 
@@ -711,6 +741,21 @@ def _ensure_table(
     print(f"CREATED table: {table_id}")
 
 
+def _readers_check_step(args: argparse.Namespace) -> Step:
+    return Step(
+        "Check who reads every row, and that no reader or token creator does",
+        action=lambda: _check_project_readers(args),
+        detail=(
+            "gcloud projects get-iam-policy, bq show of the events dataset, bq get-iam-policy "
+            f"of the table: list the holders of {', '.join(PROJECT_READ_ROLES)} on the project "
+            f"(and, with --keep-project-groups, {', '.join(PROJECT_GROUP_ROLES)}) and of any grant "
+            "on the events dataset or table; stop on a grant to everyone, and on one that reaches a "
+            "--reader or --token-creator member, or may (a group), unless --allow-existing-grants"
+        ),
+        needs_cli_auth=True,
+    )
+
+
 def _build_steps(args: argparse.Namespace) -> list[Step]:
     steps: list[Step] = []
     if args.enable_apis:
@@ -789,12 +834,13 @@ def _build_steps(args: argparse.Namespace) -> list[Step]:
                 action=lambda: _check_writer_grants(args),
                 detail=(
                     "gcloud projects get-iam-policy; bq show of the events and views "
-                    "datasets; bq get-iam-policy of the table. Stops on any other grant "
-                    "unless --allow-existing-grants"
+                    "datasets; bq get-iam-policy of the table. Stops on any other grant to it, "
+                    "to everyone or to its domain, unless --allow-existing-grants"
                 ),
                 needs_cli_auth=True,
             )
         )
+        steps.append(_readers_check_step(args))
         if args.grant_iam:
             steps.extend(
                 [
@@ -875,6 +921,9 @@ def _build_steps(args: argparse.Namespace) -> list[Step]:
             )
     if row_writer or args.reader:
         views_dataset = _views_dataset(args)
+        if not (row_writer and args.principal and (args.grant_iam or args.token_creator)):
+            # Readers alone: the check still runs before any change.
+            steps.append(_readers_check_step(args))
         if not args.keep_project_groups:
             steps.append(
                 Step(
@@ -889,20 +938,6 @@ def _build_steps(args: argparse.Namespace) -> list[Step]:
                     needs_adc=True,
                 )
             )
-        steps.append(
-            Step(
-                "Check who reads every row, and that no reader or token creator does",
-                action=lambda: _check_project_readers(args),
-                detail=(
-                    "gcloud projects get-iam-policy, bq show of the events dataset, bq get-iam-policy "
-                    f"of the table: list the holders of {', '.join(PROJECT_READ_ROLES)} on the project "
-                    f"(and, with --keep-project-groups, {', '.join(PROJECT_GROUP_ROLES)}) and of any grant "
-                    "on the events dataset or table; stop if a --reader or --token-creator member is one, "
-                    "unless --allow-existing-grants"
-                ),
-                needs_cli_auth=True,
-            )
-        )
     if args.service_account:
         email = _service_account_email(args.project, args.service_account)
         if args.token_creator and not args.enable_apis:
@@ -1285,9 +1320,9 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help=(
             "Keep a writer that already holds other grants on the project, the "
-            "datasets or the table (an audited account), and readers or token "
-            "creators that read every table through a project role. Without it, "
-            "setup stops before granting anything."
+            "datasets or the table (an audited account), and grants that reach "
+            "readers or token creators, or may (through a group), or everyone. "
+            "Without it, setup stops before granting anything."
         ),
     )
     parser.add_argument(
