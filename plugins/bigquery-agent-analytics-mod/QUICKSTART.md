@@ -22,7 +22,9 @@ checked: Windows, the desktop app and the editor extensions.
 
 ## Before you start
 
-Run `claude plugin list` (or `/plugin` in a session), and look for:
+Run `claude plugin list` (or `/plugin` in a session) for what is installed,
+and `claude plugin marketplace list` for where each marketplace was added
+from (`Source: GitHub` or `Source: Folder`). Look for:
 
 - **`bigquery-agent-analytics-mod`, already enabled**: your organization
   turned it on for you (with `@org-tools`, or another name than
@@ -36,10 +38,20 @@ Run `claude plugin list` (or `/plugin` in a session), and look for:
   pasted into your `~/.claude/settings.json` that run the tracer's
   scripts): this mod replaces it, so take those hooks out.
 - **The marketplace `bigquery-agent-analytics-plugin` added from a clone**
-  (a folder on your disk): install from it,
-  `claude plugin install bigquery-agent-analytics-mod@bigquery-agent-analytics-plugin`
-  with the same `--config` options. The `--marketplace` command below stops
-  with "its source doesn't match its extraKnownMarketplaces entry" there.
+  (`Source: Folder`): the mod installs from that clone's files, so bring the
+  clone up to date first, then install from it with the same `--config`
+  options. The `--marketplace` command below stops there with "its source
+  doesn't match its extraKnownMarketplaces entry".
+
+  ```bash
+  git -C path/to/your/clone pull
+  claude plugin marketplace update bigquery-agent-analytics-plugin
+  claude plugin install bigquery-agent-analytics-mod@bigquery-agent-analytics-plugin \
+    --config project=THE_PROJECT --config dataset=THE_DATASET
+  ```
+
+  A clone older than the mod has no mod to install, and an old one installs
+  an old mod: pull first.
 
 ## A. Your own sandbox
 
@@ -165,16 +177,31 @@ it is fixed.
 | It says | What to do |
 | --- | --- |
 | no working Google credentials | Sign in again (step 2 of your path), or fix what the notice says about the token command. A grant made moments ago can take a minute to apply |
-| BigQuery denied the identity access to the dataset | Ask your administrator for the access the notice names, then run `/bqaa-backfill` to send the rows that were refused |
+| BigQuery denied the identity access to the dataset | Ask your administrator for the row-writer grant on the table (`bigquery.tables.get` and `bigquery.tables.updateData`), never a role that reads rows such as `roles/bigquery.dataEditor`, then run `/bqaa-backfill` to send the rows that were refused |
 | BigQuery cannot find the dataset (or the table) | Check the names with your administrator, or make it: the notice prints the whole `setup.sh` command, ready to run. A dataset made moments ago can take a few minutes to accept rows; they are sent on their own then |
 | Every event appears twice in the table | The settings-hook tracer is on beside the mod: see [Before you start](#before-you-start) |
-| At install: "its source doesn't match its extraKnownMarketplaces entry" | The marketplace was added from another source (a clone): install from it, as in [Before you start](#before-you-start) |
+| At install: "its source doesn't match its extraKnownMarketplaces entry" | The marketplace was added from another source (a clone; `claude plugin marketplace list` says which): pull the clone, update the marketplace and install from it, as in [Before you start](#before-you-start) |
 
 ## For administrators
 
-1. **Sign in** with `gcloud auth login` (for `gcloud`, `bq` and the
-   scripts) and `gcloud auth application-default login` (the bootstrap's
-   view step).
+1. **What you need:** the Google Cloud CLI, signed in with
+   `gcloud auth login` (for `gcloud`, `bq` and the scripts) and
+   `gcloud auth application-default login` (the bootstrap's steps that
+   change the datasets' access); and Python 3 with the BigQuery client, in
+   a virtual environment:
+
+   ```bash
+   python3 -m venv .venv && .venv/bin/pip install google-cloud-bigquery
+   .venv/bin/python -c "import google.cloud.bigquery"
+   ```
+
+   If pip tries to build `cryptography` from source and fails (it did with
+   an Intel Python on an Apple-silicon Mac), take a built one:
+   `.venv/bin/pip install --only-binary=cryptography google-cloud-bigquery`.
+
+   The roles: project Owner, or Service Usage Admin, Service Account Admin,
+   Role Administrator, Project IAM Admin, BigQuery Data Owner and BigQuery
+   Job User.
 2. **Make the dataset, table and views** with the mod's `setup.sh`, as in
    [A.3](#3-make-the-dataset). Keep it in a project where only the
    administrators hold project roles: a project Owner, or a BigQuery data
@@ -183,13 +210,14 @@ it is fixed.
    the command when it is done. From the clone:
 
    ```bash
-   python3 bigquery_agent_analytics_skill/plugins/bigquery-agent-analytics-tracing/scripts/setup_gcp_prereqs.py \
+   .venv/bin/python bigquery_agent_analytics_skill/plugins/bigquery-agent-analytics-tracing/scripts/setup_gcp_prereqs.py \
      --project YOUR_PROJECT --dataset agent_analytics --no-create-dataset --no-create-table \
      --service-account bqaa-row-writer --writer-role row-writer \
      --token-creator group:WRITERS --reader group:READERS
    ```
 
-   It prints its plan; run it again with `--execute`. The writer service
+   It prints its plan; run it again with `--execute` (it checks the
+   BigQuery client before it changes anything). The writer service
    account may only insert rows. The writers' group may impersonate it. The
    readers' group may query the two usage views, which it authorizes on the
    events dataset, with Job User on the project, and no access to the table.
@@ -204,14 +232,17 @@ it is fixed.
      [managed settings](docs/managed-settings.md): the destination, the token
      command and every option are pinned, and the settings-hook tracer is
      turned off. Each person still signs in once.
-6. **Point the readers at the results:**
-   - the views in `<dataset>_reporting`: `daily_usage_by_user` and
-     `daily_usage_by_model`;
-   - the analysis skill in this repository
-     ([`bigquery-agent-analytics-skill/`](../../bigquery-agent-analytics-skill/SKILL.md)),
-     for questions about error rates, latency, token use and tool failures,
-     for those who may read the table;
-   - the queries in [`sql/sample_queries.sql`](sql/sample_queries.sql).
+6. **Point the readers at the results:** the two views in
+   `<dataset>_reporting`, `daily_usage_by_user` and `daily_usage_by_model`.
+   Readers are refused the table by design. Do not grant them the events
+   dataset or table to make other queries run: that reads everyone's
+   prompts and tool output.
+
+   For those who may read the raw rows (the administrators), there are the
+   queries in [`sql/sample_queries.sql`](sql/sample_queries.sql), and the
+   analysis skill in this repository
+   ([`bigquery-agent-analytics-skill/`](../../bigquery-agent-analytics-skill/SKILL.md)),
+   for questions about error rates, latency, token use and tool failures.
 
 The marketplace these commands name, `haiyuan-eng-google/bigquery_agent_analytics_skill`,
 is where the mod is published today. If the mod moves to another
