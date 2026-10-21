@@ -561,25 +561,6 @@ def _role_reads(args: argparse.Namespace, role: str, cache: dict) -> bool | None
     return None if held is None else bool(held & set(READ_PERMISSIONS))
 
 
-def _beyond_writer(permission: str) -> bool:
-    """A permission the writer must not hold beyond its row-writer binding on
-    the table: any of BigQuery's (reading, querying, changing, deleting,
-    anything on another table), changing an IAM policy, or acting as a
-    service account."""
-    return (permission.startswith("bigquery.") or permission.endswith(".setIamPolicy")
-            or permission.startswith("iam.serviceAccount"))
-
-
-def _role_beyond_writer(args: argparse.Namespace, role: str, cache: dict) -> bool | None:
-    """Whether a role reaching the writer from a grant not its own gives it
-    more than its row-writer binding: True for PROJECT_READ_ROLES; otherwise
-    from its permissions; None when they cannot be read."""
-    if role in PROJECT_READ_ROLES:
-        return True
-    held = _role_permissions(args, role, cache)
-    return None if held is None else any(_beyond_writer(permission) for permission in held)
-
-
 def _grants(args: argparse.Namespace, datasets) -> list[tuple[str, str, str, str]]:
     """(member, what it holds, the role, "project", "dataset" or "table")
     for every project binding, the access of `datasets` (leaving out what
@@ -640,15 +621,15 @@ def _check_writer_grants(args: argparse.Namespace) -> None:
     everyone, to its domain, or to a group it may be in (Cloud Identity is
     asked). A reused service account (one an earlier setup gave dataEditor
     and jobUser, say) would otherwise hand every token creator a read of
-    every row. Any project role of the writer's own counts; of everyone's,
-    its domain's or a group's, a role with any BigQuery permission (to read,
-    query, change or delete tables), or one that changes an IAM policy or
-    acts as a service account, or one whose permissions cannot be read.
+    every row. Every grant that reaches the writer counts, whatever its
+    role: the writer is to hold its row-writer binding on the table and
+    nothing else, and a role that looks harmless can still widen that role
+    (iam.roles.update) or delete the project. --allow-existing-grants keeps
+    an audited one.
     """
     principal = args.principal
     writer = principal.partition(":")[2]
     role = f"projects/{args.project}/roles/{ROW_WRITER_ROLE_ID}"
-    roles: dict = {}
     memberships: dict = {}
     definite: list[str] = []
     unverified: list[str] = []
@@ -659,14 +640,6 @@ def _check_writer_grants(args: argparse.Namespace) -> None:
         if reach == "no":
             continue
         line = f"{held} (granted to {named})"
-        known = True
-        if scope == "project" and named.lower() != principal.lower() and granted not in PROJECT_GROUP_ROLES:
-            beyond = _role_beyond_writer(args, granted, roles)
-            if beyond is False:
-                continue
-            if beyond is None:
-                line += _UNREAD_ROLE
-                known = False
         if reach == "maybe":
             kind, _, other = named.partition(":")
             answer = _member_of(args, other, writer, memberships) if kind == "group" else None
@@ -676,7 +649,7 @@ def _check_writer_grants(args: argparse.Namespace) -> None:
                 unverified.append(line)
                 continue
             line += " (the writer is a member, as Cloud Identity answers)"
-        (definite if known else unverified).append(line)
+        definite.append(line)
     if not definite and not unverified:
         print(f"OK {principal} holds nothing on the project, the datasets or the table beyond {role}")
         return
@@ -1018,13 +991,10 @@ def _build_steps(args: argparse.Namespace) -> list[Step]:
                 action=lambda: _check_writer_grants(args),
                 detail=(
                     "gcloud projects get-iam-policy; bq show of the events and views "
-                    "datasets; bq get-iam-policy of the table; gcloud iam roles describe of a "
-                    "project role granted to everyone, its domain or a group; Cloud Identity for a "
-                    "group's grant. Stops on any other grant to it, or to a group it is in (a project "
-                    "role of everyone's, its domain's or a group's when it holds any BigQuery permission, "
-                    "changes an IAM policy or acts as a service account), unless --allow-existing-grants; "
-                    "and on one that may reach it (a group Cloud Identity does not answer for, a role whose "
-                    "permissions cannot be read), unless --accept-unverified"
+                    "datasets; bq get-iam-policy of the table; Cloud Identity for a group's grant. "
+                    "Stops on any other grant that reaches it, whatever the role: its own, everyone's, "
+                    "its domain's, or a group's it is in, unless --allow-existing-grants; and on a "
+                    "group's grant Cloud Identity does not answer for, unless --accept-unverified"
                 ),
                 needs_cli_auth=True,
             )

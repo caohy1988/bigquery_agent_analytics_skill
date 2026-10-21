@@ -1136,12 +1136,20 @@ def test_the_writer_check_itself_refuses_a_public_or_domain_grant() -> None:
                 assert "already holds more than the row-writer role" in str(exc)
             else:
                 raise AssertionError("expected SystemExit")
-    # Everyone's project role that reads nothing (a viewer of billing, say) is not the writer's.
+    # Everyone's project role counts too, whatever it holds (a viewer of billing, say).
     harmless = {"bindings": [{"role": "roles/billing.viewer", "members": ["allAuthenticatedUsers"]}]}
     answers = [(("gcloud", "projects", "get-iam-policy"), 0, json.dumps(harmless)), (("bq", "show"), 0, "{}"),
                (("bq", "get-iam-policy"), 0, "{}")]
+    args = _args(service_account="bqaa-row-writer", writer_role="row-writer", principal=f"serviceAccount:{WRITER}")
     with _stub_run(_FakeRun(answers)), contextlib.redirect_stdout(io.StringIO()):
-        setup._check_writer_grants(_args(service_account="bqaa-row-writer", writer_role="row-writer", principal=f"serviceAccount:{WRITER}"))
+        try:
+            setup._check_writer_grants(args)
+        except SystemExit as exc:
+            assert "roles/billing.viewer on the project test-project (granted to allAuthenticatedUsers)" in str(exc)
+        else:
+            raise AssertionError("expected SystemExit")
+        args.allow_existing_grants = True
+        setup._check_writer_grants(args)
 
 
 GROUPS = dict(token_creator=["group:bqaa-writers@example.com"], reader=["group:bqaa-readers@example.com"])
@@ -1307,22 +1315,25 @@ def test_a_custom_project_role_that_reads_is_found() -> None:
 
 
 def test_the_writer_check_reads_a_broad_grants_custom_role() -> None:
+    # Everyone's custom role reaches the writer whatever it holds, read or
+    # not, and the writer check asks nothing about its permissions.
     args = _args(service_account="bqaa-row-writer", writer_role="row-writer", principal=f"serviceAccount:{WRITER}")
     raw = json.dumps({"includedPermissions": ["bigquery.tables.getData"]})
     narrow = json.dumps({"includedPermissions": ["resourcemanager.projects.get"]})
     policy = {"bindings": [{"role": "projects/test-project/roles/rawReader", "members": ["allAuthenticatedUsers"]}]}
-    for code, answer, stops in ((0, raw, True), (1, "ERROR: PERMISSION_DENIED", True), (0, narrow, False)):
+    for code, answer in ((0, raw), (1, "ERROR: PERMISSION_DENIED"), (0, narrow)):
         answers = [(("describe", "rawReader"), code, answer), (("gcloud", "projects", "get-iam-policy"), 0, json.dumps(policy)),
                    (("bq", "show"), 0, "{}"), (("bq", "get-iam-policy"), 0, "{}")]
-        with _stub_run(_FakeRun(answers)), contextlib.redirect_stdout(io.StringIO()):
+        fake = _FakeRun(answers)
+        with _stub_run(fake), contextlib.redirect_stdout(io.StringIO()):
             try:
                 setup._check_writer_grants(args)
             except SystemExit as exc:
-                assert stops and "projects/test-project/roles/rawReader on the project test-project" in str(exc)
-                if code:
-                    assert "a role whose permissions could not be read" in str(exc)
+                assert "projects/test-project/roles/rawReader on the project test-project (granted to allAuthenticatedUsers)" in str(exc)
+                assert "--allow-existing-grants keeps them" in str(exc)
             else:
-                assert not stops
+                raise AssertionError("expected SystemExit")
+        assert not [c for c in fake.calls if "describe" in c]
 
 
 def test_domain_members_are_refused_for_readers_and_token_creators() -> None:
@@ -1477,9 +1488,30 @@ def test_an_inherited_project_role_beyond_the_writers_access_is_refused() -> Non
     else:
         raise AssertionError("expected SystemExit for everyone's jobUser")
     assert _no_grant_calls(fake)
-    # A role with nothing of BigQuery's or IAM's, through the same group, is not the writer's concern.
-    policy = {"bindings": [{"role": "projects/test-project/roles/logReader", "members": ["group:maintenance@example.com"]}]}
-    fake = _FakeRun([(("describe", "logReader"), 0, logs), alice_out, writer_in] + _answers(policy, {}, {}))
+    # A role that holds nothing of BigQuery's counts too: Role Administrator
+    # (iam.roles.update) would let the writer's tokens widen bqaaRowWriter,
+    # and the project deleter remove the project. So do a log reader, and
+    # any other role, when the writer is in the group.
+    role_admin = json.dumps({"includedPermissions": ["iam.roles.get", "iam.roles.update"]})
+    deleter = json.dumps({"includedPermissions": ["resourcemanager.projects.delete"]})
+    for role, words, answer in (("roles/iam.roleAdmin", ("describe", "roles/iam.roleAdmin"), role_admin),
+                                ("projects/test-project/roles/roleEditor", ("describe", "roleEditor"), role_admin),
+                                ("roles/resourcemanager.projectDeleter", ("describe", "roles/resourcemanager.projectDeleter"), deleter),
+                                ("projects/test-project/roles/logReader", ("describe", "logReader"), logs)):
+        policy = {"bindings": [{"role": role, "members": ["group:maintenance@example.com"]}]}
+        for membership, expected in ((writer_in, "(the writer is a member, as Cloud Identity answers)"), (None, "could not rule out")):
+            fake = _FakeRun([(words, 0, answer), alice_out] + ([membership] if membership else []) + _answers(policy, {}, {}))
+            try:
+                _row_writer_run(fake, token_creator=["user:alice@example.com"])
+            except SystemExit as exc:
+                assert f"{role} on the project test-project (granted to group:maintenance@example.com)" in str(exc) and expected in str(exc)
+            else:
+                raise AssertionError(f"expected SystemExit for {role}")
+            assert _no_grant_calls(fake)
+    # The writer outside the group: the run goes on.
+    policy = {"bindings": [{"role": "roles/iam.roleAdmin", "members": ["group:maintenance@example.com"]}]}
+    writer_out = (("check-transitive-membership", f"--member-email={WRITER}"), 0, "{}")
+    fake = _FakeRun([alice_out, writer_out] + _answers(policy, {}, {}))
     _row_writer_run(fake, token_creator=["user:alice@example.com"])
     assert _token_creator_calls(fake)
 
