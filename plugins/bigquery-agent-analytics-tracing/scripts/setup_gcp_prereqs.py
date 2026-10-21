@@ -526,15 +526,11 @@ def _member_of(args: argparse.Namespace, group: str, member: str, cache: dict) -
     return cache[key]
 
 
-def _role_reads(args: argparse.Namespace, role: str, cache: dict) -> bool | None:
-    """Whether a role reads table data (READ_PERMISSIONS): True for
-    PROJECT_READ_ROLES and a dataset's READER, WRITER and OWNER; otherwise
-    from the permissions gcloud iam roles describe lists, for a custom role
-    of a project or an organization or any other predefined role. A role
-    that does not exist grants nothing; None when one that does cannot be
-    read."""
-    if role in PROJECT_READ_ROLES or role in ("READER", "WRITER", "OWNER"):
-        return True
+def _role_permissions(args: argparse.Namespace, role: str, cache: dict) -> frozenset[str] | None:
+    """The permissions gcloud iam roles describe lists for a role: a custom
+    role of a project or an organization, or a predefined one. A role that
+    does not exist grants nothing (an empty set); None when one that does
+    cannot be read."""
     if role not in cache:
         parts = role.split("/")
         if len(parts) == 4 and parts[0] in ("projects", "organizations") and parts[2] == "roles":
@@ -546,14 +542,42 @@ def _role_reads(args: argparse.Namespace, role: str, cache: dict) -> bool | None
         answer = None
         if result.returncode == 0:
             try:
-                held = set(json.loads(result.stdout or "{}").get("includedPermissions") or [])
-                answer = bool(held & set(READ_PERMISSIONS))
+                answer = frozenset(json.loads(result.stdout or "{}").get("includedPermissions") or [])
             except (json.JSONDecodeError, AttributeError):
                 answer = None
         elif "NOT_FOUND" in f"{result.stderr or ''}\n{result.stdout or ''}":
-            answer = False
+            answer = frozenset()
         cache[role] = answer
     return cache[role]
+
+
+def _role_reads(args: argparse.Namespace, role: str, cache: dict) -> bool | None:
+    """Whether a role reads table data (READ_PERMISSIONS): True for
+    PROJECT_READ_ROLES and a dataset's READER, WRITER and OWNER; otherwise
+    from its permissions; None when they cannot be read."""
+    if role in PROJECT_READ_ROLES or role in ("READER", "WRITER", "OWNER"):
+        return True
+    held = _role_permissions(args, role, cache)
+    return None if held is None else bool(held & set(READ_PERMISSIONS))
+
+
+def _beyond_writer(permission: str) -> bool:
+    """A permission the writer must not hold beyond its row-writer binding on
+    the table: any of BigQuery's (reading, querying, changing, deleting,
+    anything on another table), changing an IAM policy, or acting as a
+    service account."""
+    return (permission.startswith("bigquery.") or permission.endswith(".setIamPolicy")
+            or permission.startswith("iam.serviceAccount"))
+
+
+def _role_beyond_writer(args: argparse.Namespace, role: str, cache: dict) -> bool | None:
+    """Whether a role reaching the writer from a grant not its own gives it
+    more than its row-writer binding: True for PROJECT_READ_ROLES; otherwise
+    from its permissions; None when they cannot be read."""
+    if role in PROJECT_READ_ROLES:
+        return True
+    held = _role_permissions(args, role, cache)
+    return None if held is None else any(_beyond_writer(permission) for permission in held)
 
 
 def _grants(args: argparse.Namespace, datasets) -> list[tuple[str, str, str, str]]:
@@ -617,8 +641,9 @@ def _check_writer_grants(args: argparse.Namespace) -> None:
     asked). A reused service account (one an earlier setup gave dataEditor
     and jobUser, say) would otherwise hand every token creator a read of
     every row. Any project role of the writer's own counts; of everyone's,
-    its domain's or a group's, a role that reads tables, or one whose
-    permissions cannot be read.
+    its domain's or a group's, a role with any BigQuery permission (to read,
+    query, change or delete tables), or one that changes an IAM policy or
+    acts as a service account, or one whose permissions cannot be read.
     """
     principal = args.principal
     writer = principal.partition(":")[2]
@@ -636,10 +661,10 @@ def _check_writer_grants(args: argparse.Namespace) -> None:
         line = f"{held} (granted to {named})"
         known = True
         if scope == "project" and named.lower() != principal.lower() and granted not in PROJECT_GROUP_ROLES:
-            reads = _role_reads(args, granted, roles)
-            if reads is False:
+            beyond = _role_beyond_writer(args, granted, roles)
+            if beyond is False:
                 continue
-            if reads is None:
+            if beyond is None:
                 line += _UNREAD_ROLE
                 known = False
         if reach == "maybe":
@@ -995,9 +1020,11 @@ def _build_steps(args: argparse.Namespace) -> list[Step]:
                     "gcloud projects get-iam-policy; bq show of the events and views "
                     "datasets; bq get-iam-policy of the table; gcloud iam roles describe of a "
                     "project role granted to everyone, its domain or a group; Cloud Identity for a "
-                    "group's grant. Stops on any other grant to it, or to a group it is in, unless "
-                    "--allow-existing-grants; and on one that may reach it (a group Cloud Identity does "
-                    "not answer for, a role whose permissions cannot be read), unless --accept-unverified"
+                    "group's grant. Stops on any other grant to it, or to a group it is in (a project "
+                    "role of everyone's, its domain's or a group's when it holds any BigQuery permission, "
+                    "changes an IAM policy or acts as a service account), unless --allow-existing-grants; "
+                    "and on one that may reach it (a group Cloud Identity does not answer for, a role whose "
+                    "permissions cannot be read), unless --accept-unverified"
                 ),
                 needs_cli_auth=True,
             )

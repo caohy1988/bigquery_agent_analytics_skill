@@ -1432,6 +1432,58 @@ def test_accepting_the_unverified_keeps_the_definite_refusals() -> None:
             raise AssertionError("expected SystemExit")
 
 
+def test_an_inherited_project_role_beyond_the_writers_access_is_refused() -> None:
+    # A role the writer gets through a group, everyone or a domain counts
+    # when it does more than insert rows: deleting tables, running queries,
+    # changing IAM. Alice, the token creator, is outside the group.
+    janitor = json.dumps({"includedPermissions": ["bigquery.tables.delete", "bigquery.tables.get"]})
+    job_user = json.dumps({"includedPermissions": ["bigquery.jobs.create", "resourcemanager.projects.get"]})
+    iam_admin = json.dumps({"includedPermissions": ["resourcemanager.projects.setIamPolicy"]})
+    logs = json.dumps({"includedPermissions": ["logging.logEntries.list"]})
+    alice_out = (("check-transitive-membership", "--member-email=alice@example.com"), 0, "{}")
+    writer_in = (("check-transitive-membership", f"--member-email={WRITER}"), 0, '{"hasMembership": true}')
+    cases = (
+        ("projects/test-project/roles/tableJanitor", ("describe", "tableJanitor"), janitor),
+        ("roles/bigquery.jobUser", ("describe", "roles/bigquery.jobUser"), job_user),
+        ("projects/test-project/roles/iamAdmin", ("describe", "iamAdmin"), iam_admin),
+    )
+    for role, words, answer in cases:
+        policy = {"bindings": [{"role": role, "members": ["group:maintenance@example.com"]}]}
+        # The writer in the group, as Cloud Identity answers: known extra access.
+        fake = _FakeRun([(words, 0, answer), alice_out, writer_in] + _answers(policy, {}, {}))
+        try:
+            _row_writer_run(fake, token_creator=["user:alice@example.com"], accept_unverified=True)
+        except SystemExit as exc:
+            assert f"{role} on the project test-project (granted to group:maintenance@example.com) (the writer is a member" in str(exc)
+        else:
+            raise AssertionError(f"expected SystemExit for {role}")
+        assert _no_grant_calls(fake)
+        # Unanswered: not ruled out.
+        fake = _FakeRun([(words, 0, answer), alice_out] + _answers(policy, {}, {}))
+        try:
+            _row_writer_run(fake, token_creator=["user:alice@example.com"])
+        except SystemExit as exc:
+            assert "could not rule out" in str(exc) and f"{role} on the project test-project" in str(exc)
+        else:
+            raise AssertionError(f"expected SystemExit for {role}, unanswered")
+        assert _no_grant_calls(fake)
+    # Granted to everyone, jobUser lets the writer run queries.
+    public = {"bindings": [{"role": "roles/bigquery.jobUser", "members": ["allAuthenticatedUsers"]}]}
+    fake = _FakeRun([(("describe", "roles/bigquery.jobUser"), 0, job_user)] + _answers(public, {}, {}))
+    try:
+        _row_writer_run(fake)
+    except SystemExit as exc:
+        assert "roles/bigquery.jobUser on the project test-project (granted to allAuthenticatedUsers)" in str(exc)
+    else:
+        raise AssertionError("expected SystemExit for everyone's jobUser")
+    assert _no_grant_calls(fake)
+    # A role with nothing of BigQuery's or IAM's, through the same group, is not the writer's concern.
+    policy = {"bindings": [{"role": "projects/test-project/roles/logReader", "members": ["group:maintenance@example.com"]}]}
+    fake = _FakeRun([(("describe", "logReader"), 0, logs), alice_out, writer_in] + _answers(policy, {}, {}))
+    _row_writer_run(fake, token_creator=["user:alice@example.com"])
+    assert _token_creator_calls(fake)
+
+
 if __name__ == "__main__":
     for test in (
         test_service_account_plan,
@@ -1499,6 +1551,7 @@ if __name__ == "__main__":
         test_a_group_grant_the_writer_may_be_in,
         test_the_guides_setup_where_cloud_identity_answers_403,
         test_accepting_the_unverified_keeps_the_definite_refusals,
+        test_an_inherited_project_role_beyond_the_writers_access_is_refused,
     ):
         test()
     print("setup_gcp_prereqs tests passed")

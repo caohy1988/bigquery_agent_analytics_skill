@@ -88,8 +88,12 @@ So the bootstrap, with `--writer-role row-writer` or `--reader`:
   takes those grants off first (see
   [Moving from dataEditor](#moving-from-dataeditor)).
 - does the same for the writer: a grant to a group it may be in counts,
-  and Cloud Identity is asked. The writer's own `bqaaRowWriter` binding on
-  the table is not a reading grant, so a second run does not stop on it.
+  and Cloud Identity is asked. A project role that reaches the writer
+  through everyone, a domain or a group counts when it holds any BigQuery
+  permission (to read, run queries, change or delete tables), changes an
+  IAM policy or acts as a service account, not only when it reads: the
+  writer must hold nothing but its `bqaaRowWriter` binding on the table.
+  That binding is not a reading grant, so a second run does not stop on it.
 
 `--reader` and `--token-creator` take `user:`, `group:` or
 `serviceAccount:` members, not `domain:`: Token Creator for a domain would
