@@ -155,6 +155,11 @@ claude --plugin-dir ./plugins/bigquery-agent-analytics-mod
 Use this mod **or** the settings-hook tracing plugin against a table, not both:
 with both enabled every event is written twice.
 
+**For a whole team**, an administrator can turn the mod on for everyone with
+the host's managed settings, pinning the destination, the token command and
+every option, and turning off the settings-hook tracer; each person still
+signs in to gcloud once. See [Managed settings](docs/managed-settings.md).
+
 ### The dataset
 
 [`setup.sh`](setup.sh) creates the rest with the `bq` CLI, and is safe to run
@@ -1105,6 +1110,7 @@ bash tests/setup.test.sh
 bash tests/version.test.sh    # plugin.json and PLUGIN_VERSION agree
 node tests/reload.test.mjs    # node 24: the welcome card across a fresh load
 bash tests/state-contract.test.sh   # the host's $.state, as the reload test models it
+HOST_CLI_LINUX=... bash tests/managed-settings.live.sh   # docker: a managed policy in a Linux container (below)
 python3 tests/views.test.py   # needs DuckDB: python3 -m pip install duckdb
 npx -p typescript tsc -p .    # once the host CLI has loaded the mod (below)
 ```
@@ -1457,6 +1463,38 @@ landed or missed, brings the whole moment up to date.
 `tests/version.test.sh` checks that `plugin.json` and `PLUGIN_VERSION` name
 the same version: the welcome card greets an update by the latter.
 
+`tests/managed-settings.live.sh` runs the
+[managed-settings](docs/managed-settings.md) guide in a Linux container, as
+an ordinary user under a root-owned policy. Offline, with the folder
+marketplace, it checks:
+
+* that the policy's options and environment pins hold against the person's
+  own settings, a `--settings` file, a repository's settings and the shell:
+  destination, capture, live writes, token command, the folder rows wait
+  in, agent name and identity;
+* that options a policy leaves out are the person's;
+* the move from the settings-hook tracer: it keeps writing until the policy
+  turns it off (and `allowManagedModsOnly` does not stop it);
+* what a person can try: `enabledPlugins`, `plugin disable` and
+  `plugin uninstall` change nothing, while safe and bare mode load no
+  plugin;
+* that the policy works as a drop-in beside an existing
+  `managed-settings.json`;
+* that a repository's `USER` becomes `user_id`;
+* that a repository's settings `env` reaches the token command, and that an
+  admin-owned wrapper with a clean environment keeps it out;
+* the emergency switches;
+* rollback: removing the policy straight after a migration brings the
+  tracer back, while a disable policy, kept until the earlier installs are
+  gone, does not;
+* the rows left on disk.
+
+With `BQAA_CHECK_NETWORK=1` it also checks the GitHub variant pinned to a
+tag: the tag's copy, `autoUpdate` off, when a fresh machine starts
+recording, the user tier, and a rollback that leaves no copy installed. It
+needs docker and the host CLI's Linux
+build (`HOST_CLI_LINUX`).
+
 `tests/reload.test.mjs` loads `hooks/register.ts` afresh, as a hot reload
 does, which the test kit cannot, under node 24 with a small stand-in for
 `$` (its `$.state` held for the session, its `$.store` across loads, store
@@ -1627,6 +1665,7 @@ hooks/lib/status.ts          /bqaa-status text
 hooks/lib/welcome.ts         the welcome card's text, and its records in the store: the version greeted, the card's landing, its close
 setup.sh                     creates the dataset, table, views dataset and views (bq CLI)
 docs/service-account-auth.md which identity writes where, who reads the views, offboarding
+docs/managed-settings.md     turning the mod on for a team with the host's managed settings
 sql/                         DDL and sample queries
 sql/views/                   the usage views setup.sh makes
 examples/sample-rows.jsonl   fixture output
