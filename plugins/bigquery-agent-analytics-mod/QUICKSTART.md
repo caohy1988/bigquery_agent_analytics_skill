@@ -1,68 +1,107 @@
 # Quickstart
 
-The mod records each coding-agent session (prompts, model requests with
-tokens and latency, tool calls) as rows in a BigQuery table. Two paths:
+The mod records each coding-agent session as rows in a BigQuery table:
+your prompts, the model's visible answers, tool calls with their arguments
+and results, token counts and timings (the README's
+[Privacy and security](README.md#privacy-and-security) says what is kept
+and what is removed). Pick your path:
 
-- [For you](#for-you-about-5-minutes): record your own sessions, in about
-  five minutes.
-- [For a team](#for-a-team): set up the table and access once, then roll it
-  out.
+- [A. Your own sandbox](#a-your-own-sandbox): your own Google Cloud
+  project, about ten minutes.
+- [B. Your team set it up](#b-your-team-set-it-up): an administrator gave
+  you a project, a dataset and a token command, or turned the mod on for
+  you.
+- [For administrators](#for-administrators): the table, the writers and the
+  readers, set up once.
 
-The [README](README.md) is the reference: every option, how it works,
-privacy, and the limits.
+The [README](README.md) is the reference: every option, how it works, and
+the limits.
 
-## For you (about 5 minutes)
+**Checked with** host CLI 2.1.304 on macOS and Linux, in the terminal. Not
+checked: Windows, the desktop app and the editor extensions.
+
+## Before you start
+
+Run `claude plugin list` (or `/plugin` in a session), and look for:
+
+- **`bigquery-agent-analytics-mod`, already enabled**: your organization
+  turned it on for you (with `@org-tools`, or another name than
+  `@bigquery-agent-analytics-plugin`), or you installed it earlier. Skip the
+  install step, and go to its check.
+- **`bigquery-agent-analytics-tracing`, enabled**: the settings-hook tracer.
+  Turn it off for the table the mod writes to, or every event is written
+  twice:
+  `claude plugin disable bigquery-agent-analytics-tracing@bigquery-agent-analytics-plugin`.
+  The same goes for the earlier settings-hook recipe (issue #4: hooks
+  pasted into your `~/.claude/settings.json` that run the tracer's
+  scripts): this mod replaces it, so take those hooks out.
+- **The marketplace `bigquery-agent-analytics-plugin` added from a clone**
+  (a folder on your disk): install from it,
+  `claude plugin install bigquery-agent-analytics-mod@bigquery-agent-analytics-plugin`
+  with the same `--config` options. The `--marketplace` command below stops
+  with "its source doesn't match its extraKnownMarketplaces entry" there.
+
+## A. Your own sandbox
 
 ### 1. What you need
 
-- The host CLI at version 2.1.292 or later (`claude --version`).
+- The host CLI (`claude --version`; checked with 2.1.304).
 - The Google Cloud CLI (`gcloud`, which includes `bq`).
-- A BigQuery dataset you may write to: a project and dataset name from your
-  administrator, or a sandbox project of your own. With your own project,
-  first make the dataset with step 1 of [For a team](#for-a-team).
+- A Google Cloud project where you may create BigQuery datasets.
 
 ### 2. Sign in to Google Cloud
 
 ```bash
-gcloud auth application-default login
+gcloud auth login                         # for gcloud and bq: setup.sh and the query below
+gcloud auth application-default login     # for the mod's default token command
 ```
 
-If your administrator gave you a token command (a writer service account),
-sign in with `gcloud auth login` instead, and pass that command at step 3.
+### 3. Make the dataset
 
-### 3. Install the mod
+```bash
+git clone https://github.com/haiyuan-eng-google/bigquery_agent_analytics_skill
+BQAA_PROJECT_ID=YOUR_PROJECT BQAA_DATASET=agent_analytics \
+  ./bigquery_agent_analytics_skill/plugins/bigquery-agent-analytics-mod/setup.sh
+```
+
+It makes the dataset, the events table and two usage views. BigQuery can
+take a few minutes to accept rows into a table made moments ago: the mod's
+rows wait, and are sent on their own then.
+
+### 4. Install the mod
 
 ```bash
 claude plugin install bigquery-agent-analytics-mod \
   --marketplace haiyuan-eng-google/bigquery_agent_analytics_skill \
-  --config project=YOUR_PROJECT --config dataset=YOUR_DATASET
+  --config project=YOUR_PROJECT --config dataset=agent_analytics
 ```
 
-With a token command from your administrator, add
-`--config "accessTokenCommand=THE COMMAND"`. It may add that other options
-are not set yet: they all have defaults. If a session is already open, run
-`/reload-plugins` there, or start a new one.
+It may say other options are not set yet: they all have defaults. If a
+session is already open, run `/reload-plugins` there, or start a new one.
 
-### 4. Check that it is on
+### 5. Check that it works
 
-Start a session (`claude`). In the first session after the install, a card
-above the prompt says the mod is installed and names your table; a few
-seconds later it says the first rows landed in BigQuery.
+Start a session (`claude`), and keep it open for ten seconds or more:
 
-- `/plugin` lists `1 mod active · bigquery-agent-analytics-mod`.
+- A card above the prompt says the mod is installed and names your table,
+  and a few seconds later that the first rows landed in BigQuery.
 - `/bqaa-status` starts with
-  `BigQuery Agent Analytics mod: enabled, target YOUR_PROJECT.YOUR_DATASET.agent_events`,
-  has no `notice` line, and after the first send (every 5 seconds) shows
-  `requests: 1 ok` or more.
+  `BigQuery Agent Analytics mod: enabled, target YOUR_PROJECT.agent_analytics.agent_events (US)`,
+  shows no `notice` line, and shows `requests: 1 ok` or more (the mod sends
+  every 5 seconds).
 
-### 5. See your rows
+That is the check. A session that ends within a few seconds leaves its rows
+on disk, in a spill file, and the next session sends them 15 seconds in.
 
-Type one prompt, for example "list the files here". Then, in a shell:
+### 6. See your rows
+
+Type one prompt, for example "list the files here". Then, in a shell (your
+own project, so you may read the table):
 
 ```bash
 bq --project_id=YOUR_PROJECT query --use_legacy_sql=false \
   'SELECT event_type, COUNT(*) AS n
-   FROM `YOUR_PROJECT.YOUR_DATASET.agent_events`
+   FROM `YOUR_PROJECT.agent_analytics.agent_events`
    WHERE timestamp > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR)
      AND JSON_VALUE(attributes, "$.writer.plugin") = "bigquery-agent-analytics-mod"
    GROUP BY event_type ORDER BY n DESC'
@@ -75,7 +114,49 @@ and `TOOL_COMPLETED` if a tool ran, and `STATE_DELTA` for the session's
 start. The session's end is written to disk when you leave, and sent by
 your next session.
 
-### 6. If rows are not written
+## B. Your team set it up
+
+### 1. What you need
+
+- The host CLI (`claude --version`; checked with 2.1.304).
+- The Google Cloud CLI.
+- From your administrator: the project and dataset, and the token command
+  if they gave you one. With managed settings, they gave you nothing to
+  type: the mod is already on.
+
+### 2. Sign in to Google Cloud
+
+Once, as yourself:
+
+- With a token command that impersonates a writer service account
+  (`gcloud auth print-access-token --impersonate-service-account=...`):
+  `gcloud auth login`.
+- Without one (your own access to the table):
+  `gcloud auth application-default login`.
+
+### 3. Install the mod
+
+Skip this if `claude plugin list` already shows the mod enabled. Otherwise:
+
+```bash
+claude plugin install bigquery-agent-analytics-mod \
+  --marketplace haiyuan-eng-google/bigquery_agent_analytics_skill \
+  --config project=THE_PROJECT --config dataset=THE_DATASET \
+  --config "accessTokenCommand=THE TOKEN COMMAND"
+```
+
+Leave out the last line if you were given no token command.
+
+### 4. Check that it works
+
+As in [A.5](#5-check-that-it-works): the card says the first rows landed,
+and `/bqaa-status` names your administrator's table, with no `notice` line
+and `requests: 1 ok` or more.
+
+You cannot read the rows yourself: a writer may insert rows and read none.
+Your administrator, and the readers of the usage views, can.
+
+## If rows are not written
 
 The status line under the prompt, the band above it and `/bqaa-status` say
 why, and how to fix it. Rows wait on your disk meanwhile, and are sent once
@@ -83,42 +164,55 @@ it is fixed.
 
 | It says | What to do |
 | --- | --- |
-| BigQuery cannot find the dataset | Check the project and dataset names with your administrator, or make the dataset: the notice prints the whole `setup.sh` command, ready to run. BigQuery can take a few minutes to see a new dataset; the rows are sent on their own then. |
-| BigQuery denied the identity access to the dataset | Ask for the access the notice names, then run `/bqaa-backfill` to send the rows that were refused. |
-| no working Google credentials | Sign in again (`gcloud auth application-default login`), or fix what the notice says about your token command. |
+| no working Google credentials | Sign in again (step 2 of your path), or fix what the notice says about the token command. A grant made moments ago can take a minute to apply |
+| BigQuery denied the identity access to the dataset | Ask your administrator for the access the notice names, then run `/bqaa-backfill` to send the rows that were refused |
+| BigQuery cannot find the dataset (or the table) | Check the names with your administrator, or make it: the notice prints the whole `setup.sh` command, ready to run. A dataset made moments ago can take a few minutes to accept rows; they are sent on their own then |
+| Every event appears twice in the table | The settings-hook tracer is on beside the mod: see [Before you start](#before-you-start) |
+| At install: "its source doesn't match its extraKnownMarketplaces entry" | The marketplace was added from another source (a clone): install from it, as in [Before you start](#before-you-start) |
 
-## For a team
+## For administrators
 
-1. **Make the dataset and table** with the mod's `setup.sh` (it uses `bq`,
-   and also makes a views dataset, `<dataset>_reporting`, with two usage
-   views):
+1. **Sign in** with `gcloud auth login` (for `gcloud`, `bq` and the
+   scripts) and `gcloud auth application-default login` (the bootstrap's
+   view step).
+2. **Make the dataset, table and views** with the mod's `setup.sh`, as in
+   [A.3](#3-make-the-dataset). Keep it in a project where only the
+   administrators hold project roles: a project Owner, or a BigQuery data
+   role on the project, reads every row.
+3. **Set up the writers and the readers, as two groups.** `setup.sh` prints
+   the command when it is done. From the clone:
 
    ```bash
-   git clone https://github.com/haiyuan-eng-google/bigquery_agent_analytics_skill
-   BQAA_PROJECT_ID=my-gcp-project BQAA_DATASET=agent_analytics \
-     ./bigquery_agent_analytics_skill/plugins/bigquery-agent-analytics-mod/setup.sh
+   python3 bigquery_agent_analytics_skill/plugins/bigquery-agent-analytics-tracing/scripts/setup_gcp_prereqs.py \
+     --project YOUR_PROJECT --dataset agent_analytics --no-create-dataset --no-create-table \
+     --service-account bqaa-row-writer --writer-role row-writer \
+     --token-creator group:WRITERS --reader group:READERS
    ```
 
-2. **Pick how people authenticate.**
-   [Service-account auth](docs/service-account-auth.md) covers a writer
-   service account that people impersonate (recommended: no key on any
-   machine, and nobody holds table access; `setup.sh --service-account`
-   sets it up), group access with each person's own credentials, and key
-   files for CI.
-3. **Grant access to a Google group**, not to individual people: Token
-   Creator on the writer account (`setup.sh --token-creator group:...`), or
-   the row-writer role on the table. Taking someone out of the group ends
-   their access.
-4. **Roll it out.** Give people the project, dataset and token command for
-   [For you](#for-you-about-5-minutes), or turn the mod on for everyone with
-   [managed settings](docs/managed-settings.md): nobody installs anything,
-   and the table and token command are pinned.
-5. **Point people at the results.**
-   - The views in `<dataset>_reporting`: `daily_usage_by_user` and
-     `daily_usage_by_model`. Readers need `roles/bigquery.dataViewer` on
-     that dataset and `roles/bigquery.jobUser`, and no access to the table.
-   - The analysis skill in this repository
+   It prints its plan; run it again with `--execute`. The writer service
+   account may only insert rows. The writers' group may impersonate it. The
+   readers' group may query the two usage views, which it authorizes on the
+   events dataset, with Job User on the project, and no access to the table.
+   [Service-account auth](docs/service-account-auth.md) explains each step,
+   CI (no key), offboarding, and what `user_id` can and cannot prove.
+4. **Check the access** with the mod's `tests/access.live.sh`, as the
+   writer and as a reader with no other access (the same guide says how).
+5. **Roll it out:**
+   - give people path B: the project, the dataset and the token command
+     `gcloud auth print-access-token --impersonate-service-account=bqaa-row-writer@YOUR_PROJECT.iam.gserviceaccount.com`;
+   - or turn the mod on for everyone with
+     [managed settings](docs/managed-settings.md): the destination, the token
+     command and every option are pinned, and the settings-hook tracer is
+     turned off. Each person still signs in once.
+6. **Point the readers at the results:**
+   - the views in `<dataset>_reporting`: `daily_usage_by_user` and
+     `daily_usage_by_model`;
+   - the analysis skill in this repository
      ([`bigquery-agent-analytics-skill/`](../../bigquery-agent-analytics-skill/SKILL.md)),
-     which a coding agent can use to answer questions about error rates,
-     latency, token use and tool failures from the table.
-   - The ready-made queries in [`sql/sample_queries.sql`](sql/sample_queries.sql).
+     for questions about error rates, latency, token use and tool failures,
+     for those who may read the table;
+   - the queries in [`sql/sample_queries.sql`](sql/sample_queries.sql).
+
+The marketplace these commands name, `haiyuan-eng-google/bigquery_agent_analytics_skill`,
+is where the mod is published today. If the mod moves to another
+marketplace (issue #14), the install commands here change to it.
