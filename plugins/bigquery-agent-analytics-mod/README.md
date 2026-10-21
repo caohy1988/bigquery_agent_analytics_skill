@@ -25,6 +25,9 @@ permission prompt were read back the same way, as was a session started
 before its dataset existed: its rows waited, then landed on their own once
 `setup.sh` had made the dataset.
 
+**New here?** [QUICKSTART.md](QUICKSTART.md) gets your sessions into BigQuery in
+about five minutes, and has the short path for setting it up for a team.
+
 ## Why a mod, and not settings hooks
 
 The tracing plugin runs a shell script for each settings-hook event. Those
@@ -1649,6 +1652,7 @@ the same views count other producers' requests but not their tokens.
 ## Files
 
 ```
+QUICKSTART.md                the five-minute install, and the short path for a team
 .claude-plugin/plugin.json   manifest and userConfig
 hooks/hooks.json             names the hooks module
 hooks/register.ts            hooks and $ wiring
