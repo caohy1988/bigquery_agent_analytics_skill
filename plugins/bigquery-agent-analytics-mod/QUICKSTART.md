@@ -241,7 +241,15 @@ it is fixed.
    ```
 
    It prints its plan; run it again with `--execute` (it checks the
-   BigQuery client before it changes anything). The writer service
+   BigQuery client before it changes anything). It may stop on grants it
+   could not rule out: Cloud Identity answers group membership only for
+   Google Workspace Enterprise and Cloud Identity Premium accounts, so
+   elsewhere every person's grant that reads the events data is listed,
+   the project's Owners included. Check the list, then run again with
+   `--accept-unverified`; a grant known to reach a reader, a token creator
+   or everyone still stops it
+   ([service-account auth](docs/service-account-auth.md) says what each
+   flag keeps). The writer service
    account may only insert rows. The writers' group may impersonate it. The
    readers' group may query the two usage views, which it authorizes on the
    events dataset, with Job User on the project, and no access to the table.
