@@ -6,7 +6,7 @@
   "plugins": [
     {
       "name": "bigquery-agent-analytics-mod",
-      "version": "0.1.0-pin1",
+      "version": "0.1.0-pin2",
       "source": "./plugins/claude_code_dist/bigquery-agent-analytics-mod"
     }
   ]
