@@ -204,10 +204,12 @@ Python it needs. Checked: in the container, the command behind it got only
 `CLOUDSDK_PYTHON` and a proxy set in the environment, where gcloud without
 it tried to start the named interpreter.
 
-If you cannot deliver the script, pinning variables in `env` covers only
-the ones you name, while gcloud reads many more (`CLOUDSDK_*` holds its
-account, proxy and token-file settings, among others), so prefer the
-script. Pinned to `""`, `CLOUDSDK_PYTHON`, `CLOUDSDK_PYTHON_ARGS`,
+If you cannot deliver the script, use the token command in
+[§6](#6-without-a-folder-the-github-marketplace-pinned), which needs no
+file and clears the environment itself. Pinning variables in `env` instead
+covers only the ones you name, while gcloud reads many more (`CLOUDSDK_*`
+holds its account, proxy and token-file settings, among others). Pinned to
+`""`, `CLOUDSDK_PYTHON`, `CLOUDSDK_PYTHON_ARGS`,
 `CLOUDSDK_CONFIG`, `HTTPS_PROXY`, `HTTP_PROXY` and `PYTHONPATH` reached the
 command empty, and gcloud still printed a token with each.
 `CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE` cannot be pinned that way: empty, gcloud
@@ -256,8 +258,8 @@ check in [`tests/managed-settings.live.sh`](../tests/managed-settings.live.sh):
 | Sets `enabledPlugins` false, or runs `claude plugin disable` or `claude plugin uninstall` (with or without `--scope managed`) | No effect: the uninstall is refused |
 | Starts the host with `--safe-mode`, `CLAUDE_CODE_SAFE_MODE=1` or `--bare` | No plugin loads, yours included: that session records nothing |
 | Sets `USER` in their shell or a repository's settings | `user_id` changes: the login name is what the machine says |
-| Works in a repository whose settings set gcloud's variables (`CLOUDSDK_PYTHON`, `CLOUDSDK_CONFIG`, a proxy, a CA file) | They reach the token command unless it is the wrapper; through the wrapper, gcloud gets only `HOME` and `PATH` |
-| Works in a repository whose settings set `LD_PRELOAD` or `PATH` | They reach every process the session starts, the wrapper's own shell included. No setting here prevents it: trust repositories accordingly |
+| Works in a repository whose settings set gcloud's variables (`CLOUDSDK_PYTHON`, `CLOUDSDK_CONFIG`, a proxy, a CA file) | They reach the token command unless it is the wrapper, or §6's `env -i` command; through the wrapper, gcloud gets only `HOME` and `PATH`, and through the command, only `PATH` |
+| Works in a repository whose settings set `LD_PRELOAD` or `PATH` | They reach every process the session starts, the wrapper's own shell (or `env` itself) included. No setting here prevents it: trust repositories accordingly |
 | Uses another tool, or edits the policy with administrator rights on the machine | Not covered by a policy |
 | Inserts rows of their own with the writer's tokens | Possible ([service-account auth](service-account-auth.md)) |
 
@@ -304,7 +306,11 @@ twice, see the query in [Roll out in stages](#7-roll-out-in-stages).
 ## 6. Without a folder: the GitHub marketplace, pinned
 
 Where you can deliver settings but not files, name the GitHub marketplace,
-pinned to a tag, with `autoUpdate` off:
+pinned to a tag, with `autoUpdate` off. Every option and pin is as in the
+folder policy except the token command. The wrapper in
+[The policy](#2-the-policy) is a file this variant cannot deliver, and with
+`accessTokenCommand` set, the mod tries no other command. So name one that
+needs no file and clears the environment itself:
 
 ```json
 {
@@ -321,12 +327,38 @@ pinned to a tag, with `autoUpdate` off:
   },
   "pluginConfigs": {
     "bigquery-agent-analytics-mod@bigquery-agent-analytics-plugin": {
-      "options": { "...": "every option, as in the folder policy" }
+      "options": {
+        "...": "every other option, as in the folder policy",
+        "accessTokenCommand": "/usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/gcloud auth print-access-token --impersonate-service-account=bqaa-row-writer@my-gcp-project.iam.gserviceaccount.com"
+      }
     }
   },
   "env": { "...": "the same pins as the folder policy" }
 }
 ```
+
+The mod splits that line itself and runs it with no shell, so `env -i`
+starts gcloud with only `PATH`, and a repository's settings `env` does not
+reach it. With no `HOME`, gcloud finds the person's configuration through
+their account's home folder. As with the wrapper, use gcloud's absolute
+path on your machines, and a `PATH` that holds the Python it needs.
+Checked:
+
+- In the container, a stand-in gcloud at that path got only `PATH` (and
+  its shell's `PWD`), in a repository whose settings set gcloud's
+  variables.
+- On macOS, with the real gcloud, the command printed a token with
+  `CLOUDSDK_PYTHON`, `CLOUDSDK_CONFIG`, a proxy, `PYTHONPATH` and `HOME`
+  all set to wrong values. Without `env -i`, gcloud tried to start the
+  named interpreter.
+
+Someone who has not signed in sees "no working Google credentials", with
+`env` named as the token command: they run `gcloud auth login`, as in
+[What each person needs](#3-what-each-person-needs).
+
+If you name gcloud directly instead (`/usr/bin/gcloud auth print-access-token ...`),
+a repository's settings `env` reaches it: add the fallback pins from
+[The policy](#2-the-policy), which cover only the variables they name.
 
 Checked in a container, against a test tag:
 
@@ -393,13 +425,16 @@ under `~/.claude/plugins/cache/` on a pilot machine.
 
 ## 8. Stop, roll back, revoke
 
-Checked in a container unless noted:
+Each policy change below goes in the managed source that holds the policy
+(see [The policy](#2-the-policy)). Under first-wins, a change in a
+lower-ranked file that is skipped has no effect. Checked in a container,
+with the drop-in, unless noted:
 
 | To... | Do | What happens |
 | --- | --- | --- |
 | Stop recording, keep the mod | Policy: `options.enabled: false` and `env` `BQAA_TRACE_ENABLED: "false"` | The mod loads and records nothing (`/bqaa-status`: `disabled`, `captured 0`) |
 | Unload the mod at once | Policy: `"bigquery-agent-analytics-mod@org-tools": false` | The mod does not load |
-| Roll back | The disable policy below, kept until the earlier installs are gone; then delete the drop-in and the folder | Nothing loads, and no tracer hook runs |
+| Roll back | The disable policy below, in the source that holds the policy, kept until the earlier installs are gone; then remove it from that source, and delete the folder | Nothing loads, and no tracer hook runs |
 | Revoke the writer's tokens | Disable the writer service account ([service-account auth](service-account-auth.md#offboarding)) | Tokens are refused, issued ones included (a check refused one with `401` within 15 seconds, live). Sessions show "no working Google credentials" and keep rows on disk |
 
 Each takes effect when a session starts.
@@ -407,8 +442,13 @@ Each takes effect when a session starts.
 **Roll back in this order**, because the policy is also what keeps the
 earlier ways in off:
 
-1. Replace the drop-in with the disable policy: every id off, and capture
-   off for any copy that still loads.
+1. Put the disable policy where the policy is now: every id off, and
+   capture off for any copy that still loads. For a file deployment,
+   replace the drop-in with it. Where you put the complete policy in a
+   higher-ranked source (an admin console, or a device-management
+   profile), replace it there. A disable policy in the drop-in would be
+   skipped, and that source's `BQAA_TRACE_ENABLED: "true"` would outrank
+   the drop-in's `false`, so the mod would keep recording.
 
    ```json
    {
@@ -423,15 +463,24 @@ earlier ways in off:
    }
    ```
 
-   Checked: with earlier installs still there, nothing loads and no tracer
-   hook runs.
+   Checked, for the drop-in: with earlier installs still there, nothing
+   loads and no tracer hook runs.
+
+   Before going on, check on pilot machines that it is in effect:
+   `claude -p --debug-file /tmp/bqaa.log /bqaa-status` leaves no
+   `hooks module bigquery-agent-analytics-mod` line in the log. Where
+   several managed sources apply, `/status` in an interactive session
+   lists the one you changed under "Setting sources". Not checked here: the
+   container has only the file source.
 2. On each machine, remove the earlier installs, as the person or a script
    run as them: `claude plugin uninstall` for the earlier mod and the
    tracer (and the GitHub-sourced copy, for that variant), and the tracer's
    hooks pasted into their settings. `claude plugin list` shows none.
-3. Delete the drop-in, then the folder. Checked: nothing runs.
+3. Remove the disable policy from that source (for a file deployment,
+   delete the drop-in), then delete the folder. Checked, for the drop-in:
+   nothing runs.
 
-Deleting the drop-in first brings the earlier tracer and mod back on a
+Removing the policy first brings the earlier tracer and mod back on a
 machine that still has them (checked, straight after a migration), and a
 GitHub-sourced copy stays installed and keeps loading with the person's own
 options (checked) until it is uninstalled. Its files stay in

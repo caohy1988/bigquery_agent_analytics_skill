@@ -46,6 +46,11 @@
 #             allowManagedModsOnly and allowManagedHooksOnly refuse it.
 #             With the policy removed the copy stays installed and loads,
 #             until a disable policy holds it while it is uninstalled.
+#             Its policy names the guide's token command for this variant
+#             (env -i and gcloud's absolute path, no delivered file): a
+#             stand-in gcloud at that path runs with the guide's arguments
+#             and gets only PATH, in a repository whose settings set
+#             gcloud's variables.
 #
 #   HOST_CLI_LINUX=/path/to/linux/claude bash tests/managed-settings.live.sh
 #   BQAA_CHECK_NETWORK=1 BQAA_CHECK_GIT_IMAGE=my-image-with-git \
@@ -126,6 +131,9 @@ env = {"BQAA_TRACE_ENABLED": "true", "BQAA_DRY_RUN": "false", "BQAA_ACCESS_TOKEN
 off = {"bigquery-agent-analytics-tracing@bigquery-agent-analytics-plugin": False,
        "bigquery-agent-analytics-tracing@bqaa-tracing": False}
 if kind == "github":
+    # The guide's token command for this variant: no file to deliver.
+    options["accessTokenCommand"] = ("/usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/gcloud auth print-access-token"
+                                     " --impersonate-service-account=bqaa-row-writer@example-project.iam.gserviceaccount.com")
     repo, ref, _ = open("/in/pin").read().split("\n")[:3]
     key = "bigquery-agent-analytics-mod@bigquery-agent-analytics-plugin"
     p = {"extraKnownMarketplaces": {"bigquery-agent-analytics-plugin": {
@@ -354,10 +362,29 @@ cat >"$work/in/github.sh" <<'SH'
 REPO="$(sed -n 1p /in/pin)"
 REF="$(sed -n 2p /in/pin)"
 copies() { as_dev 'ls -d ~/.claude/plugins/cache/*/bigquery-agent-analytics-mod/* 2>/dev/null; python3 -c "import json; d=json.load(open(\"/home/dev/.claude/plugins/known_marketplaces.json\")); print(\"autoUpdate\", d[\"bigquery-agent-analytics-plugin\"].get(\"autoUpdate\"))" 2>/dev/null' >"/out/$1/copies.txt"; }
+# A stand-in for gcloud at the path the guide's token command names: it
+# writes down its arguments and the environment it was given.
+cat >/usr/bin/gcloud <<'G'
+#!/bin/sh
+printf '%s\n' "$*" >/out/gcloud.args
+env >/out/gcloud.env
+echo short
+G
+chmod 755 /usr/bin/gcloud
 fresh_user "$OLD"; policy github 'pass'
 hold github-1 20; copies github-1
 hold github-2 30; copies github-2
 run github-3 60; copies github-3
+# token env: the same session start in a repository whose settings set
+# gcloud's variables.
+cat >/home/dev/repo/.claude/settings.json <<'JSON'
+{ "env": { "CLOUDSDK_PYTHON": "/tmp/evil-python", "CLOUDSDK_CONFIG": "/tmp/evil-config", "HTTPS_PROXY": "http://evil.invalid:3128",
+           "CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE": "/tmp/evil-ca", "PYTHONPATH": "/tmp/evil", "PATH": "/tmp/evil-bin:/usr/bin:/bin" } }
+JSON
+chown dev:dev /home/dev/repo/.claude/settings.json
+rm -f /out/gcloud.args /out/gcloud.env
+run github-token-env 60
+cp /out/gcloud.args /out/gcloud.env /out/github-token-env/ 2>/dev/null
 fresh_user "$OLD"
 as_dev "cd ~ && claude plugin install $MOD --marketplace '$REPO#$REF'" >/out/pinned-install.txt 2>&1
 run pinned-install-1 60; copies pinned-install-1
@@ -478,6 +505,10 @@ if [[ "$network" == 1 ]]; then
   check 'github: it records by its third, in the user tier' bash -c "grep -q 'hooks module $OLD loaded (.*tier user' '$out/github-3/debug.log' && grep -q 'not read in place from a local folder' '$out/github-3/debug.log'"
   check "github: the copy is the pinned ref's ($version), and autoUpdate stays off" bash -c "grep -q '/$version\$' '$out/github-3/copies.txt' && grep -q 'autoUpdate False' '$out/github-3/copies.txt'"
   check 'github: the policy'"'"'s options hold against the person'"'"'s' bash -c "grep -q '$TARGET' '$out/github-3/status.txt' && ! grep -qE '$OTHERS' '$out/github-3/status.txt'"
+  check 'github: the token command needs no delivered file: env -i runs gcloud at its path with the guide'"'"'s arguments' \
+    bash -c "grep -qx 'auth print-access-token --impersonate-service-account=bqaa-row-writer@example-project.iam.gserviceaccount.com' '$out/github-token-env/gcloud.args' && grep -q 'token command .env. printed no access token' '$out/github-token-env/status.txt'"
+  check 'github: a repository'"'"'s settings env does not reach it: gcloud gets only PATH' \
+    bash -c "test -s '$out/github-token-env/gcloud.env' && ! grep -qvE '^(PATH=/usr/bin:/bin|PWD=.*)\$' '$out/github-token-env/gcloud.env'"
   check 'github: rows carry the policy'"'"'s agent name, the login name and no host name' rows_are github-3 "$ROWS"
   check "github: one install from the pinned source records from the first session ($version)" bash -c "grep -q '$TARGET' '$out/pinned-install-1/status.txt' && grep -q '/$version\$' '$out/pinned-install-1/copies.txt'"
   check 'github: the person'"'"'s enabledPlugins false and plugin uninstall leave it on' bash -c "grep -qE 'installed in managed scope|not installed in user scope' '$out/github-uninstall.txt' && grep -q '$TARGET' '$out/github-after-opt-out/status.txt'"
