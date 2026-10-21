@@ -27,7 +27,7 @@
       "name": "bigquery-agent-analytics-mod",
       "source": "./plugins/bigquery-agent-analytics-mod",
       "description": "Coding-agent mod that writes BigQuery Agent Analytics agent_events rows (turns, model requests with tokens and latency, tool calls, subagents) from the background, so no hook waits on BigQuery.",
-      "version": "0.1.0",
+      "version": "0.1.0-pin1",
       "homepage": "https://adk.dev/integrations/bigquery-agent-analytics/",
       "repository": "https://github.com/haiyuan-eng-google/bigquery_agent_analytics_skill",
       "license": "MIT",
