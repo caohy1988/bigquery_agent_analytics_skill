@@ -53,7 +53,11 @@
 #             the same on a machine set up by the pinned install. A third
 #             tag at the second's version on another commit (PIN_REF3) is
 #             not installed. An earlier install from another ref does not
-#             load once the policy arrives, until the same two commands.
+#             load once the policy arrives, until the same two commands; one
+#             at the tag's version from another commit (PIN_REF3) keeps its
+#             code after them ("already at the latest version"), until the
+#             guide's replacement (the disable policy, uninstall, the
+#             policy again, the pinned install) makes it the tag's.
 #             Its policy names the guide's token command for this variant
 #             (env -i and gcloud's absolute path, no delivered file): a
 #             stand-in gcloud at that path runs with the guide's arguments
@@ -473,6 +477,19 @@ policy github 'pass'
 run earlier-1 60
 upgrade earlier-upgraded "$REF"
 run earlier-upgraded-session 60
+# An install at the policy tag's version from another commit (the third tag)
+# before the policy, at the second tag, arrives; then the guide's replacement.
+rm -rf /home/dev/.claude /home/dev/.claude.json && as_dev 'mkdir -p ~/.claude'
+rm -f "$DROPIN"
+as_dev "cd ~ && claude plugin install $MOD --marketplace '$REPO#$REF3' --config project=p --config dataset=d" >/out/same-earlier-install.txt 2>&1
+ref_policy "$REF2"
+upgrade same-earlier "$REF2"
+disable_policy
+as_dev "cd ~ && claude plugin uninstall $OLD" >/out/same-earlier-uninstall.txt 2>&1; echo "exit $?" >>/out/same-earlier-uninstall.txt
+ref_policy "$REF2"
+as_dev "cd ~ && claude plugin install $MOD --marketplace '$REPO#$REF2'" >/out/same-earlier-reinstall.txt 2>&1; echo "exit $?" >>/out/same-earlier-reinstall.txt
+installed same-earlier-replaced
+run same-earlier-session 60
 echo done >/out/done
 SH
 
@@ -576,6 +593,7 @@ if [[ "$network" == 1 ]]; then
   ref3="$(sed -n 6p "$work/in/pin")"
   sha1="$(sed -n 7p "$work/in/pin")"
   sha2="$(sed -n 8p "$work/in/pin")"
+  sha3="$(sed -n 9p "$work/in/pin")"
   upgraded() { # scenario: both commands succeeded, and the copy is the given commit
     grep -qx 'exit 0' "$out/$1/readd.txt" && grep -qx 'exit 0' "$out/$1/update.txt" && test "$(cat "$out/$1/installed.txt")" = "$2"
   }
@@ -587,6 +605,10 @@ if [[ "$network" == 1 ]]; then
     bash -c "grep -q 'already at the latest version' '$out/github-same-version/update.txt' && test \"\$(cat '$out/github-same-version/installed.txt')\" = '$sha2'"
   check "github: a machine set up by the pinned install takes the same upgrade" \
     bash -c "$(declare -f upgraded); out='$out'; upgraded pinned-upgraded '$sha2' && grep -q '$TARGET' '$out/pinned-upgraded-session/status.txt'"
+  check "github: an earlier install at the tag's version from another commit ($ref3) keeps its code after the two commands" \
+    bash -c "grep -q 'already at the latest version' '$out/same-earlier/update.txt' && test \"\$(cat '$out/same-earlier/installed.txt')\" = '$sha3'"
+  check "github: the guide's replacement (the disable policy, uninstall, the policy again, the pinned install) makes it $ref2's, and it records" \
+    bash -c "grep -q 'Successfully uninstalled' '$out/same-earlier-uninstall.txt' && grep -qx 'exit 0' '$out/same-earlier-reinstall.txt' && test \"\$(cat '$out/same-earlier-replaced/installed.txt')\" = '$sha2' && grep -q '$TARGET' '$out/same-earlier-session/status.txt'"
   check 'github: an install from another ref does not load once the policy arrives, until the two commands at its tag' \
     bash -c "$(declare -f upgraded); out='$out'; grep -q \"source doesn't match its extraKnownMarketplaces entry\" '$out/earlier-1/debug.log' && ! grep -q 'hooks module $OLD loaded' '$out/earlier-1/debug.log' && upgraded earlier-upgraded '$sha1' && grep -q '$TARGET' '$out/earlier-upgraded-session/status.txt'"
   check 'github: a repository'"'"'s settings env does not reach it: gcloud gets only PATH' \

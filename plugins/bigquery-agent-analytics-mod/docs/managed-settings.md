@@ -384,20 +384,26 @@ folder, or a tag in a fork your organization controls. `ref` takes a branch
 or a tag, not a commit (checked: a commit is "not found in upstream
 origin").
 
-To move to another tag:
+To deploy a tag, the first one and every move after it:
 
-1. **Give the tag a version no earlier tag used.** Before tagging, change
-   `version` in the mod's `.claude-plugin/plugin.json`, in its entry in the
-   repository's `.claude-plugin/marketplace.json`, and `PLUGIN_VERSION` in
-   `hooks/lib/config.ts`. `claude plugin update` compares only that string,
-   and `claude plugin list` shows only that string. A tag at a version a
-   machine already has is never installed over its copy ("already at the
-   latest version"), so a fix shipped that way reaches new machines only.
-   The others keep the earlier code and still pass a check by version.
-2. **Change `ref` in the policy**, for the pilot group first.
-3. **On each machine, right after the new policy arrives**, as the person
-   (or a script run as them), fetch the marketplace at the new tag, then
-   update. Require both to succeed:
+1. **Give the tag a version nothing installed before can have.** Every
+   install from the default branch or a clone is `0.1.0`, the version in
+   every commit so far, so even the first tag needs another, such as
+   `0.1.0-org.1`, and each later tag a new one again. Before tagging,
+   change `version` in the mod's `.claude-plugin/plugin.json`, in its entry
+   in the repository's `.claude-plugin/marketplace.json`, and
+   `PLUGIN_VERSION` in `hooks/lib/config.ts`. `claude plugin update`
+   compares only that string, and `claude plugin list` shows only that
+   string. A tag at a version a machine already has is never installed over
+   its copy ("already at the latest version"), so a fix shipped that way
+   reaches new machines only. The others keep their code and still pass a
+   check by version.
+2. **Deliver the policy, or change its `ref`**, for the pilot group first.
+3. **On each machine that already has the mod from this marketplace, right
+   after the policy arrives**, as the person (or a script run as them),
+   fetch the marketplace at the tag, then update. Require both to succeed,
+   and treat "already at the latest version" as a failure: the copy is then
+   not the tag's.
 
    ```bash
    claude plugin marketplace add "haiyuan-eng-google/bigquery_agent_analytics_skill#NEW_TAG"
@@ -408,19 +414,29 @@ To move to another tag:
    from no longer matches the policy ("its source doesn't match its
    extraKnownMarketplaces entry"), `claude plugin list` shows the copy as
    failed to load, and `plugin update` alone fails ("not found").
-4. **Check by commit, not by label.** The host records each copy's commit
-   in `~/.claude/plugins/installed_plugins.json`. It is the new tag's
+4. **Check by commit, not by label, on every machine.** The host records
+   each copy's commit in `~/.claude/plugins/installed_plugins.json`. It must
+   be the tag's
    (`git ls-remote https://github.com/haiyuan-eng-google/bigquery_agent_analytics_skill NEW_TAG`):
 
    ```bash
    python3 -c 'import json, os; d = json.load(open(os.path.expanduser("~/.claude/plugins/installed_plugins.json"))); print([e.get("gitCommitSha") for e in d["plugins"]["bigquery-agent-analytics-mod@bigquery-agent-analytics-plugin"]])'
    ```
 
-The same two commands, at the policy's tag, are needed on a machine that
-already has the mod from this marketplace at another ref when the policy
-first arrives: an earlier install from the default branch, say. Until they
-run, that copy becomes the managed copy but does not load, and the machine
-records nothing.
+5. **Where the commit is not the tag's**, replace the copy. This happens to
+   a copy installed earlier at the tag's version from another commit, when
+   step 1 was skipped. Deliver the disable policy of
+   [§8](#8-stop-roll-back-revoke) to that machine, run
+   `claude plugin uninstall bigquery-agent-analytics-mod@bigquery-agent-analytics-plugin`
+   as the person, deliver the policy at the tag again, and run the pinned
+   install,
+   `claude plugin install bigquery-agent-analytics-mod --marketplace "haiyuan-eng-google/bigquery_agent_analytics_skill#TAG"`.
+   Then check the commit again.
+
+A machine that has the mod from this marketplace at another ref when the
+policy first arrives (an earlier install from the default branch, say)
+needs steps 3 to 5 too. Until then its copy becomes the managed copy but
+does not load, and the machine records nothing.
 
 Checked in a container (host CLI 2.1.304, test tags in a fork, `autoUpdate`
 off):
@@ -434,7 +450,10 @@ off):
   version", and the recorded commit stayed the earlier tag's;
 - an install from another ref before the policy: it did not load once the
   policy arrived. After the two commands at the policy's tag, it was that
-  tag's, by commit, and recorded.
+  tag's, by commit, and recorded;
+- an install before the policy at the tag's version from another commit:
+  after the two commands, "already at the latest version", and it kept its
+  own commit. Step 5 made it the tag's, by commit, and it recorded.
 
 ## 7. Roll out in stages
 
