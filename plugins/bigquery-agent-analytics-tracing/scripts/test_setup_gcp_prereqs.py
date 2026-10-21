@@ -1516,6 +1516,55 @@ def test_an_inherited_project_role_beyond_the_writers_access_is_refused() -> Non
     assert _token_creator_calls(fake)
 
 
+def test_a_token_creator_who_may_edit_the_projects_roles_is_refused() -> None:
+    # With Token Creator, a holder of iam.roles.update could add a reading
+    # permission to bqaaRowWriter and read every row as the writer.
+    role_admin = json.dumps({"includedPermissions": ["iam.roles.get", "iam.roles.update"]})
+    for role, words in (("roles/iam.roleAdmin", ("describe", "roles/iam.roleAdmin")),
+                        ("projects/test-project/roles/roleEditor", ("describe", "roleEditor"))):
+        policy = {"bindings": [{"role": role, "members": ["user:alice@example.com"]}]}
+        fake = _FakeRun([(words, 0, role_admin)] + _answers(policy, {}, {}))
+        try:
+            _row_writer_run(fake, token_creator=["user:alice@example.com"])
+        except SystemExit as exc:
+            assert "may edit the project's custom roles" in str(exc)
+            assert f"user:alice@example.com: user:alice@example.com ({role} on the project test-project)" in str(exc)
+            assert "--allow-existing-grants keeps them" in str(exc)
+        else:
+            raise AssertionError(f"expected SystemExit for {role}")
+        assert _no_grant_calls(fake)
+    # The two-group command, with a Role Administrator in the writers' group.
+    policy = {"bindings": [{"role": "roles/iam.roleAdmin", "members": ["user:bob@example.com"]}]}
+    bob_in = (("check-transitive-membership", "--group-email=bqaa-writers@example.com", "--member-email=bob@example.com"), 0, '{"hasMembership": true}')
+    bob_out = (("check-transitive-membership", "--member-email=bob@example.com"), 0, "{}")
+    for membership, expected in ((bob_in, "(a member, as Cloud Identity answers)"), (None, "could not rule out")):
+        fake = _FakeRun([(("describe", "roles/iam.roleAdmin"), 0, role_admin)] + ([membership] if membership else []) + _answers(policy, {}, {}))
+        try:
+            _row_writer_run(fake, **GROUPS)
+        except SystemExit as exc:
+            assert "group:bqaa-writers@example.com: user:bob@example.com (roles/iam.roleAdmin on the project test-project)" in str(exc)
+            assert expected in str(exc)
+        else:
+            raise AssertionError("expected SystemExit")
+        assert _no_grant_calls(fake)
+    # Bob outside the writers' group: the run goes on, and lists him.
+    out = io.StringIO()
+    fake = _FakeRun([(("describe", "roles/iam.roleAdmin"), 0, role_admin), bob_out] + _answers(policy, {}, {}))
+    args = _args(service_account="bqaa-row-writer", writer_role="row-writer", execute=True, create_dataset=False,
+                 create_table=False, keep_project_groups=True, **GROUPS)
+    with _stub_preflight(_preflight()), _stub_run(fake), contextlib.redirect_stdout(out), _views_left_alone():
+        setup.run(args)
+    assert _token_creator_calls(fake)
+    assert "may edit the project's custom roles (iam.roles.update), bqaaRowWriter included:\n  - user:bob@example.com: roles/iam.roleAdmin" in out.getvalue()
+    # A reader who may edit roles gets no impersonation, so is not refused for
+    # it (Cloud Identity answers she is not in the token creators' group).
+    fake = _FakeRun([(("describe", "roles/iam.roleAdmin"), 0, role_admin),
+                     (("check-transitive-membership", "--member-email=carol@example.com"), 0, "{}")] + _answers(
+        {"bindings": [{"role": "roles/iam.roleAdmin", "members": ["user:carol@example.com"]}]}, {}, {}))
+    _row_writer_run(fake, reader=["user:carol@example.com"])
+    assert _token_creator_calls(fake)
+
+
 if __name__ == "__main__":
     for test in (
         test_service_account_plan,
@@ -1584,6 +1633,7 @@ if __name__ == "__main__":
         test_the_guides_setup_where_cloud_identity_answers_403,
         test_accepting_the_unverified_keeps_the_definite_refusals,
         test_an_inherited_project_role_beyond_the_writers_access_is_refused,
+        test_a_token_creator_who_may_edit_the_projects_roles_is_refused,
     ):
         test()
     print("setup_gcp_prereqs tests passed")

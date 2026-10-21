@@ -56,6 +56,10 @@ VIEW_NAMES = ("daily_usage_by_user", "daily_usage_by_model")
 # The permissions that read a table's rows: reading them (queries, the
 # tabledata API, the Storage Read API) and extracting them.
 READ_PERMISSIONS = ("bigquery.tables.getData", "bigquery.tables.export")
+# The permission that edits the project's custom roles, bqaaRowWriter
+# included: with Token Creator, its holder could add a reading permission to
+# the writer's role and read every row as the writer.
+ROLE_EDIT_PERMISSIONS = ("iam.roles.update",)
 # Project roles known to read every table of the project whatever a
 # dataset's access says (any other project role is read with gcloud iam
 # roles describe, and reads when it holds READ_PERMISSIONS); and the basic
@@ -551,6 +555,14 @@ def _role_permissions(args: argparse.Namespace, role: str, cache: dict) -> froze
     return cache[role]
 
 
+def _role_edits_roles(args: argparse.Namespace, role: str, cache: dict) -> bool:
+    """Whether a role can edit the project's custom roles (ROLE_EDIT_PERMISSIONS);
+    a role whose permissions cannot be read is left to _role_reads, which
+    counts it as not ruled out."""
+    held = _role_permissions(args, role, cache)
+    return held is not None and bool(held & set(ROLE_EDIT_PERMISSIONS))
+
+
 def _role_reads(args: argparse.Namespace, role: str, cache: dict) -> bool | None:
     """Whether a role reads table data (READ_PERMISSIONS): True for
     PROJECT_READ_ROLES and a dataset's READER, WRITER and OWNER; otherwise
@@ -669,6 +681,7 @@ def _check_project_readers(args: argparse.Namespace) -> None:
     permissions could not be read), unless --accept-unverified."""
     roles: dict = {}
     grants: list[tuple[str, str, bool]] = []
+    editors: list[tuple[str, str]] = []
     for named, held, granted, scope in _grants(args, [args.dataset]):
         if scope == "project" and granted in PROJECT_GROUP_ROLES:
             if args.keep_project_groups:
@@ -679,53 +692,86 @@ def _check_project_readers(args: argparse.Namespace) -> None:
             grants.append((named, held + _UNREAD_ROLE, False))
         elif reads:
             grants.append((named, held, True))
+        elif scope == "project" and _role_edits_roles(args, granted, roles):
+            editors.append((named, held))
     if grants:
         listed = "\n  - ".join(f"{member}: {held}" for member, held, _ in grants)
         print(f"These hold a project role that reads every table, or a grant that reads the events dataset or table:\n  - {listed}")
+    if editors:
+        listed = "\n  - ".join(f"{member}: {held}" for member, held in editors)
+        print(f"These may edit the project's custom roles (iam.roles.update), bqaaRowWriter included:\n  - {listed}")
     members = [*args.reader, *args.token_creator]
     public = [f"{named} ({held})" for named, held, known in grants if known and named.lower() in _PUBLIC]
     clashes: list[str] = []
+    editing: list[str] = []
     unverified = [f"{named} ({held})" for named, held, known in grants if not known and named.lower() in _PUBLIC]
     checked: list[str] = []
     memberships: dict = {}
+
+    def judge(member: str, named: str, held: str) -> tuple[str | None, str]:
+        """Whether a grant reaches a member: "reaches", "unverified",
+        "checked" (not a member, as Cloud Identity answers) or None."""
+        reach = _reach(named, member)
+        line = f"{member}: {named} ({held})"
+        if reach == "no":
+            return None, line
+        if reach == "maybe":
+            kind, _, email = member.partition(":")
+            other_kind, _, other = named.partition(":")
+            answer = None
+            if kind == "group" and other_kind in ("user", "serviceAccount"):
+                # Is the person or service account in the member group?
+                answer = _member_of(args, email, other, memberships)
+            elif other_kind == "group" and kind in ("user", "serviceAccount", "group"):
+                # Is the member (or the whole member group) in the granted group?
+                answer = _member_of(args, other, email, memberships)
+                if answer is False and kind == "group":
+                    # Not inside it as a whole, but some of its members may be.
+                    answer = None
+            if answer is False:
+                return "checked", line
+            if answer is None:
+                return "unverified", line
+            line += " (a member, as Cloud Identity answers)"
+        return "reaches", line
+
     for member in members:
         for named, held, known in grants:
             if named.lower() in _PUBLIC and not known:
                 continue
-            reach = _reach(named, member)
-            if reach == "no":
-                continue
-            line = f"{member}: {named} ({held})"
-            if reach == "maybe":
-                kind, _, email = member.partition(":")
-                other_kind, _, other = named.partition(":")
-                answer = None
-                if kind == "group" and other_kind in ("user", "serviceAccount"):
-                    # Is the person or service account in the member group?
-                    answer = _member_of(args, email, other, memberships)
-                elif other_kind == "group" and kind in ("user", "serviceAccount", "group"):
-                    # Is the member (or the whole member group) in the granted group?
-                    answer = _member_of(args, other, email, memberships)
-                    if answer is False and kind == "group":
-                        # Not inside it as a whole, but some of its members may be.
-                        answer = None
-                if answer is False:
-                    checked.append(line)
-                    continue
-                if answer is None:
-                    unverified.append(line)
-                    continue
-                line += " (a member, as Cloud Identity answers)"
-            (clashes if known else unverified).append(line)
+            verdict, line = judge(member, named, held)
+            if verdict == "reaches":
+                (clashes if known else unverified).append(line)
+            elif verdict == "unverified":
+                unverified.append(line)
+            elif verdict == "checked":
+                checked.append(line)
+    # A token creator who may edit bqaaRowWriter could read every row as the
+    # writer once it may impersonate it.
+    for member in args.token_creator:
+        for named, held in editors:
+            verdict, line = judge(member, named, held)
+            if verdict == "reaches":
+                editing.append(line)
+            elif verdict == "unverified":
+                unverified.append(line)
+            elif verdict == "checked":
+                checked.append(line)
     definite = []
     if public:
         definite.append("everyone can read the table: " + "; ".join(public))
     if clashes:
         definite.append("a reader or token creator can read every row, views or not: " + "; ".join(clashes))
+    if editing:
+        definite.append(
+            "a token creator may edit the project's custom roles, so as the writer it could add a reading "
+            "permission to bqaaRowWriter and read every row: " + "; ".join(editing)
+        )
     if not definite and not unverified:
         note = f" (not a member, as Cloud Identity answers: {'; '.join(checked)})" if checked else ""
         print("OK no grant to everyone, and no grant that reads the events dataset or table, or project role "
-              f"that reads it, reaches a --reader or --token-creator member{note}")
+              "that reads it, reaches a --reader or --token-creator member, and no --token-creator member may "
+              f"edit the project's custom roles{note}")
         return
     _settle(definite, unverified, args, "the table can be read beyond the views",
             "Take those grants off (see docs/service-account-auth.md, Moving from dataEditor), or keep the "

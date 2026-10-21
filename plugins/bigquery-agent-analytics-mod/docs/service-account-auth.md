@@ -31,9 +31,9 @@ had: the mod shows a notice and keeps the rows on disk until a token works.
 
 | Who | Can | Cannot |
 | --- | --- | --- |
-| Writers: the writer service account, and the people or CI jobs that may get its tokens | Insert rows into the events table | Read rows, run a query, change or delete the table |
+| Writers: the writer service account, and the people or CI jobs that may get its tokens | Insert rows into the events table | Read rows, run a query, change or delete the table, as long as none of them may edit the project's custom roles: one who may could add a reading permission to `bqaaRowWriter`, so the bootstrap refuses such a token creator |
 | Readers: a group you choose | Query the views (`<dataset>_reporting`): per day, by person or by model, sessions, model requests and token counts | Read the events table, directly or in a query |
-| Administrators: a small group, and everyone with a project role that reads every table (Owner, BigQuery Admin, BigQuery Data Owner, Editor or Viewer on the project) | Read the raw rows: prompts, answers, tool arguments and results | |
+| Administrators: a small group, and everyone with a project role that reads every table (Owner, BigQuery Admin, BigQuery Data Owner, Editor or Viewer on the project), and every Role Administrator (any role with `iam.roles.update` on the project), who can widen `bqaaRowWriter` | Read the raw rows: prompts, answers, tool arguments and results | |
 
 Never grant the writer service account a role that can read rows (one with
 `bigquery.tables.getData`, such as `roles/bigquery.dataEditor` or
@@ -80,6 +80,12 @@ So the bootstrap, with `--writer-role row-writer` or `--reader`:
     which needs a caller who may see the group's members); when it goes
     through a set of identity-pool principals; and when it is of a role
     whose permissions could not be read.
+
+  It also stops when a `--token-creator` member may edit the project's
+  custom roles (`iam.roles.update`, in Role Administrator), with the same
+  reach and Cloud Identity rules: as the writer, such a member could add a
+  reading permission to `bqaaRowWriter` and read every row. It lists those
+  holders beside the ones who read every row.
 
   The two kinds stop the run apart, and each flag keeps only its own: a
   grant known to reach a member, or everyone, needs
@@ -260,6 +266,10 @@ bq --project_id=my-gcp-project add-iam-policy-binding \
 ```
 
 (The role is the one `setup_gcp_prereqs.py --writer-role row-writer` makes.)
+Keep that group free of anyone who may edit the project's custom roles
+(`iam.roles.update`, in Role Administrator): they could add a reading
+permission to `bqaaRowWriter` and read every row through the group's
+binding.
 Avoid `roles/bigquery.dataEditor` for a shared table: it can also read every
 row, everyone's prompts and tool output included, and change or delete the
 table. It fits one person's sandbox.
