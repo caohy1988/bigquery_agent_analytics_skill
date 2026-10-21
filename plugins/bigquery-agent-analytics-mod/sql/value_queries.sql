@@ -266,21 +266,19 @@ ORDER BY day DESC;
 --     error. Normalized: rows with no writer are named for ADK, and an ADK
 --     response's tokens are read from total_token_count when total_tokens
 --     is missing. Other columns differ by producer and are left out.
---     An ADK model call counts once, as one row, with the largest token
---     count among its responses, in error if any of them was. ADK writes a
---     response for each streamed chunk, and with progressive streaming off
---     it writes further final responses under the agent's span; one agent
---     can also make several calls at once. So an ADK response belongs to
---     the request on its own span. A later final on the agent's span
---     belongs to the call that closed under it (its final response on its
---     own span) when exactly one could have written it: the one call that
---     closed since the last request under that span. Otherwise the rows
---     cannot tell which call wrote it, and it counts in no call's requests
---     or tokens (the call's own final carries its usage), only as a row of
---     its own; responses_ambiguous says how many. Requests are looked up
---     from a day before the window, so a call that began just before it is
---     still matched, and only rows inside the window are counted. A
---     response with no request found is counted by its span, or alone, and
+--     An ADK model call counts once, as one row: the responses on its
+--     request's own span (each streamed chunk, and its final response),
+--     with the largest token count among them, in error if any was. With
+--     progressive streaming off, ADK also writes later finals under the
+--     agent's span; they repeat their call's usage, and when several calls
+--     share that span the rows cannot always tell which call wrote one. So
+--     a later final counts in no call's requests or tokens, and as a row
+--     only when it reports an error; later_finals says how many were left
+--     out. A call whose own rows recorded no usage adds no tokens and is in
+--     model_requests_without_usage. Requests are looked up from a day
+--     before the window, so a call that began just before it is still
+--     matched, and only rows inside the window are counted. A response
+--     with no request found is counted by its span, or alone, and
 --     model_requests_unmatched says how many requests were counted so.
 WITH events AS (
   SELECT
@@ -301,22 +299,11 @@ spans AS (
 closes AS (
   SELECT
     *,
-    COUNTIF(event_type = 'LLM_RESPONSE' AND on_request_span AND final) OVER under_span AS closed_so_far,
-    LAST_VALUE(IF(event_type = 'LLM_RESPONSE' AND on_request_span AND final, span_id, NULL) IGNORE NULLS) OVER under_span AS closed_call
-  FROM spans
-  WINDOW under_span AS (
-    PARTITION BY adk, session_id, IF(on_request_span, parent_span_id, span_id)
-    ORDER BY timestamp, IF(on_request_span, 0, 1)
-    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
-),
-linked AS (
-  SELECT
-    *,
-    closed_so_far - IFNULL(LAST_VALUE(IF(event_type = 'LLM_REQUEST', closed_so_far, NULL) IGNORE NULLS) OVER (
+    COUNTIF(event_type = 'LLM_RESPONSE' AND on_request_span AND final) OVER (
       PARTITION BY adk, session_id, IF(on_request_span, parent_span_id, span_id)
       ORDER BY timestamp, IF(on_request_span, 0, 1)
-      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW), 0) AS could_have_written
-  FROM closes
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS closed_so_far
+  FROM spans
 ),
 tagged AS (
   SELECT
@@ -328,26 +315,24 @@ tagged AS (
     status = 'ERROR' AS failed,
     COALESCE(SAFE_CAST(JSON_VALUE(attributes, '$.usage_metadata.total_tokens') AS INT64),
       SAFE_CAST(JSON_VALUE(attributes, '$.usage_metadata.total_token_count') AS INT64)) AS tokens,
-    adk AND event_type = 'LLM_RESPONSE' AND NOT on_request_span AND span_id IS NOT NULL AND final
-      AND closed_so_far > 0 AND could_have_written != 1 AS ambiguous,
+    adk AND event_type = 'LLM_RESPONSE' AND NOT on_request_span AND span_id IS NOT NULL AND closed_so_far > 0 AS later_final,
     IF(adk AND event_type = 'LLM_RESPONSE',
       CASE
         WHEN on_request_span THEN CONCAT('request ', span_id)
-        WHEN span_id IS NOT NULL AND final AND could_have_written = 1 THEN CONCAT('request ', closed_call)
-        WHEN span_id IS NOT NULL AND final AND closed_so_far > 0 THEN NULL
+        WHEN span_id IS NOT NULL AND closed_so_far > 0 THEN NULL
         WHEN span_id IS NOT NULL THEN CONCAT('span ', span_id)
         ELSE GENERATE_UUID()
       END,
       NULL) AS call
-  FROM linked
+  FROM closes
 ),
 counted AS (
-  SELECT producer, agent, session_id, IF(ambiguous, 'LLM_RESPONSE, ambiguous', event_type) AS event_type, failed,
-    IF(ambiguous, NULL, tokens) AS tokens, FALSE AS unmatched, ambiguous
+  SELECT producer, agent, session_id, IF(later_final, 'LLM_RESPONSE, later final', event_type) AS event_type, failed,
+    IF(later_final, NULL, tokens) AS tokens, FALSE AS unmatched, later_final, NOT later_final OR failed AS a_row
   FROM tagged
   WHERE in_window AND call IS NULL
   UNION ALL
-  SELECT producer, agent, session_id, 'LLM_RESPONSE', LOGICAL_OR(failed), MAX(tokens), NOT STARTS_WITH(call, 'request '), FALSE
+  SELECT producer, agent, session_id, 'LLM_RESPONSE', LOGICAL_OR(failed), MAX(tokens), NOT STARTS_WITH(call, 'request '), FALSE, TRUE
   FROM tagged
   WHERE in_window AND call IS NOT NULL
   GROUP BY producer, agent, session_id, call
@@ -358,9 +343,10 @@ SELECT
   COUNT(DISTINCT session_id) AS sessions,
   COUNTIF(event_type = 'LLM_RESPONSE') AS model_requests,
   COUNTIF(unmatched) AS model_requests_unmatched,
-  COUNTIF(ambiguous) AS responses_ambiguous,
+  COUNTIF(event_type = 'LLM_RESPONSE' AND tokens IS NULL) AS model_requests_without_usage,
+  COUNTIF(later_final) AS later_finals,
   SUM(IF(event_type = 'LLM_RESPONSE', tokens, 0)) AS tokens,
-  ROUND(COUNTIF(failed) / COUNT(*) * 100, 1) AS error_row_pct
+  ROUND(COUNTIF(failed AND a_row) / COUNTIF(a_row) * 100, 1) AS error_row_pct
 FROM counted
 GROUP BY producer, agent
 ORDER BY producer, agent;

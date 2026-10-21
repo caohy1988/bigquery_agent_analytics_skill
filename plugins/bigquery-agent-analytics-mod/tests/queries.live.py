@@ -255,6 +255,38 @@ def interleaved(session, agent, per_worker):
 
 FIXTURE += interleaved("A5", "adk-shared-interleaved", per_worker=False)
 FIXTURE += interleaved("A6", "adk-workers-interleaved", per_worker=True)
+
+
+# Staggered orders under one shared agent span (progressive streaming off):
+# a call is requested and closes between an earlier call's own final and its
+# later finals. R is a request, F a call's own final, L a later final on the
+# agent span; the digits are the calls.
+def staggered(session, agent, order, tokens, error_in=None):
+    out, second = [], 0
+    agent_span = f"{agent}-span"
+    for step in order:
+        kind, call = step[0], int(step[1])
+        second += 1
+        at = f"2026-10-20T19:{second // 60:02d}:{second % 60:02d}Z"
+        common = dict(user="carol", agent=agent, writer=None, invocation=f"I{session}")
+        if kind == "R":
+            out.append(row(None, at, "LLM_REQUEST", session, span=f"{agent}-req-{call}", parent=agent_span,
+                           attributes={"model": "model-c"}, **common))
+        else:
+            attributes = {"model": "model-c", "usage_metadata": {"total_token_count": tokens[call]},
+                          "cache_type": "none", "finish_reason": "STOP"}
+            span, parent = (f"{agent}-req-{call}", agent_span) if kind == "F" else (agent_span, None)
+            status = "ERROR" if error_in == step else "OK"
+            out.append(row(None, at, "LLM_RESPONSE", session, span=span, parent=parent, attributes=attributes,
+                           status=status, **common))
+    return out
+
+
+FIXTURE += staggered("A7", "adk-staggered", ["R1", "F1", "R2", "F2", "L1", "L1", "L2", "L2"], {1: 100, 2: 40})
+FIXTURE += staggered("A8", "adk-staggered-three",
+                     ["R1", "R2", "F1", "R3", "F2", "L1", "L1", "F3", "L2", "L2", "L3", "L3"], {1: 100, 2: 40, 3: 30})
+# A later final that reports an error is kept as an error row.
+FIXTURE += staggered("A9", "adk-later-error", ["R1", "F1", "L1"], {1: 50}, error_in="L1")
 # The replay: e05 sent twice.
 FIXTURE.append(dict(FIXTURE[4]))
 ROSTER = ["alice", "bob", "dave"]
@@ -327,17 +359,24 @@ def checks(name: str, rows: list[dict]):
         adk = p[("adk (no writer)", "adk-agent")]
         yield "ADK, normalized: each streamed call once, with its largest token count: 3 model requests, 147 tokens (77 from total_token_count), 25.0% of 4 rows in error, rows with no event_id kept", (adk["sessions"], adk["model_requests"], adk["tokens"], adk["error_row_pct"]) == (1, 3, 147, 25.0)
         legacy = p[("adk (no writer)", "adk-legacy")]
-        yield "ADK with progressive streaming off: final responses under the agent's span go to the call that closed before them: 2 model requests, 150 tokens (100 once, then 50), 20.0% of 5 rows in error", (legacy["sessions"], legacy["model_requests"], legacy["model_requests_unmatched"], legacy["tokens"], legacy["error_row_pct"]) == (1, 2, 0, 150, 20.0)
+        yield "ADK with progressive streaming off, sequential calls: each counted from its own span's rows, the later finals under the agent's span left out: 2 model requests, 150 tokens (100 once, then 50), 20.0% of 5 rows in error", (legacy["sessions"], legacy["model_requests"], legacy["model_requests_unmatched"], legacy["tokens"], legacy["error_row_pct"]) == (1, 2, 0, 150, 20.0)
         yield "ADK's streamed calls with no request rows: counted by their span, and said so (3 unmatched)", adk["model_requests_unmatched"] == 3
         fan = p[("adk (no writer)", "adk-fanout")]
         yield "ADK, three concurrent calls of one agent: 3 model requests, 45 tokens", (fan["model_requests"], fan["model_requests_unmatched"], fan["tokens"], fan["error_row_pct"]) == (3, 0, 45, 0.0)
         fan_legacy = p[("adk (no writer)", "adk-fanout-legacy")]
-        yield "ADK, two concurrent calls with progressive streaming off: 2 model requests, 140 tokens (100 and 40); the second call's later finals could be either call's, so they are counted in neither and shown (2)", (fan_legacy["model_requests"], fan_legacy["model_requests_unmatched"], fan_legacy["tokens"], fan_legacy["responses_ambiguous"]) == (2, 0, 140, 2)
+        yield "ADK, two concurrent calls with progressive streaming off: 2 model requests, 140 tokens (100 and 40), their 4 later finals left out", (fan_legacy["model_requests"], fan_legacy["model_requests_unmatched"], fan_legacy["tokens"], fan_legacy["later_finals"]) == (2, 0, 140, 4)
         shared = p[("adk (no writer)", "adk-shared-interleaved")]
-        yield "ADK, interleaved later finals under a shared agent span: 2 model requests, 140 tokens, not 200; the 4 finals no row can tie to one call are shown", (shared["model_requests"], shared["tokens"], shared["responses_ambiguous"]) == (2, 140, 4)
+        yield "ADK, interleaved later finals under a shared agent span: 2 model requests, 140 tokens, not 200", (shared["model_requests"], shared["tokens"], shared["later_finals"]) == (2, 140, 4)
         workers = p[("adk (no writer)", "adk-workers-interleaved")]
-        yield "ADK, the same with an agent span per worker (ADK's layout): every later final is tied to its call: 2 model requests, 140 tokens, none ambiguous", (workers["model_requests"], workers["tokens"], workers["responses_ambiguous"]) == (2, 140, 0)
-        yield "sequential and unstreamed calls leave nothing ambiguous", (legacy["responses_ambiguous"], fan["responses_ambiguous"], adk["responses_ambiguous"]) == (0, 0, 0)
+        yield "ADK, the same with an agent span per worker (ADK's layout): 2 model requests, 140 tokens", (workers["model_requests"], workers["tokens"], workers["later_finals"]) == (2, 140, 4)
+        staggered_two = p[("adk (no writer)", "adk-staggered")]
+        yield "ADK, a call requested and closed between another's own final and its later finals, under one span: 2 model requests, 140 tokens, not 200", (staggered_two["model_requests"], staggered_two["tokens"], staggered_two["later_finals"]) == (2, 140, 4)
+        staggered_three = p[("adk (no writer)", "adk-staggered-three")]
+        yield "ADK, three staggered calls of 100, 40 and 30 under one span: 3 model requests, 170 tokens, not 230", (staggered_three["model_requests"], staggered_three["tokens"], staggered_three["later_finals"]) == (3, 170, 6)
+        later_error = p[("adk (no writer)", "adk-later-error")]
+        yield "ADK, a later final that reports an error is kept as an error row: 1 model request, 50 tokens, 33.3% of 3 rows", (later_error["model_requests"], later_error["tokens"], later_error["later_finals"], later_error["error_row_pct"]) == (1, 50, 1, 33.3)
+        yield "sequential calls leave out their later finals (2) and keep 20.0% of 5 rows; unstreamed calls have none", (legacy["later_finals"], legacy["error_row_pct"], fan["later_finals"], adk["later_finals"]) == (2, 20.0, 0, 0)
+        yield "a call whose own rows recorded no usage adds no tokens and is shown: the mod's main loop has 1", (mod["model_requests_without_usage"], adk["model_requests_without_usage"]) == (1, 0)
         yield "the mod's and the tracer's rows are never unmatched", all(r["model_requests_unmatched"] == 0 for r in rows if r["producer"] != "adk (no writer)")
     elif name == "V7 clipped":
         p = by(rows, "producer", "agent")

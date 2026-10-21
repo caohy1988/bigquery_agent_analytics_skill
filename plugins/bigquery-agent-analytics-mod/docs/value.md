@@ -17,7 +17,7 @@ on a synthetic fixture and checks the answers.
 | Team lead or administrator | What does a session cost? | V4, with your rates | An administrator | An estimate: tokens times the rates you enter, dated. Not a bill. None for a session and model with a response that recorded no usage |
 | Team lead or administrator | Which tools do people use, and how often do they fail, prompt, or get refused, by the person, a hook or a permission rule? | V5, sample 4 | An administrator | Each refused call is counted once, by where the refusal came from (`permission_decision_source`): the person, a hook, a rule, or another source (`refused_other`: one the host did not give, recorded as `unknown`, or one the queries do not name). The four add up to all refused calls (`refused_pct`, `refused`). A call that a rule blocks before the host records it leaves no row |
 | Team lead or administrator | Are errors going up? | V6, sample 8 | An administrator | Each rate has its own denominator (turns, model requests, tool calls), as V6 shows them |
-| Platform team | How do coding-agent sessions compare with our ADK agents? | V7 | An administrator of the shared table | Only sessions, model requests, tokens and error rows are compared; other columns differ by producer. An ADK model call counts once, with the largest token count among its responses, however it streamed and when one agent makes several calls at once. A response whose request is not in the table counts by its span, and `model_requests_unmatched` says how many requests were counted so. A later final under an agent span several concurrent calls share, which the rows cannot tie to one of them, counts in no call and is shown in `responses_ambiguous` |
+| Platform team | How do coding-agent sessions compare with our ADK agents? | V7 | An administrator of the shared table | Only sessions, model requests, tokens and error rows are compared; other columns differ by producer. An ADK model call counts once, with the largest token count among its responses, however it streamed and when one agent makes several calls at once. A call's tokens come from its own rows only, so a later final, which repeats them, is left out (`later_finals`). A call whose own rows recorded no usage is in `model_requests_without_usage`, and one whose request is not in the table counts by its span (`model_requests_unmatched`) |
 | Anyone with the views | Sessions, model requests and tokens per day, by person or model | `daily_usage_by_user`, `daily_usage_by_model` | The reader group | No prompts, tools or errors: counts only |
 
 ## Denominators
@@ -42,25 +42,23 @@ on a synthetic fixture and checks the answers.
   on by default), it writes up to three final responses for a call that
   streams text and then a function call, the later ones under the agent's
   span. And one agent can run several calls at once (`parallel_worker`).
-  V7 matches responses to requests this way:
-  - a response belongs to the `LLM_REQUEST` on its own span;
-  - a later final on the agent's span belongs to the call that closed under
-    it (its final response on its own span) when exactly one could have
-    written it: the one call that closed since the last request under that
-    span. That holds for sequential calls, and for ADK's parallel workers,
-    each of which has an agent span of its own;
-  - when several calls sharing that span had closed, the rows cannot tell
-    which wrote it: it counts in no call's requests or tokens (the call's
-    own final carries its usage) and as a row of its own in the error rows,
-    and `responses_ambiguous` says how many;
+  V7 counts them this way:
+  - a call is the responses on its `LLM_REQUEST`'s own span, with the
+    largest token count among them, in error if any was;
+  - a later final on the agent's span repeats its call's usage, and when
+    several calls share that span the rows cannot always tell which call
+    wrote it. So it counts in no call's requests or tokens, and as a row
+    only when it reports an error (`later_finals` says how many were left
+    out);
+  - a call whose own rows recorded no usage adds no tokens
+    (`model_requests_without_usage`);
   - a response with no request found is counted by its span, or alone
     (`model_requests_unmatched`).
 
   Requests are looked up from a day before the window, so a call that
   began just before it is still matched; only rows inside the window are
   counted. Each call is one request and one row of the error rows'
-  denominator, with the largest token count among its responses, and in
-  error if any of them was.
+  denominator.
 - **Missing is not zero**:
   - a person with no rows is "not seen";
   - a day with no rows at all is still listed, every enrolled person not
