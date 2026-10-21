@@ -23,8 +23,10 @@
 
 -- V1. Developer: my sessions at a glance. Per session: when it started, how
 --     long it was open, its prompts, turns, model requests, tool calls, the
---     tool calls that failed, and its tokens. Add AND user_id = 'you' for
---     yours (user_id is the login name the machine reported).
+--     tool calls that failed, the tokens recorded, and the responses that
+--     recorded none (their tokens are unknown, not zero). Add
+--     AND user_id = 'you' for yours (user_id is the login name the machine
+--     reported).
 WITH events AS (
   SELECT *
   FROM `{PROJECT}.{DATASET}.{TABLE}`
@@ -42,16 +44,19 @@ SELECT
   COUNTIF(event_type = 'LLM_RESPONSE') AS model_requests,
   COUNTIF(event_type = 'TOOL_COMPLETED') AS tool_calls,
   COUNTIF(event_type = 'TOOL_COMPLETED' AND status = 'ERROR') AS failed_tool_calls,
-  SUM(IF(event_type = 'LLM_RESPONSE', SAFE_CAST(JSON_VALUE(attributes, '$.usage_metadata.total_tokens') AS INT64), 0)) AS tokens
+  SUM(IF(event_type = 'LLM_RESPONSE', SAFE_CAST(JSON_VALUE(attributes, '$.usage_metadata.total_tokens') AS INT64), 0)) AS tokens,
+  COUNTIF(event_type = 'LLM_RESPONSE' AND JSON_VALUE(attributes, '$.usage_metadata.total_tokens') IS NULL) AS responses_without_usage
 FROM events
 GROUP BY session_id
 ORDER BY started_at DESC;
 
 -- V2. Developer: where each turn's time went. The turn's total (NULL when
---     no end of turn was recorded), the time in model requests and in tool
---     calls (a permission prompt's wait is part of its tool call's), and
---     the tool calls that asked for permission. The parts can add up to
---     more than the turn: a tool call can run beside a model request.
+--     no end of turn was recorded), the time in model requests, answered or
+--     failed, and in tool calls (a permission prompt's wait is part of its
+--     tool call's), and the tool calls that asked for permission. A part is
+--     NULL when one of its requests or calls recorded no duration: unknown,
+--     not zero. The parts can add up to more than the turn: a tool call can
+--     run beside a model request.
 WITH events AS (
   SELECT *
   FROM `{PROJECT}.{DATASET}.{TABLE}`
@@ -65,21 +70,26 @@ SELECT
   invocation_id,
   MIN(timestamp) AS started_at,
   MAX(IF(event_type IN ('INVOCATION_COMPLETED', 'INVOCATION_ERROR'), SAFE_CAST(JSON_VALUE(latency_ms, '$.total_ms') AS INT64), NULL)) AS turn_ms,
-  SUM(IF(event_type = 'LLM_RESPONSE', SAFE_CAST(JSON_VALUE(latency_ms, '$.total_ms') AS INT64), 0)) AS model_ms,
-  SUM(IF(event_type = 'TOOL_COMPLETED', SAFE_CAST(JSON_VALUE(latency_ms, '$.total_ms') AS INT64), 0)) AS tool_ms,
+  IF(COUNTIF(event_type IN ('LLM_RESPONSE', 'LLM_ERROR') AND SAFE_CAST(JSON_VALUE(latency_ms, '$.total_ms') AS INT64) IS NULL) > 0, NULL,
+    IFNULL(SUM(IF(event_type IN ('LLM_RESPONSE', 'LLM_ERROR'), SAFE_CAST(JSON_VALUE(latency_ms, '$.total_ms') AS INT64), NULL)), 0)) AS model_ms,
+  IF(COUNTIF(event_type = 'TOOL_COMPLETED' AND SAFE_CAST(JSON_VALUE(latency_ms, '$.total_ms') AS INT64) IS NULL) > 0, NULL,
+    IFNULL(SUM(IF(event_type = 'TOOL_COMPLETED', SAFE_CAST(JSON_VALUE(latency_ms, '$.total_ms') AS INT64), NULL)), 0)) AS tool_ms,
   COUNTIF(event_type = 'TOOL_COMPLETED' AND JSON_VALUE(attributes, '$.permission_requested') = 'true') AS permission_prompts
 FROM events
 GROUP BY session_id, invocation_id
 ORDER BY started_at DESC;
 
--- V3. Team lead: adoption against a roster. Per day: the people enrolled
---     (a table of their login names that you keep, team_roster, with one
---     user_id column), how many of them have rows, their sessions and
---     turns, and the sessions from no one on the roster or with no user_id.
---     A person with no rows is shown as not seen, not as zero use: they
---     may not have used the agent, or their sessions may not be recorded.
---     Under impersonation leave userIdFromCredentials off, or every row
---     carries the service account and the roster matches no one.
+-- V3. Team lead: adoption against a roster. Per calendar day of the
+--     window: the people enrolled (a table of their login names that you
+--     keep, team_roster, with one user_id column), how many of them have
+--     rows, their sessions and turns, and the sessions from no one on the
+--     roster or with no user_id. A person with no rows is "not seen", not
+--     zero use: they may not have used the agent, or their sessions may not
+--     be recorded. A day with no rows at all is listed too, every enrolled
+--     person not seen, and no_rows_that_day says so: absent telemetry, not
+--     proof that nobody worked. Under impersonation leave
+--     userIdFromCredentials off, or every row carries the service account
+--     and the roster matches no one.
 WITH events AS (
   SELECT *
   FROM `{PROJECT}.{DATASET}.{TABLE}`
@@ -89,27 +99,44 @@ WITH events AS (
 ),
 roster AS (
   SELECT DISTINCT user_id FROM `{PROJECT}.{DATASET}.team_roster`
+),
+days AS (
+  SELECT day FROM UNNEST(GENERATE_DATE_ARRAY(DATE(@start), DATE(@end))) AS day
+),
+daily AS (
+  SELECT
+    DATE(e.timestamp) AS day,
+    COUNT(*) AS rows_that_day,
+    COUNT(DISTINCT IF(r.user_id IS NOT NULL, e.user_id, NULL)) AS enrolled_seen,
+    COUNT(DISTINCT IF(r.user_id IS NOT NULL, e.session_id, NULL)) AS enrolled_sessions,
+    COUNTIF(r.user_id IS NOT NULL AND e.event_type = 'INVOCATION_STARTING') AS enrolled_turns,
+    COUNT(DISTINCT IF(r.user_id IS NULL, e.session_id, NULL)) AS other_sessions
+  FROM events AS e
+  LEFT JOIN roster AS r ON e.user_id = r.user_id
+  GROUP BY day
 )
 SELECT
-  DATE(e.timestamp) AS day,
+  d.day,
   (SELECT COUNT(*) FROM roster) AS enrolled,
-  COUNT(DISTINCT IF(r.user_id IS NOT NULL, e.user_id, NULL)) AS enrolled_seen,
-  (SELECT COUNT(*) FROM roster) - COUNT(DISTINCT IF(r.user_id IS NOT NULL, e.user_id, NULL)) AS enrolled_not_seen,
-  COUNT(DISTINCT IF(r.user_id IS NOT NULL, e.session_id, NULL)) AS enrolled_sessions,
-  COUNTIF(r.user_id IS NOT NULL AND e.event_type = 'INVOCATION_STARTING') AS enrolled_turns,
-  COUNT(DISTINCT IF(r.user_id IS NULL, e.session_id, NULL)) AS other_sessions
-FROM events AS e
-LEFT JOIN roster AS r ON e.user_id = r.user_id
-GROUP BY day
-ORDER BY day DESC;
+  IFNULL(a.enrolled_seen, 0) AS enrolled_seen,
+  (SELECT COUNT(*) FROM roster) - IFNULL(a.enrolled_seen, 0) AS enrolled_not_seen,
+  IFNULL(a.enrolled_sessions, 0) AS enrolled_sessions,
+  IFNULL(a.enrolled_turns, 0) AS enrolled_turns,
+  IFNULL(a.other_sessions, 0) AS other_sessions,
+  a.day IS NULL AS no_rows_that_day
+FROM days AS d
+LEFT JOIN daily AS a USING (day)
+ORDER BY d.day DESC;
 
 -- V4. Team lead: estimated cost per session and model. Tokens split the
 --     way they are priced (uncached input, cache reads, cache writes,
 --     output) times the rates you put in `rates`: USD per million tokens,
 --     one row per model id as the model column shows it, with the date and
 --     source of the rates. An estimate, not a bill: a model with no rate
---     row has no cost (NULL), not zero, and discounts and other charges
---     are not counted.
+--     row has no cost (NULL), not zero; nor has a session and model with a
+--     response that recorded no usage (responses_without_usage counts
+--     them), as its tokens are unknown. Discounts and other charges are
+--     not counted.
 WITH rates AS (
   -- rates: begin
   SELECT * FROM UNNEST([
@@ -140,11 +167,13 @@ SELECT
   SUM(IFNULL(r.cache_read_tokens, 0)) AS cache_read_tokens,
   SUM(IFNULL(r.cache_write_tokens, 0)) AS cache_write_tokens,
   SUM(IFNULL(r.output_tokens, 0)) AS output_tokens,
+  COUNTIF(r.input_tokens IS NULL OR r.output_tokens IS NULL OR r.cache_read_tokens IS NULL OR r.cache_write_tokens IS NULL) AS responses_without_usage,
   ANY_VALUE(p.rates_as_of) AS rates_as_of,
-  ROUND((SUM(IFNULL(r.input_tokens, 0)) * ANY_VALUE(p.input_usd)
-    + SUM(IFNULL(r.cache_read_tokens, 0)) * ANY_VALUE(p.cache_read_usd)
-    + SUM(IFNULL(r.cache_write_tokens, 0)) * ANY_VALUE(p.cache_write_usd)
-    + SUM(IFNULL(r.output_tokens, 0)) * ANY_VALUE(p.output_usd)) / 1e6, 6) AS estimated_usd
+  IF(COUNTIF(r.input_tokens IS NULL OR r.output_tokens IS NULL OR r.cache_read_tokens IS NULL OR r.cache_write_tokens IS NULL) > 0, NULL,
+    ROUND((SUM(r.input_tokens) * ANY_VALUE(p.input_usd)
+      + SUM(r.cache_read_tokens) * ANY_VALUE(p.cache_read_usd)
+      + SUM(r.cache_write_tokens) * ANY_VALUE(p.cache_write_usd)
+      + SUM(r.output_tokens) * ANY_VALUE(p.output_usd)) / 1e6, 6)) AS estimated_usd
 FROM responses AS r
 LEFT JOIN rates AS p USING (model)
 GROUP BY r.session_id, r.model
@@ -152,11 +181,22 @@ ORDER BY r.session_id, r.model;
 
 -- V5. Team lead: the tools people use most. Per tool: the people who used
 --     it, its calls, and the share of calls that failed, asked for
---     permission, were rejected at the permission prompt, or were denied by
---     a hook. Those two are not all denials: a call that a permission rule
---     blocks before it runs may leave no row.
+--     permission, and were refused, each refused call counted once by where
+--     the refusal came from: the person at the prompt (rejected or
+--     aborted), a hook, or a permission rule (permission_decision_source
+--     config). A call that a rule blocks before the host records it leaves
+--     no row.
 WITH tools AS (
-  SELECT *
+  SELECT
+    *,
+    CASE
+      WHEN JSON_VALUE(attributes, '$.permission_decision') = 'reject'
+        AND JSON_VALUE(attributes, '$.permission_decision_source') IN ('user_reject', 'user_abort') THEN 'prompt'
+      WHEN JSON_VALUE(attributes, '$.denied') = 'true'
+        OR (JSON_VALUE(attributes, '$.permission_decision') = 'reject' AND JSON_VALUE(attributes, '$.permission_decision_source') = 'hook') THEN 'hook'
+      WHEN JSON_VALUE(attributes, '$.permission_decision') = 'reject' AND JSON_VALUE(attributes, '$.permission_decision_source') = 'config' THEN 'rule'
+      WHEN JSON_VALUE(attributes, '$.permission_decision') = 'reject' THEN 'other'
+    END AS refusal
   FROM `{PROJECT}.{DATASET}.{TABLE}`
   WHERE event_type = 'TOOL_COMPLETED'
     AND timestamp BETWEEN @start AND @end
@@ -169,8 +209,9 @@ SELECT
   COUNT(*) AS calls,
   ROUND(COUNTIF(status = 'ERROR') / COUNT(*) * 100, 1) AS error_pct,
   ROUND(COUNTIF(JSON_VALUE(attributes, '$.permission_requested') = 'true') / COUNT(*) * 100, 1) AS asked_pct,
-  ROUND(COUNTIF(JSON_VALUE(attributes, '$.permission_decision') = 'reject') / COUNT(*) * 100, 1) AS rejected_pct,
-  ROUND(COUNTIF(JSON_VALUE(attributes, '$.denied') = 'true') / COUNT(*) * 100, 1) AS denied_by_hook_pct
+  ROUND(COUNTIF(refusal = 'prompt') / COUNT(*) * 100, 1) AS rejected_at_prompt_pct,
+  ROUND(COUNTIF(refusal = 'hook') / COUNT(*) * 100, 1) AS denied_by_hook_pct,
+  ROUND(COUNTIF(refusal = 'rule') / COUNT(*) * 100, 1) AS denied_by_rule_pct
 FROM tools
 GROUP BY tool
 ORDER BY calls DESC, tool;
@@ -178,9 +219,19 @@ ORDER BY calls DESC, tool;
 -- V6. Team lead: errors over time. Per day, each count beside its own
 --     denominator: turns and those that ended in an error, model requests
 --     (answered or failed) and the failed ones, tool calls and the failed
---     ones, and the tool calls rejected at a prompt or denied by a hook.
+--     ones, and the refused tool calls, each counted once by where the
+--     refusal came from (as in V5).
 WITH events AS (
-  SELECT *
+  SELECT
+    *,
+    CASE
+      WHEN JSON_VALUE(attributes, '$.permission_decision') = 'reject'
+        AND JSON_VALUE(attributes, '$.permission_decision_source') IN ('user_reject', 'user_abort') THEN 'prompt'
+      WHEN JSON_VALUE(attributes, '$.denied') = 'true'
+        OR (JSON_VALUE(attributes, '$.permission_decision') = 'reject' AND JSON_VALUE(attributes, '$.permission_decision_source') = 'hook') THEN 'hook'
+      WHEN JSON_VALUE(attributes, '$.permission_decision') = 'reject' AND JSON_VALUE(attributes, '$.permission_decision_source') = 'config' THEN 'rule'
+      WHEN JSON_VALUE(attributes, '$.permission_decision') = 'reject' THEN 'other'
+    END AS refusal
   FROM `{PROJECT}.{DATASET}.{TABLE}`
   WHERE timestamp BETWEEN @start AND @end
     AND JSON_VALUE(attributes, '$.writer.plugin') = 'bigquery-agent-analytics-mod'
@@ -194,8 +245,9 @@ SELECT
   COUNTIF(event_type = 'LLM_ERROR') AS failed_model_requests,
   COUNTIF(event_type = 'TOOL_COMPLETED') AS tool_calls,
   COUNTIF(event_type = 'TOOL_COMPLETED' AND status = 'ERROR') AS failed_tool_calls,
-  COUNTIF(event_type = 'TOOL_COMPLETED' AND JSON_VALUE(attributes, '$.permission_decision') = 'reject') AS rejected_tool_calls,
-  COUNTIF(event_type = 'TOOL_COMPLETED' AND JSON_VALUE(attributes, '$.denied') = 'true') AS denied_by_hook
+  COUNTIF(event_type = 'TOOL_COMPLETED' AND refusal = 'prompt') AS rejected_at_prompt,
+  COUNTIF(event_type = 'TOOL_COMPLETED' AND refusal = 'hook') AS denied_by_hook,
+  COUNTIF(event_type = 'TOOL_COMPLETED' AND refusal = 'rule') AS denied_by_rule
 FROM events
 GROUP BY day
 ORDER BY day DESC;

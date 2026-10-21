@@ -66,10 +66,21 @@ ORDER BY requests DESC;
 
 -- 4. Tool failure rate and latency. A permission prompt's wait is inside
 --    total_ms, so the share of calls that prompted is listed beside it.
---    denied_by_hook and rejected_at_prompt are not all denials: a call that
---    a permission rule blocks before it runs may leave no row.
+--    Each refused call is counted once, by where the refusal came from: the
+--    person at the prompt, a hook, or a permission rule
+--    (permission_decision_source). A call that a rule blocks before the
+--    host records it leaves no row.
 WITH tools AS (
-  SELECT *
+  SELECT
+    *,
+    CASE
+      WHEN JSON_VALUE(attributes, '$.permission_decision') = 'reject'
+        AND JSON_VALUE(attributes, '$.permission_decision_source') IN ('user_reject', 'user_abort') THEN 'prompt'
+      WHEN JSON_VALUE(attributes, '$.denied') = 'true'
+        OR (JSON_VALUE(attributes, '$.permission_decision') = 'reject' AND JSON_VALUE(attributes, '$.permission_decision_source') = 'hook') THEN 'hook'
+      WHEN JSON_VALUE(attributes, '$.permission_decision') = 'reject' AND JSON_VALUE(attributes, '$.permission_decision_source') = 'config' THEN 'rule'
+      WHEN JSON_VALUE(attributes, '$.permission_decision') = 'reject' THEN 'other'
+    END AS refusal
   FROM `{PROJECT}.{DATASET}.{TABLE}`
   WHERE event_type = 'TOOL_COMPLETED'
     AND timestamp BETWEEN @start AND @end
@@ -82,8 +93,9 @@ SELECT
   COUNT(*) AS calls,
   COUNTIF(status = 'ERROR') AS failures,
   ROUND(COUNTIF(status = 'ERROR') / COUNT(*) * 100, 2) AS fail_rate_pct,
-  COUNTIF(JSON_VALUE(attributes, '$.denied') = 'true') AS denied_by_hook,
-  COUNTIF(JSON_VALUE(attributes, '$.permission_decision') = 'reject') AS rejected_at_prompt,
+  COUNTIF(refusal = 'prompt') AS rejected_at_prompt,
+  COUNTIF(refusal = 'hook') AS denied_by_hook,
+  COUNTIF(refusal = 'rule') AS denied_by_rule,
   COUNTIF(JSON_VALUE(attributes, '$.permission_requested') = 'true') AS asked_permission,
   APPROX_QUANTILES(CAST(JSON_VALUE(latency_ms, '$.total_ms') AS INT64), 100)[OFFSET(50)] AS p50_ms,
   APPROX_QUANTILES(CAST(JSON_VALUE(latency_ms, '$.total_ms') AS INT64), 100)[OFFSET(95)] AS p95_ms

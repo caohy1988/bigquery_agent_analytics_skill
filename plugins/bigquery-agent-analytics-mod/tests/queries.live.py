@@ -10,7 +10,11 @@ The fixture holds what the queries must count right:
     an ADK agent's, the latter with no event_id and its tokens under
     usage_metadata.total_token_count;
   - a subagent run;
-  - both answers to a permission prompt, and a hook's denial.
+  - each kind of refusal: a person's at the prompt, a hook's and a
+    permission rule's, each to be counted once;
+  - a failed model request with its duration, and a response that
+    recorded neither usage nor a duration;
+  - a window with a day of no rows, and a window with none at all.
 
 It makes a dataset of its own (bqaa_query_check_<random>, in US), with the
 events table and a team_roster table, prints each query's dry-run bytes,
@@ -72,7 +76,8 @@ FIXTURE = [
     row("e06", D1 + "04Z", "TOOL_STARTING", "S1", **I1, span="tool-1", parent="req-1", content={"tool": "Bash"}),
     row("e07", D1 + "05Z", "TOOL_COMPLETED", "S1", **I1, span="tool-1", parent="req-1",
         content={"tool": "Bash", "tool_origin": "builtin"},
-        attributes={"permission_requested": True, "permission_decision": "accept"}, latency={"total_ms": 500}),
+        attributes={"permission_requested": True, "permission_decision": "accept", "permission_decision_source": "user_temporary"},
+        latency={"total_ms": 500}),
     row("e08", D1 + "06Z", "TOOL_COMPLETED", "S1", **I1, span="tool-2", parent="req-1",
         content={"tool": "Edit", "tool_origin": "builtin"}, latency={"total_ms": 200}, status="ERROR"),
     row("e09", D1 + "07Z", "LLM_RESPONSE", "S1", **I1, span="req-2", parent="inv-1",
@@ -89,23 +94,33 @@ FIXTURE = [
         attributes={"model": "model-b", "usage_metadata": usage(200, 40)},
         latency={"total_ms": 1500, "time_to_first_token_ms": 500}),
     row("e15", D2 + "02Z", "TOOL_COMPLETED", "S2", user="bob", invocation="I2", content={"tool": "Bash", "tool_origin": "builtin"},
-        attributes={"permission_requested": True, "permission_decision": "reject"}, latency={"total_ms": 300},
+        attributes={"permission_requested": True, "permission_decision": "reject", "permission_decision_source": "user_reject"},
+        latency={"total_ms": 300},
         status="ERROR"),
     row("e16", D2 + "03Z", "TOOL_COMPLETED", "S2", user="bob", invocation="I2", content={"tool": "WebFetch", "tool_origin": "builtin"},
-        attributes={"denied": True}, latency={"total_ms": 0}, status="ERROR"),
+        attributes={"denied": True, "permission_decision": "reject", "permission_decision_source": "hook"},
+        latency={"total_ms": 0}, status="ERROR"),
+    # A permission rule's refusal.
+    row("e24", D2 + "03Z", "TOOL_COMPLETED", "S2", user="bob", invocation="I2", content={"tool": "Write", "tool_origin": "builtin"},
+        attributes={"permission_decision": "reject", "permission_decision_source": "config"}, latency={"total_ms": 0},
+        status="ERROR"),
     row("e17", D2 + "04Z", "AGENT_STARTING", "S2", user="bob", invocation="I2", agent="general-purpose"),
     row("e18", D2 + "05Z", "LLM_RESPONSE", "S2", user="bob", invocation="I2", agent="general-purpose",
         attributes={"model": "model-a", "usage_metadata": usage(30, 20)},
         latency={"total_ms": 800, "time_to_first_token_ms": 200}),
     row("e19", D2 + "06Z", "AGENT_COMPLETED", "S2", user="bob", invocation="I2", agent="general-purpose",
         attributes={"usage_metadata": {"total_tokens": 50}}, latency={"total_ms": 2000}),
+    # A request that failed after 6 s: its time is model time too.
     row("e20", D2 + "07Z", "LLM_ERROR", "S2", user="bob", invocation="I2", attributes={"model": "model-a"},
-        status="ERROR"),
-    row("e21", D2 + "08Z", "INVOCATION_ERROR", "S2", user="bob", invocation="I2", latency={"total_ms": 8000},
+        latency={"total_ms": 6000}, status="ERROR"),
+    row("e21", D2 + "08Z", "INVOCATION_ERROR", "S2", user="bob", invocation="I2", latency={"total_ms": 9000},
         status="ERROR"),
     # S3: no user_id.
     row("e22", "2026-10-20T12:00:00Z", "LLM_RESPONSE", "S3", user=None, invocation="I3",
         attributes={"model": "model-a", "usage_metadata": usage(20, 10)}, latency={"total_ms": 600}),
+    # A response that recorded no usage and no duration: unknown, not zero.
+    row("e23", "2026-10-20T12:00:01Z", "LLM_RESPONSE", "S3", user=None, invocation="I3",
+        content={"response": "ok"}, attributes={"model": "model-a"}),
     # The settings-hook tracer, writing beside the mod.
     row("t01", "2026-10-20T13:00:00Z", "LLM_RESPONSE", "T1", writer=TRACER_WRITER,
         attributes={"model": "model-a", "usage_metadata": {"input_tokens": 900, "output_tokens": 99, "total_tokens": 999}}),
@@ -141,58 +156,68 @@ def checks(name: str, rows: list[dict]):
         yield "the mod's sessions, and no other producer's", set(s) == {"S1", "S2", "S3"}
         yield "S1: 2 model requests and 195 tokens (the replayed row counted once)", s["S1"]["model_requests"] == 2 and s["S1"]["tokens"] == 195
         yield "S1: 2 tool calls, 1 failed; 1 prompt, 1 turn", (s["S1"]["tool_calls"], s["S1"]["failed_tool_calls"], s["S1"]["prompts"], s["S1"]["turns"]) == (2, 1, 1, 1)
-        yield "S2: 290 tokens with the subagent's, 2 failed tool calls", s["S2"]["tokens"] == 290 and s["S2"]["failed_tool_calls"] == 2
-        yield "S3: kept with no user_id", "S3" in s and s["S3"]["user_id"] is None and s["S3"]["tokens"] == 30
+        yield "S2: 290 tokens with the subagent's, 3 tool calls, all failed", (s["S2"]["tokens"], s["S2"]["tool_calls"], s["S2"]["failed_tool_calls"]) == (290, 3, 3)
+        yield "S3: kept with no user_id; 2 responses, 1 without usage, 30 tokens recorded", "S3" in s and s["S3"]["user_id"] is None and (s["S3"]["model_requests"], s["S3"]["responses_without_usage"], s["S3"]["tokens"]) == (2, 1, 30)
     elif name == "V2":
         t = by(rows, "invocation_id")
         yield "I1: turn 7000 ms, models 1400 ms, tools 700 ms, 1 permission prompt", (t["I1"]["turn_ms"], t["I1"]["model_ms"], t["I1"]["tool_ms"], t["I1"]["permission_prompts"]) == (7000, 1400, 700, 1)
-        yield "I2: turn 8000 ms, models 2300 ms (with the subagent's), tools 300 ms", (t["I2"]["turn_ms"], t["I2"]["model_ms"], t["I2"]["tool_ms"]) == (8000, 2300, 300)
-        yield "I3: no end of turn recorded: turn_ms is NULL, not 0", t["I3"]["turn_ms"] is None and t["I3"]["model_ms"] == 600
+        yield "I2: turn 9000 ms, models 8300 ms (with the subagent's and the 6000 ms failed request), tools 300 ms", (t["I2"]["turn_ms"], t["I2"]["model_ms"], t["I2"]["tool_ms"]) == (9000, 8300, 300)
+        yield "I3: no end of turn, and a response with no duration: turn_ms and model_ms are NULL, not 0", t["I3"]["turn_ms"] is None and t["I3"]["model_ms"] is None
     elif name == "V3":
         d = by(rows, "day")
         yield "day 1: 3 enrolled, 1 seen, 2 not seen, 1 session, 1 turn", (d["2026-10-19"]["enrolled"], d["2026-10-19"]["enrolled_seen"], d["2026-10-19"]["enrolled_not_seen"], d["2026-10-19"]["enrolled_sessions"], d["2026-10-19"]["enrolled_turns"]) == (3, 1, 2, 1, 1)
         yield "day 2: 1 enrolled seen (bob); the session with no user_id is apart", (d["2026-10-20"]["enrolled_seen"], d["2026-10-20"]["enrolled_sessions"], d["2026-10-20"]["other_sessions"]) == (1, 1, 1)
         yield "the tracer's and ADK's people are not counted", all(r["enrolled_sessions"] + r["other_sessions"] <= 2 for r in rows)
+        yield "both days have rows", [r["no_rows_that_day"] for r in rows] == [False, False]
+    elif name == "V3 silent day":
+        d = by(rows, "day")
+        yield "a day with no rows is listed: 3 enrolled, 0 seen, 3 not seen, no rows that day", set(d) == {"2026-10-19", "2026-10-20", "2026-10-21"} and (d["2026-10-21"]["enrolled"], d["2026-10-21"]["enrolled_seen"], d["2026-10-21"]["enrolled_not_seen"], d["2026-10-21"]["enrolled_sessions"], d["2026-10-21"]["no_rows_that_day"]) == (3, 0, 3, 0, True)
+    elif name == "V3 empty window":
+        yield "a window with no rows at all lists each day, everyone not seen", len(rows) == 2 and all((r["enrolled"], r["enrolled_not_seen"], r["no_rows_that_day"]) == (3, 3, True) for r in rows)
     elif name == "V4":
         c = by(rows, "session_id", "model")
         yield "S1 model-a: 2 requests; 110 input, 50 cache reads, 10 cache writes, 25 output", (c[("S1", "model-a")]["model_requests"], c[("S1", "model-a")]["input_tokens"], c[("S1", "model-a")]["cache_read_tokens"], c[("S1", "model-a")]["cache_write_tokens"], c[("S1", "model-a")]["output_tokens"]) == (2, 110, 50, 10, 25)
         yield "S1 model-a: estimated 0.000535 USD at the fixture's rates, dated", near(c[("S1", "model-a")]["estimated_usd"], 0.000535) and c[("S1", "model-a")]["rates_as_of"] == "2026-10-01"
         yield "S2 model-b: no rate row, so no cost (NULL, not 0)", c[("S2", "model-b")]["estimated_usd"] is None
         yield "S2 model-a (the subagent's request): 0.00026 USD", near(c[("S2", "model-a")]["estimated_usd"], 0.00026)
+        yield "S3 model-a: a response without usage makes the estimate unknown (NULL), at a matching rate", (c[("S3", "model-a")]["model_requests"], c[("S3", "model-a")]["responses_without_usage"], c[("S3", "model-a")]["estimated_usd"]) == (2, 1, None)
         yield "the tracer's model-a response is not counted", ("T1", "model-a") not in c
     elif name == "V5":
         t = by(rows, "tool")
-        yield "tools: Bash, Edit, WebFetch (not the tracer's or ADK's)", set(t) == {"Bash", "Edit", "WebFetch"}
-        yield "Bash: 2 people, 2 calls, 50% failed, 100% asked, 50% rejected at the prompt", (t["Bash"]["people"], t["Bash"]["calls"], t["Bash"]["error_pct"], t["Bash"]["asked_pct"], t["Bash"]["rejected_pct"], t["Bash"]["denied_by_hook_pct"]) == (2, 2, 50.0, 100.0, 50.0, 0.0)
-        yield "WebFetch: denied by a hook, 100%", t["WebFetch"]["denied_by_hook_pct"] == 100.0 and t["WebFetch"]["rejected_pct"] == 0.0
+        yield "tools: Bash, Edit, WebFetch, Write (not the tracer's or ADK's)", set(t) == {"Bash", "Edit", "WebFetch", "Write"}
+        yield "Bash: 2 people, 2 calls, 50% failed, 100% asked, 50% rejected at the prompt", (t["Bash"]["people"], t["Bash"]["calls"], t["Bash"]["error_pct"], t["Bash"]["asked_pct"], t["Bash"]["rejected_at_prompt_pct"], t["Bash"]["denied_by_hook_pct"], t["Bash"]["denied_by_rule_pct"]) == (2, 2, 50.0, 100.0, 50.0, 0.0, 0.0)
+        yield "WebFetch: a hook's refusal (source hook, denied), counted once, as the hook's", (t["WebFetch"]["denied_by_hook_pct"], t["WebFetch"]["rejected_at_prompt_pct"], t["WebFetch"]["denied_by_rule_pct"]) == (100.0, 0.0, 0.0)
+        yield "Write: a rule's refusal (source config), not a person's", (t["Write"]["denied_by_rule_pct"], t["Write"]["rejected_at_prompt_pct"], t["Write"]["denied_by_hook_pct"]) == (100.0, 0.0, 0.0)
+        yield "no call in two refusal columns", all(r["rejected_at_prompt_pct"] + r["denied_by_hook_pct"] + r["denied_by_rule_pct"] <= 100.0 for r in rows)
     elif name == "V6":
         d = by(rows, "day")
         yield "day 1: 1 turn, 0 failed; 2 model requests; 2 tool calls, 1 failed", (d["2026-10-19"]["turns"], d["2026-10-19"]["failed_turns"], d["2026-10-19"]["model_requests"], d["2026-10-19"]["failed_model_requests"], d["2026-10-19"]["tool_calls"], d["2026-10-19"]["failed_tool_calls"]) == (1, 0, 2, 0, 2, 1)
-        yield "day 2: 1 failed turn; 4 model requests, 1 failed; 2 tool calls failed, 1 rejected, 1 denied", (d["2026-10-20"]["failed_turns"], d["2026-10-20"]["model_requests"], d["2026-10-20"]["failed_model_requests"], d["2026-10-20"]["failed_tool_calls"], d["2026-10-20"]["rejected_tool_calls"], d["2026-10-20"]["denied_by_hook"]) == (1, 4, 1, 2, 1, 1)
+        yield "day 2: 1 failed turn; 5 model requests, 1 failed; 3 tool calls failed: 1 at the prompt, 1 by a hook, 1 by a rule", (d["2026-10-20"]["failed_turns"], d["2026-10-20"]["model_requests"], d["2026-10-20"]["failed_model_requests"], d["2026-10-20"]["tool_calls"], d["2026-10-20"]["failed_tool_calls"], d["2026-10-20"]["rejected_at_prompt"], d["2026-10-20"]["denied_by_hook"], d["2026-10-20"]["denied_by_rule"]) == (1, 5, 1, 3, 3, 1, 1, 1)
     elif name == "V7":
         p = by(rows, "producer", "agent")
         mod = p[("bigquery-agent-analytics-mod", "coding-agent")]
-        yield "the mod (main loop): 3 sessions, 4 model requests, 465 tokens, 26.3% rows in error", (mod["sessions"], mod["model_requests"], mod["tokens"], mod["error_row_pct"]) == (3, 4, 465, 26.3)
+        yield "the mod (main loop): 3 sessions, 5 model requests, 465 tokens, 28.6% rows in error", (mod["sessions"], mod["model_requests"], mod["tokens"], mod["error_row_pct"]) == (3, 5, 465, 28.6)
         yield "the mod's subagent: 1 request, 50 tokens", (p[("bigquery-agent-analytics-mod", "general-purpose")]["model_requests"], p[("bigquery-agent-analytics-mod", "general-purpose")]["tokens"]) == (1, 50)
         yield "the tracer, apart: 999 tokens", p[("bqaa-coding-agent-plugin", "coding-agent")]["tokens"] == 999
         yield "ADK, normalized: 77 tokens from total_token_count, both rows kept with no event_id", (p[("adk (no writer)", "adk-agent")]["tokens"], p[("adk (no writer)", "adk-agent")]["error_row_pct"]) == (77, 50.0)
     elif name == "1":
-        yield "the mod's rows, each once: 22", len(rows) == 22
+        yield "the mod's rows, each once: 24", len(rows) == 24
     elif name == "2":
         c = by(rows, "session_id", "model")
         yield "S1 model-a: 2 requests, 25 output tokens, cache-read share 0.294", (c[("S1", "model-a")]["model_requests"], c[("S1", "model-a")]["output_tokens"], c[("S1", "model-a")]["cache_read_share"]) == (2, 25, 0.294)
         yield "the tracer's response is not counted", ("T1", "model-a") not in c
     elif name == "3":
         m = by(rows, "model")
-        yield "model-a: 4 requests (the replay once, no tracer's); model-b: 1", (m["model-a"]["requests"], m["model-b"]["requests"]) == (4, 1) and "model-c" not in m
+        yield "model-a: 5 requests (the replay once, no tracer's); model-b: 1", (m["model-a"]["requests"], m["model-b"]["requests"]) == (5, 1) and "model-c" not in m
     elif name == "4":
         t = by(rows, "tool_name")
         yield "Bash: 2 calls, 1 failure, 1 rejected at the prompt, 0 denied by a hook, 2 asked", (t["Bash"]["calls"], t["Bash"]["failures"], t["Bash"]["rejected_at_prompt"], t["Bash"]["denied_by_hook"], t["Bash"]["asked_permission"]) == (2, 1, 1, 0, 2)
-        yield "WebFetch: 1 denied by a hook; no ADK tool", t["WebFetch"]["denied_by_hook"] == 1 and "search" not in t
+        yield "WebFetch: 1 denied by a hook, not rejected at a prompt; no ADK tool", (t["WebFetch"]["denied_by_hook"], t["WebFetch"]["rejected_at_prompt"]) == (1, 0) and "search" not in t
+        yield "Write: 1 denied by a rule", (t["Write"]["denied_by_rule"], t["Write"]["rejected_at_prompt"], t["Write"]["denied_by_hook"]) == (1, 0, 0)
     elif name == "5":
         t = by(rows, "invocation_id")
         yield "I1: the prompt, 2 model requests, 2 tool calls, 195 tokens", (t["I1"]["prompt"], t["I1"]["model_requests"], t["I1"]["tool_calls"], t["I1"]["turn_tokens"]) == ("list the files", 2, 2, 195)
-        yield "I2: 1 subagent, and its error rows", t["I2"]["subagents"] == 1 and t["I2"]["error_rows"] == 4
+        yield "I2: 1 subagent, and its 5 error rows", t["I2"]["subagents"] == 1 and t["I2"]["error_rows"] == 5
     elif name == "6":
         yield "trace-1: 10 rows, each once", len(rows) == 10
         bash = [r for r in rows if r["event_type"] == "TOOL_COMPLETED" and r["detail"] == "Bash"]
@@ -203,7 +228,7 @@ def checks(name: str, rows: list[dict]):
     elif name == "8":
         d = by(rows, "day")
         yield "day 1: 1 session, 11 rows (the replay once), 1 error", (d["2026-10-19"]["sessions"], d["2026-10-19"]["rows_written"], d["2026-10-19"]["error_rows"]) == (1, 11, 1)
-        yield "day 2: 2 sessions, 11 rows, 4 errors", (d["2026-10-20"]["sessions"], d["2026-10-20"]["rows_written"], d["2026-10-20"]["error_rows"]) == (2, 11, 4)
+        yield "day 2: 2 sessions, 13 rows, 5 errors", (d["2026-10-20"]["sessions"], d["2026-10-20"]["rows_written"], d["2026-10-20"]["error_rows"]) == (2, 13, 5)
 
 
 def queries(path: Path) -> dict[str, str]:
@@ -265,40 +290,45 @@ def main() -> int:
         client.query(f"CREATE TABLE `{project}.{dataset}.team_roster` AS "
                      f"SELECT user_id FROM UNNEST({json.dumps(ROSTER)}) AS user_id").result()
         print(f"# fixture: {len(FIXTURE)} rows in {project}.{dataset}.agent_events")
+        runs = []
         for path in (MOD / "sql" / "value_queries.sql", MOD / "sql" / "sample_queries.sql"):
             for name, sql in queries(path).items():
                 if name == "V4":
                     sql = re.sub(r"-- rates: begin.*?-- rates: end", RATES, sql, flags=re.S)
-                base = [sys.executable, str(RUNNER), "--project", project, "--dataset", dataset,
-                        "--table", "agent_events", "--start", START, "--end", END]
-                if name == "6":
-                    base += ["--trace-id", "trace-1"]
-                dry = subprocess.run(base + ["--dry-run", sql], capture_output=True, text=True)
-                run = subprocess.run(base + [sql], capture_output=True, text=True)
-                label = f"{path.name} {name}"
-                if run.returncode != 0 or dry.returncode != 0:
+                runs.append((f"{path.name} {name}", name, sql, START, END))
+                if name == "V3":
+                    runs.append((f"{path.name} V3 (through a day with no rows)", "V3 silent day", sql, START, "2026-10-21"))
+                    runs.append((f"{path.name} V3 (a window with no rows)", "V3 empty window", sql, "2026-09-01", "2026-09-02"))
+        for label, name, sql, start, end in runs:
+            base = [sys.executable, str(RUNNER), "--project", project, "--dataset", dataset,
+                    "--table", "agent_events", "--start", start, "--end", end]
+            if name == "6":
+                base += ["--trace-id", "trace-1"]
+            dry = subprocess.run(base + ["--dry-run", sql], capture_output=True, text=True)
+            run = subprocess.run(base + [sql], capture_output=True, text=True)
+            if run.returncode != 0 or dry.returncode != 0:
+                failed += 1
+                print(f"not ok - {label} runs: {(run.stderr or dry.stderr).strip()[:300]}")
+                continue
+            scanned = json.loads(dry.stdout)["total_bytes_processed"]
+            rows = [json.loads(line) for line in run.stdout.splitlines() if line.strip()]
+            print(f"# {label}: dry run {scanned} bytes, {len(rows)} rows")
+            results = checks(name, rows)
+            while True:
+                try:
+                    what, ok = next(results)
+                except StopIteration:
+                    break
+                except Exception as error:  # a column or row the query lacks
                     failed += 1
-                    print(f"not ok - {label} runs: {(run.stderr or dry.stderr).strip()[:300]}")
-                    continue
-                scanned = json.loads(dry.stdout)["total_bytes_processed"]
-                rows = [json.loads(line) for line in run.stdout.splitlines() if line.strip()]
-                print(f"# {label}: dry run {scanned} bytes, {len(rows)} rows")
-                results = checks(name, rows)
-                while True:
-                    try:
-                        what, ok = next(results)
-                    except StopIteration:
-                        break
-                    except Exception as error:  # a column or row the query lacks
-                        failed += 1
-                        print(f"not ok - {label}: the answer lacks {error!r}")
-                        break
-                    if ok:
-                        passed += 1
-                        print(f"ok - {label}: {what}")
-                    else:
-                        failed += 1
-                        print(f"not ok - {label}: {what}")
+                    print(f"not ok - {label}: the answer lacks {error!r}")
+                    break
+                if ok:
+                    passed += 1
+                    print(f"ok - {label}: {what}")
+                else:
+                    failed += 1
+                    print(f"not ok - {label}: {what}")
     finally:
         client.delete_dataset(f"{project}.{dataset}", delete_contents=True, not_found_ok=True)
     print(f"{passed} passed, {failed} failed")
