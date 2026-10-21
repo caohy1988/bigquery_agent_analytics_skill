@@ -280,6 +280,8 @@ ORDER BY day DESC;
 --     matched, and only rows inside the window are counted. A response
 --     with no request found is counted by its span, or alone, and
 --     model_requests_unmatched says how many requests were counted so.
+--     When an agent's only rows in the window are later finals, it has no
+--     rows to take a share of: its error_row_pct is NULL.
 WITH events AS (
   SELECT
     *,
@@ -346,7 +348,7 @@ SELECT
   COUNTIF(event_type = 'LLM_RESPONSE' AND tokens IS NULL) AS model_requests_without_usage,
   COUNTIF(later_final) AS later_finals,
   SUM(IF(event_type = 'LLM_RESPONSE', tokens, 0)) AS tokens,
-  ROUND(COUNTIF(failed AND a_row) / COUNTIF(a_row) * 100, 1) AS error_row_pct
+  ROUND(SAFE_DIVIDE(COUNTIF(failed AND a_row), COUNTIF(a_row)) * 100, 1) AS error_row_pct
 FROM counted
 GROUP BY producer, agent
 ORDER BY producer, agent;

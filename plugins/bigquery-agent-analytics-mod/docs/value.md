@@ -58,7 +58,8 @@ on a synthetic fixture and checks the answers.
   Requests are looked up from a day before the window, so a call that
   began just before it is still matched; only rows inside the window are
   counted. Each call is one request and one row of the error rows'
-  denominator.
+  denominator. An agent whose only rows in the window are later finals
+  has none, so its `error_row_pct` is empty (NULL).
 - **Missing is not zero**:
   - a person with no rows is "not seen";
   - a day with no rows at all is still listed, every enrolled person not

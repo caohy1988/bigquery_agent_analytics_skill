@@ -21,7 +21,8 @@ The fixture holds what the queries must count right:
     the order ADK 2.11 wrote them; and two concurrent calls with
     progressive streaming off whose later finals interleave, under one
     agent span the calls share and under an agent span per worker, as ADK
-    2.11 wrote them;
+    2.11 wrote them; and a window that holds only one agent's later finals,
+    beside another agent's calls;
   - a subagent run;
   - each kind of refusal: a person's at the prompt, a hook's, a permission
     rule's, and two from elsewhere (a source the queries do not name, and
@@ -378,6 +379,12 @@ def checks(name: str, rows: list[dict]):
         yield "sequential calls leave out their later finals (2) and keep 20.0% of 5 rows; unstreamed calls have none", (legacy["later_finals"], legacy["error_row_pct"], fan["later_finals"], adk["later_finals"]) == (2, 20.0, 0, 0)
         yield "a call whose own rows recorded no usage adds no tokens and is shown: the mod's main loop has 1", (mod["model_requests_without_usage"], adk["model_requests_without_usage"]) == (1, 0)
         yield "the mod's and the tracer's rows are never unmatched", all(r["model_requests_unmatched"] == 0 for r in rows if r["producer"] != "adk (no writer)")
+    elif name == "V7 later finals only":
+        p = by(rows, "producer", "agent")
+        only = p.get(("adk (no writer)", "adk-staggered"))
+        yield "a window holding only an agent's later finals: 0 model requests, 4 later finals, 0 tokens, no error rows' share (NULL)", only is not None and (only["model_requests"], only["later_finals"], only["tokens"], only["error_row_pct"]) == (0, 4, 0, None)
+        three = p.get(("adk (no writer)", "adk-staggered-three"))
+        yield "beside it, another agent's calls requested before the window: 2 model requests, matched, 70 tokens, 2 later finals left out, 0.0% in error", three is not None and (three["model_requests"], three["model_requests_unmatched"], three["tokens"], three["later_finals"], three["error_row_pct"]) == (2, 0, 70, 2, 0.0)
     elif name == "V7 clipped":
         p = by(rows, "producer", "agent")
         legacy = p[("adk (no writer)", "adk-legacy")]
@@ -482,6 +489,8 @@ def main() -> int:
                 runs.append((f"{path.name} {name}", name, sql, START, END))
                 if name == "V7":
                     runs.append((f"{path.name} V7 (from just after a call's request)", "V7 clipped", sql, "2026-10-20T15:00:01Z", END))
+                    runs.append((f"{path.name} V7 (a window of later finals)", "V7 later finals only", sql,
+                                 "2026-10-20T19:00:05Z", "2026-10-20T19:00:08Z"))
                 if name == "V3":
                     runs.append((f"{path.name} V3 (through a day with no rows)", "V3 silent day", sql, START, "2026-10-21"))
                     runs.append((f"{path.name} V3 (a window with no rows)", "V3 empty window", sql, "2026-09-01", "2026-09-02"))
@@ -494,7 +503,10 @@ def main() -> int:
             run = subprocess.run(base + [sql], capture_output=True, text=True)
             if run.returncode != 0 or dry.returncode != 0:
                 failed += 1
-                print(f"not ok - {label} runs: {(run.stderr or dry.stderr).strip()[:300]}")
+                bad, step = (dry, "dry run") if dry.returncode != 0 else (run, "run")
+                # The runner's own ERROR line, past any warnings.
+                errors = [line for line in bad.stderr.splitlines() if line.startswith("ERROR")] or [bad.stderr.strip()]
+                print(f"not ok - {label} {step} fails: {errors[-1][:300]}")
                 continue
             scanned = json.loads(dry.stdout)["total_bytes_processed"]
             rows = [json.loads(line) for line in run.stdout.splitlines() if line.strip()]
