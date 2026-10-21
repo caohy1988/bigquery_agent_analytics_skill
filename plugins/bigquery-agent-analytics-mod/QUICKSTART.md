@@ -29,7 +29,8 @@ from (`Source: GitHub` or `Source: Folder`). Look for:
 - **`bigquery-agent-analytics-mod`, already enabled**: your organization
   turned it on for you (with `@org-tools`, or another name than
   `@bigquery-agent-analytics-plugin`), or you installed it earlier. Skip the
-  install step, and go to its check.
+  install step, but still sign in, as in [B.2](#2-sign-in-to-google-cloud-1)
+  (with managed settings, that is `gcloud auth login`), then go to its check.
 - **`bigquery-agent-analytics-tracing`, enabled**: the settings-hook tracer.
   Turn it off for the table the mod writes to, or every event is written
   twice:
@@ -52,6 +53,27 @@ from (`Source: GitHub` or `Source: Folder`). Look for:
 
   A clone older than the mod has no mod to install, and an old one installs
   an old mod: pull first.
+- **The marketplace `bigquery-agent-analytics-plugin` added from GitHub**
+  (`Source: GitHub`), for example by issue #4's recipe: the install commands
+  below use the copy it fetched then, and do not refresh it. Added before
+  the mod was published, it stops the install with
+  `Plugin "bigquery-agent-analytics-mod" not found in marketplace`; added
+  later, it installs that older copy. Update it first:
+
+  ```bash
+  claude plugin marketplace update bigquery-agent-analytics-plugin
+  ```
+
+  If the mod is already installed from it, `claude plugin update` keeps the
+  copy you have while the version number is the same ("already at the
+  latest version"). After the update above, uninstall it and install it
+  again, with the same `--config` options:
+
+  ```bash
+  claude plugin uninstall bigquery-agent-analytics-mod@bigquery-agent-analytics-plugin
+  claude plugin install bigquery-agent-analytics-mod@bigquery-agent-analytics-plugin \
+    --config project=THE_PROJECT --config dataset=THE_DATASET
+  ```
 
 ## A. Your own sandbox
 
@@ -134,16 +156,17 @@ your next session.
 - The Google Cloud CLI.
 - From your administrator: the project and dataset, and the token command
   if they gave you one. With managed settings, they gave you nothing to
-  type: the mod is already on.
+  type: the mod is already on, with a token command that impersonates the
+  writer service account, so you sign in with `gcloud auth login` (step 2).
 
 ### 2. Sign in to Google Cloud
 
 Once, as yourself:
 
-- With a token command that impersonates a writer service account
-  (`gcloud auth print-access-token --impersonate-service-account=...`):
-  `gcloud auth login`.
-- Without one (your own access to the table):
+- With managed settings, or a token command that impersonates a writer
+  service account (`gcloud auth print-access-token --impersonate-service-account=...`,
+  or a command your administrator named that runs it): `gcloud auth login`.
+- Only with no token command at all, and your own access to the table:
   `gcloud auth application-default login`.
 
 ### 3. Install the mod
@@ -176,10 +199,11 @@ it is fixed.
 
 | It says | What to do |
 | --- | --- |
-| no working Google credentials | Sign in again (step 2 of your path), or fix what the notice says about the token command. A grant made moments ago can take a minute to apply |
+| no working Google credentials | Sign in again (step 2 of your path): `gcloud auth login` when your organization manages the mod or gave you a token command (the notice may name it as `bqaa-token` or `env`), and `gcloud auth application-default login` only without one. Or fix what the notice says about the token command. A grant made moments ago can take a minute to apply |
 | BigQuery denied the identity access to the dataset | Ask your administrator for the row-writer grant on the table (`bigquery.tables.get` and `bigquery.tables.updateData`), never a role that reads rows such as `roles/bigquery.dataEditor`, then run `/bqaa-backfill` to send the rows that were refused |
 | BigQuery cannot find the dataset (or the table) | Check the names with your administrator, or make it: the notice prints the whole `setup.sh` command, ready to run. A dataset made moments ago can take a few minutes to accept rows; they are sent on their own then |
 | Every event appears twice in the table | The settings-hook tracer is on beside the mod: see [Before you start](#before-you-start) |
+| At install: `Plugin "bigquery-agent-analytics-mod" not found in marketplace` | The marketplace was added from GitHub before the mod was published, and keeps that copy: `claude plugin marketplace update bigquery-agent-analytics-plugin`, then install again (see [Before you start](#before-you-start)) |
 | At install: "its source doesn't match its extraKnownMarketplaces entry" | The marketplace was added from another source (a clone; `claude plugin marketplace list` says which): pull the clone, update the marketplace and install from it, as in [Before you start](#before-you-start) |
 
 ## For administrators
@@ -227,11 +251,13 @@ it is fixed.
    writer and as a reader with no other access (the same guide says how).
 5. **Roll it out:**
    - give people path B: the project, the dataset and the token command
-     `gcloud auth print-access-token --impersonate-service-account=bqaa-row-writer@YOUR_PROJECT.iam.gserviceaccount.com`;
+     `gcloud auth print-access-token --impersonate-service-account=bqaa-row-writer@YOUR_PROJECT.iam.gserviceaccount.com`.
+     Each signs in once with `gcloud auth login`;
    - or turn the mod on for everyone with
      [managed settings](docs/managed-settings.md): the destination, the token
      command and every option are pinned, and the settings-hook tracer is
-     turned off. Each person still signs in once.
+     turned off. Each person still signs in once, with `gcloud auth login`
+     (not `application-default`: the token command impersonates the writer).
 6. **Point the readers at the results:** the two views in
    `<dataset>_reporting`, `daily_usage_by_user` and `daily_usage_by_model`.
    Readers are refused the table by design. Do not grant them the events
