@@ -1,214 +1,347 @@
 # Service-account auth for team rollouts
 
-How a team writes to one shared table without giving every person write
-access to it, and without keeping long-lived keys in configuration files.
-The mod gets each access token by running its `accessTokenCommand` option, a
-command with no shell that prints a token (see the README's
-[Authentication](../README.md#authentication)). Each option below is a
-different command, or a different grant.
+How a team writes to one shared table so that nobody needs read access to it
+to write, nobody keeps a long-lived service-account key, and people who read
+the results never touch the raw rows. The mod gets each access token by
+running its `accessTokenCommand` option, a command with no shell that prints
+a token (the README's [Authentication](../README.md#authentication)); each
+setup below is a different command, or a different grant.
 
-| Option | Who BigQuery sees | Secret on each machine | Access is removed by | Use it for |
-| --- | --- | --- | --- | --- |
-| [1. Service-account impersonation](#1-service-account-impersonation-recommended) (recommended) | One writer service account | None: each person's own gcloud sign-in | Taking the person out of a group | Teams |
-| [2. Group access](#2-group-access-with-each-persons-own-credentials) | Each person | None: each person's own gcloud sign-in | Taking the person out of a group | Small teams, or when BigQuery should see each person |
-| [3. Key file](#3-a-key-file-ci-and-headless-machines-only) (discouraged) | One service account | A long-lived private key | Deleting the key | CI and headless machines with no other way in |
+## Choose a setup
 
-In every option the person's sessions keep working when a token cannot be
-had: the mod shows a notice, and rows wait on disk until a token works.
+| Where the agent runs | Setup | Each person or machine needs | BigQuery sees |
+| --- | --- | --- | --- |
+| People's workstations | [1. Impersonate a writer service account](#1-impersonation-workstations) (recommended) | The Google Cloud CLI, signed in once with `gcloud auth login`; membership of the group allowed to impersonate the writer | the writer service account |
+| People's workstations, when BigQuery should see each person | [2. Direct group access](#2-direct-group-access) | The Google Cloud CLI, signed in once with `gcloud auth application-default login`; membership of the writer group | each person |
+| CI (GitHub Actions and the like) | [3. Workload Identity Federation](#3-ci-workload-identity-federation) | The job's auth step and the Google Cloud CLI; nothing stored | the writer service account |
+| A VM, container or service with its own service account | [4. The attached service account](#4-the-attached-service-account) | The Google Cloud CLI; nothing stored | that service account |
+| None of the above works | [5. A key file](#5-a-key-file-an-approved-exception) (an approved exception) | The key file, a long-lived secret | a service account of its own |
 
-## 1. Service-account impersonation (recommended)
+None of setups 1 to 4 keeps a long-lived service-account key. Setups 1 and
+2 keep the person's own Google sign-in on the machine: `gcloud auth login`
+and `gcloud auth application-default login` store a refresh token for the
+person in gcloud's configuration folder (`~/.config/gcloud`), which lasts
+until it is revoked (`gcloud auth revoke`, or by an administrator) or the
+organization's session policy ends it. Setups 3 and 4 store nothing.
 
-One service account may insert rows into the events table, and nothing
-else. People may only ask Google for short-lived tokens of that account
-(`roles/iam.serviceAccountTokenCreator`), granted to a Google group. Nobody
-holds table access or a key, and taking someone out of the group ends their
-access.
+In every setup the person's sessions keep working when a token cannot be
+had: the mod shows a notice and keeps the rows on disk until a token works.
 
-### What the administrator does
+## Who can do what
 
-[`setup.sh`](../setup.sh) does it all with `--service-account`:
+| Who | Can | Cannot |
+| --- | --- | --- |
+| Writers: the writer service account, and the people or CI jobs that may get its tokens | Insert rows into the events table | Read rows, run a query, change or delete the table |
+| Readers: a group you choose | Query the views (`<dataset>_reporting`): per day, by person or by model, sessions, model requests and token counts | Read the events table, directly or in a query |
+| Administrators: a small group | Read the raw rows: prompts, answers, tool arguments and results | |
 
-```bash
-BQAA_PROJECT_ID=my-gcp-project BQAA_DATASET=agent_analytics \
-  ./setup.sh --service-account bqaa-writer --token-creator group:bqaa-users@example.com
-```
+Never grant the writer service account a role that can read rows (one with
+`bigquery.tables.getData`, such as `roles/bigquery.dataEditor` or
+`roles/bigquery.dataViewer`): everyone who can get its tokens would read
+everyone's prompts and tool output.
 
-Besides the dataset, table and views, it creates, or finds:
+## What this protects, and what it does not
 
-1. the service account `bqaa-writer@my-gcp-project.iam.gserviceaccount.com`;
-2. the project's custom role `bqaaRowWriter`, with two permissions
-   (see [What a writer needs](#what-a-writer-needs));
-3. that role for the service account, on the events table alone;
-4. `roles/iam.serviceAccountTokenCreator` on the service account, for each
-   `--token-creator` member (`group:`, `user:` or `serviceAccount:`; repeat
-   the flag for more).
+- **A leaked writer token** inserts rows until it expires (an hour at most),
+  and reads nothing.
+- **A writer, or anyone who can get the writer's tokens, can add misleading
+  rows**: any content, any `user_id`, and BigQuery cannot tell. Rows that
+  cannot be forged need a server that authenticates each caller and writes
+  for it (a write proxy that stamps the verified caller into `user_id`); that
+  is a separate design, not this one.
+- **The rows hold prompts, answers and tool output** (the README's
+  [Privacy and security](../README.md#privacy-and-security)): only
+  administrators read the table; readers see the views, which hold counts.
+- **A copied key file** (setup 5) works from anywhere until the key is
+  deleted.
+- **Capture is not enforced on a machine its user controls**: they can turn
+  the mod off, change its options, or insert rows of their own. A managed
+  policy pins what it can ([managed settings](managed-settings.md)).
 
-It is safe to run again, and `--dry-run` prints the commands without running
-them. It needs `gcloud` and `bq`, signed in as someone who may create
-service accounts, custom roles, datasets and tables and set their IAM
-policies: project Owner, or Service Account Admin, Role Administrator,
-BigQuery Data Owner and BigQuery Job User. The commands it runs, to do the
-same by hand:
+## Set it up
 
-```bash
-gcloud iam service-accounts create bqaa-writer --project=my-gcp-project \
-  --display-name="BigQuery Agent Analytics mod writer"
-gcloud iam roles create bqaaRowWriter --project=my-gcp-project \
-  --title="BigQuery Agent Analytics row writer" \
-  --permissions=bigquery.tables.get,bigquery.tables.updateData --stage=GA
-bq --project_id=my-gcp-project add-iam-policy-binding \
-  --member=serviceAccount:bqaa-writer@my-gcp-project.iam.gserviceaccount.com \
-  --role=projects/my-gcp-project/roles/bqaaRowWriter \
-  my-gcp-project:agent_analytics.agent_events
-gcloud iam service-accounts add-iam-policy-binding \
-  bqaa-writer@my-gcp-project.iam.gserviceaccount.com --project=my-gcp-project \
-  --member=group:bqaa-users@example.com --role=roles/iam.serviceAccountTokenCreator
-```
+1. **The dataset, table and views**: the mod's [`setup.sh`](../setup.sh)
+   (the README's [The dataset](../README.md#the-dataset)).
+2. **The writer and the readers**: the repository's bootstrap,
+   [`setup_gcp_prereqs.py`](../../bigquery-agent-analytics-tracing/scripts/setup_gcp_prereqs.py).
+   It prints its plan; read it, then run it again with `--execute`:
 
-New grants can take a minute or two to apply. Until they do, the token
-command fails and the mod shows the credentials notice; the rows wait and
-are sent once it works.
-
-### What each person does
-
-1. Sign in to gcloud once, as themselves: `gcloud auth login`. Impersonation
-   uses gcloud's own sign-in, not the Application Default Credentials that
-   `gcloud auth application-default login` sets up.
-2. Set the mod's `accessTokenCommand` option:
-
-   ```text
-   gcloud auth print-access-token --impersonate-service-account=bqaa-writer@my-gcp-project.iam.gserviceaccount.com
+   ```bash
+   python3 plugins/bigquery-agent-analytics-tracing/scripts/setup_gcp_prereqs.py \
+     --project my-gcp-project --dataset agent_analytics \
+     --no-create-dataset --no-create-table \
+     --service-account bqaa-row-writer --writer-role row-writer \
+     --token-creator group:bqaa-writers@example.com \
+     --reader group:bqaa-readers@example.com
    ```
 
+   With `--writer-role row-writer` it:
+   - creates, or finds, the service account
+     `bqaa-row-writer@my-gcp-project.iam.gserviceaccount.com`. Give the
+     writer an account of its own: the tracing plugin's guide makes a
+     `bqaa-writer` with `roles/bigquery.dataEditor`;
+   - stops, before it grants anything, if that account already holds any
+     role on the project, the events or views dataset, or the table, other
+     than the row-writer role on the table. `--allow-existing-grants` keeps
+     them, for an account someone audited. Roles granted to the account on a
+     folder, the organization, other datasets or through a group are not
+     looked at;
+   - creates, or finds, the project's custom role `bqaaRowWriter`, with two
+     permissions (see [What a writer needs](#what-a-writer-needs)), and
+     stops if the role holds any other. It grants the role to the service
+     account on the events table alone: no `roles/bigquery.dataEditor`, no
+     `roles/bigquery.jobUser`;
+   - enables the IAM Service Account Credentials API
+     (`iamcredentials.googleapis.com`), which issues the impersonated
+     tokens, and grants `roles/iam.serviceAccountTokenCreator` on the
+     service account to each `--token-creator` (a group, so access ends with
+     group membership). With `--no-enable-apis`, it checks that the API is
+     on instead;
+   - for each `--reader`, grants `roles/bigquery.dataViewer` on the views
+     dataset and `roles/bigquery.jobUser` on the project, and authorizes the
+     views on the events dataset, so readers need no access to the table.
+
+   It needs `gcloud`, `bq` and the Python BigQuery client, signed in (with
+   `gcloud auth login`, and `gcloud auth application-default login` for the
+   step that authorizes the views) as someone who may enable services,
+   create service accounts and custom roles, and set IAM on them, the
+   project, the table and the datasets: project Owner, or Service Usage
+   Admin, Service Account Admin, Role Administrator, Project IAM Admin,
+   BigQuery Data Owner and BigQuery Job User. New grants can take a minute
+   or more to apply.
+3. **Check the access**: [`tests/access.live.sh`](../tests/access.live.sh),
+   as the writer and a reader, asks BigQuery which rights each holds on the
+   table and tries what each must be refused (nothing is written or changed):
+
+   ```bash
+   PROJECT=my-gcp-project DATASET=agent_analytics \
+     WRITER_SA=bqaa-row-writer@my-gcp-project.iam.gserviceaccount.com \
+     READER_SA=a-reader@my-gcp-project.iam.gserviceaccount.com \
+     bash plugins/bigquery-agent-analytics-mod/tests/access.live.sh
+   ```
+
+   It expects the writer to hold exactly `bigquery.tables.get` and
+   `bigquery.tables.updateData` on the table, and to be refused a read of its
+   rows and any query; and the reader to query a view, and to be refused the
+   table, directly and in a query. Its caller needs Token Creator on both
+   service accounts (here `READER_SA` stands in for a member of the readers'
+   group). With `INSERT_PROBE=1` it also inserts one row as the writer.
+
+## 1. Impersonation (workstations)
+
+Each person:
+
+1. Installs the Google Cloud CLI and signs in once, as themselves:
+   `gcloud auth login`. Impersonation uses gcloud's own sign-in, not the
+   Application Default Credentials of `gcloud auth application-default login`.
+2. Sets the mod's `accessTokenCommand` to
+   `gcloud auth print-access-token --impersonate-service-account=bqaa-row-writer@my-gcp-project.iam.gserviceaccount.com`.
    At install time that is one more `--config` (the value is one argument):
 
    ```bash
-   claude plugin install bigquery-agent-analytics-mod@bigquery-agent-analytics-plugin \
+   claude plugin install bigquery-agent-analytics-mod \
+     --marketplace haiyuan-eng-google/bigquery_agent_analytics_skill \
      --config project=my-gcp-project --config dataset=agent_analytics \
-     --config "accessTokenCommand=gcloud auth print-access-token --impersonate-service-account=bqaa-writer@my-gcp-project.iam.gserviceaccount.com"
+     --config "accessTokenCommand=gcloud auth print-access-token --impersonate-service-account=bqaa-row-writer@my-gcp-project.iam.gserviceaccount.com"
    ```
 
-   For an installed copy, `/plugin configure` (or `claude plugin configure`)
-   sets it. An administrator can set it for everyone with managed settings
-   instead.
+   An installed copy takes it from `/plugin configure`, or an administrator
+   sets it for everyone with [managed settings](managed-settings.md).
+3. Checks it: `/bqaa-status` shows `enabled, target ...`, no `notice` line,
+   and after the first send (every 5 seconds) `requests: 1 ok` or more.
 
-### Check it
+## 2. Direct group access
 
-- `/bqaa-status` shows `enabled, target my-gcp-project.agent_analytics.agent_events`
-  and, after the first send (every 5 seconds), `sent` above 0 and a
-  `last success` time.
-- The rows are there:
-
-  ```bash
-  bq --project_id=my-gcp-project query --use_legacy_sql=false \
-    'SELECT user_id, event_type, timestamp FROM `my-gcp-project.agent_analytics.agent_events`
-     WHERE timestamp > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR) ORDER BY timestamp DESC LIMIT 10'
-  ```
-
-### `user_id` under impersonation
-
-Keep `userIdFromCredentials` off (its default). Then `user_id` is the
-person's login name (`$USER`, or `BQAA_USER_ID`), so rows still tell people
-apart, although BigQuery sees only the service account. With
-`userIdFromCredentials` on, the mod looks up the token's account, which is
-now the service account: every row's `user_id` becomes
-`bqaa-writer@my-gcp-project.iam.gserviceaccount.com`.
-
-`user_id` is what the person's machine says. BigQuery checks who may insert,
-not what a row contains, and keeps no audit-log entry per streaming insert.
-Google's IAM can record who asked for each service-account token when Data
-Access audit logs are on for the IAM Service Account Credentials API; that
-names the person behind the service account, though not row by row.
-
-Google also documents impersonation through Application Default Credentials
-(`gcloud auth application-default login --impersonate-service-account=...`),
-which leaves the mod's default token command as it is. It was not tried with
-the mod; the `--impersonate-service-account` command above was.
-
-## 2. Group access with each person's own credentials
-
-Give a Google group the right to insert rows, and keep the mod's default
-token command (`gcloud auth application-default print-access-token`). Each
-person signs in once with `gcloud auth application-default login`. Rows are
-inserted as each person, and `userIdFromCredentials` gives each person's own
-verified email.
-
-Grant the narrow role on the table to the group (the role from option 1;
-`setup.sh --service-account` creates it, or create it with the
-`gcloud iam roles create` command above):
+Grant the row-writer role on the table to a group, and keep the default
+token command. Each person installs the Google Cloud CLI and signs in once
+with `gcloud auth application-default login`. Rows are inserted as each
+person.
 
 ```bash
 bq --project_id=my-gcp-project add-iam-policy-binding \
-  --member=group:bqaa-users@example.com \
+  --member=group:bqaa-writers@example.com \
   --role=projects/my-gcp-project/roles/bqaaRowWriter \
   my-gcp-project:agent_analytics.agent_events
 ```
 
-`roles/bigquery.dataEditor` on the dataset also works, and is what one
-person needs on a sandbox of their own. For a shared table it is too much:
-it can read every row (everyone's prompts and tool output), and create and
-delete tables.
+(The role is the one `setup_gcp_prereqs.py --writer-role row-writer` makes.)
+Avoid `roles/bigquery.dataEditor` for a shared table: it can also read every
+row, everyone's prompts and tool output included, and change or delete the
+table. It fits one person's sandbox.
 
-## 3. A key file (CI and headless machines only)
+## 3. CI: Workload Identity Federation
 
-Discouraged. A service-account key is a long-lived secret: anyone who copies
-the file can insert rows until the key is deleted, and every copy has to be
-replaced when it is rotated. On CI, prefer workload identity federation;
-where it is used, the token comes from gcloud the same way.
+The CI system's own short-lived identity token is exchanged for the writer
+service account's token: no key. For GitHub Actions (the IAM Service
+Account Credentials API must be on, as the bootstrap leaves it):
 
-The mod cannot use a key file directly: it has no way to sign the token
-request. Wrap it in a token command that reads the key through Application
-Default Credentials, with the variable set for that command alone:
-
-```text
-env GOOGLE_APPLICATION_CREDENTIALS=/secure/path/bqaa-writer-key.json gcloud auth application-default print-access-token
+```bash
+gcloud iam workload-identity-pools create bqaa-ci --project=my-gcp-project --location=global
+gcloud iam workload-identity-pools providers create-oidc github \
+  --project=my-gcp-project --location=global --workload-identity-pool=bqaa-ci \
+  --issuer-uri=https://token.actions.githubusercontent.com \
+  --attribute-mapping="google.subject=assertion.sub,attribute.repository=assertion.repository,attribute.ref=assertion.ref" \
+  --attribute-condition="assertion.repository == 'my-org/my-repo' && assertion.ref == 'refs/heads/main'"
+gcloud iam service-accounts add-iam-policy-binding \
+  bqaa-row-writer@my-gcp-project.iam.gserviceaccount.com --project=my-gcp-project \
+  --role=roles/iam.workloadIdentityUser \
+  --member="principal://iam.googleapis.com/projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/bqaa-ci/subject/repo:my-org/my-repo:ref:refs/heads/main"
 ```
 
-- Create the key with `gcloud iam service-accounts keys create
-  /secure/path/bqaa-writer-key.json --iam-account=bqaa-writer@my-gcp-project.iam.gserviceaccount.com`,
-  keep it readable by the machine's account only, and never commit it.
-- Rotate it: create a new key, put it in place, then delete the old one with
-  `gcloud iam service-accounts keys delete KEY_ID --iam-account=...`.
-- `BQAA_ACCESS_TOKEN` takes a token as it is instead, for a short job that
-  gets one some other way (it is read again every 5 minutes).
+Three things bound who can get the writer's tokens:
+
+- **The audience.** The provider accepts only tokens issued for it: with no
+  `--allowed-audiences`, its own resource name, which the auth action below
+  asks GitHub for.
+- **The repository and branch**, in the attribute condition: a token from
+  any other repository or branch is refused at the exchange.
+- **The subject**, in the binding: one `principal://.../subject/...`
+  (GitHub's `sub` claim, `repo:OWNER/REPO:ref:refs/heads/BRANCH` for a push
+  or a manual run), not the whole pool. Jobs that use a GitHub environment
+  carry `repo:OWNER/REPO:environment:NAME` instead.
+
+In the workflow:
+
+```yaml
+permissions:
+  contents: read
+  id-token: write
+steps:
+  - uses: google-github-actions/auth@v2
+    with:
+      workload_identity_provider: projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/bqaa-ci/providers/github
+      service_account: bqaa-row-writer@my-gcp-project.iam.gserviceaccount.com
+  - uses: google-github-actions/setup-gcloud@v2
+```
+
+After those steps, `gcloud auth print-access-token`, the mod's token command
+there, prints the writer's token.
+
+## 4. The attached service account
+
+On a VM, a container platform or a service that runs as its own service
+account, grant that account the row-writer role on the table and set the
+token command to `gcloud auth print-access-token`: gcloud gets the attached
+account's token from the metadata server, with no sign-in and no key.
+
+## 5. A key file: an approved exception
+
+A service-account key is a long-lived secret: anyone who copies it can insert
+rows until the key is deleted. Use one only where none of the setups above
+works, as an exception someone approved, with a named owner for rotation and
+for revocation, and an end date. Your organization may forbid keys outright
+(the `iam.disableServiceAccountKeyCreation` policy); then use 3 or 4.
+
+Give the exception a service account of its own, with the row-writer role
+on the table and nothing else. Never create a key for the writer service
+account people impersonate: the key would bypass the group that controls
+who may impersonate it, and deleting it is the only way to stop it.
+
+The mod cannot use a key file directly (it cannot sign the token request).
+Wrap it in a token command that reads the key for that command alone:
+
+```text
+env GOOGLE_APPLICATION_CREDENTIALS=/secure/path/bqaa-exception-key.json gcloud auth application-default print-access-token
+```
+
+Keep the file readable by the machine's account only, and never commit it.
+To rotate: create a new key (`gcloud iam service-accounts keys create`), put
+it in place, then delete the old one (`gcloud iam service-accounts keys
+delete KEY_ID --iam-account=...`). Deleting the key revokes it.
 
 ## What a writer needs
 
-Inserting rows with `insertAll`, which the mod does, takes two permissions
-on the table:
+Streaming inserts (`insertAll`, which the mod uses) take two permissions on
+the table:
 
-- `bigquery.tables.updateData`, to insert rows;
-- `bigquery.tables.get`. Streaming inserts check it too: without it BigQuery
-  answers `403 ... Permission bigquery.tables.get denied on table`.
+- `bigquery.tables.updateData`, to insert;
+- `bigquery.tables.get`, which streaming inserts also check: without it
+  BigQuery answers `403 ... Permission bigquery.tables.get denied on table`.
 
-The custom role `bqaaRowWriter` holds exactly these two, granted on the
-events table alone, so the writer can insert rows into that table and read
-none. Google's documentation also lists `bigquery.datasets.get` on the
-dataset for `insertAll`; the table-level pair was enough when this guide was
-checked. If BigQuery ever asks for it, grant `roles/bigquery.metadataViewer`
-on the dataset, which reads table names and schemas, not rows.
+`bqaaRowWriter` holds exactly these two, granted on the events table alone.
+Google's documentation also lists `bigquery.datasets.get` on the dataset for
+streaming inserts; inserts worked without it when this guide was checked. If
+BigQuery ever asks for it, grant `roles/bigquery.metadataViewer` on the
+dataset (names and schemas, no rows).
 
-With this role the writer cannot create the table: create it with
-`setup.sh`, which also builds the views. If the table is missing, the mod's
-attempt to create it is refused, and the mod shows the "BigQuery cannot find
-the table" notice with the `setup.sh` command; rows wait until the table is
-there. To skip that attempt, set `BQAA_AUTO_CREATE_TABLE=false`.
+The writer cannot create the table. If it is missing, the mod's attempt is
+refused, and the mod shows "BigQuery cannot find the table" with the
+`setup.sh` command, while rows wait. Set `BQAA_AUTO_CREATE_TABLE=false` to
+skip that attempt.
 
-People who read the results need none of this. They read the views:
-`roles/bigquery.dataViewer` on the views dataset (`<dataset>_reporting`) and
-`roles/bigquery.jobUser` on a project, with the views authorized on the
-events dataset so that readers need no access to the table.
+## What `user_id` holds
+
+| Setup | `user_id`, by default | With `userIdFromCredentials` on |
+| --- | --- | --- |
+| 1. Impersonation | The person's login name (`$USER`), or `BQAA_USER_ID` | The writer service account's address, the same for everyone |
+| 2. Direct group access | The login name, or `BQAA_USER_ID` | The person's verified email |
+| 3, 4, 5 | The machine's login name (on CI, the runner's), or `BQAA_USER_ID` | The service account's address |
+
+- `userIdFromCredentials` is off by default. Under impersonation leave it
+  off: otherwise every row says the service account.
+- The login name and `BQAA_USER_ID` are what the machine says. `BQAA_USER_ID`
+  is read only from the environment, and a managed setting gives everyone
+  the same value, so it cannot name each person from one central policy.
+- BigQuery checks who may insert, not what a row holds: `user_id` is an
+  attribution, not proof.
+
+## What the logs show
+
+- BigQuery's audit logs do not record streaming inserts row by row, so they
+  cannot say who inserted which row.
+- Under impersonation, each token request is a call to the IAM Service
+  Account Credentials API, which records the caller in its Data Access audit
+  logs when those logs are turned on for that API (they are not by default).
+  That names who could insert in a given hour, not row by row.
+
+## Offboarding
+
+1. **Take the person out** of the group that has Token Creator (setup 1) or
+   the row-writer role (setup 2). The change applies as IAM propagates:
+   usually within minutes, not at once.
+2. **Tokens already issued** stay valid until they expire, up to an hour
+   after they were issued; the mod keeps one for 45 minutes. Their own
+   Google sign-in on the machine ends with their account (or
+   `gcloud auth revoke` there).
+3. **To cut every token off at once**, disable the writer service account:
+   `gcloud iam service-accounts disable bqaa-row-writer@my-gcp-project.iam.gserviceaccount.com`.
+   When this guide was checked, a token issued before the disable was
+   refused (`401`) 15 seconds after it, and no new token was issued; every
+   person's rows then wait until you enable it again
+   (`gcloud iam service-accounts enable ...`). For a key file (setup 5),
+   delete the key.
+4. **Check that access is gone**: the group no longer lists the person
+   (`gcloud identity groups memberships list --group-email=...`), and the
+   service account's policy names no one else
+   (`gcloud iam service-accounts get-iam-policy ...`). As the person, a
+   token command that still works means a grant was missed.
+5. **Rows still on the person's machine** (its dead-letter folder) stay
+   there once no token works; delete the folder (`~/.bqaa-mod/dead-letter`
+   by default) with the machine.
+
+## Organization policies that can get in the way
+
+- `iam.disableServiceAccountKeyCreation` stops key files (setup 5): use
+  setup 3 or 4.
+- `iam.allowedPolicyMemberDomains` (domain-restricted sharing): every
+  `group:` and `user:` member granted above must be in an allowed domain.
+- VPC Service Controls: with BigQuery and the IAM Service Account
+  Credentials API inside a perimeter, requests from workstations and CI need
+  an access level or an ingress rule.
+- `iam.workloadIdentityPoolProviders` limits the identity providers a pool
+  may trust (setup 3).
 
 ## If rows are not written
 
 - **"no working Google credentials"**: the token command fails. Run it by
-  hand to see why: not signed in (`gcloud auth login`), no
-  `roles/iam.serviceAccountTokenCreator` on the service account, or a grant
-  made moments ago that has not applied yet.
-- **"BigQuery denied the identity access to the dataset"**: BigQuery refused
-  the insert. The identity (the service account, for option 1) needs
-  `roles/bigquery.dataEditor` on the dataset, or `bqaaRowWriter` (or the two
-  permissions) on the table. Then run `/bqaa-backfill` to send the refused
-  rows.
-- **"BigQuery cannot find the table"**: run the `setup.sh` command the
-  notice shows.
+  hand: not signed in (`gcloud auth login` for setup 1,
+  `gcloud auth application-default login` for setup 2), no Token Creator on
+  the service account, the IAM Service Account Credentials API off, or a
+  grant made moments ago.
+- **"BigQuery denied the identity access to the dataset"**: the identity
+  (the service account, in setups 1, 3, 4 and 5) lacks the row-writer role on
+  the table. Run the bootstrap again with `--writer-role row-writer`, which
+  grants it, then run `/bqaa-backfill` to send the refused rows. Do not
+  grant a role that reads rows instead.
+- **"BigQuery cannot find the table"**: run the `setup.sh` command the notice
+  shows.

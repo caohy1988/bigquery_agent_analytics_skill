@@ -4,11 +4,23 @@
 The script is intentionally dry-run by default. Pass --execute when the printed
 plan looks right. It uses the caller's current Google Cloud credentials for
 setup, and grants narrower runtime roles to --principal when provided.
+
+--writer-role row-writer grants the writer only what inserting rows takes: a
+custom role with bigquery.tables.updateData and bigquery.tables.get, on the
+events table alone, so the writer reads no rows, runs no queries and deletes
+nothing. --token-creator lets a group impersonate the writer service account,
+and --reader gives a group the views (in the views dataset), with the views
+authorized on the events dataset so readers need no access to the table.
+Before it grants anything, it refuses a writer that already holds other
+grants on the project, the datasets or the table (--allow-existing-grants
+keeps them), and a bqaaRowWriter role that holds more than those two
+permissions.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shlex
 import subprocess
@@ -26,6 +38,12 @@ from bqaa_tracing import bq_schema  # noqa: E402
 
 
 BIGQUERY_API_SERVICES = ("bigquery.googleapis.com", "bigquerystorage.googleapis.com")
+# The custom role --writer-role row-writer grants: streaming inserts check
+# bigquery.tables.get as well as bigquery.tables.updateData ("Permission
+# bigquery.tables.get denied on table" without it).
+ROW_WRITER_ROLE_ID = "bqaaRowWriter"
+ROW_WRITER_PERMISSIONS = ("bigquery.tables.get", "bigquery.tables.updateData")
+
 PRINCIPAL_PREFIXES = (
     "user:",
     "serviceAccount:",
@@ -214,6 +232,236 @@ def _require_project_dataset(args: argparse.Namespace) -> None:
         raise SystemExit("--dataset is required, or set BQAA_DATASET")
     if args.principal:
         _validate_principal(args.principal)
+    if args.token_creator and not args.service_account:
+        raise SystemExit("--token-creator goes with --service-account")
+    for member in [*args.token_creator, *args.reader]:
+        if not any(member.startswith(prefix) for prefix in ("user:", "group:", "serviceAccount:", "domain:")):
+            raise SystemExit(
+                f"{member!r}: --token-creator and --reader take user:, group:, "
+                "serviceAccount: or domain: members"
+            )
+
+
+def _dataset_grant_command(args: argparse.Namespace, dataset: str, member: str, role: str) -> list[str]:
+    """Grant a role on a dataset with BigQuery's GRANT statement.
+
+    ``bq add-iam-policy-binding`` takes a dataset only on allowlisted
+    projects ("This feature requires allowlisting"), and stops reading flags
+    at its first positional argument, so the SQL statement is the reliable
+    way. Members are checked before this (a principal prefix and no quotes).
+    """
+    if '"' in member or "`" in member or "`" in role:
+        raise SystemExit(f"{member!r} or {role!r} holds a quote")
+    statement = f'GRANT `{role}` ON SCHEMA `{args.project}.{dataset}` TO "{member}"'
+    return _bq_command(
+        args,
+        f"--project_id={args.project}",
+        "query",
+        "--use_legacy_sql=false",
+        f"--location={args.location or 'US'}",
+        statement,
+    )
+
+
+def _views_dataset(args: argparse.Namespace) -> str:
+    return args.views_dataset or f"{args.dataset}_reporting"
+
+
+def _json_output(command: list[str], missing_ok: bool = False) -> dict:
+    """Run a gcloud or bq command that prints JSON, and parse it.
+
+    With ``missing_ok``, a resource that does not exist reads as ``{}``.
+    """
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        said = f"{result.stderr or ''}\n{result.stdout or ''}"
+        if missing_ok and ("Not found" in said or "NOT_FOUND" in said):
+            return {}
+        raise SystemExit(f"{_quote_command(command)} failed: {_summarize_stderr(said, 'no output')}")
+    try:
+        value = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError as error:
+        raise SystemExit(f"{_quote_command(command)} printed no JSON: {error}") from error
+    return value if isinstance(value, dict) else {}
+
+
+def _ensure_row_writer_role(args: argparse.Namespace) -> None:
+    """Create the row-writer role, or add the permissions it lacks.
+
+    A role that holds more than ROW_WRITER_PERMISSIONS is refused: bound on
+    the table, it would let the writer read or change it.
+    """
+    project = args.project
+    name = f"projects/{project}/roles/{ROW_WRITER_ROLE_ID}"
+    describe = subprocess.run(
+        _gcloud_command(args, "iam", "roles", "describe", ROW_WRITER_ROLE_ID, "--project", project, "--format=json"),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if describe.returncode == 0:
+        try:
+            role = json.loads(describe.stdout or "{}")
+        except json.JSONDecodeError as error:
+            raise SystemExit(f"gcloud iam roles describe {name} printed no JSON: {error}") from error
+        if role.get("deleted"):
+            raise SystemExit(
+                f"{name} is deleted. Undelete it (gcloud iam roles undelete {ROW_WRITER_ROLE_ID} "
+                f"--project {project}) and run again."
+            )
+        held = set(role.get("includedPermissions") or [])
+        extra = sorted(held - set(ROW_WRITER_PERMISSIONS))
+        if extra:
+            raise SystemExit(
+                f"{name} also holds {', '.join(extra)}: bound on the table, it would let the writer "
+                f"do more than insert rows. Remove them (gcloud iam roles update {ROW_WRITER_ROLE_ID} "
+                f"--project {project} --remove-permissions {','.join(extra)}) and run again."
+            )
+        missing = [permission for permission in ROW_WRITER_PERMISSIONS if permission not in held]
+        if missing:
+            subprocess.run(
+                _gcloud_command(
+                    args, "iam", "roles", "update", ROW_WRITER_ROLE_ID, "--project", project,
+                    "--add-permissions", ",".join(missing), "--quiet",
+                ),
+                stdout=subprocess.DEVNULL,
+                check=True,
+            )
+            print(f"UPDATED role {name}: added {', '.join(missing)}")
+        else:
+            print(f"OK role exists, with {', '.join(ROW_WRITER_PERMISSIONS)} only: {name}")
+        return
+    permissions = ",".join(ROW_WRITER_PERMISSIONS)
+    subprocess.run(
+        _gcloud_command(
+            args, "iam", "roles", "create", ROW_WRITER_ROLE_ID, "--project", project,
+            "--title", "BQAA row writer",
+            "--description", "Inserts rows into the tables it is granted on, and reads none",
+            "--permissions", permissions, "--stage", "GA",
+        ),
+        stdout=subprocess.DEVNULL,
+        check=True,
+    )
+    print(f"CREATED role: {name} ({permissions})")
+
+
+# The access-entry key that names a member of each kind in a dataset's ACL.
+_ACCESS_KEYS = {"user": "userByEmail", "serviceAccount": "userByEmail", "group": "groupByEmail", "domain": "domain"}
+
+
+def _check_writer_grants(args: argparse.Namespace) -> None:
+    """Refuse a writer that already holds more than the row-writer role.
+
+    Looks at the project's IAM policy, the events and views datasets' access
+    and the events table's IAM policy. A reused service account (one an
+    earlier setup gave dataEditor and jobUser, say) would otherwise hand
+    every token creator a read of every row.
+    """
+    principal = args.principal
+    kind, _, name = principal.partition(":")
+    lowered = principal.lower()
+    role = f"projects/{args.project}/roles/{ROW_WRITER_ROLE_ID}"
+    found: list[str] = []
+    policy = _json_output(_gcloud_command(args, "projects", "get-iam-policy", args.project, "--format=json"))
+    for binding in policy.get("bindings") or []:
+        if lowered in (member.lower() for member in binding.get("members") or []):
+            found.append(f"{binding.get('role')} on the project {args.project}")
+    key = _ACCESS_KEYS.get(kind)
+    for dataset in dict.fromkeys([args.dataset, _views_dataset(args)]):
+        info = _json_output(_bq_command(args, "--format=json", "show", f"{args.project}:{dataset}"), missing_ok=True)
+        for entry in info.get("access") or []:
+            named = (key is not None and str(entry.get(key, "")).lower() == name.lower()) or str(
+                entry.get("iamMember", "")
+            ).lower() == lowered
+            if named:
+                found.append(f"{entry.get('role')} on the dataset {args.project}.{dataset}")
+    table = f"{args.project}:{args.dataset}.{args.table}"
+    table_policy = _json_output(_bq_command(args, "--format=json", "get-iam-policy", table), missing_ok=True)
+    for binding in table_policy.get("bindings") or []:
+        if binding.get("role") == role:
+            continue
+        if lowered in (member.lower() for member in binding.get("members") or []):
+            found.append(f"{binding.get('role')} on the table {args.project}.{args.dataset}.{args.table}")
+    if not found:
+        print(f"OK {principal} holds nothing on the project, the datasets or the table beyond {role}")
+        return
+    listed = "\n  - ".join(found)
+    if args.allow_existing_grants:
+        print(f"KEPT (--allow-existing-grants) what {principal} already holds:\n  - {listed}")
+        return
+    raise SystemExit(
+        f"{principal} already holds more than the row-writer role:\n  - {listed}\n"
+        "Its tokens could read or change the table. Use a new service account for the writer, or "
+        "remove those grants and run again; --allow-existing-grants keeps them (an audited account)."
+    )
+
+
+def _check_api_enabled(args: argparse.Namespace, service: str) -> None:
+    """Fail when a service the plan relies on is not enabled (--no-enable-apis)."""
+    result = subprocess.run(
+        _gcloud_command(
+            args, "services", "list", "--enabled", "--project", args.project,
+            f"--filter=config.name={service}", "--format=value(config.name)",
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0 or service not in (result.stdout or "").split():
+        raise SystemExit(
+            f"{service} is not enabled on {args.project}: impersonation needs it. Enable it "
+            f"(gcloud services enable {service} --project {args.project}), or run without --no-enable-apis."
+        )
+    print(f"OK {service} is enabled")
+
+
+def _run_with_retry(command: list[str], what: str) -> None:
+    """A binding, tried again for a minute: a service account made moments ago
+    is not yet a member IAM accepts everywhere."""
+    for attempt in range(1, 8):
+        result = subprocess.run(command, stdout=subprocess.DEVNULL, check=False)
+        if result.returncode == 0:
+            return
+        if attempt < 7:
+            print(f"{what} failed; retrying after IAM propagation delay (attempt {attempt}/7).", file=sys.stderr)
+            time.sleep(10)
+    raise subprocess.CalledProcessError(result.returncode, command)
+
+
+def _authorize_views(project: str, dataset: str, views_dataset: str) -> None:
+    """Authorize every view of the views dataset on the events dataset, so
+    readers of the views need no access to the table."""
+    from google.cloud import bigquery
+
+    client = bigquery.Client(project=project)
+    source = client.get_dataset(f"{project}.{dataset}")
+    views = [t for t in client.list_tables(f"{project}.{views_dataset}") if t.table_type == "VIEW"]
+    if not views:
+        print(f"SKIPPED: no views in {project}.{views_dataset} yet (the mod's setup.sh makes them)")
+        return
+    entries = list(source.access_entries)
+    known = {
+        (e.entity_id.get("projectId"), e.entity_id.get("datasetId"), e.entity_id.get("tableId"))
+        for e in entries
+        if e.entity_type == "view" and isinstance(e.entity_id, dict)
+    }
+    added = []
+    for view in views:
+        key = (view.project, view.dataset_id, view.table_id)
+        if key in known:
+            continue
+        entries.append(
+            bigquery.AccessEntry(
+                None, "view", {"projectId": view.project, "datasetId": view.dataset_id, "tableId": view.table_id}
+            )
+        )
+        added.append(view.table_id)
+    if added:
+        source.access_entries = entries
+        client.update_dataset(source, ["access_entries"])
+        print(f"AUTHORIZED on {project}.{dataset}: {', '.join(added)}")
+    else:
+        print(f"OK views already authorized on {project}.{dataset}")
 
 
 def _ensure_dataset(project: str, dataset: str, location: str | None) -> None:
@@ -268,6 +516,10 @@ def _build_steps(args: argparse.Namespace) -> list[Step]:
         services = list(BIGQUERY_API_SERVICES)
         if args.service_account:
             services.append("iam.googleapis.com")
+        if args.token_creator:
+            # Impersonation's tokens come from the IAM Service Account
+            # Credentials API.
+            services.append("iamcredentials.googleapis.com")
         steps.append(
             Step(
                 "Enable Google Cloud APIs",
@@ -326,21 +578,51 @@ def _build_steps(args: argparse.Namespace) -> list[Step]:
             )
         )
 
-    if args.grant_iam and args.principal:
+    if args.grant_iam and args.principal and args.writer_role == "row-writer":
+        role = f"projects/{args.project}/roles/{ROW_WRITER_ROLE_ID}"
+        steps.extend(
+            [
+                Step(
+                    f"Check that {args.principal} holds nothing beyond the row-writer role",
+                    action=lambda: _check_writer_grants(args),
+                    detail=(
+                        "gcloud projects get-iam-policy; bq show of the events and views "
+                        "datasets; bq get-iam-policy of the table. Stops on any other grant "
+                        "unless --allow-existing-grants"
+                    ),
+                    needs_cli_auth=True,
+                ),
+                Step(
+                    f"Ensure role {role} ({', '.join(ROW_WRITER_PERMISSIONS)})",
+                    action=lambda: _ensure_row_writer_role(args),
+                    detail=(
+                        "gcloud iam roles describe; on missing, create with "
+                        f"{','.join(ROW_WRITER_PERMISSIONS)}; else add any it lacks, "
+                        "and stop if it holds any other"
+                    ),
+                    needs_cli_auth=True,
+                ),
+                Step(
+                    "Grant the row-writer role to runtime principal, on the table alone",
+                    _bq_command(
+                        args,
+                        "add-iam-policy-binding",
+                        "--member",
+                        args.principal,
+                        "--role",
+                        role,
+                        f"{args.project}:{args.dataset}.{args.table}",
+                    ),
+                    needs_cli_auth=True,
+                ),
+            ]
+        )
+    elif args.grant_iam and args.principal:
         steps.extend(
             [
                 Step(
                     "Grant dataset dataEditor to runtime principal",
-                    _bq_command(
-                        args,
-                        "add-iam-policy-binding",
-                        "-d",
-                        f"{args.project}:{args.dataset}",
-                        "--member",
-                        args.principal,
-                        "--role",
-                        "roles/bigquery.dataEditor",
-                    ),
+                    _dataset_grant_command(args, args.dataset, args.principal, "roles/bigquery.dataEditor"),
                     needs_cli_auth=True,
                 ),
                 Step(
@@ -376,6 +658,63 @@ def _build_steps(args: argparse.Namespace) -> list[Step]:
                     needs_cli_auth=True,
                 )
             )
+    if args.service_account:
+        email = _service_account_email(args.project, args.service_account)
+        if args.token_creator and not args.enable_apis:
+            steps.append(
+                Step(
+                    "Check that iamcredentials.googleapis.com is enabled",
+                    action=lambda: _check_api_enabled(args, "iamcredentials.googleapis.com"),
+                    detail="gcloud services list --enabled; impersonation's tokens come from this API",
+                    needs_cli_auth=True,
+                )
+            )
+        for member in args.token_creator:
+            command = _gcloud_command(
+                args, "iam", "service-accounts", "add-iam-policy-binding", email,
+                "--project", args.project, "--member", member,
+                "--role", "roles/iam.serviceAccountTokenCreator",
+            )
+            steps.append(
+                Step(
+                    f"Grant token creation on {email} to {member}",
+                    action=lambda command=command, member=member: _run_with_retry(command, f"Token Creator for {member}"),
+                    detail=_quote_command(command),
+                    needs_cli_auth=True,
+                )
+            )
+
+    views_dataset = _views_dataset(args)
+    for member in args.reader:
+        steps.extend(
+            [
+                Step(
+                    f"Grant views dataset dataViewer to reader {member}",
+                    _dataset_grant_command(args, views_dataset, member, "roles/bigquery.dataViewer"),
+                    needs_cli_auth=True,
+                ),
+                Step(
+                    f"Grant project jobUser to reader {member}, to run queries",
+                    _gcloud_command(
+                        args, "projects", "add-iam-policy-binding", args.project,
+                        "--member", member, "--role", "roles/bigquery.jobUser",
+                    ),
+                    needs_cli_auth=True,
+                ),
+            ]
+        )
+    if args.reader:
+        steps.append(
+            Step(
+                f"Authorize the views of {args.project}.{views_dataset} on {args.project}.{args.dataset}",
+                action=lambda: _authorize_views(args.project, args.dataset, views_dataset),
+                detail=(
+                    "bigquery.Client: add each view of the views dataset to the events "
+                    "dataset's access entries, so readers need no access to the table"
+                ),
+                needs_adc=True,
+            )
+        )
     return steps
 
 
@@ -562,6 +901,8 @@ def _print_plan(args: argparse.Namespace, steps: list[Step]) -> None:
     print(f"location: {args.location or '(client default)'}")
     principal = args.principal or "(IAM grants skipped)"
     print(f"principal: {principal}")
+    if args.principal and args.grant_iam:
+        print(f"writer role: {args.writer_role}")
     print()
     if args.grant_iam and not args.principal:
         print("IAM grants are skipped because --principal was not provided.")
@@ -645,6 +986,53 @@ def main(argv: list[str] | None = None) -> int:
             "Create this service account if missing and grant it runtime IAM. "
             "Use an account id such as bqaa-writer or a full service account email."
         ),
+    )
+    parser.add_argument(
+        "--writer-role",
+        choices=("data-editor", "row-writer"),
+        default="data-editor",
+        help=(
+            "What the runtime principal gets. data-editor (default): dataset "
+            "dataEditor and project jobUser, enough for the tracing plugin's "
+            "verification queries. row-writer: a custom role with "
+            "bigquery.tables.updateData and bigquery.tables.get on the table "
+            "alone (inserts only: no reads, queries or deletes)."
+        ),
+    )
+    parser.add_argument(
+        "--token-creator",
+        action="append",
+        default=[],
+        metavar="MEMBER",
+        help=(
+            "Grant roles/iam.serviceAccountTokenCreator on --service-account to "
+            "this member (best a group:), so it can impersonate the writer. Repeatable."
+        ),
+    )
+    parser.add_argument(
+        "--reader",
+        action="append",
+        default=[],
+        metavar="MEMBER",
+        help=(
+            "Grant this member (best a group:) dataViewer on the views dataset and "
+            "project jobUser, and authorize the views on the events dataset, so "
+            "readers need no access to the table. Repeatable."
+        ),
+    )
+    parser.add_argument(
+        "--allow-existing-grants",
+        action="store_true",
+        help=(
+            "With --writer-role row-writer: keep a writer that already holds other "
+            "grants on the project, the datasets or the table (an audited account). "
+            "Without it, setup stops before granting anything."
+        ),
+    )
+    parser.add_argument(
+        "--views-dataset",
+        default=os.environ.get("BQAA_VIEWS_DATASET") or "",
+        help="The views dataset (default: <dataset>_reporting).",
     )
     parser.add_argument("--execute", action="store_true", help="Apply the printed plan.")
     parser.add_argument(

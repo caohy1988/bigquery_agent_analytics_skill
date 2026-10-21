@@ -170,8 +170,11 @@ BQAA_PROJECT_ID=my-gcp-project BQAA_DATASET=agent_analytics ./plugins/bigquery-a
 ```
 
 `--dry-run` prints the commands and the SQL. Without it, they run.
-`--service-account NAME [--token-creator group:team@example.com]` also sets
-up a writer service account for a team (see
+`setup.sh` grants nothing: who may write and who may read is the
+repository's
+[`setup_gcp_prereqs.py`](../bigquery-agent-analytics-tracing/scripts/setup_gcp_prereqs.py),
+which `setup.sh` names when it is done (for a team, a writer service account
+that may only insert rows, and readers of the views alone; see
 [Service-account auth](docs/service-account-auth.md)).
 
 `setup.sh` ships with the mod. Installed from a marketplace, it is in the
@@ -383,13 +386,17 @@ service-account key file cannot be used directly: the mods environment has
 token. The type declarations mark `$.process.run` as CLI only; where it is
 not available, set `BQAA_ACCESS_TOKEN`.
 
-The identity needs to insert rows into the table: `roles/bigquery.dataEditor`
-on the dataset (it can also create the table), or, narrower, the
-`bqaaRowWriter` role that `setup.sh --service-account` makes, with
-`bigquery.tables.get` and `bigquery.tables.updateData`, on the table alone.
-For a team, [Service-account auth](docs/service-account-auth.md) covers a
-writer service account that people impersonate (no key, no table access for
-anyone), group access, and key files for CI.
+The identity needs to insert rows into the table. `roles/bigquery.dataEditor`
+on the dataset does (it can also create the table), and fits one person's
+sandbox; it can also read, change and delete every row, so never grant it to
+an identity a team shares. For a shared table, grant `bigquery.tables.get` and
+`bigquery.tables.updateData` on the table alone: the `bqaaRowWriter` role that
+the repository's `setup_gcp_prereqs.py --writer-role row-writer` makes.
+[Service-account auth](docs/service-account-auth.md) says which identity to
+use where (a writer service account that people impersonate, with no
+long-lived key; group access; Workload Identity Federation for CI; an attached
+service account; a key file only as an approved exception), who reads the
+views, and offboarding.
 
 ### If rows cannot be written
 
@@ -1419,21 +1426,24 @@ And the other additions:
   for the next token; and a lookup that answers late, for an older token,
   does not replace the newer account.
 
-`tests/setup.test.sh` runs `setup.sh` against stand-ins for `bq` and
-`gcloud` that log their calls. It checks:
+`tests/setup.test.sh` runs `setup.sh` against a stand-in `bq` that logs its
+calls. It checks:
 
 * the datasets, table and views it makes, on a first run and on a second;
 * the fallback variables;
 * that a dry run calls nothing;
 * that names which are not plain ones are refused before any call;
-* `--service-account`: the service account, the row-writer role with its two
-  permissions (and the permissions an existing one lacks), its binding on
-  the events table alone after the table is made, the token creators, a
-  domain-scoped project, a dry run, and names and members it refuses;
 * that the rendered views keep to this mod's rows;
 * that the command the mod prints for a missing dataset makes the views in
   `<dataset>_reporting` even when the shell already sets `BQAA_VIEWS_DATASET`
   (valid or not), or another project, dataset or table.
+
+`tests/access.live.sh` checks, against a real project, the access that
+[Service-account auth](docs/service-account-auth.md) sets up: the writer
+service account holds only `bigquery.tables.get` and
+`bigquery.tables.updateData` on the table, and is refused a read of its rows
+and any query; a reader queries a view, and is refused the table, directly
+and in a query. It changes nothing (`INSERT_PROBE=1` adds one insert).
 
 `tests/state-contract.test.sh` checks, with the host CLI's own test runtime,
 what `tests/reload.test.mjs` models of the host's `$.state`, so its stand-in
@@ -1614,12 +1624,12 @@ hooks/lib/deadletter.ts      dead-letter file format, files sized in UTF-8 bytes
 hooks/lib/config.ts          options and environment
 hooks/lib/status.ts          /bqaa-status text
 hooks/lib/welcome.ts         the welcome card's text, and its records in the store: the version greeted, the card's landing, its close
-setup.sh                     creates the dataset, table, views dataset and views (bq CLI); with --service-account, a writer service account (gcloud)
-docs/service-account-auth.md service-account impersonation, group access and key files for team rollouts
+setup.sh                     creates the dataset, table, views dataset and views (bq CLI)
+docs/service-account-auth.md which identity writes where, who reads the views, offboarding
 sql/                         DDL and sample queries
 sql/views/                   the usage views setup.sh makes
 examples/sample-rows.jsonl   fixture output
-tests/                       plugin-test suites, setup.test.sh for setup.sh, version.test.sh, and reload.test.mjs
+tests/                       plugin-test suites, setup.test.sh for setup.sh, version.test.sh, reload.test.mjs, and access.live.sh (live)
 types/index.d.ts             the values the mod keeps in the session's $.state
 ```
 
