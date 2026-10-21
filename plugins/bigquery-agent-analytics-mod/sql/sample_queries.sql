@@ -67,9 +67,11 @@ ORDER BY requests DESC;
 -- 4. Tool failure rate and latency. A permission prompt's wait is inside
 --    total_ms, so the share of calls that prompted is listed beside it.
 --    Each refused call is counted once, by where the refusal came from: the
---    person at the prompt, a hook, or a permission rule
---    (permission_decision_source). A call that a rule blocks before the
---    host records it leaves no row.
+--    person at the prompt, a hook, a permission rule
+--    (permission_decision_source), or another source (refused_other: one
+--    the host did not give, which the mod records as unknown, or one not
+--    named here); the four add up to refused. A call that a rule blocks
+--    before the host records it leaves no row.
 WITH tools AS (
   SELECT
     *,
@@ -93,9 +95,11 @@ SELECT
   COUNT(*) AS calls,
   COUNTIF(status = 'ERROR') AS failures,
   ROUND(COUNTIF(status = 'ERROR') / COUNT(*) * 100, 2) AS fail_rate_pct,
+  COUNTIF(refusal IS NOT NULL) AS refused,
   COUNTIF(refusal = 'prompt') AS rejected_at_prompt,
   COUNTIF(refusal = 'hook') AS denied_by_hook,
   COUNTIF(refusal = 'rule') AS denied_by_rule,
+  COUNTIF(refusal = 'other') AS refused_other,
   COUNTIF(JSON_VALUE(attributes, '$.permission_requested') = 'true') AS asked_permission,
   APPROX_QUANTILES(CAST(JSON_VALUE(latency_ms, '$.total_ms') AS INT64), 100)[OFFSET(50)] AS p50_ms,
   APPROX_QUANTILES(CAST(JSON_VALUE(latency_ms, '$.total_ms') AS INT64), 100)[OFFSET(95)] AS p95_ms

@@ -8,10 +8,13 @@ The fixture holds what the queries must count right:
   - a session with no user_id;
   - other producers in the same table: the settings-hook tracer's rows and
     an ADK agent's, the latter with no event_id and its tokens under
-    usage_metadata.total_token_count;
+    usage_metadata.total_token_count, with two streamed model calls (a row
+    for each chunk and the last; one call's final row marked by cache_type
+    and finish_reason, the other's not), each to be counted once;
   - a subagent run;
-  - each kind of refusal: a person's at the prompt, a hook's and a
-    permission rule's, each to be counted once;
+  - each kind of refusal: a person's at the prompt, a hook's, a permission
+    rule's, and two from elsewhere (a source the queries do not name, and
+    none), each to be counted once, the kinds adding up to all refusals;
   - a failed model request with its duration, and a response that
     recorded neither usage nor a duration;
   - a window with a day of no rows, and a window with none at all.
@@ -104,6 +107,13 @@ FIXTURE = [
     row("e24", D2 + "03Z", "TOOL_COMPLETED", "S2", user="bob", invocation="I2", content={"tool": "Write", "tool_origin": "builtin"},
         attributes={"permission_decision": "reject", "permission_decision_source": "config"}, latency={"total_ms": 0},
         status="ERROR"),
+    # Refusals from elsewhere: a source the queries do not name (the mod
+    # records `unknown` for a source the host did not give) and none at all.
+    row("e25", D2 + "03Z", "TOOL_COMPLETED", "S2", user="bob", invocation="I2", content={"tool": "Glob", "tool_origin": "builtin"},
+        attributes={"permission_requested": True, "permission_decision": "reject", "permission_decision_source": "unknown"},
+        latency={"total_ms": 0}, status="ERROR"),
+    row("e26", D2 + "03Z", "TOOL_COMPLETED", "S2", user="bob", invocation="I2", content={"tool": "Glob", "tool_origin": "builtin"},
+        attributes={"permission_decision": "reject"}, latency={"total_ms": 0}, status="ERROR"),
     row("e17", D2 + "04Z", "AGENT_STARTING", "S2", user="bob", invocation="I2", agent="general-purpose"),
     row("e18", D2 + "05Z", "LLM_RESPONSE", "S2", user="bob", invocation="I2", agent="general-purpose",
         attributes={"model": "model-a", "usage_metadata": usage(30, 20)},
@@ -131,6 +141,20 @@ FIXTURE = [
         attributes={"model": "model-c", "usage_metadata": {"total_token_count": 77}}),
     row(None, "2026-10-20T14:00:01Z", "TOOL_COMPLETED", "A1", user="carol", agent="adk-agent", writer=None,
         content={"tool": "search"}, status="ERROR"),
+    # Two streamed ADK model calls: a row for each chunk and one for the
+    # final response, under the call's span_id. The first call's final row
+    # has cache_type and finish_reason (and shares its second with a chunk);
+    # the second call's rows have neither, as an older plugin writes them.
+    row(None, "2026-10-20T14:00:02Z", "LLM_RESPONSE", "A1", user="carol", agent="adk-agent", writer=None, span="adk-call-2",
+        attributes={"model": "model-c", "usage_metadata": {"total_token_count": 5}}),
+    row(None, "2026-10-20T14:00:04Z", "LLM_RESPONSE", "A1", user="carol", agent="adk-agent", writer=None, span="adk-call-2",
+        attributes={"model": "model-c", "usage_metadata": {"total_token_count": 12}}),
+    row(None, "2026-10-20T14:00:04Z", "LLM_RESPONSE", "A1", user="carol", agent="adk-agent", writer=None, span="adk-call-2",
+        attributes={"model": "model-c", "usage_metadata": {"total_token_count": 40}, "cache_type": "none", "finish_reason": "STOP"}),
+    row(None, "2026-10-20T14:00:05Z", "LLM_RESPONSE", "A1", user="carol", agent="adk-agent", writer=None, span="adk-call-3",
+        attributes={"model": "model-c", "usage_metadata": {"total_token_count": 3}}),
+    row(None, "2026-10-20T14:00:06Z", "LLM_RESPONSE", "A1", user="carol", agent="adk-agent", writer=None, span="adk-call-3",
+        attributes={"model": "model-c", "usage_metadata": {"total_token_count": 30}}),
 ]
 # The replay: e05 sent twice.
 FIXTURE.append(dict(FIXTURE[4]))
@@ -156,7 +180,7 @@ def checks(name: str, rows: list[dict]):
         yield "the mod's sessions, and no other producer's", set(s) == {"S1", "S2", "S3"}
         yield "S1: 2 model requests and 195 tokens (the replayed row counted once)", s["S1"]["model_requests"] == 2 and s["S1"]["tokens"] == 195
         yield "S1: 2 tool calls, 1 failed; 1 prompt, 1 turn", (s["S1"]["tool_calls"], s["S1"]["failed_tool_calls"], s["S1"]["prompts"], s["S1"]["turns"]) == (2, 1, 1, 1)
-        yield "S2: 290 tokens with the subagent's, 3 tool calls, all failed", (s["S2"]["tokens"], s["S2"]["tool_calls"], s["S2"]["failed_tool_calls"]) == (290, 3, 3)
+        yield "S2: 290 tokens with the subagent's, 5 tool calls, all failed", (s["S2"]["tokens"], s["S2"]["tool_calls"], s["S2"]["failed_tool_calls"]) == (290, 5, 5)
         yield "S3: kept with no user_id; 2 responses, 1 without usage, 30 tokens recorded", "S3" in s and s["S3"]["user_id"] is None and (s["S3"]["model_requests"], s["S3"]["responses_without_usage"], s["S3"]["tokens"]) == (2, 1, 30)
     elif name == "V2":
         t = by(rows, "invocation_id")
@@ -184,24 +208,27 @@ def checks(name: str, rows: list[dict]):
         yield "the tracer's model-a response is not counted", ("T1", "model-a") not in c
     elif name == "V5":
         t = by(rows, "tool")
-        yield "tools: Bash, Edit, WebFetch, Write (not the tracer's or ADK's)", set(t) == {"Bash", "Edit", "WebFetch", "Write"}
-        yield "Bash: 2 people, 2 calls, 50% failed, 100% asked, 50% rejected at the prompt", (t["Bash"]["people"], t["Bash"]["calls"], t["Bash"]["error_pct"], t["Bash"]["asked_pct"], t["Bash"]["rejected_at_prompt_pct"], t["Bash"]["denied_by_hook_pct"], t["Bash"]["denied_by_rule_pct"]) == (2, 2, 50.0, 100.0, 50.0, 0.0, 0.0)
+        yield "tools: Bash, Edit, Glob, WebFetch, Write (not the tracer's or ADK's)", set(t) == {"Bash", "Edit", "Glob", "WebFetch", "Write"}
+        yield "Bash: 2 people, 2 calls, 50% failed, 100% asked, 50% refused, all at the prompt", (t["Bash"]["people"], t["Bash"]["calls"], t["Bash"]["error_pct"], t["Bash"]["asked_pct"], t["Bash"]["refused_pct"], t["Bash"]["rejected_at_prompt_pct"], t["Bash"]["denied_by_hook_pct"], t["Bash"]["denied_by_rule_pct"], t["Bash"]["refused_other_pct"]) == (2, 2, 50.0, 100.0, 50.0, 50.0, 0.0, 0.0, 0.0)
+        yield "Glob: refusals from an unnamed source and from none, both as other: 100% refused", (t["Glob"]["calls"], t["Glob"]["asked_pct"], t["Glob"]["refused_pct"], t["Glob"]["refused_other_pct"], t["Glob"]["rejected_at_prompt_pct"], t["Glob"]["denied_by_hook_pct"], t["Glob"]["denied_by_rule_pct"]) == (2, 50.0, 100.0, 100.0, 0.0, 0.0, 0.0)
         yield "WebFetch: a hook's refusal (source hook, denied), counted once, as the hook's", (t["WebFetch"]["denied_by_hook_pct"], t["WebFetch"]["rejected_at_prompt_pct"], t["WebFetch"]["denied_by_rule_pct"]) == (100.0, 0.0, 0.0)
         yield "Write: a rule's refusal (source config), not a person's", (t["Write"]["denied_by_rule_pct"], t["Write"]["rejected_at_prompt_pct"], t["Write"]["denied_by_hook_pct"]) == (100.0, 0.0, 0.0)
-        yield "no call in two refusal columns", all(r["rejected_at_prompt_pct"] + r["denied_by_hook_pct"] + r["denied_by_rule_pct"] <= 100.0 for r in rows)
+        yield "each tool's refusal kinds add up to its refused share", all(near(r["rejected_at_prompt_pct"] + r["denied_by_hook_pct"] + r["denied_by_rule_pct"] + r["refused_other_pct"], r["refused_pct"]) for r in rows)
     elif name == "V6":
         d = by(rows, "day")
         yield "day 1: 1 turn, 0 failed; 2 model requests; 2 tool calls, 1 failed", (d["2026-10-19"]["turns"], d["2026-10-19"]["failed_turns"], d["2026-10-19"]["model_requests"], d["2026-10-19"]["failed_model_requests"], d["2026-10-19"]["tool_calls"], d["2026-10-19"]["failed_tool_calls"]) == (1, 0, 2, 0, 2, 1)
-        yield "day 2: 1 failed turn; 5 model requests, 1 failed; 3 tool calls failed: 1 at the prompt, 1 by a hook, 1 by a rule", (d["2026-10-20"]["failed_turns"], d["2026-10-20"]["model_requests"], d["2026-10-20"]["failed_model_requests"], d["2026-10-20"]["tool_calls"], d["2026-10-20"]["failed_tool_calls"], d["2026-10-20"]["rejected_at_prompt"], d["2026-10-20"]["denied_by_hook"], d["2026-10-20"]["denied_by_rule"]) == (1, 5, 1, 3, 3, 1, 1, 1)
+        yield "day 2: 1 failed turn; 5 model requests, 1 failed; 5 tool calls failed, all refused: 1 at the prompt, 1 by a hook, 1 by a rule, 2 from elsewhere", (d["2026-10-20"]["failed_turns"], d["2026-10-20"]["model_requests"], d["2026-10-20"]["failed_model_requests"], d["2026-10-20"]["tool_calls"], d["2026-10-20"]["failed_tool_calls"], d["2026-10-20"]["refused_tool_calls"], d["2026-10-20"]["rejected_at_prompt"], d["2026-10-20"]["denied_by_hook"], d["2026-10-20"]["denied_by_rule"], d["2026-10-20"]["refused_other"]) == (1, 5, 1, 5, 5, 5, 1, 1, 1, 2)
+        yield "each day's refusal kinds add up to its refused calls (5 distinct refused calls on day 2)", all(r["rejected_at_prompt"] + r["denied_by_hook"] + r["denied_by_rule"] + r["refused_other"] == r["refused_tool_calls"] for r in rows) and d["2026-10-20"]["refused_tool_calls"] == len({x["event_id"] for x in FIXTURE if x["event_type"] == "TOOL_COMPLETED" and x["timestamp"].startswith("2026-10-20") and x["attributes"].get("writer") == MOD_WRITER and (x["attributes"].get("permission_decision") == "reject" or x["attributes"].get("denied"))})
     elif name == "V7":
         p = by(rows, "producer", "agent")
         mod = p[("bigquery-agent-analytics-mod", "coding-agent")]
-        yield "the mod (main loop): 3 sessions, 5 model requests, 465 tokens, 28.6% rows in error", (mod["sessions"], mod["model_requests"], mod["tokens"], mod["error_row_pct"]) == (3, 5, 465, 28.6)
+        yield "the mod (main loop): 3 sessions, 5 model requests, 465 tokens, 34.8% rows in error", (mod["sessions"], mod["model_requests"], mod["tokens"], mod["error_row_pct"]) == (3, 5, 465, 34.8)
         yield "the mod's subagent: 1 request, 50 tokens", (p[("bigquery-agent-analytics-mod", "general-purpose")]["model_requests"], p[("bigquery-agent-analytics-mod", "general-purpose")]["tokens"]) == (1, 50)
         yield "the tracer, apart: 999 tokens", p[("bqaa-coding-agent-plugin", "coding-agent")]["tokens"] == 999
-        yield "ADK, normalized: 77 tokens from total_token_count, both rows kept with no event_id", (p[("adk (no writer)", "adk-agent")]["tokens"], p[("adk (no writer)", "adk-agent")]["error_row_pct"]) == (77, 50.0)
+        adk = p[("adk (no writer)", "adk-agent")]
+        yield "ADK, normalized: each streamed call once, as its final row (marked, else the last of its span): 3 model requests, 147 tokens (77 from total_token_count), 25.0% of 4 rows in error, rows with no event_id kept", (adk["sessions"], adk["model_requests"], adk["tokens"], adk["error_row_pct"]) == (1, 3, 147, 25.0)
     elif name == "1":
-        yield "the mod's rows, each once: 24", len(rows) == 24
+        yield "the mod's rows, each once: 26", len(rows) == 26
     elif name == "2":
         c = by(rows, "session_id", "model")
         yield "S1 model-a: 2 requests, 25 output tokens, cache-read share 0.294", (c[("S1", "model-a")]["model_requests"], c[("S1", "model-a")]["output_tokens"], c[("S1", "model-a")]["cache_read_share"]) == (2, 25, 0.294)
@@ -211,13 +238,15 @@ def checks(name: str, rows: list[dict]):
         yield "model-a: 5 requests (the replay once, no tracer's); model-b: 1", (m["model-a"]["requests"], m["model-b"]["requests"]) == (5, 1) and "model-c" not in m
     elif name == "4":
         t = by(rows, "tool_name")
-        yield "Bash: 2 calls, 1 failure, 1 rejected at the prompt, 0 denied by a hook, 2 asked", (t["Bash"]["calls"], t["Bash"]["failures"], t["Bash"]["rejected_at_prompt"], t["Bash"]["denied_by_hook"], t["Bash"]["asked_permission"]) == (2, 1, 1, 0, 2)
+        yield "Bash: 2 calls, 1 failure, 1 refused (at the prompt), 0 denied by a hook, 2 asked", (t["Bash"]["calls"], t["Bash"]["failures"], t["Bash"]["refused"], t["Bash"]["rejected_at_prompt"], t["Bash"]["denied_by_hook"], t["Bash"]["refused_other"], t["Bash"]["asked_permission"]) == (2, 1, 1, 1, 0, 0, 2)
+        yield "Glob: 2 refused from elsewhere (an unnamed source, and none)", (t["Glob"]["calls"], t["Glob"]["refused"], t["Glob"]["refused_other"], t["Glob"]["rejected_at_prompt"], t["Glob"]["denied_by_hook"], t["Glob"]["denied_by_rule"]) == (2, 2, 2, 0, 0, 0)
+        yield "each tool's refusal kinds add up to its refused calls", all(r["rejected_at_prompt"] + r["denied_by_hook"] + r["denied_by_rule"] + r["refused_other"] == r["refused"] for r in rows)
         yield "WebFetch: 1 denied by a hook, not rejected at a prompt; no ADK tool", (t["WebFetch"]["denied_by_hook"], t["WebFetch"]["rejected_at_prompt"]) == (1, 0) and "search" not in t
         yield "Write: 1 denied by a rule", (t["Write"]["denied_by_rule"], t["Write"]["rejected_at_prompt"], t["Write"]["denied_by_hook"]) == (1, 0, 0)
     elif name == "5":
         t = by(rows, "invocation_id")
         yield "I1: the prompt, 2 model requests, 2 tool calls, 195 tokens", (t["I1"]["prompt"], t["I1"]["model_requests"], t["I1"]["tool_calls"], t["I1"]["turn_tokens"]) == ("list the files", 2, 2, 195)
-        yield "I2: 1 subagent, and its 5 error rows", t["I2"]["subagents"] == 1 and t["I2"]["error_rows"] == 5
+        yield "I2: 1 subagent, and its 7 error rows", t["I2"]["subagents"] == 1 and t["I2"]["error_rows"] == 7
     elif name == "6":
         yield "trace-1: 10 rows, each once", len(rows) == 10
         bash = [r for r in rows if r["event_type"] == "TOOL_COMPLETED" and r["detail"] == "Bash"]
@@ -228,7 +257,7 @@ def checks(name: str, rows: list[dict]):
     elif name == "8":
         d = by(rows, "day")
         yield "day 1: 1 session, 11 rows (the replay once), 1 error", (d["2026-10-19"]["sessions"], d["2026-10-19"]["rows_written"], d["2026-10-19"]["error_rows"]) == (1, 11, 1)
-        yield "day 2: 2 sessions, 13 rows, 5 errors", (d["2026-10-20"]["sessions"], d["2026-10-20"]["rows_written"], d["2026-10-20"]["error_rows"]) == (2, 13, 5)
+        yield "day 2: 2 sessions, 15 rows, 7 errors", (d["2026-10-20"]["sessions"], d["2026-10-20"]["rows_written"], d["2026-10-20"]["error_rows"]) == (2, 15, 7)
 
 
 def queries(path: Path) -> dict[str, str]:

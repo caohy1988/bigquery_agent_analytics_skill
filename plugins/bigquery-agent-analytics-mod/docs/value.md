@@ -15,9 +15,9 @@ on a synthetic fixture and checks the answers.
 | Developer | Where did my sessions' time, tokens and tool failures go? | V1 (per session), V2 (per turn), sample 5 (per turn, with the prompt) | Someone who may read the table: you, in your own sandbox project; in a team, an administrator | In a team set up as issue #13's service-account guide recommends, you can write rows and read none. Per-day totals by person are in the views (`daily_usage_by_user`), which a reader group may query |
 | Team lead or administrator | Who uses it, against who was enrolled? | V3, with a roster | An administrator | Who did not use the agent and whose sessions were not recorded look the same: both have no rows. A day with no rows at all is listed, and flagged |
 | Team lead or administrator | What does a session cost? | V4, with your rates | An administrator | An estimate: tokens times the rates you enter, dated. Not a bill. None for a session and model with a response that recorded no usage |
-| Team lead or administrator | Which tools do people use, and how often do they fail, prompt, or get refused, by the person, a hook or a permission rule? | V5, sample 4 | An administrator | Each refused call is counted once, by where the refusal came from (`permission_decision_source`). A call that a rule blocks before the host records it leaves no row |
+| Team lead or administrator | Which tools do people use, and how often do they fail, prompt, or get refused, by the person, a hook or a permission rule? | V5, sample 4 | An administrator | Each refused call is counted once, by where the refusal came from (`permission_decision_source`): the person, a hook, a rule, or another source (`refused_other`: one the host did not give, recorded as `unknown`, or one the queries do not name). The four add up to all refused calls (`refused_pct`, `refused`). A call that a rule blocks before the host records it leaves no row |
 | Team lead or administrator | Are errors going up? | V6, sample 8 | An administrator | Each rate has its own denominator (turns, model requests, tool calls), as V6 shows them |
-| Platform team | How do coding-agent sessions compare with our ADK agents? | V7 | An administrator of the shared table | Only sessions, model requests, tokens and error rows are compared; other columns differ by producer |
+| Platform team | How do coding-agent sessions compare with our ADK agents? | V7 | An administrator of the shared table | Only sessions, model requests, tokens and error rows are compared; other columns differ by producer. An ADK model call counts once, as its final response: ADK also writes a row for each streamed chunk, and those are left out |
 | Anyone with the views | Sessions, model requests and tokens per day, by person or model | `daily_usage_by_user`, `daily_usage_by_model` | The reader group | No prompts, tools or errors: counts only |
 
 ## Denominators
@@ -36,6 +36,12 @@ on a synthetic fixture and checks the answers.
 - **Errors**: per turn (turns that ended in `INVOCATION_ERROR`), per model
   request (`LLM_ERROR` among answered and failed requests) and per tool call
   (`TOOL_COMPLETED` with status `ERROR`), never one rate over all rows.
+- **ADK model requests** (V7): one per model call. ADK writes an
+  `LLM_RESPONSE` row for each chunk of a streamed response as well as the
+  final one, all under the call's `span_id`; only the final row has
+  `cache_type` or `finish_reason`. V7 keeps that row (or, where none has
+  them, the last of the span) for the requests, the tokens and the error
+  rows' denominator.
 - **Missing is not zero**:
   - a person with no rows is "not seen";
   - a day with no rows at all is still listed, every enrolled person not

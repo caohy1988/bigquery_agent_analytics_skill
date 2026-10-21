@@ -181,11 +181,13 @@ ORDER BY r.session_id, r.model;
 
 -- V5. Team lead: the tools people use most. Per tool: the people who used
 --     it, its calls, and the share of calls that failed, asked for
---     permission, and were refused, each refused call counted once by where
---     the refusal came from: the person at the prompt (rejected or
---     aborted), a hook, or a permission rule (permission_decision_source
---     config). A call that a rule blocks before the host records it leaves
---     no row.
+--     permission, and were refused (refused_pct). Each refused call is also
+--     counted once by where the refusal came from: the person at the prompt
+--     (rejected or aborted), a hook, a permission rule
+--     (permission_decision_source config), or another source
+--     (refused_other_pct: one the host did not give, which the mod records
+--     as unknown, or one not named here). Those four add up to refused_pct.
+--     A call that a rule blocks before the host records it leaves no row.
 WITH tools AS (
   SELECT
     *,
@@ -209,9 +211,11 @@ SELECT
   COUNT(*) AS calls,
   ROUND(COUNTIF(status = 'ERROR') / COUNT(*) * 100, 1) AS error_pct,
   ROUND(COUNTIF(JSON_VALUE(attributes, '$.permission_requested') = 'true') / COUNT(*) * 100, 1) AS asked_pct,
+  ROUND(COUNTIF(refusal IS NOT NULL) / COUNT(*) * 100, 1) AS refused_pct,
   ROUND(COUNTIF(refusal = 'prompt') / COUNT(*) * 100, 1) AS rejected_at_prompt_pct,
   ROUND(COUNTIF(refusal = 'hook') / COUNT(*) * 100, 1) AS denied_by_hook_pct,
-  ROUND(COUNTIF(refusal = 'rule') / COUNT(*) * 100, 1) AS denied_by_rule_pct
+  ROUND(COUNTIF(refusal = 'rule') / COUNT(*) * 100, 1) AS denied_by_rule_pct,
+  ROUND(COUNTIF(refusal = 'other') / COUNT(*) * 100, 1) AS refused_other_pct
 FROM tools
 GROUP BY tool
 ORDER BY calls DESC, tool;
@@ -219,8 +223,9 @@ ORDER BY calls DESC, tool;
 -- V6. Team lead: errors over time. Per day, each count beside its own
 --     denominator: turns and those that ended in an error, model requests
 --     (answered or failed) and the failed ones, tool calls and the failed
---     ones, and the refused tool calls, each counted once by where the
---     refusal came from (as in V5).
+--     ones, and the refused tool calls (refused_tool_calls), split by where
+--     the refusal came from (as in V5) into rejected_at_prompt,
+--     denied_by_hook, denied_by_rule and refused_other, which add up to it.
 WITH events AS (
   SELECT
     *,
@@ -245,9 +250,11 @@ SELECT
   COUNTIF(event_type = 'LLM_ERROR') AS failed_model_requests,
   COUNTIF(event_type = 'TOOL_COMPLETED') AS tool_calls,
   COUNTIF(event_type = 'TOOL_COMPLETED' AND status = 'ERROR') AS failed_tool_calls,
+  COUNTIF(event_type = 'TOOL_COMPLETED' AND refusal IS NOT NULL) AS refused_tool_calls,
   COUNTIF(event_type = 'TOOL_COMPLETED' AND refusal = 'prompt') AS rejected_at_prompt,
   COUNTIF(event_type = 'TOOL_COMPLETED' AND refusal = 'hook') AS denied_by_hook,
-  COUNTIF(event_type = 'TOOL_COMPLETED' AND refusal = 'rule') AS denied_by_rule
+  COUNTIF(event_type = 'TOOL_COMPLETED' AND refusal = 'rule') AS denied_by_rule,
+  COUNTIF(event_type = 'TOOL_COMPLETED' AND refusal = 'other') AS refused_other
 FROM events
 GROUP BY day
 ORDER BY day DESC;
@@ -256,7 +263,11 @@ ORDER BY day DESC;
 --     settings-hook tracer. The producers share the agent_events schema,
 --     so one table, or a UNION over two, holds them all. Per producer and
 --     agent: sessions, model requests, tokens and the share of rows in
---     error. Normalized: rows with no writer are named for ADK, and an ADK
+--     error. Normalized: rows with no writer are named for ADK; an ADK model
+--     call counts once, as its final response, since ADK also writes an
+--     LLM_RESPONSE row for each streamed chunk under the call's span_id
+--     (the row with cache_type or finish_reason is kept, else the last of
+--     the span), and the chunks are left out of every column; and an ADK
 --     response's tokens are read from total_token_count when total_tokens
 --     is missing. Other columns differ by producer and are left out.
 WITH events AS (
@@ -264,6 +275,16 @@ WITH events AS (
   FROM `{PROJECT}.{DATASET}.{TABLE}`
   WHERE timestamp BETWEEN @start AND @end
   QUALIFY event_id IS NULL OR ROW_NUMBER() OVER (PARTITION BY event_id ORDER BY timestamp) = 1
+),
+calls AS (
+  SELECT *
+  FROM events
+  WHERE TRUE
+  QUALIFY event_type != 'LLM_RESPONSE' OR JSON_VALUE(attributes, '$.writer.plugin') IS NOT NULL OR span_id IS NULL
+    OR ROW_NUMBER() OVER (
+      PARTITION BY session_id, span_id, event_type
+      ORDER BY (JSON_VALUE(attributes, '$.cache_type') IS NOT NULL OR JSON_VALUE(attributes, '$.finish_reason') IS NOT NULL) DESC,
+        timestamp DESC) = 1
 )
 SELECT
   IFNULL(JSON_VALUE(attributes, '$.writer.plugin'), 'adk (no writer)') AS producer,
@@ -273,6 +294,6 @@ SELECT
   SUM(IF(event_type = 'LLM_RESPONSE', COALESCE(SAFE_CAST(JSON_VALUE(attributes, '$.usage_metadata.total_tokens') AS INT64),
     SAFE_CAST(JSON_VALUE(attributes, '$.usage_metadata.total_token_count') AS INT64)), 0)) AS tokens,
   ROUND(COUNTIF(status = 'ERROR') / COUNT(*) * 100, 1) AS error_row_pct
-FROM events
+FROM calls
 GROUP BY producer, agent
 ORDER BY producer, agent;
