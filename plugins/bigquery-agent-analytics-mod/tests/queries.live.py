@@ -35,6 +35,9 @@ The fixture holds what the queries must count right:
     that closes before them, seen from that window, from one after the
     turn and from one that starts after the turn's first request ended,
     and a turn with no requests or tool calls;
+  - a turn longer than a day, a tool call with a permission wait in it,
+    seen from a window whose day of lookback misses the turn's start, and
+    from one that covers it;
   - a window with a day of no rows, and a window with none at all.
 
 It makes a dataset of its own (bqaa_query_check_<random>, in US), with the
@@ -330,6 +333,22 @@ FIXTURE += [
     row("e9a", D9 + "24Z", "INVOCATION_COMPLETED", "S9", invocation="I9b", trace="trace-9b", span="inv-9b",
         latency={"total_ms": 1000}),
 ]
+# SL, on days outside the other windows: a turn of 25 hours. Its tool call,
+# which asked for permission, waited from 2026-10-23 10:00:03 to 2026-10-24
+# 11:00:03.
+IL = dict(invocation="IL", trace="trace-l")
+FIXTURE += [
+    row("l01", "2026-10-23T10:00:00Z", "INVOCATION_STARTING", "SL", **IL, span="inv-l"),
+    row("l02", "2026-10-23T10:00:01Z", "LLM_REQUEST", "SL", **IL, span="req-l1", parent="inv-l", attributes={"model": "model-a"}),
+    row("l03", "2026-10-23T10:00:02Z", "LLM_RESPONSE", "SL", **IL, span="req-l1", parent="inv-l",
+        attributes={"model": "model-a", "usage_metadata": usage(10, 5)}, latency={"total_ms": 1000}),
+    row("l04", "2026-10-23T10:00:03Z", "TOOL_STARTING", "SL", **IL, span="tool-l1", parent="req-l1", content={"tool": "Bash"}),
+    row("l05", "2026-10-24T11:00:03Z", "TOOL_COMPLETED", "SL", **IL, span="tool-l1", parent="req-l1",
+        content={"tool": "Bash", "tool_origin": "builtin"},
+        attributes={"permission_requested": True, "permission_decision": "accept", "permission_decision_source": "user_temporary"},
+        latency={"total_ms": 90000000}),
+    row("l06", "2026-10-24T11:00:04Z", "INVOCATION_COMPLETED", "SL", **IL, span="inv-l", latency={"total_ms": 90004000}),
+]
 # The replay: e05 sent twice.
 FIXTURE.append(dict(FIXTURE[4]))
 ROSTER = ["alice", "bob", "dave"]
@@ -361,6 +380,8 @@ def checks(name: str, rows: list[dict]):
         yield "I1: turn 7000 ms, models 1400 ms, tools 700 ms, 1 permission prompt", (t["I1"]["turn_ms"], t["I1"]["model_ms"], t["I1"]["tool_ms"], t["I1"]["permission_prompts"]) == (7000, 1400, 700, 1)
         yield "I2: turn 9000 ms, models 8300 ms (with the subagent's and the 6000 ms failed request), tools 300 ms", (t["I2"]["turn_ms"], t["I2"]["model_ms"], t["I2"]["tool_ms"]) == (9000, 8300, 300)
         yield "I3: no end of turn, and a response with no duration: turn_ms and model_ms are NULL, not 0", t["I3"]["turn_ms"] is None and t["I3"]["model_ms"] is None
+        yield "I3, with no start row read, may be missing earlier calls: its tool time and prompts are NULL too", (t["I3"]["tool_ms"], t["I3"]["permission_prompts"]) == (None, None)
+        yield "whole_turn: I1 and I2 (their start rows were read), not I3", (t["I1"].get("whole_turn"), t["I2"].get("whole_turn"), t["I3"].get("whole_turn")) == (True, True, False)
     elif name == "V2 ends mid-turn":
         t = by(rows, "invocation_id")
         yield "a window that ends before a model request and a tool call end: that turn's model and tool time are NULL, not 1000 and 0 ms", "I9" in t and (t["I9"]["turn_ms"], t["I9"]["model_ms"], t["I9"]["tool_ms"]) == (None, None, None)
@@ -371,6 +392,15 @@ def checks(name: str, rows: list[dict]):
     elif name == "V2 starts mid-turn":
         t = by(rows, "invocation_id")
         yield "a window that starts after the turn's first request ended: the turn is taken whole, from when it started: models 18000 ms, not 17000", "I9" in t and (t["I9"]["turn_ms"], t["I9"]["model_ms"], t["I9"]["tool_ms"], t["I9"]["started_at"].replace("T", " ")[:19]) == (22000, 18000, 17000, "2026-10-22 20:00:00")
+    elif name == "V2 past the lookback":
+        t = by(rows, "invocation_id")
+        yield "a turn that began more than a day before the window: NULL model and tool time and prompts, not 0 and 90000000 ms", "IL" in t and (t["IL"]["turn_ms"], t["IL"]["model_ms"], t["IL"]["tool_ms"], t["IL"]["permission_prompts"]) == (90004000, None, None, None)
+        yield "its start from its end row, 2026-10-23 10:00:00, not the first row read", "IL" in t and str(t["IL"]["started_at"]).replace("T", " ")[:19] == "2026-10-23 10:00:00"
+        yield "and whole_turn says it is not whole", "IL" in t and t["IL"].get("whole_turn") is False
+    elif name == "V2 whole long turn":
+        t = by(rows, "invocation_id")
+        yield "the same turn from a window whose lookback reaches its start: models 1000 ms, tools 90000000 ms, 1 permission prompt, from 2026-10-23 10:00:00", "IL" in t and (str(t["IL"]["started_at"]).replace("T", " ")[:19], t["IL"]["turn_ms"], t["IL"]["model_ms"], t["IL"]["tool_ms"], t["IL"]["permission_prompts"]) == ("2026-10-23 10:00:00", 90004000, 1000, 90000000, 1)
+        yield "and it is whole", "IL" in t and t["IL"].get("whole_turn") is True
     elif name == "V3":
         d = by(rows, "day")
         yield "day 1: 3 enrolled, 1 seen, 2 not seen, 1 session, 1 turn", (d["2026-10-19"]["enrolled"], d["2026-10-19"]["enrolled_seen"], d["2026-10-19"]["enrolled_not_seen"], d["2026-10-19"]["enrolled_sessions"], d["2026-10-19"]["enrolled_turns"]) == (3, 1, 2, 1, 1)
@@ -546,7 +576,9 @@ def main() -> int:
                 if name == "V2":
                     for case, start, end in (("V2 ends mid-turn", "2026-10-22T20:00:00Z", "2026-10-22T20:00:10Z"),
                                              ("V2 after the turn", "2026-10-22T20:00:00Z", "2026-10-22T20:00:30Z"),
-                                             ("V2 starts mid-turn", "2026-10-22T20:00:15Z", "2026-10-22T20:00:30Z")):
+                                             ("V2 starts mid-turn", "2026-10-22T20:00:15Z", "2026-10-22T20:00:30Z"),
+                                             ("V2 past the lookback", "2026-10-24T11:00:00Z", "2026-10-24T11:00:10Z"),
+                                             ("V2 whole long turn", "2026-10-24T09:00:00Z", "2026-10-24T11:00:10Z")):
                         runs.append((f"{path.name} {case}", case, sql, start, end))
                 if name == "V3":
                     runs.append((f"{path.name} V3 (through a day with no rows)", "V3 silent day", sql, START, "2026-10-21"))

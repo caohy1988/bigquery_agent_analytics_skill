@@ -71,7 +71,12 @@ on a synthetic fixture and checks the answers.
     window (it ended later, or the row was lost). A turn with no requests,
     or no tool calls, has 0 for that part, and a failed request's time
     counts as model time. V2 takes each turn with a row in the window
-    whole, looking its rows up from a day before the window;
+    whole, looking its rows up from a day before the window. A turn whose
+    start row is not among them (it began more than a day before the
+    window, the mod was loaded mid-turn, or the row was lost) has
+    `whole_turn` false: its earlier calls may be missing, so its model and
+    tool time and its permission prompts are NULL, and its `started_at`
+    comes from its end row (NULL without one);
   - a response that recorded no usage adds no tokens, and is counted in
     `responses_without_usage`;
   - a session and model with such a response, or a model with no rate row,
@@ -92,8 +97,9 @@ python3 bigquery-agent-analytics-skill/scripts/run_bq.py \
 ```
 
 `--dry-run` prints the bytes the query would scan; drop it to run it. The
-table is partitioned by day, so the window decides the bytes. On the
-fixture each query scanned 3 to 5 KB. V3 also reads `team_roster` in the
+table is partitioned by day, so the window decides the bytes; V2 and V7
+also read the day before it, to find the starts of turns and calls that
+began earlier. On the fixture each query scanned at most 15 KB. V3 also reads `team_roster` in the
 same dataset; V4 needs your rates in its `rates` block.
 
 ## Cost, as an estimate

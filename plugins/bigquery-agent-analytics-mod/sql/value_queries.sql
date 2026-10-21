@@ -61,8 +61,13 @@ ORDER BY started_at DESC;
 --     was lost). Unknown, not zero; a turn with no requests, or no tool
 --     calls, has 0 for that part. A turn with a row in the window is taken
 --     whole, its rows looked up from a day before the window, so one that
---     began before it keeps its earlier calls. The parts can add up to more
---     than the turn: a tool call can run beside a model request.
+--     began before it keeps its earlier calls. whole_turn is FALSE when the
+--     turn's start row is not among them: it began more than a day before
+--     the window, the mod was loaded mid-turn, or the row was lost. Its
+--     earlier calls may be missing, so its model and tool time and its
+--     permission prompts are NULL, and started_at comes from its end row
+--     (its end less its total; NULL without one). The parts can add up to
+--     more than the turn: a tool call can run beside a model request.
 WITH events AS (
   SELECT
     *,
@@ -103,7 +108,9 @@ turns AS (
   SELECT
     session_id,
     invocation_id,
-    MIN(timestamp) AS started_at,
+    LOGICAL_OR(event_type = 'INVOCATION_STARTING') AS whole_turn,
+    MIN(timestamp) AS first_row_at,
+    MAX(IF(event_type IN ('INVOCATION_COMPLETED', 'INVOCATION_ERROR'), timestamp, NULL)) AS ended_at,
     MAX(IF(event_type IN ('INVOCATION_COMPLETED', 'INVOCATION_ERROR'), SAFE_CAST(JSON_VALUE(latency_ms, '$.total_ms') AS INT64), NULL)) AS turn_ms,
     COUNTIF(event_type = 'TOOL_COMPLETED' AND JSON_VALUE(attributes, '$.permission_requested') = 'true') AS permission_prompts
   FROM turn_rows
@@ -112,15 +119,16 @@ turns AS (
 SELECT
   t.session_id,
   t.invocation_id,
-  t.started_at,
+  IF(t.whole_turn, t.first_row_at, TIMESTAMP_SUB(t.ended_at, INTERVAL t.turn_ms MILLISECOND)) AS started_at,
+  t.whole_turn,
   t.turn_ms,
-  IF(p.invocation_id IS NULL, 0, p.model_ms) AS model_ms,
-  IF(p.invocation_id IS NULL, 0, p.tool_ms) AS tool_ms,
-  t.permission_prompts
+  IF(NOT t.whole_turn, NULL, IF(p.invocation_id IS NULL, 0, p.model_ms)) AS model_ms,
+  IF(NOT t.whole_turn, NULL, IF(p.invocation_id IS NULL, 0, p.tool_ms)) AS tool_ms,
+  IF(t.whole_turn, t.permission_prompts, NULL) AS permission_prompts
 FROM turns AS t
 LEFT JOIN parts AS p
   ON p.invocation_id = t.invocation_id AND p.session_id IS NOT DISTINCT FROM t.session_id
-ORDER BY t.started_at DESC;
+ORDER BY started_at DESC;
 
 -- V3. Team lead: adoption against a roster. Per calendar day of the
 --     window: the people enrolled (a table of their login names that you
