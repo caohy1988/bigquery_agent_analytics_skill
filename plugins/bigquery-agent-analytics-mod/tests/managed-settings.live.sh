@@ -5,10 +5,12 @@
 # check reads the host's debug log.
 #
 # Offline (--network none), the organization's folder marketplace:
-#   pins      the policy's options and environment pins hold against the
-#             person's own settings, a --settings file, a repository's
-#             settings and the shell (destination, table, capture, live
-#             writes, token command, spool folder, agent name, identity);
+#   pins      the policy, a drop-in file beside an existing
+#             managed-settings.json (whose keys still apply), holds its
+#             options and environment pins against the person's own
+#             settings, a --settings file, a repository's settings and the
+#             shell (destination, table, capture, live writes, token
+#             command, spool folder, agent name, identity);
 #   partial   a policy that pins only some options leaves the rest to the
 #             person (why the guide pins every one);
 #   unpinned  without the environment pins, the shell and a repository
@@ -21,11 +23,17 @@
 #   opt-out   a person's enabledPlugins, plugin disable and plugin uninstall
 #             leave the mod on; safe mode and bare mode load no plugins;
 #   identity  a repository's settings can set USER, and so user_id;
+#   token env a repository's settings env reaches the token command
+#             (gcloud's interpreter, configuration, proxy and CA variables),
+#             and an admin-owned wrapper that starts it with a clean
+#             environment keeps them out;
 #   disable   the policy's enabledPlugins false unloads the mod, and its
 #             kill switch keeps it loaded but recording nothing;
-#   rollback  with the policy gone the mod is gone, rows left behind stay
-#             on disk, are listed again when it comes back, and go when the
-#             folder is deleted.
+#   rollback  straight after a migration, removing the policy brings the
+#             earlier tracer and mod back; a disable policy kept until they
+#             are uninstalled does not. With the policy gone the mod is
+#             gone, rows left behind stay on disk, are listed again when it
+#             comes back, and go when the folder is deleted.
 # With BQAA_CHECK_NETWORK=1, the GitHub-sourced variant, pinned to a ref
 # (needs network, and an image with git, named by BQAA_CHECK_GIT_IMAGE):
 #   github    a fresh machine records nothing in its first session and
@@ -36,6 +44,8 @@
 #             options hold, and it runs in the user tier: a person's
 #             enabledPlugins and plugin uninstall leave it on, and
 #             allowManagedModsOnly and allowManagedHooksOnly refuse it.
+#             With the policy removed the copy stays installed and loads,
+#             until a disable policy holds it while it is uninstalled.
 #
 #   HOST_CLI_LINUX=/path/to/linux/claude bash tests/managed-settings.live.sh
 #   BQAA_CHECK_NETWORK=1 BQAA_CHECK_GIT_IMAGE=my-image-with-git \
@@ -91,11 +101,18 @@ OLD="$MOD@bigquery-agent-analytics-plugin"
 TRACER=bigquery-agent-analytics-tracing@bigquery-agent-analytics-plugin
 install -m 755 /in/claude /usr/local/bin/claude
 useradd -m dev
-mkdir -p /etc/claude-code
+# What the organization already delivers, and the mod's drop-in beside it.
+DROPIN=/etc/claude-code/managed-settings.d/50-bqaa-mod.json
+mkdir -p /etc/claude-code/managed-settings.d
+cat >/etc/claude-code/managed-settings.json <<'JSON'
+{ "permissions": { "deny": ["WebFetch(domain:example.invalid)"] }, "env": { "ORG_EXISTING": "kept" } }
+JSON
+chmod 644 /etc/claude-code/managed-settings.json
 chmod 777 /out
 as_dev() { su dev -c "$1"; }
-# The policy: python that edits the dict `p` (the guide's complete example
-# for the folder, or for GitHub with "github" as the first argument).
+# The policy, written to the drop-in: python that edits the dict `p` (the
+# guide's complete example for the folder, or for GitHub with "github" as
+# the first argument).
 policy() {
   python3 - "$@" <<'PY'
 import json, sys
@@ -120,10 +137,25 @@ else:
          "enabledPlugins": {key: True, "bigquery-agent-analytics-mod@bigquery-agent-analytics-plugin": False, **off},
          "pluginConfigs": {key: {"options": options}}, "env": env}
 exec(edit)
-json.dump(p, open("/etc/claude-code/managed-settings.json", "w"), indent=1)
+json.dump(p, open("/etc/claude-code/managed-settings.d/50-bqaa-mod.json", "w"), indent=1)
 PY
-  chown root:root /etc/claude-code/managed-settings.json
-  chmod 644 /etc/claude-code/managed-settings.json
+  chown root:root "$DROPIN"
+  chmod 644 "$DROPIN"
+}
+# The guide's disable policy, for a rollback: every id off, and capture off
+# for any copy that still loads.
+disable_policy() {
+  cat >"$DROPIN" <<'JSON'
+{ "enabledPlugins": {
+    "bigquery-agent-analytics-mod@org-tools": false,
+    "bigquery-agent-analytics-mod@bigquery-agent-analytics-plugin": false,
+    "bigquery-agent-analytics-mod@bqaa-tracing": false,
+    "bigquery-agent-analytics-tracing@bigquery-agent-analytics-plugin": false,
+    "bigquery-agent-analytics-tracing@bqaa-tracing": false },
+  "env": { "BQAA_TRACE_ENABLED": "false" } }
+JSON
+  chown root:root "$DROPIN"
+  chmod 644 "$DROPIN"
 }
 # The person's own settings (for the plugin key given) and a repository's,
 # each saying otherwise.
@@ -188,6 +220,24 @@ cat >/opt/org/agent-plugins/.claude-plugin/marketplace.json <<'JSON'
 { "name": "org-tools", "owner": { "name": "Example Org" },
   "plugins": [ { "name": "bigquery-agent-analytics-mod", "source": "./plugins/bigquery-agent-analytics-mod" } ] }
 JSON
+# The guide's clean-environment wrapper for the token command, here running
+# a stand-in for gcloud that writes down the environment it was given.
+mkdir -p /opt/org/bin
+cat >/opt/org/bin/bqaa-token <<'W'
+#!/bin/sh
+PATH=/usr/bin:/bin
+export PATH
+unset LD_PRELOAD LD_LIBRARY_PATH
+user=$(/usr/bin/id -un)
+home=$(eval echo "~$user")
+exec /usr/bin/env -i HOME="$home" PATH=/usr/bin:/bin /bin/sh -c 'env > /out/token-env-wrapped.env; echo short'
+W
+chmod 755 /opt/org/bin/bqaa-token
+# Token commands that write down the environment they were given.
+for name in token-env-direct token-env-pinned; do
+  printf '#!/bin/sh\nenv > /out/%s.env\necho short\n' "$name" >/opt/org/bin/$name
+  chmod 755 /opt/org/bin/$name
+done
 chown -R root:root /opt/org && chmod -R go-w /opt/org
 # What a person may already have: the old marketplace, with the
 # settings-hook tracer (a stand-in that logs each hook it runs) and the mod
@@ -208,7 +258,7 @@ cat >$L/plugins/bigquery-agent-analytics-tracing/.claude-plugin/plugin.json <<'J
   } }
 JSON
 chown -R dev:dev $L
-as_dev 'touch /opt/org/agent-plugins/x /etc/claude-code/x 2>/dev/null; ls /opt/org/agent-plugins/x /etc/claude-code/x 2>/dev/null | wc -l >/out/user-wrote'
+as_dev 'touch /opt/org/agent-plugins/x /etc/claude-code/x /etc/claude-code/managed-settings.d/x 2>/dev/null; ls /opt/org/agent-plugins/x /etc/claude-code/x /etc/claude-code/managed-settings.d/x 2>/dev/null | wc -l >/out/user-wrote'
 
 # pins: the complete example against everything the person controls.
 fresh_user "$ORG"; policy 'pass'
@@ -227,7 +277,7 @@ fresh_user "$ORG"; policy 'p["env"] = {}'
 run unpinned 60 "" "$SHELL_ENV"
 # migration: the old marketplace installed before any policy, then the
 # policy without the old ids turned off, then with them.
-rm -f /etc/claude-code/managed-settings.json
+rm -f "$DROPIN"
 fresh_user "$ORG"
 as_dev "cd ~ && claude plugin marketplace add $L && claude plugin install $TRACER && claude plugin install $OLD" >/out/legacy-install.txt 2>&1
 run before-policy 60
@@ -239,6 +289,18 @@ policy 'del p["enabledPlugins"]["bigquery-agent-analytics-tracing@bigquery-agent
 run managed-mods-only 60
 policy 'del p["enabledPlugins"]["bigquery-agent-analytics-tracing@bigquery-agent-analytics-plugin"]; del p["enabledPlugins"]["bigquery-agent-analytics-mod@bigquery-agent-analytics-plugin"]; p["allowManagedHooksOnly"] = True'
 run managed-hooks-only 60
+# rollback straight after the migration, the earlier installs still there:
+# removing the policy brings them back; the disable policy, kept until they
+# are uninstalled, does not.
+policy 'pass'
+run migrated 60
+rm -f "$DROPIN"
+run rollback-too-soon 60
+disable_policy
+run rollback-disabled 15
+as_dev "cd ~ && claude plugin uninstall $TRACER && claude plugin uninstall $OLD" >/out/legacy-uninstall.txt 2>&1
+rm -f "$DROPIN"
+run rollback-done 15
 # opt-out: what the person can try (their settings already turn it off).
 fresh_user "$ORG"; policy 'pass'
 as_dev "cd ~ && claude plugin disable $ORG" >/out/disable.txt 2>&1; echo "exit $?" >>/out/disable.txt
@@ -253,6 +315,20 @@ run bare 15 "--bare"
 fresh_user "$ORG"
 echo '{ "env": { "USER": "someone-else", "HOME": "/home/dev/repo/elsewhere" } }' >/home/dev/repo/.claude/settings.json
 run repository-user 60
+# token env: a repository's settings env at the token command, directly,
+# through the wrapper, and with the policy pinning gcloud's variables.
+fresh_user "$ORG"
+cat >/home/dev/repo/.claude/settings.json <<'JSON'
+{ "env": { "CLOUDSDK_PYTHON": "/tmp/evil-python", "CLOUDSDK_CONFIG": "/tmp/evil-config", "HTTPS_PROXY": "http://evil.invalid:3128",
+           "CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE": "/tmp/evil-ca", "PYTHONPATH": "/tmp/evil", "PATH": "/tmp/evil-bin:/usr/bin:/bin" } }
+JSON
+chown dev:dev /home/dev/repo/.claude/settings.json
+policy 'p["pluginConfigs"]["bigquery-agent-analytics-mod@org-tools"]["options"]["accessTokenCommand"] = "/opt/org/bin/token-env-direct"'
+run token-env-direct 60
+policy 'p["pluginConfigs"]["bigquery-agent-analytics-mod@org-tools"]["options"]["accessTokenCommand"] = "/opt/org/bin/bqaa-token"'
+run token-env-wrapped 60
+policy 'p["pluginConfigs"]["bigquery-agent-analytics-mod@org-tools"]["options"]["accessTokenCommand"] = "/opt/org/bin/token-env-pinned"; p["env"].update({k: "" for k in ("CLOUDSDK_PYTHON", "CLOUDSDK_PYTHON_ARGS", "CLOUDSDK_CONFIG", "HTTPS_PROXY", "HTTP_PROXY", "PYTHONPATH")})'
+run token-env-pinned 60
 # disable: the policy turns the mod off, or keeps it loaded but recording nothing.
 fresh_user "$ORG"; policy 'p["enabledPlugins"]["bigquery-agent-analytics-mod@org-tools"] = False'
 run policy-off 15
@@ -262,9 +338,9 @@ run kill-switch 60
 # folder deleted.
 policy 'pass'
 run before-rollback 60
-mv /etc/claude-code/managed-settings.json /root/managed-settings.json
+mv "$DROPIN" /root/50-bqaa-mod.json
 run rolled-back 15
-mv /root/managed-settings.json /etc/claude-code/managed-settings.json
+mv /root/50-bqaa-mod.json "$DROPIN"
 run restored 60
 as_dev 'rm -rf ~/.bqaa-mod/dead-letter'
 run purged 60
@@ -291,6 +367,20 @@ policy github 'p["pluginConfigs"]["cc-plugin-sec-default@builtin"] = {"options":
 run github-managed-mods-only 15
 policy github 'p["allowManagedHooksOnly"] = True'
 run github-managed-hooks-only 15
+# rollback: a copy the person installed stays enabled in their settings
+# when the policy is removed, and loads with their own options; the disable
+# policy, kept until the copy is uninstalled, leaves nothing.
+rm -rf /home/dev/.claude /home/dev/.claude.json && as_dev 'mkdir -p ~/.claude'
+policy github 'pass'
+as_dev "cd ~ && claude plugin install $MOD --marketplace '$REPO#$REF'" >/out/github-rollback-install.txt 2>&1
+run github-before-rollback 60
+rm -f "$DROPIN"
+run github-policy-removed 60
+disable_policy
+run github-disabled 15
+as_dev "cd ~ && claude plugin uninstall $OLD" >/out/github-rollback-uninstall.txt 2>&1
+rm -f "$DROPIN"
+run github-rollback-done 15
 echo done >/out/done
 SH
 
@@ -349,11 +439,24 @@ check 'migration: allowManagedHooksOnly stops the tracer and the old mod, not th
 check 'opt-out: plugin uninstall is refused, with or without --scope managed' \
   bash -c "grep -qE 'installed in managed scope|not installed in user scope' '$out/uninstall.txt' && grep -q 'Invalid scope: managed' '$out/uninstall.txt'"
 check 'migration: a policy false refuses a new install of the tracer' grep -q 'blocked by your organization' "$out/blocked-install.txt"
+check 'rollback: removing the policy straight after the migration brings the tracer and the old mod back' \
+  bash -c "grep -qx rollback-too-soon '$out/tracer-ran' && grep -q 'hooks module $OLD loaded' '$out/rollback-too-soon/debug.log'"
+check 'rollback: the disable policy loads no mod and runs no tracer hook' \
+  bash -c "test -s '$out/rollback-disabled/debug.log' && ! grep -qx rollback-disabled '$out/tracer-ran' && ! grep -q 'hooks module bigquery-agent-analytics-mod' '$out/rollback-disabled/debug.log'"
+check 'rollback: once the earlier installs are uninstalled, removing the policy leaves nothing running' \
+  bash -c "test -s '$out/rollback-done/debug.log' && ! grep -qx rollback-done '$out/tracer-ran' && ! grep -q 'hooks module bigquery-agent-analytics-mod' '$out/rollback-done/debug.log'"
 check 'opt-out: after plugin disable and uninstall, and with the person'"'"'s enabledPlugins false, the mod still records' \
   has after-opt-out "$TARGET" status.txt
 for s in safe-mode safe-mode-env bare; do
   check "opt-out: $s loads no plugin, the organization's included" not_loaded "$s" "$ORG"
 done
+check 'pins: the drop-in applies beside the existing managed-settings.json, whose env still reaches the session' grep -qx 'ORG_EXISTING=kept' "$out/token-env-direct.env"
+check 'token env: a repository'"'"'s CLOUDSDK_PYTHON, CLOUDSDK_CONFIG, proxy, CA file, PYTHONPATH and PATH reach the token command' \
+  bash -c "grep -qx 'CLOUDSDK_PYTHON=/tmp/evil-python' '$out/token-env-direct.env' && grep -qx 'HTTPS_PROXY=http://evil.invalid:3128' '$out/token-env-direct.env' && grep -qx 'CLOUDSDK_CONFIG=/tmp/evil-config' '$out/token-env-direct.env' && grep -q '^PATH=/tmp/evil-bin' '$out/token-env-direct.env'"
+check 'token env: through the wrapper, the command gets only HOME, PATH and PWD' \
+  bash -c "test -s '$out/token-env-wrapped.env' && ! grep -qvE '^(HOME=/home/dev|PATH=/usr/bin:/bin|PWD=.*)\$' '$out/token-env-wrapped.env'"
+check 'token env: with the policy pinning them, gcloud'"'"'s variables reach the command empty' \
+  bash -c "grep -qx 'CLOUDSDK_PYTHON=' '$out/token-env-pinned.env' && grep -qx 'HTTPS_PROXY=' '$out/token-env-pinned.env' && grep -qx 'CLOUDSDK_CONFIG=' '$out/token-env-pinned.env'"
 check 'identity: a repository'"'"'s USER becomes user_id; its HOME does not move the rows' \
   bash -c "grep -q 'user_id=someone-else' '$out/repository-user/rows.txt' && grep -q '^/home/dev/.bqaa-mod/' '$out/repository-user/files.txt' && ! grep -q elsewhere '$out/repository-user/files.txt'"
 check 'disable: the policy'"'"'s enabledPlugins false unloads the mod' not_loaded policy-off "$ORG"
@@ -380,6 +483,11 @@ if [[ "$network" == 1 ]]; then
   check 'github: the person'"'"'s enabledPlugins false and plugin uninstall leave it on' bash -c "grep -qE 'installed in managed scope|not installed in user scope' '$out/github-uninstall.txt' && grep -q '$TARGET' '$out/github-after-opt-out/status.txt'"
   check 'github: allowManagedModsOnly refuses the copy' grep -q 'refused by cc-plugin-sec-default: mods are limited to your organization' "$out/github-managed-mods-only/debug.log"
   check 'github: allowManagedHooksOnly does not load the copy' not_loaded github-managed-hooks-only "$OLD"
+  check 'github: with the policy removed, the copy stays installed and loads without the policy'"'"'s options' \
+    bash -c "grep -q 'hooks module $OLD loaded' '$out/github-policy-removed/debug.log' && ! grep -q '$TARGET' '$out/github-policy-removed/status.txt'"
+  check 'github: the disable policy does not load the copy' not_loaded github-disabled "$OLD"
+  check 'github: uninstalled under the disable policy, the copy stays gone once the policy is removed' \
+    bash -c "grep -q 'Successfully uninstalled' '$out/github-rollback-uninstall.txt' && test -s '$out/github-rollback-done/debug.log' && ! grep -q 'hooks module $OLD loaded' '$out/github-rollback-done/debug.log'"
 fi
 
 echo "$passed passed, $failed failed"

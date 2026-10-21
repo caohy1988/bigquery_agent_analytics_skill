@@ -1478,13 +1478,21 @@ marketplace, it checks:
 * what a person can try: `enabledPlugins`, `plugin disable` and
   `plugin uninstall` change nothing, while safe and bare mode load no
   plugin;
+* that the policy works as a drop-in beside an existing
+  `managed-settings.json`;
 * that a repository's `USER` becomes `user_id`;
+* that a repository's settings `env` reaches the token command, and that an
+  admin-owned wrapper with a clean environment keeps it out;
 * the emergency switches;
-* a rollback, with the rows left on disk.
+* rollback: removing the policy straight after a migration brings the
+  tracer back, while a disable policy, kept until the earlier installs are
+  gone, does not;
+* the rows left on disk.
 
 With `BQAA_CHECK_NETWORK=1` it also checks the GitHub variant pinned to a
 tag: the tag's copy, `autoUpdate` off, when a fresh machine starts
-recording, and the user tier. It needs docker and the host CLI's Linux
+recording, the user tier, and a rollback that leaves no copy installed. It
+needs docker and the host CLI's Linux
 build (`HOST_CLI_LINUX`).
 
 `tests/reload.test.mjs` loads `hooks/register.ts` afresh, as a hot reload

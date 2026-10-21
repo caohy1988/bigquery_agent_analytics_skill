@@ -85,13 +85,34 @@ to the pilot group first.
 
 ## 2. The policy
 
-The host CLI reads its managed settings from one file per machine:
+The host CLI reads managed settings from a file per machine:
 
 - Linux and WSL: `/etc/claude-code/managed-settings.json` (checked)
 - macOS: `/Library/Application Support/ClaudeCode/managed-settings.json`
   (not checked here)
 - Windows: `C:\Program Files\ClaudeCode\managed-settings.json` (not checked
   here)
+
+**Put the mod's entries in a drop-in of their own**, in a
+`managed-settings.d/` folder beside that file:
+`/etc/claude-code/managed-settings.d/50-bqaa-mod.json`. It merges with the
+file your organization may already deliver, so nothing there is replaced
+(checked: an existing file's `env` still reached the session beside the
+drop-in), and a rollback swaps or deletes one file.
+
+**Where the machine also gets policy from the host's admin console or a
+device-management profile**, the host by default reads only the
+highest-ranked managed source that holds any setting, and skips the others
+(`managedSourcesBehavior: "first-wins"`), while `env` is merged variable by
+variable across all of them. The plugin entries in a skipped file are then
+ignored (the mod does not load, and the earlier ids stay on), but its `env`
+pins still reach any copy a person installed. So put the entries in the
+source your organization already uses, or set
+`managedSourcesBehavior: "merge"` in the highest-ranked one. In an
+interactive session, `/status` names the sources in effect ("Setting
+sources") and those skipped ("Skipped sources"). Not checked here: the
+container has only the file source, and `/status` needs an interactive
+session.
 
 The complete policy for the folder. Set every option: an option the policy
 leaves out is the person's (their own value, or the environment's).
@@ -116,7 +137,7 @@ leaves out is the person's (their own value, or the environment's).
         "location": "US",
         "enabled": true,
         "dryRun": false,
-        "accessTokenCommand": "/usr/bin/gcloud auth print-access-token --impersonate-service-account=bqaa-row-writer@my-gcp-project.iam.gserviceaccount.com",
+        "accessTokenCommand": "/opt/org/bin/bqaa-token",
         "deadLetterDir": "",
         "agentName": "coding-agent",
         "maxPayloadChars": 16384,
@@ -144,7 +165,7 @@ leaves out is the person's (their own value, or the environment's).
 | `enabledPlugins` | Turns the mod on for everyone who gets the policy, and turns off the earlier ways in: the mod under its old marketplace id, and the settings-hook tracer from either marketplace (see [Moving from the settings-hook tracer](#5-moving-from-the-settings-hook-tracer-or-an-earlier-install)). A `false` here also refuses a new install of that plugin |
 | `options.project`, `dataset`, `table`, `location` | The destination. The person's own options, a `--settings` file and `BQAA_PROJECT_ID`, `BQAA_DATASET`, `BQAA_TABLE` or `BQ_TABLE` in their shell or a repository's settings change nothing |
 | `options.enabled`, `dryRun` and `env` `BQAA_TRACE_ENABLED`, `BQAA_DRY_RUN` | Capture on, and rows really sent. These two switches also read the environment: without the `env` pins, a shell or a repository's settings turn capture off or a dry run on |
-| `options.accessTokenCommand` and `env` `BQAA_ACCESS_TOKEN: ""` | How tokens are had: here, impersonation of the writer service account. No token from the environment instead. Name gcloud by its absolute path on your machines: a session started from a desktop app or an editor may not have the shell's `PATH` |
+| `options.accessTokenCommand` and `env` `BQAA_ACCESS_TOKEN: ""` | How tokens are had: the wrapper below, which impersonates the writer service account with a clean environment. No token from the environment instead |
 | `options.deadLetterDir: ""` and `env` `BQAA_DEAD_LETTER_DIR: ""` | Rows that wait stay in each person's home folder (`~/.bqaa-mod/dead-letter`), not in a folder the person, a `--settings` file or a repository's settings name (a repository could otherwise put them in its working tree, where a commit could take them). A pinned `~/...` would not be expanded, hence the empty value |
 | `options.agentName`, `maxPayloadChars`, `flushIntervalMs` | The `agent` column, how much of each payload is kept, and how often rows are sent |
 | `options.userIdFromCredentials: false` and `env` `BQAA_USER_ID: ""` | `user_id` is each person's login name. Under impersonation, `userIdFromCredentials` would make every row's `user_id` the service account |
@@ -155,11 +176,50 @@ leaves out is the person's (their own value, or the environment's).
 Left to each person, as they change when rows are sent and not where:
 `BQAA_REQUEST_TIMEOUT_MS`, `BQAA_MAX_QUEUE_ROWS` and `BQAA_EXIT_FLUSH_MS`.
 
+**The token command, as an admin-owned wrapper.** The mod runs the token
+command itself, at session start, with the session's environment, and a
+trusted repository's settings `env` is part of it. When this guide was
+checked, a repository's `CLOUDSDK_PYTHON`, `CLOUDSDK_CONFIG`,
+`CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE`, `HTTPS_PROXY`, `PYTHONPATH` and `PATH`
+all reached it, so a repository could choose the interpreter gcloud runs,
+or route its traffic through a proxy. Deliver this script with the folder,
+owned by an administrator, mode 755, and name it in `accessTokenCommand`:
+
+```sh
+#!/bin/sh
+# /opt/org/bin/bqaa-token: the mod's token command, with a clean environment.
+PATH=/usr/bin:/bin
+export PATH
+unset LD_PRELOAD LD_LIBRARY_PATH DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH
+user=$(/usr/bin/id -un)
+home=$(eval echo "~$user")
+exec /usr/bin/env -i HOME="$home" PATH=/usr/bin:/bin \
+  /usr/bin/gcloud auth print-access-token \
+  --impersonate-service-account=bqaa-row-writer@my-gcp-project.iam.gserviceaccount.com
+```
+
+Use gcloud's absolute path on your machines, and a `PATH` that holds the
+Python it needs. Checked: in the container, the command behind it got only
+`HOME`, `PATH` and `PWD`; on macOS, it printed a token with
+`CLOUDSDK_PYTHON` and a proxy set in the environment, where gcloud without
+it tried to start the named interpreter.
+
+If you cannot deliver the script, pinning variables in `env` covers only
+the ones you name, while gcloud reads many more (`CLOUDSDK_*` holds its
+account, proxy and token-file settings, among others), so prefer the
+script. Pinned to `""`, `CLOUDSDK_PYTHON`, `CLOUDSDK_PYTHON_ARGS`,
+`CLOUDSDK_CONFIG`, `HTTPS_PROXY`, `HTTP_PROXY` and `PYTHONPATH` reached the
+command empty, and gcloud still printed a token with each.
+`CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE` cannot be pinned that way: empty, gcloud
+refuses to run ("The provided path must exist"). Pins apply to every process
+a session starts, the person's own gcloud commands included.
+
 To check a machine: `claude -p /bqaa-status` (no model call) prints
 `enabled, target my-gcp-project.agent_analytics.agent_events (US)`, and
 `claude -p --debug-file /tmp/bqaa.log /bqaa-status` leaves
 `hooks module bigquery-agent-analytics-mod@org-tools loaded (... tier prepend)`
-in the log.
+in the log. In an interactive session, `/status` shows which managed
+sources are in effect, as above.
 
 ## 3. What each person needs
 
@@ -196,6 +256,8 @@ check in [`tests/managed-settings.live.sh`](../tests/managed-settings.live.sh):
 | Sets `enabledPlugins` false, or runs `claude plugin disable` or `claude plugin uninstall` (with or without `--scope managed`) | No effect: the uninstall is refused |
 | Starts the host with `--safe-mode`, `CLAUDE_CODE_SAFE_MODE=1` or `--bare` | No plugin loads, yours included: that session records nothing |
 | Sets `USER` in their shell or a repository's settings | `user_id` changes: the login name is what the machine says |
+| Works in a repository whose settings set gcloud's variables (`CLOUDSDK_PYTHON`, `CLOUDSDK_CONFIG`, a proxy, a CA file) | They reach the token command unless it is the wrapper; through the wrapper, gcloud gets only `HOME` and `PATH` |
+| Works in a repository whose settings set `LD_PRELOAD` or `PATH` | They reach every process the session starts, the wrapper's own shell included. No setting here prevents it: trust repositories accordingly |
 | Uses another tool, or edits the policy with administrator rights on the machine | Not covered by a policy |
 | Inserts rows of their own with the writer's tokens | Possible ([service-account auth](service-account-auth.md)) |
 
@@ -216,7 +278,8 @@ the policy: their own `enabled: false` (`/plugin configure`) or a shell's
   GitHub is refused. Settings hooks still run.
 - `"allowManagedHooksOnly": true`: only managed plugins' hooks run. The
   folder mod loads; a copy from GitHub, people's own plugins and the hooks
-  in their settings files do not.
+  in their settings files do not. A repository's settings `env` still
+  reaches the session, the token command included.
 
 ## 5. Moving from the settings-hook tracer or an earlier install
 
@@ -336,16 +399,49 @@ Checked in a container unless noted:
 | --- | --- | --- |
 | Stop recording, keep the mod | Policy: `options.enabled: false` and `env` `BQAA_TRACE_ENABLED: "false"` | The mod loads and records nothing (`/bqaa-status`: `disabled`, `captured 0`) |
 | Unload the mod at once | Policy: `"bigquery-agent-analytics-mod@org-tools": false` | The mod does not load |
-| Roll back | Remove the policy's entries (or the file) and the folder | The mod does not load. Rows that waited stay on disk |
+| Roll back | The disable policy below, kept until the earlier installs are gone; then delete the drop-in and the folder | Nothing loads, and no tracer hook runs |
 | Revoke the writer's tokens | Disable the writer service account ([service-account auth](service-account-auth.md#offboarding)) | Tokens are refused, issued ones included (a check refused one with `401` within 15 seconds, live). Sessions show "no working Google credentials" and keep rows on disk |
 
 Each takes effect when a session starts.
+
+**Roll back in this order**, because the policy is also what keeps the
+earlier ways in off:
+
+1. Replace the drop-in with the disable policy: every id off, and capture
+   off for any copy that still loads.
+
+   ```json
+   {
+     "enabledPlugins": {
+       "bigquery-agent-analytics-mod@org-tools": false,
+       "bigquery-agent-analytics-mod@bigquery-agent-analytics-plugin": false,
+       "bigquery-agent-analytics-mod@bqaa-tracing": false,
+       "bigquery-agent-analytics-tracing@bigquery-agent-analytics-plugin": false,
+       "bigquery-agent-analytics-tracing@bqaa-tracing": false
+     },
+     "env": { "BQAA_TRACE_ENABLED": "false" }
+   }
+   ```
+
+   Checked: with earlier installs still there, nothing loads and no tracer
+   hook runs.
+2. On each machine, remove the earlier installs, as the person or a script
+   run as them: `claude plugin uninstall` for the earlier mod and the
+   tracer (and the GitHub-sourced copy, for that variant), and the tracer's
+   hooks pasted into their settings. `claude plugin list` shows none.
+3. Delete the drop-in, then the folder. Checked: nothing runs.
+
+Deleting the drop-in first brings the earlier tracer and mod back on a
+machine that still has them (checked, straight after a migration), and a
+GitHub-sourced copy stays installed and keeps loading with the person's own
+options (checked) until it is uninstalled. Its files stay in
+`~/.claude/plugins/cache/` after that; delete them with the rest.
 
 **Rows that waited** are in each person's
 `~/.bqaa-mod/dead-letter/<project.dataset.table>/`. They hold prompts and
 tool output, so treat them as personal data on the machine:
 
-- After a rollback they stay (checked).
+- With the policy gone they stay (checked).
 - With the mod back, `/bqaa-status` lists them (checked), and they are sent
   once tokens work, at session start or with `/bqaa-backfill`.
 - To discard them, delete the folder (checked: nothing waits after).
@@ -369,15 +465,17 @@ pilot:
 
 [`tests/managed-settings.live.sh`](../tests/managed-settings.live.sh) runs
 this guide in a Linux container with host CLI 2.1.304, as an ordinary user
-under a root-owned policy: offline for the folder (35 checks), and over the
-network for the GitHub variant pinned to a test tag (10 more, with
+under a root-owned policy delivered as a drop-in: offline for the folder,
+and over the network for the GitHub variant pinned to a test tag (with
 `BQAA_CHECK_NETWORK=1`). Every row of the tables above marked as checked is
 one of its checks.
 
 Not checked:
 
 - the macOS and Windows policy files;
-- policies delivered by device-management profiles or an admin console;
+- policies delivered by device-management profiles or an admin console,
+  and `managedSourcesBehavior`;
+- `/status` (it needs an interactive session);
 - the desktop app and editor extensions (the checks run the CLI);
 - Windows token commands;
 - how a GitHub copy follows a changed `ref`;
