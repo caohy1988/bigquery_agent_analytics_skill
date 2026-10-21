@@ -49,7 +49,9 @@ claude plugin install bigquery-agent-analytics-mod \
   --config project=my-gcp-project --config dataset=agent_analytics
 ```
 
-See `plugins/bigquery-agent-analytics-mod/README.md` for the dataset
+[`plugins/bigquery-agent-analytics-mod/QUICKSTART.md`](plugins/bigquery-agent-analytics-mod/QUICKSTART.md)
+walks through a sandbox of your own, joining what your team set up, and
+the administrator's steps. See `plugins/bigquery-agent-analytics-mod/README.md` for the dataset
 (`setup.sh`), installing from a clone, configuration, the event mapping,
 sample rows and queries, and limitations.
 
