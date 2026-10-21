@@ -18,7 +18,10 @@ The fixture holds what the queries must count right:
     a failed tool and a second call, also counted from a window that
     starts after the first call's request; and an ADK agent making
     concurrent calls (three with progressive streaming, two without), in
-    the order ADK 2.11 wrote them;
+    the order ADK 2.11 wrote them; and two concurrent calls with
+    progressive streaming off whose later finals interleave, under one
+    agent span the calls share and under an agent span per worker, as ADK
+    2.11 wrote them;
   - a subagent run;
   - each kind of refusal: a person's at the prompt, a hook's, a permission
     rule's, and two from elsewhere (a source the queries do not name, and
@@ -218,6 +221,40 @@ def fanout(session, agent, calls, start_minute, legacy):
 
 FIXTURE += fanout("A3", "adk-fanout", [15, 15, 15], "16:00", legacy=False)
 FIXTURE += fanout("A4", "adk-fanout-legacy", [100, 40], "17:00", legacy=True)
+
+
+# Two concurrent calls with progressive streaming off whose callbacks
+# interleave (both texts, both own finals, then each call's two later
+# finals), as ADK 2.11 wrote them: under the one agent span the calls share,
+# and under an agent span per worker.
+def interleaved(session, agent, per_worker):
+    out, second = [], 0
+    def r(event_type, span, parent, tokens=None, final=False):
+        nonlocal second
+        second += 1
+        attributes = {"model": "model-c"}
+        if tokens is not None:
+            attributes["usage_metadata"] = {"total_token_count": tokens}
+        if final:
+            attributes.update(cache_type="none", finish_reason="STOP")
+        out.append(row(None, f"2026-10-20T18:00:{second:02d}Z", event_type, session, user="carol", agent=agent, writer=None,
+                       invocation=f"I{session}", span=span, parent=parent, attributes=attributes))
+    shared = f"{agent}-span"
+    spans = {i: (f"{agent}-worker-{i}" if per_worker else shared) for i in (1, 2)}
+    for i in (1, 2):
+        r("LLM_REQUEST", f"{agent}-req-{i}", spans[i])
+    for i in (1, 2):
+        r("LLM_RESPONSE", f"{agent}-req-{i}", spans[i])
+    for i, tokens in ((1, 100), (2, 40)):
+        r("LLM_RESPONSE", f"{agent}-req-{i}", spans[i], tokens, final=True)
+    for i, tokens in ((1, 100), (2, 40)):
+        for _ in range(2):
+            r("LLM_RESPONSE", spans[i], shared if per_worker else None, tokens, final=True)
+    return out
+
+
+FIXTURE += interleaved("A5", "adk-shared-interleaved", per_worker=False)
+FIXTURE += interleaved("A6", "adk-workers-interleaved", per_worker=True)
 # The replay: e05 sent twice.
 FIXTURE.append(dict(FIXTURE[4]))
 ROSTER = ["alice", "bob", "dave"]
@@ -295,7 +332,12 @@ def checks(name: str, rows: list[dict]):
         fan = p[("adk (no writer)", "adk-fanout")]
         yield "ADK, three concurrent calls of one agent: 3 model requests, 45 tokens", (fan["model_requests"], fan["model_requests_unmatched"], fan["tokens"], fan["error_row_pct"]) == (3, 0, 45, 0.0)
         fan_legacy = p[("adk (no writer)", "adk-fanout-legacy")]
-        yield "ADK, two concurrent calls with progressive streaming off: 2 model requests, 140 tokens (100 and 40)", (fan_legacy["model_requests"], fan_legacy["model_requests_unmatched"], fan_legacy["tokens"]) == (2, 0, 140)
+        yield "ADK, two concurrent calls with progressive streaming off: 2 model requests, 140 tokens (100 and 40); the second call's later finals could be either call's, so they are counted in neither and shown (2)", (fan_legacy["model_requests"], fan_legacy["model_requests_unmatched"], fan_legacy["tokens"], fan_legacy["responses_ambiguous"]) == (2, 0, 140, 2)
+        shared = p[("adk (no writer)", "adk-shared-interleaved")]
+        yield "ADK, interleaved later finals under a shared agent span: 2 model requests, 140 tokens, not 200; the 4 finals no row can tie to one call are shown", (shared["model_requests"], shared["tokens"], shared["responses_ambiguous"]) == (2, 140, 4)
+        workers = p[("adk (no writer)", "adk-workers-interleaved")]
+        yield "ADK, the same with an agent span per worker (ADK's layout): every later final is tied to its call: 2 model requests, 140 tokens, none ambiguous", (workers["model_requests"], workers["tokens"], workers["responses_ambiguous"]) == (2, 140, 0)
+        yield "sequential and unstreamed calls leave nothing ambiguous", (legacy["responses_ambiguous"], fan["responses_ambiguous"], adk["responses_ambiguous"]) == (0, 0, 0)
         yield "the mod's and the tracer's rows are never unmatched", all(r["model_requests_unmatched"] == 0 for r in rows if r["producer"] != "adk (no writer)")
     elif name == "V7 clipped":
         p = by(rows, "producer", "agent")

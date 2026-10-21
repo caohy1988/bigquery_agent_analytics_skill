@@ -271,12 +271,16 @@ ORDER BY day DESC;
 --     response for each streamed chunk, and with progressive streaming off
 --     it writes further final responses under the agent's span; one agent
 --     can also make several calls at once. So an ADK response belongs to
---     the request on its own span; one on the agent's span belongs to the
---     call that last closed under it (its final response on its own span),
---     else to the latest request under it. Requests are looked up from a
---     day before the window, so a call that began just before it is still
---     matched, and only rows inside the window are counted. A response
---     with no request found is counted by its span, or alone, and
+--     the request on its own span. A later final on the agent's span
+--     belongs to the call that closed under it (its final response on its
+--     own span) when exactly one could have written it: the one call that
+--     closed since the last request under that span. Otherwise the rows
+--     cannot tell which call wrote it, and it counts in no call's requests
+--     or tokens (the call's own final carries its usage), only as a row of
+--     its own; responses_ambiguous says how many. Requests are looked up
+--     from a day before the window, so a call that began just before it is
+--     still matched, and only rows inside the window are counted. A
+--     response with no request found is counted by its span, or alone, and
 --     model_requests_unmatched says how many requests were counted so.
 WITH events AS (
   SELECT
@@ -294,18 +298,25 @@ spans AS (
     JSON_VALUE(attributes, '$.cache_type') IS NOT NULL OR JSON_VALUE(attributes, '$.finish_reason') IS NOT NULL AS final
   FROM events
 ),
+closes AS (
+  SELECT
+    *,
+    COUNTIF(event_type = 'LLM_RESPONSE' AND on_request_span AND final) OVER under_span AS closed_so_far,
+    LAST_VALUE(IF(event_type = 'LLM_RESPONSE' AND on_request_span AND final, span_id, NULL) IGNORE NULLS) OVER under_span AS closed_call
+  FROM spans
+  WINDOW under_span AS (
+    PARTITION BY adk, session_id, IF(on_request_span, parent_span_id, span_id)
+    ORDER BY timestamp, IF(on_request_span, 0, 1)
+    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+),
 linked AS (
   SELECT
     *,
-    LAST_VALUE(IF(event_type = 'LLM_RESPONSE' AND on_request_span AND final, span_id, NULL) IGNORE NULLS) OVER (
+    closed_so_far - IFNULL(LAST_VALUE(IF(event_type = 'LLM_REQUEST', closed_so_far, NULL) IGNORE NULLS) OVER (
       PARTITION BY adk, session_id, IF(on_request_span, parent_span_id, span_id)
       ORDER BY timestamp, IF(on_request_span, 0, 1)
-      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS closed_call,
-    LAST_VALUE(IF(event_type = 'LLM_REQUEST', span_id, NULL) IGNORE NULLS) OVER (
-      PARTITION BY adk, session_id, IF(on_request_span, parent_span_id, span_id)
-      ORDER BY timestamp, IF(event_type = 'LLM_REQUEST', 0, 1)
-      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS open_call
-  FROM spans
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW), 0) AS could_have_written
+  FROM closes
 ),
 tagged AS (
   SELECT
@@ -317,10 +328,13 @@ tagged AS (
     status = 'ERROR' AS failed,
     COALESCE(SAFE_CAST(JSON_VALUE(attributes, '$.usage_metadata.total_tokens') AS INT64),
       SAFE_CAST(JSON_VALUE(attributes, '$.usage_metadata.total_token_count') AS INT64)) AS tokens,
+    adk AND event_type = 'LLM_RESPONSE' AND NOT on_request_span AND span_id IS NOT NULL AND final
+      AND closed_so_far > 0 AND could_have_written != 1 AS ambiguous,
     IF(adk AND event_type = 'LLM_RESPONSE',
       CASE
         WHEN on_request_span THEN CONCAT('request ', span_id)
-        WHEN span_id IS NOT NULL AND COALESCE(closed_call, open_call) IS NOT NULL THEN CONCAT('request ', COALESCE(closed_call, open_call))
+        WHEN span_id IS NOT NULL AND final AND could_have_written = 1 THEN CONCAT('request ', closed_call)
+        WHEN span_id IS NOT NULL AND final AND closed_so_far > 0 THEN NULL
         WHEN span_id IS NOT NULL THEN CONCAT('span ', span_id)
         ELSE GENERATE_UUID()
       END,
@@ -328,11 +342,12 @@ tagged AS (
   FROM linked
 ),
 counted AS (
-  SELECT producer, agent, session_id, event_type, failed, tokens, FALSE AS unmatched
+  SELECT producer, agent, session_id, IF(ambiguous, 'LLM_RESPONSE, ambiguous', event_type) AS event_type, failed,
+    IF(ambiguous, NULL, tokens) AS tokens, FALSE AS unmatched, ambiguous
   FROM tagged
   WHERE in_window AND call IS NULL
   UNION ALL
-  SELECT producer, agent, session_id, 'LLM_RESPONSE', LOGICAL_OR(failed), MAX(tokens), NOT STARTS_WITH(call, 'request ')
+  SELECT producer, agent, session_id, 'LLM_RESPONSE', LOGICAL_OR(failed), MAX(tokens), NOT STARTS_WITH(call, 'request '), FALSE
   FROM tagged
   WHERE in_window AND call IS NOT NULL
   GROUP BY producer, agent, session_id, call
@@ -343,6 +358,7 @@ SELECT
   COUNT(DISTINCT session_id) AS sessions,
   COUNTIF(event_type = 'LLM_RESPONSE') AS model_requests,
   COUNTIF(unmatched) AS model_requests_unmatched,
+  COUNTIF(ambiguous) AS responses_ambiguous,
   SUM(IF(event_type = 'LLM_RESPONSE', tokens, 0)) AS tokens,
   ROUND(COUNTIF(failed) / COUNT(*) * 100, 1) AS error_row_pct
 FROM counted
