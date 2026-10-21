@@ -263,37 +263,60 @@ ORDER BY day DESC;
 --     settings-hook tracer. The producers share the agent_events schema,
 --     so one table, or a UNION over two, holds them all. Per producer and
 --     agent: sessions, model requests, tokens and the share of rows in
---     error. Normalized: rows with no writer are named for ADK; an ADK model
---     call counts once, as its final response, since ADK also writes an
---     LLM_RESPONSE row for each streamed chunk under the call's span_id
---     (the row with cache_type or finish_reason is kept, else the last of
---     the span), and the chunks are left out of every column; and an ADK
+--     error. Normalized: rows with no writer are named for ADK, and an ADK
 --     response's tokens are read from total_token_count when total_tokens
---     is missing. Other columns differ by producer and are left out.
+--     is missing. An ADK model call counts once, as one row: ADK writes an
+--     LLM_RESPONSE for each streamed chunk, and with progressive streaming
+--     off it writes further final responses, some under the agent's span
+--     rather than the call's. So each ADK response belongs to the latest
+--     LLM_REQUEST before it from the same agent in the same invocation
+--     (else to its span, else to itself), and each call counts one
+--     request, with the largest token count among its responses, in error
+--     if any of them was. Other columns differ by producer and are left
+--     out.
 WITH events AS (
   SELECT *
   FROM `{PROJECT}.{DATASET}.{TABLE}`
   WHERE timestamp BETWEEN @start AND @end
   QUALIFY event_id IS NULL OR ROW_NUMBER() OVER (PARTITION BY event_id ORDER BY timestamp) = 1
 ),
-calls AS (
-  SELECT *
+tagged AS (
+  SELECT
+    IFNULL(JSON_VALUE(attributes, '$.writer.plugin'), 'adk (no writer)') AS producer,
+    agent,
+    session_id,
+    event_type,
+    status = 'ERROR' AS failed,
+    COALESCE(SAFE_CAST(JSON_VALUE(attributes, '$.usage_metadata.total_tokens') AS INT64),
+      SAFE_CAST(JSON_VALUE(attributes, '$.usage_metadata.total_token_count') AS INT64)) AS tokens,
+    IF(JSON_VALUE(attributes, '$.writer.plugin') IS NULL AND event_type = 'LLM_RESPONSE',
+      COALESCE(
+        LAST_VALUE(IF(event_type = 'LLM_REQUEST', FORMAT('request %s %t', IFNULL(span_id, ''), timestamp), NULL) IGNORE NULLS) OVER (
+          PARTITION BY session_id, invocation_id, agent, JSON_VALUE(attributes, '$.writer.plugin') IS NULL
+          ORDER BY timestamp, IF(event_type = 'LLM_REQUEST', 0, 1)
+          ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+        CONCAT('span ', span_id),
+        GENERATE_UUID()),
+      NULL) AS call
   FROM events
-  WHERE TRUE
-  QUALIFY event_type != 'LLM_RESPONSE' OR JSON_VALUE(attributes, '$.writer.plugin') IS NOT NULL OR span_id IS NULL
-    OR ROW_NUMBER() OVER (
-      PARTITION BY session_id, span_id, event_type
-      ORDER BY (JSON_VALUE(attributes, '$.cache_type') IS NOT NULL OR JSON_VALUE(attributes, '$.finish_reason') IS NOT NULL) DESC,
-        timestamp DESC) = 1
+),
+counted AS (
+  SELECT producer, agent, session_id, event_type, failed, tokens
+  FROM tagged
+  WHERE call IS NULL
+  UNION ALL
+  SELECT producer, agent, session_id, 'LLM_RESPONSE', LOGICAL_OR(failed), MAX(tokens)
+  FROM tagged
+  WHERE call IS NOT NULL
+  GROUP BY producer, agent, session_id, call
 )
 SELECT
-  IFNULL(JSON_VALUE(attributes, '$.writer.plugin'), 'adk (no writer)') AS producer,
+  producer,
   agent,
   COUNT(DISTINCT session_id) AS sessions,
   COUNTIF(event_type = 'LLM_RESPONSE') AS model_requests,
-  SUM(IF(event_type = 'LLM_RESPONSE', COALESCE(SAFE_CAST(JSON_VALUE(attributes, '$.usage_metadata.total_tokens') AS INT64),
-    SAFE_CAST(JSON_VALUE(attributes, '$.usage_metadata.total_token_count') AS INT64)), 0)) AS tokens,
-  ROUND(COUNTIF(status = 'ERROR') / COUNT(*) * 100, 1) AS error_row_pct
-FROM calls
+  SUM(IF(event_type = 'LLM_RESPONSE', tokens, 0)) AS tokens,
+  ROUND(COUNTIF(failed) / COUNT(*) * 100, 1) AS error_row_pct
+FROM counted
 GROUP BY producer, agent
 ORDER BY producer, agent;

@@ -17,7 +17,7 @@ on a synthetic fixture and checks the answers.
 | Team lead or administrator | What does a session cost? | V4, with your rates | An administrator | An estimate: tokens times the rates you enter, dated. Not a bill. None for a session and model with a response that recorded no usage |
 | Team lead or administrator | Which tools do people use, and how often do they fail, prompt, or get refused, by the person, a hook or a permission rule? | V5, sample 4 | An administrator | Each refused call is counted once, by where the refusal came from (`permission_decision_source`): the person, a hook, a rule, or another source (`refused_other`: one the host did not give, recorded as `unknown`, or one the queries do not name). The four add up to all refused calls (`refused_pct`, `refused`). A call that a rule blocks before the host records it leaves no row |
 | Team lead or administrator | Are errors going up? | V6, sample 8 | An administrator | Each rate has its own denominator (turns, model requests, tool calls), as V6 shows them |
-| Platform team | How do coding-agent sessions compare with our ADK agents? | V7 | An administrator of the shared table | Only sessions, model requests, tokens and error rows are compared; other columns differ by producer. An ADK model call counts once, as its final response: ADK also writes a row for each streamed chunk, and those are left out |
+| Platform team | How do coding-agent sessions compare with our ADK agents? | V7 | An administrator of the shared table | Only sessions, model requests, tokens and error rows are compared; other columns differ by producer. An ADK model call counts once, with the largest token count among its responses: ADK writes a row for each streamed chunk, and with progressive streaming off it writes further final responses under the agent's span |
 | Anyone with the views | Sessions, model requests and tokens per day, by person or model | `daily_usage_by_user`, `daily_usage_by_model` | The reader group | No prompts, tools or errors: counts only |
 
 ## Denominators
@@ -38,10 +38,13 @@ on a synthetic fixture and checks the answers.
   (`TOOL_COMPLETED` with status `ERROR`), never one rate over all rows.
 - **ADK model requests** (V7): one per model call. ADK writes an
   `LLM_RESPONSE` row for each chunk of a streamed response as well as the
-  final one, all under the call's `span_id`; only the final row has
-  `cache_type` or `finish_reason`. V7 keeps that row (or, where none has
-  them, the last of the span) for the requests, the tokens and the error
-  rows' denominator.
+  final one. With progressive streaming off (it is on by default), it
+  writes up to three final responses for a call that streams text and then
+  a function call, the later ones under the agent's span. V7 gives each
+  ADK response to the latest `LLM_REQUEST` before it from the same agent in
+  the same invocation (else to its span, else to itself). Each call is one
+  request and one row of the error rows' denominator, with the largest
+  token count among its responses, and in error if any of them was.
 - **Missing is not zero**:
   - a person with no rows is "not seen";
   - a day with no rows at all is still listed, every enrolled person not

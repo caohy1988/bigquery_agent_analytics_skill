@@ -10,7 +10,12 @@ The fixture holds what the queries must count right:
     an ADK agent's, the latter with no event_id and its tokens under
     usage_metadata.total_token_count, with two streamed model calls (a row
     for each chunk and the last; one call's final row marked by cache_type
-    and finish_reason, the other's not), each to be counted once;
+    and finish_reason, the other's not), each to be counted once; and an
+    ADK agent with progressive streaming off, whose rows are those ADK
+    2.11's own aggregator and plugin wrote for a call that streamed text
+    and then a function call (a partial and a final response under the
+    call's span, two more final responses under the agent's), followed by
+    a failed tool and a second call;
   - a subagent run;
   - each kind of refusal: a person's at the prompt, a hook's, a permission
     rule's, and two from elsewhere (a source the queries do not name, and
@@ -155,6 +160,29 @@ FIXTURE = [
         attributes={"model": "model-c", "usage_metadata": {"total_token_count": 3}}),
     row(None, "2026-10-20T14:00:06Z", "LLM_RESPONSE", "A1", user="carol", agent="adk-agent", writer=None, span="adk-call-3",
         attributes={"model": "model-c", "usage_metadata": {"total_token_count": 30}}),
+    # Progressive streaming off: one call that streamed text, then a
+    # function call carrying the call's usage. ADK 2.11 wrote a partial and a
+    # final response under the call's span, then two more final responses
+    # under the agent's span, each with the call's 100 tokens; a failed
+    # tool and a second, unstreamed call follow.
+    row(None, "2026-10-20T15:00:00Z", "LLM_REQUEST", "A2", user="carol", agent="adk-legacy", writer=None, invocation="IA2",
+        span="adk-req-1", parent="adk-agent-1", attributes={"model": "model-c"}),
+    row(None, "2026-10-20T15:00:01Z", "LLM_RESPONSE", "A2", user="carol", agent="adk-legacy", writer=None, invocation="IA2",
+        span="adk-req-1", parent="adk-agent-1", attributes={"model": "model-c"}),
+    row(None, "2026-10-20T15:00:02Z", "LLM_RESPONSE", "A2", user="carol", agent="adk-legacy", writer=None, invocation="IA2",
+        span="adk-req-1", parent="adk-agent-1",
+        attributes={"model": "model-c", "usage_metadata": {"total_token_count": 100}, "cache_type": "none", "finish_reason": "STOP"}),
+    row(None, "2026-10-20T15:00:02Z", "LLM_RESPONSE", "A2", user="carol", agent="adk-legacy", writer=None, invocation="IA2",
+        span="adk-agent-1", attributes={"model": "model-c", "usage_metadata": {"total_token_count": 100}, "cache_type": "none", "finish_reason": "STOP"}),
+    row(None, "2026-10-20T15:00:02Z", "LLM_RESPONSE", "A2", user="carol", agent="adk-legacy", writer=None, invocation="IA2",
+        span="adk-agent-1", attributes={"model": "model-c", "usage_metadata": {"total_token_count": 100}, "cache_type": "none", "finish_reason": "STOP"}),
+    row(None, "2026-10-20T15:00:03Z", "TOOL_COMPLETED", "A2", user="carol", agent="adk-legacy", writer=None, invocation="IA2",
+        span="adk-tool-1", parent="adk-agent-1", content={"tool": "search"}, status="ERROR"),
+    row(None, "2026-10-20T15:00:04Z", "LLM_REQUEST", "A2", user="carol", agent="adk-legacy", writer=None, invocation="IA2",
+        span="adk-req-2", parent="adk-agent-1", attributes={"model": "model-c"}),
+    row(None, "2026-10-20T15:00:05Z", "LLM_RESPONSE", "A2", user="carol", agent="adk-legacy", writer=None, invocation="IA2",
+        span="adk-req-2", parent="adk-agent-1",
+        attributes={"model": "model-c", "usage_metadata": {"total_token_count": 50}, "cache_type": "none", "finish_reason": "STOP"}),
 ]
 # The replay: e05 sent twice.
 FIXTURE.append(dict(FIXTURE[4]))
@@ -226,7 +254,9 @@ def checks(name: str, rows: list[dict]):
         yield "the mod's subagent: 1 request, 50 tokens", (p[("bigquery-agent-analytics-mod", "general-purpose")]["model_requests"], p[("bigquery-agent-analytics-mod", "general-purpose")]["tokens"]) == (1, 50)
         yield "the tracer, apart: 999 tokens", p[("bqaa-coding-agent-plugin", "coding-agent")]["tokens"] == 999
         adk = p[("adk (no writer)", "adk-agent")]
-        yield "ADK, normalized: each streamed call once, as its final row (marked, else the last of its span): 3 model requests, 147 tokens (77 from total_token_count), 25.0% of 4 rows in error, rows with no event_id kept", (adk["sessions"], adk["model_requests"], adk["tokens"], adk["error_row_pct"]) == (1, 3, 147, 25.0)
+        yield "ADK, normalized: each streamed call once, with its largest token count: 3 model requests, 147 tokens (77 from total_token_count), 25.0% of 4 rows in error, rows with no event_id kept", (adk["sessions"], adk["model_requests"], adk["tokens"], adk["error_row_pct"]) == (1, 3, 147, 25.0)
+        legacy = p[("adk (no writer)", "adk-legacy")]
+        yield "ADK with progressive streaming off: final responses under the agent's span go to the request before them: 2 model requests, 150 tokens (100 once, then 50), 20.0% of 5 rows in error", (legacy["sessions"], legacy["model_requests"], legacy["tokens"], legacy["error_row_pct"]) == (1, 2, 150, 20.0)
     elif name == "1":
         yield "the mod's rows, each once: 26", len(rows) == 26
     elif name == "2":
