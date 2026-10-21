@@ -1613,3 +1613,4 @@ types/index.d.ts             the values the mod keeps in the session's $.state
 The credential notice, the identity options, the permission decisions,
 `setup.sh` and the views follow ideas from the upstream reference mod
 (Apache-2.0). They were reimplemented, and no code was copied.
+
