@@ -19,8 +19,9 @@ It also takes the project's Viewer and Editor groups off the events dataset
 (and Editors off the views dataset), so those project roles read no rows
 (--keep-project-groups leaves them), lists who still reads every row through
 a project role (custom ones too, by their permissions), and stops if a
---reader or --token-creator member does, or may: through a domain, or a group
-whose membership Cloud Identity does not answer for.
+--reader or --token-creator member does (--allow-existing-grants keeps it),
+or may: through a domain, or a group whose membership Cloud Identity does not
+answer for (--accept-unverified accepts that, and only that).
 """
 
 from __future__ import annotations
@@ -277,10 +278,11 @@ def _require_project_dataset(args: argparse.Namespace) -> None:
             "read every row. Name another with --views-dataset."
         )
     for member in [*args.token_creator, *args.reader]:
-        if not any(member.startswith(prefix) for prefix in ("user:", "group:", "serviceAccount:", "domain:")):
+        if not any(member.startswith(prefix) for prefix in ("user:", "group:", "serviceAccount:")):
             raise SystemExit(
-                f"{member!r}: --token-creator and --reader take user:, group:, "
-                "serviceAccount: or domain: members"
+                f"{member!r}: --token-creator and --reader take user:, group: or serviceAccount: "
+                "members. Not a domain: Token Creator for a domain lets everyone in it mint the writer's "
+                "tokens, and a domain's members cannot be checked against the grants on the events data."
             )
 
 
@@ -499,8 +501,11 @@ def _unexpanded(named: str) -> bool:
 def _member_of(args: argparse.Namespace, group: str, member: str, cache: dict) -> bool | None:
     """Whether `member` (an address) is in `group`, directly or through other
     groups, as Cloud Identity answers (gcloud identity groups memberships
-    check-transitive-membership); None when it cannot answer (no such
-    group in a directory the caller may read, the API off, no access)."""
+    check-transitive-membership); None when it cannot answer. The method
+    answers only for Google Workspace Enterprise Standard, Enterprise Plus
+    and Enterprise for Education, and Cloud Identity Premium, accounts, and
+    with 403 elsewhere; nor does it answer for a group the caller cannot
+    see."""
     key = (group.lower(), member.lower())
     if key not in cache:
         result = subprocess.run(
@@ -522,11 +527,13 @@ def _member_of(args: argparse.Namespace, group: str, member: str, cache: dict) -
 
 
 def _role_reads(args: argparse.Namespace, role: str, cache: dict) -> bool | None:
-    """Whether a project role reads table data (READ_PERMISSIONS): True for
-    PROJECT_READ_ROLES; otherwise from the permissions gcloud iam roles
-    describe lists, for a custom role of a project or an organization or
-    any other predefined role; None when they cannot be read."""
-    if role in PROJECT_READ_ROLES:
+    """Whether a role reads table data (READ_PERMISSIONS): True for
+    PROJECT_READ_ROLES and a dataset's READER, WRITER and OWNER; otherwise
+    from the permissions gcloud iam roles describe lists, for a custom role
+    of a project or an organization or any other predefined role. A role
+    that does not exist grants nothing; None when one that does cannot be
+    read."""
+    if role in PROJECT_READ_ROLES or role in ("READER", "WRITER", "OWNER"):
         return True
     if role not in cache:
         parts = role.split("/")
@@ -543,104 +550,140 @@ def _role_reads(args: argparse.Namespace, role: str, cache: dict) -> bool | None
                 answer = bool(held & set(READ_PERMISSIONS))
             except (json.JSONDecodeError, AttributeError):
                 answer = None
+        elif "NOT_FOUND" in f"{result.stderr or ''}\n{result.stdout or ''}":
+            answer = False
         cache[role] = answer
     return cache[role]
 
 
-def _grants(args: argparse.Namespace, datasets) -> list[tuple[str, str, str | None]]:
-    """(member, what it holds, the project role or None) for every project
-    binding, the access of `datasets` (leaving out what the dataset-access
-    step takes off), and the events table's IAM policy."""
-    grants: list[tuple[str, str, str | None]] = []
+def _grants(args: argparse.Namespace, datasets) -> list[tuple[str, str, str, str]]:
+    """(member, what it holds, the role, "project", "dataset" or "table")
+    for every project binding, the access of `datasets` (leaving out what
+    the dataset-access step takes off), and the events table's IAM policy."""
+    grants: list[tuple[str, str, str, str]] = []
     policy = _json_output(_gcloud_command(args, "projects", "get-iam-policy", args.project, "--format=json"))
     for binding in policy.get("bindings") or []:
         for member in binding.get("members") or []:
-            grants.append((member, f"{binding.get('role')} on the project {args.project}", binding.get("role")))
+            grants.append((member, f"{binding.get('role')} on the project {args.project}", binding.get("role") or "", "project"))
     for dataset in datasets:
         cleared = set() if args.keep_project_groups else (_EVENTS_CLEARED if dataset == args.dataset else _VIEWS_CLEARED)
         info = _json_output(_bq_command(args, "--format=json", "show", f"{args.project}:{dataset}"), missing_ok=True)
         for entry in info.get("access") or []:
             member = _dataset_member(entry)
             if member and entry.get("role") and member.lower() not in cleared:
-                grants.append((member, f"{entry['role']} on the dataset {args.project}.{dataset}", None))
+                grants.append((member, f"{entry['role']} on the dataset {args.project}.{dataset}", entry["role"], "dataset"))
     table = f"{args.project}:{args.dataset}.{args.table}"
     table_policy = _json_output(_bq_command(args, "--format=json", "get-iam-policy", table), missing_ok=True)
     for binding in table_policy.get("bindings") or []:
         for member in binding.get("members") or []:
-            grants.append((member, f"{binding.get('role')} on the table {args.project}.{args.dataset}.{args.table}", None))
+            grants.append((member, f"{binding.get('role')} on the table {args.project}.{args.dataset}.{args.table}",
+                           binding.get("role") or "", "table"))
     return grants
 
 
 _UNREAD_ROLE = " (a role whose permissions could not be read)"
 
 
+def _settle(definite: list[str], unverified: list[str], args: argparse.Namespace, what: str, fix: str) -> None:
+    """Stop on what definitely reaches too far unless --allow-existing-grants,
+    and on what could not be ruled out unless --accept-unverified: each flag
+    keeps its own kind only."""
+    stops = []
+    if definite:
+        if args.allow_existing_grants:
+            print("KEPT (--allow-existing-grants): " + "; ".join(definite))
+        else:
+            stops.append(f"{what}: " + "; ".join(definite) + ". " + fix + " --allow-existing-grants keeps them.")
+    if unverified:
+        if args.accept_unverified:
+            print("ACCEPTED (--accept-unverified), not ruled out: " + "; ".join(unverified))
+        else:
+            stops.append(
+                "this setup could not rule out that these reach further (a group's or an identity pool's members, "
+                "a domain's other names, or a role whose permissions it could not read): " + "; ".join(unverified)
+                + ". Check them, then --accept-unverified accepts them (and nothing that is known to reach further)."
+            )
+    if stops:
+        raise SystemExit(" | ".join(stops))
+
+
 def _check_writer_grants(args: argparse.Namespace) -> None:
-    """Refuse a writer that already holds more than the row-writer role.
+    """Refuse a writer that already holds, or may hold, more than the
+    row-writer role.
 
     Looks at the project's IAM policy, the events and views datasets' access
     and the events table's IAM policy, for grants to the writer itself, to
-    everyone, or to its domain. A reused service account (one an earlier
-    setup gave dataEditor and jobUser, say) would otherwise hand every token
-    creator a read of every row. Any project role of the writer's own
-    counts; of everyone's or its domain's, a role that reads tables, or one
-    whose permissions cannot be read.
+    everyone, to its domain, or to a group it may be in (Cloud Identity is
+    asked). A reused service account (one an earlier setup gave dataEditor
+    and jobUser, say) would otherwise hand every token creator a read of
+    every row. Any project role of the writer's own counts; of everyone's,
+    its domain's or a group's, a role that reads tables, or one whose
+    permissions cannot be read.
     """
     principal = args.principal
+    writer = principal.partition(":")[2]
     role = f"projects/{args.project}/roles/{ROW_WRITER_ROLE_ID}"
     roles: dict = {}
-    found: list[str] = []
-    for named, held, project_role in _grants(args, dict.fromkeys([args.dataset, _views_dataset(args)])):
-        if _reach(named, principal) != "yes":
+    memberships: dict = {}
+    definite: list[str] = []
+    unverified: list[str] = []
+    for named, held, granted, scope in _grants(args, dict.fromkeys([args.dataset, _views_dataset(args)])):
+        if scope == "table" and granted == role and named.lower() == principal.lower():
             continue
-        if project_role is not None and named.lower() != principal.lower() and project_role not in PROJECT_GROUP_ROLES:
-            reads = _role_reads(args, project_role, roles)
+        reach = _reach(named, principal)
+        if reach == "no":
+            continue
+        line = f"{held} (granted to {named})"
+        known = True
+        if scope == "project" and named.lower() != principal.lower() and granted not in PROJECT_GROUP_ROLES:
+            reads = _role_reads(args, granted, roles)
             if reads is False:
                 continue
             if reads is None:
-                held += _UNREAD_ROLE
-        if held.startswith(f"{role} on the table") and named.lower() == principal.lower():
-            continue
-        found.append(f"{held} (granted to {named})")
-    if not found:
+                line += _UNREAD_ROLE
+                known = False
+        if reach == "maybe":
+            kind, _, other = named.partition(":")
+            answer = _member_of(args, other, writer, memberships) if kind == "group" else None
+            if answer is False:
+                continue
+            if answer is None:
+                unverified.append(line)
+                continue
+            line += " (the writer is a member, as Cloud Identity answers)"
+        (definite if known else unverified).append(line)
+    if not definite and not unverified:
         print(f"OK {principal} holds nothing on the project, the datasets or the table beyond {role}")
         return
-    listed = "\n  - ".join(found)
-    if args.allow_existing_grants:
-        print(f"KEPT (--allow-existing-grants) what reaches {principal}:\n  - {listed}")
-        return
-    raise SystemExit(
-        f"{principal} already holds more than the row-writer role:\n  - {listed}\n"
-        "Its tokens could read or change the table. Use a new service account for the writer, or "
-        "remove those grants and run again; --allow-existing-grants keeps them (an audited account)."
-    )
+    _settle(definite, unverified, args, f"{principal} already holds more than the row-writer role",
+            "Its tokens could read or change the table. Use a new service account for the writer, or remove "
+            "those grants and run again;")
 
 
 def _check_project_readers(args: argparse.Namespace) -> None:
     """Name who can read every row: a project role that reads tables (a
     predefined one, or any role whose permissions say so), or a grant on the
-    events dataset or table. Stop when everyone can, and when a --reader or
-    --token-creator member can or may: its own grant, everyone's or its
-    domain's; or one this setup cannot rule out (a domain that may hold the
-    member under another name, a group or identity pool on either side whose
-    membership Cloud Identity does not answer for, a role whose permissions
-    could not be read)."""
+    events dataset or table that reads it. Stop when everyone can, and when
+    a --reader or --token-creator member can, unless --allow-existing-grants;
+    and when one may, which this setup cannot rule out (a domain that may
+    hold the member under another name, a group or identity pool on either
+    side whose membership Cloud Identity does not answer for, a role whose
+    permissions could not be read), unless --accept-unverified."""
     roles: dict = {}
     grants: list[tuple[str, str, bool]] = []
-    for named, held, project_role in _grants(args, [args.dataset]):
-        if project_role is None:
-            grants.append((named, held, True))
-        elif project_role in PROJECT_GROUP_ROLES:
+    for named, held, granted, scope in _grants(args, [args.dataset]):
+        if scope == "project" and granted in PROJECT_GROUP_ROLES:
             if args.keep_project_groups:
                 grants.append((named, held, True))
-        else:
-            reads = _role_reads(args, project_role, roles)
-            if reads is None:
-                grants.append((named, held + _UNREAD_ROLE, False))
-            elif reads:
-                grants.append((named, held, True))
+            continue
+        reads = _role_reads(args, granted, roles)
+        if reads is None:
+            grants.append((named, held + _UNREAD_ROLE, False))
+        elif reads:
+            grants.append((named, held, True))
     if grants:
         listed = "\n  - ".join(f"{member}: {held}" for member, held, _ in grants)
-        print(f"These hold a project role that reads every table, or a grant on the events dataset or table:\n  - {listed}")
+        print(f"These hold a project role that reads every table, or a grant that reads the events dataset or table:\n  - {listed}")
     members = [*args.reader, *args.token_creator]
     public = [f"{named} ({held})" for named, held, known in grants if known and named.lower() in _PUBLIC]
     clashes: list[str] = []
@@ -676,30 +719,19 @@ def _check_project_readers(args: argparse.Namespace) -> None:
                     continue
                 line += " (a member, as Cloud Identity answers)"
             (clashes if known else unverified).append(line)
-    problems = []
+    definite = []
     if public:
-        problems.append("everyone can read the table: " + "; ".join(public))
+        definite.append("everyone can read the table: " + "; ".join(public))
     if clashes:
-        problems.append("a reader or token creator can read every row, views or not: " + "; ".join(clashes))
-    if unverified:
-        problems.append(
-            "a reader or token creator may reach these, which this setup could not rule out (a group's or an "
-            "identity pool's members, a domain's other names, or a role whose permissions it could not "
-            "read): " + "; ".join(unverified)
-        )
-    if not problems:
+        definite.append("a reader or token creator can read every row, views or not: " + "; ".join(clashes))
+    if not definite and not unverified:
         note = f" (not a member, as Cloud Identity answers: {'; '.join(checked)})" if checked else ""
-        print("OK no grant to everyone, and no grant on the events dataset or table, or project role that "
-              f"reads it, reaches a --reader or --token-creator member{note}")
+        print("OK no grant to everyone, and no grant that reads the events dataset or table, or project role "
+              f"that reads it, reaches a --reader or --token-creator member{note}")
         return
-    if args.allow_existing_grants:
-        print("KEPT (--allow-existing-grants): " + " | ".join(problems))
-        return
-    raise SystemExit(
-        " | ".join(problems) + ". Take those grants off (see docs/service-account-auth.md, Moving from "
-        "dataEditor), or keep the events dataset in a project of its own; check what could not be ruled "
-        "out, then --allow-existing-grants keeps it."
-    )
+    _settle(definite, unverified, args, "the table can be read beyond the views",
+            "Take those grants off (see docs/service-account-auth.md, Moving from dataEditor), or keep the "
+            "events dataset in a project of its own;")
 
 
 def _check_api_enabled(args: argparse.Namespace, service: str) -> None:
@@ -874,9 +906,10 @@ def _readers_check_step(args: argparse.Namespace) -> Step:
             f"list the holders of a project role that reads tables ({', '.join(READ_PERMISSIONS)}; and, "
             f"with --keep-project-groups, {', '.join(PROJECT_GROUP_ROLES)}) and of any grant on the "
             "events dataset or table; stop on a grant to everyone, and on one that reaches a --reader "
-            "or --token-creator member, or may (another domain; a group or identity pool, unless gcloud "
-            "identity groups memberships check-transitive-membership says the member is not in it; a "
-            "role whose permissions cannot be read), unless --allow-existing-grants"
+            "or --token-creator member, unless --allow-existing-grants; and on one that may (another "
+            "domain; a group or identity pool, unless gcloud identity groups memberships "
+            "check-transitive-membership says the member is not in it; a role whose permissions cannot "
+            "be read), unless --accept-unverified"
         ),
         needs_cli_auth=True,
     )
@@ -961,9 +994,10 @@ def _build_steps(args: argparse.Namespace) -> list[Step]:
                 detail=(
                     "gcloud projects get-iam-policy; bq show of the events and views "
                     "datasets; bq get-iam-policy of the table; gcloud iam roles describe of a "
-                    "project role granted to everyone or its domain. Stops on any other grant to it, "
-                    "and on a project role of everyone's or its domain's that reads tables, or whose "
-                    "permissions cannot be read, unless --allow-existing-grants"
+                    "project role granted to everyone, its domain or a group; Cloud Identity for a "
+                    "group's grant. Stops on any other grant to it, or to a group it is in, unless "
+                    "--allow-existing-grants; and on one that may reach it (a group Cloud Identity does "
+                    "not answer for, a role whose permissions cannot be read), unless --accept-unverified"
                 ),
                 needs_cli_auth=True,
             )
@@ -1449,9 +1483,22 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "Keep a writer that already holds other grants on the project, the "
             "datasets or the table (an audited account), and grants that reach "
-            "readers or token creators, or may (through a domain, a group or "
-            "identity pool, or a role whose permissions cannot be read), or "
-            "everyone. Without it, setup stops before granting anything."
+            "readers or token creators, or everyone. It does not accept what "
+            "could not be ruled out (see --accept-unverified). Without it, setup "
+            "stops before granting anything."
+        ),
+    )
+    parser.add_argument(
+        "--accept-unverified",
+        action="store_true",
+        help=(
+            "Accept grants that may reach the writer, a reader or a token creator "
+            "but could not be ruled out: a group or identity pool whose members "
+            "Cloud Identity does not answer for (its membership check answers only "
+            "for Google Workspace Enterprise and Cloud Identity Premium accounts), "
+            "another domain's grant, or a role whose permissions could not be read. "
+            "Grants known to reach further still stop setup unless "
+            "--allow-existing-grants is also given."
         ),
     )
     parser.add_argument(

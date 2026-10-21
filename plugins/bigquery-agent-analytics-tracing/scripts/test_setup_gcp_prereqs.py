@@ -35,6 +35,7 @@ def _args(**overrides: object) -> argparse.Namespace:
         "reader": [],
         "views_dataset": "",
         "allow_existing_grants": False,
+        "accept_unverified": False,
         "keep_project_groups": False,
     }
     defaults.update(overrides)
@@ -410,7 +411,7 @@ def test_members_must_name_their_kind() -> None:
         try:
             setup._require_project_dataset(_args(**overrides))
         except SystemExit as exc:
-            assert "user:, group:, serviceAccount: or domain:" in str(exc)
+            assert "user:, group: or serviceAccount:" in str(exc)
         else:
             raise AssertionError(f"expected SystemExit for {field}")
 
@@ -466,6 +467,10 @@ class _FakeRun:
             if all(word in command for word in words):
                 code, out = answer_code, answer_out
                 break
+        else:
+            if "check-transitive-membership" in command:
+                # Unanswered here, as on most accounts (403): never "not a member".
+                code, out = 1, "ERROR: (gcloud.identity.groups.memberships.check-transitive-membership) PERMISSION_DENIED"
         if check and code != 0:
             raise subprocess.CalledProcessError(code, command)
         return subprocess.CompletedProcess(command, code, out, "")
@@ -483,14 +488,16 @@ def _stub_run(fake: _FakeRun):
 
 @contextlib.contextmanager
 def _views_left_alone():
-    """A run that gets past the checks with readers authorizes the views
-    through the BigQuery client: stood in for here."""
-    original = setup._authorize_views
+    """A run that gets past the checks authorizes the views and, without
+    --keep-project-groups, changes the datasets' access, both through the
+    BigQuery client: stood in for here."""
+    originals = setup._authorize_views, setup._restrict_dataset_access
     setup._authorize_views = lambda *args, **kwargs: None
+    setup._restrict_dataset_access = lambda *args, **kwargs: None
     try:
         yield
     finally:
-        setup._authorize_views = original
+        setup._authorize_views, setup._restrict_dataset_access = originals
 
 
 WRITER = "bqaa-row-writer@test-project.iam.gserviceaccount.com"
@@ -929,7 +936,9 @@ def test_a_token_creator_or_reader_with_a_grant_on_the_events_dataset_or_table_i
     # The tracing plugin's default setup gives each developer dataEditor on
     # the dataset; a group that keeps it reads every row.
     dataset = {"access": [{"role": "roles/bigquery.dataEditor", "groupByEmail": "BQAA-writers@example.com"}]}
-    fake = _FakeRun(_answers({}, dataset, {}))
+    # The writer is not in that group (Cloud Identity's answer), so the
+    # writer check passes and the token creators' check refuses.
+    fake = _FakeRun([(("check-transitive-membership", f"--member-email={WRITER}"), 0, "{}")] + _answers({}, dataset, {}))
     try:
         _row_writer_run(fake)
     except SystemExit as exc:
@@ -969,11 +978,13 @@ def test_every_grant_on_the_events_dataset_and_table_is_listed() -> None:
                (("bq", "get-iam-policy"), 0, json.dumps(table))]
     out = io.StringIO()
     with _stub_run(_FakeRun(answers)), contextlib.redirect_stdout(out):
-        setup._check_project_readers(_args(reader=["group:r@example.com"]))
+        setup._check_project_readers(_args(reader=["group:r@example.com"], accept_unverified=True))
     text = out.getvalue()
     assert "specialGroup:projectOwners: OWNER on the dataset test-project.agent_analytics" in text
     assert "user:admin@example.com: OWNER on the dataset test-project.agent_analytics" in text
-    assert f"serviceAccount:{WRITER}: projects/test-project/roles/bqaaRowWriter on the table" in text
+    # The writer's own row-writer binding reads no rows: not listed, not asked about.
+    assert "bqaaRowWriter on the table" not in text
+    assert "ACCEPTED (--accept-unverified), not ruled out: group:r@example.com: user:admin@example.com" in text
 
 
 def test_a_missing_bigquery_client_stops_before_any_change() -> None:
@@ -1065,7 +1076,7 @@ def test_a_group_grant_a_reader_may_be_in_needs_the_override() -> None:
             assert "could not rule out" in str(exc) and "user:alice@example.com: group:all-staff@example.com" in str(exc)
         else:
             raise AssertionError("expected SystemExit")
-        setup._check_project_readers(_args(reader=["user:alice@example.com"], allow_existing_grants=True))
+        setup._check_project_readers(_args(reader=["user:alice@example.com"], accept_unverified=True))
         # With no reader or token creator, there is no one to be a member.
         setup._check_project_readers(_args(service_account="bqaa-row-writer", writer_role="row-writer"))
     # Cloud Identity's answer settles it: a member reads every row; one who is not passes.
@@ -1178,7 +1189,7 @@ def test_a_persons_grant_with_group_readers_needs_cloud_identity_or_the_override
     assert _token_creator_calls(fake)
     # Unanswered, the override keeps it.
     fake = _FakeRun([(("identity", "check-transitive-membership"), 1, "ERROR: PERMISSION_DENIED")] + _answers({}, dataset, {}))
-    _row_writer_run(fake, allow_existing_grants=True, **GROUPS)
+    _row_writer_run(fake, accept_unverified=True, **GROUPS)
     assert _token_creator_calls(fake)
 
 
@@ -1314,6 +1325,113 @@ def test_the_writer_check_reads_a_broad_grants_custom_role() -> None:
                 assert not stops
 
 
+def test_domain_members_are_refused_for_readers_and_token_creators() -> None:
+    for extra in (dict(reader=["domain:example.com"]),
+                  dict(service_account="bqaa-row-writer", writer_role="row-writer", token_creator=["domain:example.com"])):
+        try:
+            setup._require_project_dataset(_args(**extra))
+        except SystemExit as exc:
+            assert "Not a domain" in str(exc)
+        else:
+            raise AssertionError(f"expected SystemExit for {extra}")
+
+
+def test_a_group_grant_the_writer_may_be_in() -> None:
+    # A reading group holds project dataViewer; Alice, the token creator, is
+    # not in it, but the writer may be: impersonating it would read every row.
+    policy = {"bindings": [{"role": "roles/bigquery.dataViewer", "members": ["group:raw-readers@example.com"]}]}
+    alice_out = (("check-transitive-membership", "--member-email=alice@example.com"), 0, "{}")
+    writer_in = (("check-transitive-membership", f"--member-email={WRITER}"), 0, '{"hasMembership": true}')
+    fake = _FakeRun([alice_out, writer_in] + _answers(policy, {}, {}))
+    try:
+        _row_writer_run(fake, token_creator=["user:alice@example.com"], keep_project_groups=False)
+    except SystemExit as exc:
+        assert "already holds more than the row-writer role" in str(exc)
+        assert "(granted to group:raw-readers@example.com) (the writer is a member, as Cloud Identity answers)" in str(exc)
+    else:
+        raise AssertionError("expected SystemExit")
+    assert _no_grant_calls(fake)
+    asked = [c for c in fake.calls if "check-transitive-membership" in c and f"--member-email={WRITER}" in c]
+    assert asked and "--group-email=raw-readers@example.com" in asked[0]
+    # Unanswered for the writer: not ruled out, so it stops too, unless accepted.
+    fake = _FakeRun([alice_out] + _answers(policy, {}, {}))
+    try:
+        _row_writer_run(fake, token_creator=["user:alice@example.com"], keep_project_groups=False)
+    except SystemExit as exc:
+        assert "could not rule out" in str(exc) and "granted to group:raw-readers@example.com" in str(exc)
+    else:
+        raise AssertionError("expected SystemExit")
+    assert _no_grant_calls(fake)
+    fake = _FakeRun([alice_out] + _answers(policy, {}, {}))
+    _row_writer_run(fake, token_creator=["user:alice@example.com"], keep_project_groups=False, accept_unverified=True)
+    assert _token_creator_calls(fake)
+    # Neither Alice nor the writer in it: the run goes on.
+    writer_out = (("check-transitive-membership", f"--member-email={WRITER}"), 0, "{}")
+    fake = _FakeRun([alice_out, writer_out] + _answers(policy, {}, {}))
+    _row_writer_run(fake, token_creator=["user:alice@example.com"], keep_project_groups=False)
+    assert _token_creator_calls(fake)
+
+
+def test_the_guides_setup_where_cloud_identity_answers_403() -> None:
+    # The two-group command in a project whose Owner made the dataset
+    # (BigQuery's OWNER entry for its creator), on an account whose Cloud
+    # Identity answers 403 to every membership question.
+    owner = {"bindings": [{"role": "roles/owner", "members": ["user:admin@example.com"]}]}
+    dataset = {"access": [{"role": "OWNER", "userByEmail": "admin@example.com"},
+                          {"role": "OWNER", "specialGroup": "projectOwners"}]}
+    fake = _FakeRun(_answers(owner, dataset, {}))
+    try:
+        _row_writer_run(fake, keep_project_groups=False, **GROUPS)
+    except SystemExit as exc:
+        assert "could not rule out" in str(exc) and "user:admin@example.com" in str(exc)
+        assert "--allow-existing-grants keeps" not in str(exc)
+    else:
+        raise AssertionError("expected SystemExit")
+    assert _no_grant_calls(fake)
+    # Checked and accepted: the first run completes.
+    fake = _FakeRun(_answers(owner, dataset, {}))
+    _row_writer_run(fake, keep_project_groups=False, accept_unverified=True, **GROUPS)
+    assert _token_creator_calls(fake)
+    # The rerun, with the writer's bqaaRowWriter binding on the table: the
+    # same acceptance holds, and nobody is asked about the writer's binding.
+    bound = {"bindings": [{"role": "projects/test-project/roles/bqaaRowWriter", "members": [f"serviceAccount:{WRITER}"]}]}
+    fake = _FakeRun(_answers(owner, dataset, bound))
+    _row_writer_run(fake, keep_project_groups=False, accept_unverified=True, **GROUPS)
+    assert _token_creator_calls(fake)
+    assert not [c for c in fake.calls if "check-transitive-membership" in c and f"--member-email={WRITER}" in c]
+
+
+def test_accepting_the_unverified_keeps_the_definite_refusals() -> None:
+    cases = (
+        # The writer holds WRITER on the events dataset (round 1's case).
+        ({}, {"access": [{"role": "WRITER", "userByEmail": WRITER}]}, {}),
+        # Everyone reads the table.
+        ({}, {}, {"bindings": [{"role": "roles/bigquery.dataViewer", "members": ["allAuthenticatedUsers"]}]}),
+        # The readers' group itself reads every table through a project role.
+        ({"bindings": [{"role": "roles/bigquery.dataViewer", "members": ["group:bqaa-readers@example.com"]}]}, {}, {}),
+    )
+    for project_policy, dataset, table in cases:
+        fake = _FakeRun(_answers(project_policy, dataset, table))
+        try:
+            _row_writer_run(fake, accept_unverified=True, **GROUPS)
+        except SystemExit as exc:
+            assert "--allow-existing-grants keeps them" in str(exc)
+        else:
+            raise AssertionError(f"expected SystemExit for {project_policy, dataset, table}")
+        assert _no_grant_calls(fake)
+    # And --allow-existing-grants alone accepts nothing that was not ruled out.
+    dataset = {"access": [{"role": "READER", "groupByEmail": "all-staff@example.com"}]}
+    answers = [(("gcloud", "projects", "get-iam-policy"), 0, "{}"), (("bq", "show"), 0, json.dumps(dataset)),
+               (("bq", "get-iam-policy"), 0, "{}")]
+    with _stub_run(_FakeRun(answers)), contextlib.redirect_stdout(io.StringIO()):
+        try:
+            setup._check_project_readers(_args(reader=["user:alice@example.com"], allow_existing_grants=True))
+        except SystemExit as exc:
+            assert "could not rule out" in str(exc) and "--accept-unverified" in str(exc)
+        else:
+            raise AssertionError("expected SystemExit")
+
+
 if __name__ == "__main__":
     for test in (
         test_service_account_plan,
@@ -1377,6 +1495,10 @@ if __name__ == "__main__":
         test_a_domain_grant_and_a_person_in_another_domain_need_the_override,
         test_a_custom_project_role_that_reads_is_found,
         test_the_writer_check_reads_a_broad_grants_custom_role,
+        test_domain_members_are_refused_for_readers_and_token_creators,
+        test_a_group_grant_the_writer_may_be_in,
+        test_the_guides_setup_where_cloud_identity_answers_403,
+        test_accepting_the_unverified_keeps_the_definite_refusals,
     ):
         test()
     print("setup_gcp_prereqs tests passed")

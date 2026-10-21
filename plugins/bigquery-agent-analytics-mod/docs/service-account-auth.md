@@ -81,19 +81,32 @@ So the bootstrap, with `--writer-role row-writer` or `--reader`:
     through a set of identity-pool principals; and when it is of a role
     whose permissions could not be read.
 
-  Check those, then `--allow-existing-grants` keeps them. Moving a team off
-  `roles/bigquery.dataEditor` takes those grants off first (see
+  The two kinds stop the run apart, and each flag keeps only its own: a
+  grant known to reach a member, or everyone, needs
+  `--allow-existing-grants`; one the bootstrap could not rule out needs
+  `--accept-unverified`. Moving a team off `roles/bigquery.dataEditor`
+  takes those grants off first (see
   [Moving from dataEditor](#moving-from-dataeditor)).
+- does the same for the writer: a grant to a group it may be in counts,
+  and Cloud Identity is asked. The writer's own `bqaaRowWriter` binding on
+  the table is not a reading grant, so a second run does not stop on it.
 
-Roles held on a folder or the organization are not looked at. Where Cloud
-Identity cannot answer for a group, a grant that may reach its members
-stops the run until someone who can see them says otherwise. That includes
-the project's Owners, and the Google service agents that hold BigQuery data
-roles: in a shared project, run the bootstrap as someone who may see the
-groups' members, or check the grants it lists and pass
-`--allow-existing-grants`. The simplest way to keep the audience small is a
-project of its own for the events dataset, where only the administrators
-hold project roles.
+`--reader` and `--token-creator` take `user:`, `group:` or
+`serviceAccount:` members, not `domain:`: Token Creator for a domain would
+let everyone in it mint the writer's tokens.
+
+Cloud Identity's membership check answers only for Google Workspace
+Enterprise Standard, Enterprise Plus and Enterprise for Education, and
+Cloud Identity Premium, accounts; elsewhere it answers 403, and so it does
+for a group the caller cannot see. Then every person's and service
+account's grant that reads the events data counts as not ruled out,
+including the project's Owners, BigQuery's `OWNER` entry for whoever made
+the dataset, and the Google service agents that hold BigQuery data roles.
+Check the grants the bootstrap lists, then pass `--accept-unverified`:
+grants known to reach a reader, a token creator or everyone still stop the
+run. Roles held on a folder or the organization are not looked at. The
+simplest way to keep the audience small is a project of its own for the
+events dataset, where only the administrators hold project roles.
 
 ## What this protects, and what it does not
 
@@ -372,7 +385,7 @@ readers' group a reader, take them off:
    a grant there, or may. With readers or token creators that are groups,
    a person's grant there stops it unless Cloud Identity answers that the
    person is in neither group. A domain's grant stops it until you have
-   checked who the domain holds and pass `--allow-existing-grants`.
+   checked who the domain holds and pass `--accept-unverified`.
 
 ## What a writer needs
 
