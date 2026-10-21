@@ -541,6 +541,16 @@ def _recording_stub(tmp: Path) -> tuple[Path, Path]:
     return _write_stub(tmp / "recording-python", f"IFS=$'\\t'\nprintf '%s\\n' \"$*\" >> \"{record}\""), record
 
 
+def _recording_env(tmp: Path, stub: Path) -> dict[str, str]:
+    """_base_env for hooks that start the recording stub. A hook's wait is
+    whole seconds counted from its start, so a hook whose queueing crosses a
+    second boundary has none left and returns before its run has started (by
+    design: the run is detached). With a long wait each hook returns only
+    once its run is recorded, so the record holds every run, in the hooks'
+    order. The stub exits at once, so no hook waits longer for it."""
+    return _base_env(tmp, BQAA_PYTHON=str(stub), BQAA_HOOK_WAIT_SECONDS="10")
+
+
 def _recorded_runs(record: Path) -> list[tuple[str, ...]]:
     """process_hook_queue's arguments for each run, in the order the hooks
     started them."""
@@ -1009,7 +1019,7 @@ def test_numbers_freed_during_a_run_do_not_reorder_its_session() -> None:
     # events, and the runs go in-process so they interleave just that way.
     with _tmpdir() as tmp, _drainer_lock_held(tmp / "spool"):
         stub, record = _recording_stub(tmp)
-        hook_env = _base_env(tmp, BQAA_PYTHON=str(stub))
+        hook_env = _recording_env(tmp, stub)
         queue = tmp / "state" / "queue"
         # So one run can go while the other holds its session's lock.
         assert bqaa_tracing._queue_lock(queue, "session-a") != bqaa_tracing._queue_lock(queue, "session-b")
@@ -1106,17 +1116,31 @@ def test_hook_does_not_take_a_number_used_up_since_its_listing() -> None:
         last = queue / "last"
         os.mkfifo(last)
 
+        stop = threading.Event()
+
         def serve() -> None:
-            for value in ("", "000000000001", "000000000001"):
-                with last.open("w", encoding="ascii") as fifo:  # once the hook opens it
-                    fifo.write(value + "\n")
+            # Each open pairs with one of the hook's reads, once the hook
+            # opens the FIFO. An open that comes while the hook's previous
+            # read still holds it can lose its value (that read takes only
+            # its first line, or closes before the write), so after the
+            # first value every read gets the same one, for as long as the
+            # hook may read.
+            value = ""
+            while not stop.is_set():
+                try:
+                    with last.open("w", encoding="ascii") as fifo:
+                        fifo.write(value + "\n")
+                except BrokenPipeError:
+                    continue
+                value = "000000000001"
 
         server = threading.Thread(target=serve, daemon=True)
         server.start()
         try:
-            _, proc = _run_hook("pre_tool_use.sh", PRE_PAYLOAD, _base_env(tmp, BQAA_PYTHON=str(stub)))
+            _, proc = _run_hook("pre_tool_use.sh", PRE_PAYLOAD, _recording_env(tmp, stub))
         finally:
-            # Unblock the server if the hook read the FIFO fewer times.
+            # Unblock the server's open, which waits for a reader.
+            stop.set()
             while server.is_alive():
                 fd = os.open(last, os.O_RDONLY | os.O_NONBLOCK)
                 server.join(0.2)
@@ -1132,7 +1156,7 @@ def test_queue_applies_only_its_own_sessions_events() -> None:
     # so an adapter run applies only its own session's events.
     with _tmpdir() as tmp, _drainer_lock_held(tmp / "spool"):
         stub, record = _recording_stub(tmp)
-        env = _base_env(tmp, BQAA_PYTHON=str(stub))
+        env = _recording_env(tmp, stub)
         for session_id in ("session-a", "session-b"):
             _run_hook("pre_tool_use.sh", dict(PRE_PAYLOAD, session_id=session_id), env)
         assert len(_queued_entries(tmp / "state")) == 2
@@ -1154,7 +1178,7 @@ def test_queue_numbers_are_never_handed_out_twice() -> None:
     # event under its number isn't its own.
     with _tmpdir() as tmp, _drainer_lock_held(tmp / "spool"):
         stub, record = _recording_stub(tmp)
-        env = _base_env(tmp, BQAA_PYTHON=str(stub))
+        env = _recording_env(tmp, stub)
         state = tmp / "state"
 
         def queue_event(session_id: str) -> tuple[str, ...]:
@@ -1240,7 +1264,7 @@ def test_saturated_queue_of_expired_entries_is_pruned() -> None:
         assert used >= 10_000, used
         # And the queue takes events again, numbered above the pruned ones.
         stub, record = _recording_stub(tmp)
-        _, proc = _run_hook("pre_tool_use.sh", PRE_PAYLOAD, _base_env(tmp, BQAA_PYTHON=str(stub)))
+        _, proc = _run_hook("pre_tool_use.sh", PRE_PAYLOAD, _recording_env(tmp, stub))
         assert proc.returncode == 0, proc
         ((_, entry, _),) = _recorded_runs(record)
         assert int(entry) > 10_000, entry
@@ -1271,7 +1295,7 @@ def test_payload_that_cannot_be_parsed_holds_up_no_other_event() -> None:
     # the other runs pass it by.
     with _tmpdir() as tmp, _drainer_lock_held(tmp / "spool"):
         stub, record = _recording_stub(tmp)
-        hook_env = _base_env(tmp, BQAA_PYTHON=str(stub))
+        hook_env = _recording_env(tmp, stub)
         nested = _deeply_nested(dict(PRE_PAYLOAD, session_id="session-a"), "tool_input")
         huge = _with_huge_integer(dict(POST_PAYLOAD, session_id="session-b"), "tool_response")
         _run_hook("pre_tool_use.sh", dict(PRE_PAYLOAD, session_id="session-a"), hook_env)
