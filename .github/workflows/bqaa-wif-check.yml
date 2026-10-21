@@ -1,0 +1,32 @@
+# Checks the keyless CI recipe in docs/service-account-auth.md: GitHub's OIDC
+# token, exchanged through Workload Identity Federation for the writer
+# service account's token (no key), inserts a row and cannot read the table.
+name: bqaa-wif-check
+on:
+  push:
+    branches: [wif-check]
+  workflow_dispatch:
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/201486563047/locations/global/workloadIdentityPools/bqaa-ci/providers/github
+          service_account: bqaa-mod-writer@test-project-0728-467323.iam.gserviceaccount.com
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: The mod's token command, an insert, and a refused read
+        run: |
+          set -u
+          API=https://bigquery.googleapis.com/bigquery/v2/projects/test-project-0728-467323/datasets/bqaa_mod_e2e_1021/tables/agent_events
+          T="$(gcloud auth print-access-token)"
+          echo "token length ${#T}"
+          ROW="{\"rows\": [{\"insertId\": \"wif-$GITHUB_RUN_ID\", \"json\": {\"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\", \"event_type\": \"ACCESS_CHECK\", \"agent\": \"wif-check\", \"session_id\": \"$GITHUB_RUN_ID\"}}]}"
+          insert=$(curl -s -o /tmp/insert.json -w '%{http_code}' -X POST -H "Authorization: Bearer $T" -H 'Content-Type: application/json' --data "$ROW" "$API/insertAll")
+          echo "insertAll: $insert $(cat /tmp/insert.json)"
+          read=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $T" "$API/data?maxResults=1")
+          echo "tabledata.list: $read"
+          test "$insert" = 200 && test "$read" = 403
