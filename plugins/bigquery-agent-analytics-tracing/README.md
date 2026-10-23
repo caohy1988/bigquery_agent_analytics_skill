@@ -468,8 +468,9 @@ ORDER BY rows_written DESC
   output. Normally you see the queue + spool + Popen cost (~5–20 ms) plus
   Python startup. If Python can't start (on macOS a hung `syspolicyd` can
   block launching a non-Apple interpreter for many minutes) or anything
-  else stalls, a tool call pays at most the wait. Each hook also has a
-  10 s `timeout` in `plugin.json` as a backstop (the default is 600 s).
+  else stalls, a tool call pays at most the wait. Every hook except
+  `SessionEnd` also has a 10 s `timeout` in `plugin.json` as a backstop
+  (the default is 600 s).
 - **Events apply in hook order.** The hook queues its event before it
   returns, and whichever `bqaa_hook.py` run takes the session's lock first
   applies all of that session's queued events, oldest first. A late

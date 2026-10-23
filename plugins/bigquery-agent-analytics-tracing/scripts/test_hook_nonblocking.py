@@ -294,13 +294,15 @@ def _stdin(text: str) -> Iterator[None]:
         sys.stdin = saved
 
 
-def _run_hook(script: str, payload: object, env: dict[str, str]) -> tuple[float, subprocess.CompletedProcess]:
+def _run_hook(
+    script: str, payload: object, env: dict[str, str], bash: str = "bash"
+) -> tuple[float, subprocess.CompletedProcess]:
     """Run hooks/<script> like the agent: payload on stdin (a str is sent
     as is), then wait for the process to exit and for EOF on stdout and
     stderr."""
     start = time.monotonic()
     proc = subprocess.run(
-        ["bash", str(PLUGIN_ROOT / "hooks" / script)],
+        [bash, str(PLUGIN_ROOT / "hooks" / script)],
         input=payload if isinstance(payload, str) else json.dumps(payload),
         capture_output=True,
         text=True,
@@ -351,6 +353,15 @@ def _run_hook_holding_stdin(
         if proc.poll() is None:
             proc.kill()
         proc.wait()
+
+
+def _bash_builds() -> list[str]:
+    """bash as the agent finds it on PATH, plus macOS's /bin/bash (3.2) when
+    that's another bash: 3.2 handles some shell options differently."""
+    on_path = shutil.which("bash")
+    if on_path and os.path.exists("/bin/bash") and not os.path.samefile(on_path, "/bin/bash"):
+        return ["bash", "/bin/bash"]
+    return ["bash"]
 
 
 def _write_stub(path: Path, body: str) -> Path:
@@ -721,6 +732,25 @@ def test_main_fails_open_on_bad_input() -> None:
                     raise AssertionError(f"{label}: main() raised {exc!r}") from exc
             assert rc == 0, label
             assert "ERROR hook=PreToolUse" in (tmp / "bqaa.log").read_text(encoding="utf-8"), label
+
+
+def test_hook_fails_open_under_inherited_shell_options() -> None:
+    # 2026-10-23 review: the agent runs `bash .../<hook>.sh`, and bash turns
+    # on the options an exported SHELLOPTS names. Under nounset, bash 3.2
+    # (macOS's /bin/bash) called the listing of an empty queue unbound;
+    # under errexit, reading queue/last before anything had written it
+    # ended the script. Either way the hook exited 1 before queueing, and
+    # the event was lost.
+    for bash in _bash_builds():
+        for shellopts in ("nounset", "errexit", "errexit:nounset:pipefail"):
+            label = (bash, shellopts)
+            with _tmpdir() as tmp, _drainer_lock_held(tmp / "spool"):
+                env = _base_env(tmp, SHELLOPTS=shellopts, BQAA_HOOK_WAIT_SECONDS="5")
+                _, proc = _run_hook("pre_tool_use.sh", PRE_PAYLOAD, env, bash=bash)
+                assert proc.returncode == 0 and proc.stdout == proc.stderr == "", (label, proc)
+                files = _wait_for_spool_files(tmp / "spool", count=1, timeout=10)
+                assert len(files) == 1, (label, files)
+                _assert_tool_starting_envelope(files[0])
 
 
 # ---------------------------------------------------------------------------
@@ -1234,6 +1264,21 @@ def test_cleanup_leaves_queue_locks_in_place() -> None:
         assert [row["event_type"] for row in _spooled_rows(tmp / "spool")] == ["TOOL_STARTING", "TOOL_COMPLETED"]
 
 
+def _fill_queue_with_expired_entries(state_dir: Path) -> Path:
+    """Fill the queue up to QUEUE_MAX (10,000) with unfinished entries (no
+    end line) past the TTL: nothing can apply them, and cleanup prunes them
+    by age. Returns the queue dir."""
+    queue = state_dir / "queue"
+    queue.mkdir(parents=True)
+    long_ago = time.time() - 48 * 3600
+    payload = json.dumps(PRE_PAYLOAD)
+    for n in range(1, 10_001):
+        path = queue / f"{n:012d}"
+        path.write_text(f"PreToolUse\n{payload}\n", encoding="utf-8")
+        os.utime(path, (long_ago, long_ago))
+    return queue
+
+
 def test_saturated_queue_of_expired_entries_is_pruned() -> None:
     # 2026-10-12 review: at QUEUE_MAX (10,000) queued events the hook exited
     # before starting Python, so when adapter runs never got going and every
@@ -1241,16 +1286,7 @@ def test_saturated_queue_of_expired_entries_is_pruned() -> None:
     # and no event could ever be queued again. The hook now gives Python one
     # bounded shot at the cleanup before dropping the event.
     with _tmpdir() as tmp, _drainer_lock_held(tmp / "spool"):
-        queue = tmp / "state" / "queue"
-        queue.mkdir(parents=True)
-        long_ago = time.time() - 48 * 3600
-        payload = json.dumps(PRE_PAYLOAD)
-        for n in range(1, 10_001):
-            # Unfinished entries (no end line): nothing can apply them, and
-            # cleanup prunes them by age.
-            path = queue / f"{n:012d}"
-            path.write_text(f"PreToolUse\n{payload}\n", encoding="utf-8")
-            os.utime(path, (long_ago, long_ago))
+        queue = _fill_queue_with_expired_entries(tmp / "state")
         elapsed, proc = _run_hook("pre_tool_use.sh", PRE_PAYLOAD, _base_env(tmp))
         assert proc.returncode == 0 and proc.stdout == "" and proc.stderr == "", proc
         assert elapsed < HOOK_DEADLINE_SECONDS, f"hook held the agent for {elapsed:.1f}s"
@@ -1269,6 +1305,31 @@ def test_saturated_queue_of_expired_entries_is_pruned() -> None:
         ((_, entry, _),) = _recorded_runs(record)
         assert int(entry) > 10_000, entry
         assert [path.name for path in _queued_entries(tmp / "state")] == [entry]
+
+
+def test_payload_read_gets_only_the_wait_a_cleanup_left() -> None:
+    # 2026-10-23 review: after a full queue's cleanup the payload read still
+    # got all of BQAA_HOOK_WAIT_SECONDS, so with a sender that never closes
+    # stdin the hook took the cleanup's time and then the whole wait again
+    # (5.6 s for a 3 s wait, with the cleanup held up 2 s). The read now
+    # gets what's left of the wait, but at least a second, so the hook stays
+    # within the wait plus about a second. The wait is 5 s so that the
+    # delayed cleanup still finishes inside it when the hook's whole-second
+    # clock has ticked once before it starts the cleanup, which leaves 4 s.
+    wait = 5
+    with _tmpdir() as tmp, _drainer_lock_held(tmp / "spool"):
+        _fill_queue_with_expired_entries(tmp / "state")
+        slow_cleanup = _write_stub(
+            tmp / "slow-cleanup-python", f'[[ "$2" == --cleanup ]] && sleep 2\nexec "{sys.executable}" "$@"'
+        )
+        env = _base_env(tmp, BQAA_PYTHON=str(slow_cleanup), BQAA_HOOK_WAIT_SECONDS=str(wait))
+        elapsed, returncode, stdout, stderr = _run_hook_holding_stdin("pre_tool_use.sh", PRE_PAYLOAD, env)
+        assert returncode is not None and elapsed < wait + 2, f"hook held the agent for {elapsed:.1f}s"
+        assert returncode == 0 and stdout == b"" and stderr == b"", (returncode, stdout, stderr)
+        # The cleanup made room in time, and the whole payload was queued.
+        files = _wait_for_spool_files(tmp / "spool", count=1, timeout=10)
+        assert len(files) == 1, files
+        _assert_tool_starting_envelope(files[0])
 
 
 # ---------------------------------------------------------------------------
@@ -1500,6 +1561,7 @@ def main() -> int:
         test_direct_write_gives_up_on_hung_auth,
         test_hook_fails_open_when_python_fails,
         test_main_fails_open_on_bad_input,
+        test_hook_fails_open_under_inherited_shell_options,
         test_hook_enqueues_tool_event_before_returning,
         test_healthy_hook_does_not_sit_out_the_wait_and_drainer_sends,
         test_usercustomize_cannot_restore_a_real_google,
@@ -1515,6 +1577,7 @@ def main() -> int:
         test_queue_numbers_are_never_handed_out_twice,
         test_cleanup_leaves_queue_locks_in_place,
         test_saturated_queue_of_expired_entries_is_pruned,
+        test_payload_read_gets_only_the_wait_a_cleanup_left,
         test_payload_that_cannot_be_parsed_holds_up_no_other_event,
         test_transcript_lines_that_cannot_be_parsed_are_skipped,
         test_drainer_sends_spooled_row_unchanged,

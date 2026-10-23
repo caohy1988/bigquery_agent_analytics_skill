@@ -18,6 +18,9 @@
 #      all. Whole seconds: macOS ships bash 3.2, whose read -t takes no less.
 
 exec 2>/dev/null
+# bash turns on the options an exported SHELLOPTS names. Under errexit or
+# nounset the hook would stop part way with status 1 and lose the event.
+set +e +u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_DIR="$(dirname "$SCRIPT_DIR")"
@@ -110,7 +113,8 @@ read_used() {
 }
 
 LAST=0
-for entry in "${QUEUED[@]}"; do
+# Not "${QUEUED[@]}": bash 3.2 calls an empty array unbound under nounset.
+for entry in ${QUEUED[@]+"${QUEUED[@]}"}; do
   n=$((10#${entry##*/}))
   ((n > LAST)) && LAST=$n
 done
@@ -145,9 +149,14 @@ printf '%s\n' "$HOOK_NAME" >&5
 # cat copies the payload in the background and holds the write end of the
 # pipe read on fd 4 until it's done. Don't wait for it past the deadline: a
 # sender may write the payload and never close stdin.
-READ_SECONDS=$((WAIT_SECONDS > 0 ? WAIT_SECONDS : 1))
 exec 4< <(exec "$CAT_BIN" 3>&1 >&5) || exit 0
 CAT_PID=$!
+# The read gets what's left of the wait (a full queue's cleanup may have
+# used some of it), but at least a second, even with nothing left: bash 3.2
+# takes whole seconds only, and its read -t 0 returns at once without
+# reading anything.
+READ_SECONDS=$((WAIT_SECONDS - SECONDS))
+((READ_SECONDS > 0)) || READ_SECONDS=1
 read -r -t "$READ_SECONDS" -u 4 _ || true
 if kill -0 "$CAT_PID"; then
   kill "$CAT_PID"
